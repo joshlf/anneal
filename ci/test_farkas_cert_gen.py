@@ -530,44 +530,80 @@ def _seeded_differential_corpus(seed: int, n_ent: int, n_mir: int) -> list[str]:
     out: list[str] = []
     for i in range(n_ent):
         dom = rng.choice(["nat", "int"])
+        mode = rng.choice(["suff", "strict", "equiv"])
         pre_sides = [(expr(dom), expr(dom)) for _ in range(rng.randint(0, 3))]
-        pre = [f"{a} {rng.choice(['<=', '<='])} {b}" for a, b in pre_sides]
-        obl = [ineq(dom) for _ in range(rng.randint(0, 1))]
-        # Entailed-by-construction obligations: scaled / summed / relaxed `pre` rows.
-        for _ in range(rng.randint(1, 2)):
-            if not pre_sides:
-                break
-            picks = rng.sample(pre_sides, k=min(len(pre_sides), rng.randint(1, 2)))
-            k = rng.randint(1, 3)
-            lhs = " + ".join(f"{k} * ({a})" for a, _ in picks)
-            rhs = " + ".join(f"{k} * ({b})" for _, b in picks) + f" + {rng.randint(0, 3)}"
-            obl.append(f"{lhs} <= {rhs}")
+        if mode == "equiv" and pre_sides:
+            # Bidirectional equivalent obligations: positively scaled & shifted rows
+            # (exercises `divCut` on the reverse entailment edge when `k >= 2`).
+            pre = [f"{a} <= {b}" for a, b in pre_sides]
+            obl = []
+            for a, b in pre_sides:
+                k = rng.randint(1, 3)
+                shift = rng.randint(0, 3)
+                obl.append(f"{k} * ({a}) + {shift} <= {k} * ({b}) + {shift}")
+        else:
+            pre = [f"{a} {rng.choice(['<=', '<'])} {b}" for a, b in pre_sides]
+            obl = [ineq(dom) for _ in range(rng.randint(0, 1))]
+            # Entailed-by-construction obligations: scaled / summed / relaxed `pre` rows.
+            for _ in range(rng.randint(1, 2)):
+                if not pre_sides:
+                    break
+                picks = rng.sample(pre_sides, k=min(len(pre_sides), rng.randint(1, 2)))
+                k = rng.randint(1, 3)
+                lhs = " + ".join(f"{k} * ({a})" for a, _ in picks)
+                rhs = " + ".join(f"{k} * ({b})" for _, b in picks) + f" + {rng.randint(0, 3)}"
+                obl.append(f"{lhs} <= {rhs}")
         if not obl:
             obl = [ineq(dom)]
         used = sorted({v for t in pre + obl for v in names
                        if re.search(rf"\b{v}\b", t)})
         domain_vals = range(0, 5) if dom == "nat" else range(-3, 4)
-        mode = rng.choice(["suff", "equiv"])
+        ascii_flag = rng.random() < 0.35
         try:
-            for vals in itertools.product(domain_vals, repeat=len(used)):
+            grid = list(itertools.product(domain_vals, repeat=len(used)))
+            sat_wit: str | None = None
+            sat_snip: str | None = None
+            for vals in grid:
                 wit = ",".join(f"{v}={c}" for v, c in zip(used, vals))
-                res = generate_entailment_certificate(
+                r0 = generate_entailment_certificate(
                     dom, pre, obl, wit, check_equiv=(mode == "equiv"),
                     thm_name=f"diff_ent_{seed}_{i}", max_nodes=600,
+                    ascii_lean=ascii_flag,
                 )
-                if res["solved"]:
-                    out.append(res["lean_snippet"])
+                if r0["solved"]:
+                    sat_wit = wit
+                    sat_snip = r0["lean_snippet"]
                     break
-                if "failed_obligation_index" in res or "failed_pre_index" in res:
+                if "failed_obligation_index" in r0 or "failed_pre_index" in r0:
                     break
+            if sat_wit is not None and sat_snip is not None:
+                if mode == "strict":
+                    emitted = False
+                    for vals in grid:
+                        wit = ",".join(f"{v}={c}" for v, c in zip(used, vals))
+                        r1 = generate_entailment_certificate(
+                            dom, pre, obl, sat_wit, strict_witness_str=wit,
+                            thm_name=f"diff_ent_{seed}_{i}", max_nodes=600,
+                            ascii_lean=ascii_flag,
+                        )
+                        if r1["solved"]:
+                            out.append(r1["lean_snippet"])
+                            emitted = True
+                            break
+                    if not emitted:
+                        out.append(sat_snip)
+                else:
+                    out.append(sat_snip)
         except ParseError:
             continue
     for i in range(n_mir):
         preset = rng.choice([
             "slice-range", "uint-add-no-overflow", "uint-sub-no-underflow",
             "uint-mul-const-no-overflow", "non-overlapping-ptrs", "aligned-stride",
+            "aipcc-interval-refine",
         ])
         hyps = [ineq("nat") for _ in range(rng.randint(1, 4))]
+        ascii_flag = rng.random() < 0.35
         if preset == "slice-range":
             kw: dict[str, Any] = dict(
                 offset_expr=expr("nat"), len_expr=expr("nat"), total_expr=expr("nat"))
@@ -575,17 +611,32 @@ def _seeded_differential_corpus(seed: int, n_ent: int, n_mir: int) -> list[str]:
             kw = dict(width=rng.choice([8, 16, 32, 64, 128]),
                       lhs_expr=expr("nat"), rhs_expr=expr("nat"))
         elif preset == "uint-mul-const-no-overflow":
-            kw = dict(width=rng.choice([8, 16]), scale=rng.randint(0, 255), var_name=expr("nat"))
+            w = rng.choice([8, 16, 32, 64, 128])
+            kw = dict(width=w, scale=rng.choice([0, 1, 2, 7, 255]), var_name=expr("nat"))
         elif preset == "non-overlapping-ptrs":
             kw = dict(src_offset_expr=expr("nat"), dst_offset_expr=expr("nat"),
                       count_expr=expr("nat"),
                       direction=rng.choice(["src-before-dst", "dst-before-src"]))
+        elif preset == "aipcc-interval-refine":
+            w = rng.choice([8, 16, 32, 64, 128])
+            lo = rng.randint(0, 10)
+            hi = lo + rng.randint(0, 20)
+            var = rng.choice(names)
+            use_src = rng.random() < 0.6
+            if use_src:
+                hyps = [f"{var} <= {hi}", *hyps[:2]]
+                kw = dict(width=w, var_name=var, src_lo=lo, src_hi=hi + 10,
+                          target_lo=lo, target_hi=hi)
+            else:
+                hyps = [f"{lo} <= {var}", f"{var} <= {hi}", *hyps[:1]]
+                kw = dict(width=w, var_name=var, target_lo=lo, target_hi=hi)
         else:
             kw = dict(align=rng.choice([1, 2, 4, 8]), offset_expr=expr("nat"),
                       quot_expr=expr("nat"))
         try:
             res = generate_mir_bounds_certificate(
-                preset, hyps, f"diff_mir_{seed}_{i}", max_nodes=600, **kw)
+                preset, hyps, f"diff_mir_{seed}_{i}", max_nodes=600,
+                ascii_lean=ascii_flag, **kw)
         except ParseError:
             continue
         if res["solved"]:
@@ -774,6 +825,22 @@ class FarkasMirCertGenTests(unittest.TestCase):
         with self.assertRaisesRegex(ParseError, "maxRecDepth"):
             generate_mir_bounds_certificate(
                 "uint-add-no-overflow", too_many_hyps, "too_many", width=8
+            )
+        # Oversized entailment problem (>30 obligations in nat, or >30 pre/vars)
+        # fails closed upfront with ParseError instead of emitting Lean that hits
+        # default `maxRecDepth`.
+        with self.assertRaisesRegex(ParseError, "maxRecDepth"):
+            generate_entailment_certificate(
+                "nat", ["x <= 5"], [f"x <= {5 + i}" for i in range(35)], "x=0"
+            )
+        with self.assertRaisesRegex(ParseError, "maxRecDepth"):
+            generate_entailment_certificate(
+                "int", ["x <= 5"], [f"x <= {5 + i}" for i in range(45)], "x=0"
+            )
+        depth16_ent = " + ".join(["x"] * 17)
+        with self.assertRaisesRegex(ParseError, "kernel limits"):
+            generate_entailment_certificate(
+                "nat", [f"{depth16_ent} < y"], ["x <= y"], "x=0,y=1"
             )
         # Missing `--goal` in default mode keeps the baseline argparse contract
         # (`required=True`): usage error on stderr and `SystemExit(2)`, no JSON.
@@ -1350,9 +1417,13 @@ class FarkasMirCertGenTests(unittest.TestCase):
 
             # Seeded differential corpus: every snippet the generator claims to have
             # solved must be accepted by the kernel, warning-free.
-            corpus = _seeded_differential_corpus(4416, 60, 50)
-            self.assertGreaterEqual(len(corpus), 30)
-            self.assertGreaterEqual(sum("_cert rfl" not in c and "fwd_certs" in c for c in corpus), 8)
+            corpus = _seeded_differential_corpus(4416, 80, 60)
+            self.assertGreaterEqual(len(corpus), 40)
+            self.assertGreaterEqual(sum("_cert rfl" not in c and "fwd_certs" in c for c in corpus), 12)
+            self.assertGreaterEqual(sum(".strict [" in c for c in corpus), 2)
+            self.assertGreaterEqual(sum(".equiv [" in c for c in corpus), 2)
+            self.assertGreaterEqual(sum("farkas_discharges_aipcc_interval_refinement" in c for c in corpus), 3)
+            self.assertGreaterEqual(sum(c.isascii() for c in corpus), 5)
             cbody = "\n\n".join(
                 "\n".join(ln for ln in snip.splitlines() if not ln.startswith(("import ", "open ")))
                 for snip in corpus

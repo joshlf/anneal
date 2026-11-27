@@ -1326,9 +1326,18 @@ def generate_entailment_certificate(
     obl_parsed = [iq for s in obligation_strings for iq in parse_inequalities(s, domain, reserved=reserved)]
     pre_le = [(_ast_to_le(l, op, r)[0], _ast_to_le(l, op, r)[1]) for l, op, r in pre_parsed]
     obl_le = [(_ast_to_le(l, op, r)[0], _ast_to_le(l, op, r)[1]) for l, op, r in obl_parsed]
+    for la, ra in (*pre_le, *obl_le):
+        _walk_ast(la, domain, caps=True)
+        _walk_ast(ra, domain, caps=True)
     vars_ = _collect_vars(
         [node for pair in (*pre_le, *obl_le) for node in pair], domain
     )
+    mv, mh, _, _, _ = _KERNEL_CAPS[domain]
+    if len(vars_) > mv or len(pre_le) > mh or len(obl_le) > mh:
+        raise ParseError(
+            f"Entailment problem exceeds Lean maxRecDepth bounds (`--domain {domain}`: "
+            f"vars {len(vars_)}/{mv}, pre {len(pre_le)}/{mh}, obligations {len(obl_le)}/{mh})."
+        )
     vidx = {nm: i for i, nm in enumerate(vars_)}
 
     # Validate non-vacuity satisfiability witness against every `pre` inequality.

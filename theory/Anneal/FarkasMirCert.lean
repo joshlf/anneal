@@ -808,6 +808,18 @@ theorem mirAbsSlot_uintCopy_iv_bounds {ty : Ty} {locals : List LocalSlot}
     lo ≤ sc.bits ∧ sc.bits ≤ hi ∧ sc.bits + 1 ≤ modPow2 (uintWidth u) :=
   absVal_denote_iv_bounds hNonWrap h.2.2.1
 
+/-- Extracts `lo ≤ sc.bits`, `sc.bits ≤ hi`, and
+`sc.bits + 1 ≤ modPow2 (uintWidth u)` from a `MirAbsSlot.uintBoolPair`
+denotation carrying a non-wrapping interval `.iv lo hi`. -/
+theorem mirAbsSlot_uintBoolPair_iv_bounds {ty : Ty} {locals : List LocalSlot}
+    {u : UintTy} {initDom : InitDom} {t : Tnum} {lo hi : Nat} {sg : StridedCong}
+    {ov : BoolAbs} {sc : ScalarInt} {vb : Value}
+    (hNonWrap : Nat.ble lo hi = true)
+    (h : (MirAbsSlot.uintBoolPair u ⟨initDom, t, .iv lo hi, sg⟩ ov).denote ty locals
+      (.init (.aggregate 0 [.scalar sc, vb]))) :
+    lo ≤ sc.bits ∧ sc.bits ≤ hi ∧ sc.bits + 1 ≤ modPow2 (uintWidth u) :=
+  absVal_denote_iv_bounds hNonWrap h.2.2.1
+
 /-- Packages extracted `WrappedInterval` bounds as `NatCutIneq.holds`
 hypotheses ready for `NatCutGoal`. -/
 theorem natCutIneqs_of_wrappedInterval {M lo hi x : Nat} {env : List Nat} {v : Nat}
@@ -2707,5 +2719,87 @@ theorem canary_e2e_mirAbsSlot_to_uint_add_no_overflow
     [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1]
     rfl [sa.bits, sb.bits] locals mem hAb.2.1 hTight
   exact ⟨hRef.1, hAdd.2.2.1⟩
+
+/-- Canary: `mirAbsSlot_uintBoolPair_iv_bounds` extracts interval bounds from
+an initialized `(uint, bool)` aggregate slot. -/
+theorem canary_mirAbsSlot_uintBoolPair_iv_bounds
+    (ty : Ty) (locals : List LocalSlot) (t : Tnum) (sg : StridedCong)
+    (ov : BoolAbs) (sc : ScalarInt) (vb : Value)
+    (h : (MirAbsSlot.uintBoolPair .u16 ⟨.init, t, .iv 4 40, sg⟩ ov).denote
+      ty locals (.init (.aggregate 0 [.scalar sc, vb]))) :
+    4 ≤ sc.bits ∧ sc.bits ≤ 40 ∧ sc.bits + 1 ≤ modPow2 (uintWidth .u16) :=
+  mirAbsSlot_uintBoolPair_iv_bounds rfl h
+
+/-- Canary: every constructor of the unified `FarkasMirGoal` schema (all 12
+obligation families) is positively discharged via `checkFarkasMirGoal_sound`
+using a single `rfl`. -/
+theorem canary_checkFarkasMirGoal_all_variants :
+    (FarkasMirGoal.uintAddNoOverflow .u8
+      [⟨.var 0, .cst 100⟩, ⟨.var 1, .cst 150⟩] (.var 0) (.var 1)).denote ∧
+    (FarkasMirGoal.uintSubNoUnderflow .u32
+      [⟨.add (.var 1) (.cst 4), .var 0⟩] (.var 0) (.var 1)).denote ∧
+    (FarkasMirGoal.uintSubNoUnderflowCertified .u32
+      [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst 1000⟩]
+      (.var 0) (.var 1)).denote ∧
+    (FarkasMirGoal.uintMulConstNoOverflow .u8
+      [⟨.var 0, .cst 10⟩] 8 (.var 0)).denote ∧
+    (FarkasMirGoal.sliceBounds
+      [⟨.var 0, .cst 4⟩, ⟨.var 1, .cst 8⟩, ⟨.cst 12, .var 2⟩]
+      (.var 0) (.var 1) (.var 2)).denote ∧
+    (FarkasMirGoal.sliceSplit
+      [⟨.add (.var 0) (.var 1), .var 2⟩, ⟨.var 2, .add (.var 0) (.var 1)⟩]
+      (.var 0) (.var 1) (.var 2)).denote ∧
+    (FarkasMirGoal.alignedStride
+      [⟨.mulC 8 (.var 1), .var 0⟩, ⟨.var 0, .mulC 8 (.var 1)⟩]
+      8 (.var 0) (.var 1)).denote ∧
+    (FarkasMirGoal.nonOverlappingPtrs
+      [⟨.add (.var 0) (.var 2), .var 1⟩]
+      (.var 0) (.var 1) (.var 2) .srcBeforeDst).denote ∧
+    (FarkasMirGoal.arrayToSliceCast
+      [⟨.mulC 8 (.var 1), .var 0⟩, ⟨.var 0, .mulC 8 (.var 1)⟩,
+       ⟨.var 0, .cst 16⟩, ⟨.var 2, .cst 4⟩, ⟨.cst 48, .var 3⟩]
+      8 8 (.var 0) (.var 1) (.var 2) (.var 3)).denote ∧
+    (FarkasMirGoal.aipccIntervalRefine
+      [⟨.cst 10, .var 0⟩, ⟨.var 0, .cst 50⟩] 256 10 50 (.var 0)).denote ∧
+    (FarkasMirGoal.natEntailmentAdequacy
+      [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩] [0] (.strict [6])).denote ∧
+    (FarkasMirGoal.intEntailmentAdequacy
+      [⟨.cst ⟨true, 3⟩, .var 0⟩] [⟨.cst ⟨true, 5⟩, .var 0⟩]
+      [Int.negOfNat 1] (.strict [Int.negOfNat 4])).denote :=
+  ⟨checkFarkasMirGoal_sound _ (.single [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1]) rfl,
+   checkFarkasMirGoal_sound _ (.single [.hyp 0, .hyp 3, .comb 0 1 1 1]) rfl,
+   checkFarkasMirGoal_sound _ (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) rfl,
+   checkFarkasMirGoal_sound _ (.single [.hyp 0, .hyp 2, .comb 0 8 1 1]) rfl,
+   checkFarkasMirGoal_sound _ (.single [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 2, .comb 2 1 3 1, .hyp 6, .comb 4 1 5 1]) rfl,
+   checkFarkasMirGoal_sound _ (.pair [.hyp 0, .hyp 5, .comb 0 1 1 1] [.hyp 1, .hyp 5, .comb 0 1 1 1]) rfl,
+   checkFarkasMirGoal_sound _ (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) rfl,
+   checkFarkasMirGoal_sound _ (.single [.hyp 0, .hyp 4, .comb 0 1 1 1]) rfl,
+   checkFarkasMirGoal_sound _
+     (.triple [.hyp 0, .hyp 9, .comb 0 1 1 1] [.hyp 1, .hyp 9, .comb 0 1 1 1]
+              [.hyp 2, .hyp 3, .comb 0 1 1 8, .hyp 4, .comb 2 1 3 1, .hyp 9, .comb 4 1 5 1]) rfl,
+   checkFarkasMirGoal_sound _ (.pair [.hyp 0, .hyp 3, .comb 0 1 1 1] [.hyp 1, .hyp 3, .comb 0 1 1 1]) rfl,
+   checkFarkasMirGoal_sound _ (.edge [[.hyp 0, .hyp 2, .comb 0 1 1 1]]) rfl,
+   checkFarkasMirGoal_sound _ (.edge [[.hyp 0, .hyp 1, .comb 0 1 1 1]]) rfl⟩
+
+/-- Negative canary: mismatched `FarkasMirCert` payload constructors fail closed
+across all four certificate shapes (`.single`, `.pair`, `.triple`, `.edge`). -/
+theorem neg_canary_checkFarkasMirGoal_mismatched_payloads :
+    checkFarkasMirGoal
+      (.uintAddNoOverflow .u8 [⟨.var 0, .cst 1⟩] (.var 0) (.cst 0))
+      (.pair [] []) = false ∧
+    checkFarkasMirGoal
+      (.sliceSplit [⟨.var 0, .var 0⟩] (.var 0) (.cst 0) (.var 0))
+      (.single []) = false ∧
+    checkFarkasMirGoal
+      (.arrayToSliceCast [] 8 8 (.cst 0) (.cst 0) (.cst 0) (.cst 0))
+      (.pair [] []) = false ∧
+    checkFarkasMirGoal
+      (.natEntailmentAdequacy [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩] [0] .sufficientOnly)
+      (.triple [] [] []) = false ∧
+    checkFarkasMirGoal
+      (.intEntailmentAdequacy [⟨.var 0, .cst SInt.zero⟩] [⟨.var 0, .cst SInt.zero⟩]
+        [Int.ofNat 0] .sufficientOnly)
+      (.single []) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.FarkasMirCert
