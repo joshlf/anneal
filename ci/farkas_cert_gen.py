@@ -533,12 +533,19 @@ _SUPPORTED_WIDTHS = frozenset({8, 16, 32, 64, 128})
 _MIR_SNIPPET_RESERVED = frozenset((
     "modPow2 uintWidth uintBytes scalarModulus evalScalarBinOp ValidSliceRange "
     "evalPtrOffset AlignedPtr NonOverlappingPtrs WrappedInterval RawPtrVal LocalSlot "
-    "Memory NatCutIneq NatLinExpr ScalarInt UintTy some none wrappedInterval_denote_bounds "
+    "Memory NatCutIneq NatLinExpr ScalarInt UintTy UintScalarInRange some none "
+    "Bool Option And Or Not True False Eq FarkasMirCert wrappedInterval_denote_bounds "
     "farkas_discharges_slice_bounds farkas_discharges_aligned_stride "
     "farkas_discharges_u64_add_no_overflow farkas_discharges_uint_add_no_overflow "
     "farkas_discharges_uint_sub_no_underflow farkas_discharges_uint_sub_no_underflow_certified "
     "farkas_discharges_uint_mul_const_no_overflow farkas_discharges_non_overlapping_ptrs "
     "farkas_discharges_aipcc_interval_refinement"
+).split())
+_ENTAILMENT_SNIPPET_RESERVED = frozenset((
+    "NatLinSpec IntLinSpec NatAdequacyMode IntAdequacyMode "
+    "NatEntailmentAdequacyProp IntEntailmentAdequacyProp "
+    "farkas_entailment_adequacy_cert farkas_int_entailment_adequacy_cert "
+    "NatCutIneq IntCutIneq NatLinExpr IntLinExpr SInt FarkasMirCert"
 ).split())
 _MIR_BOUNDS_PRESETS = (
     "slice-range",
@@ -627,8 +634,8 @@ def _check_fixed_goal_caps(
     vset: dict[str, None] = {}
     nodes = voccs = 0
     for la, ra in [*le_hyps, (gl_le, gr_le)]:
-        _, ln, lv, _ = _walk_ast(la, domain, vset)
-        _, rn, rv, _ = _walk_ast(ra, domain, vset)
+        _, ln, lv, _ = _walk_ast(la, domain, vset, caps=True)
+        _, rn, rv, _ = _walk_ast(ra, domain, vset, caps=True)
         nodes, voccs = nodes + ln + rn, voccs + lv + rv
     depths: list[int] = []
     for st in steps:
@@ -797,6 +804,8 @@ def generate_mir_bounds_certificate(
         off_ast = _parse_expr_str(offset_expr, "nat", reserved=reserved)
         len_ast = _parse_expr_str(len_expr, "nat", reserved=reserved)
         tot_ast = _parse_expr_str(total_expr, "nat", reserved=reserved)
+        gl_le = ("add", off_ast, len_ast)
+        _walk_ast(gl_le, "nat", caps=True)
         parsed = [iq for hs in hyp_strings for iq in parse_inequalities(hs, "nat", reserved=reserved)]
         le_hyps_full = [(*_ast_to_le(l, op, r), l, op, r) for l, op, r in parsed]
         le_hyps_ast = [(la, ra) for la, ra, *_ in le_hyps_full]
@@ -804,7 +813,7 @@ def generate_mir_bounds_certificate(
             [off_ast, len_ast, tot_ast, *[x for pair in le_hyps_ast for x in pair]], "nat"
         )
         vidx = {nm: i for i, nm in enumerate(vars_)}
-        steps = _solve_fixed_goal("nat", le_hyps_ast, ("add", off_ast, len_ast), tot_ast, vidx, max_nodes)
+        steps = _solve_fixed_goal("nat", le_hyps_ast, gl_le, tot_ast, vidx, max_nodes)
         if steps is None:
             return {
                 "solved": False, "mode": "mir-bounds", "preset": preset, "domain": "nat",
@@ -1200,6 +1209,7 @@ def generate_mir_bounds_certificate(
             f"private def {thm_name}_hyps : List NatCutIneq :=\n  [{hyp_lits}]\n\n"
             f"private def {thm_name}_cert : List CutStep :=\n  [{_format_steps(steps)}]\n\n"
             f"private theorem {thm_name} {v_bind}(locals : List LocalSlot) (mem : Memory){h_bind} :\n"
+            f"    UintScalarInRange {uty} {sc_k} {conj}\n"
             f"    {prod_s} < modPow2 (uintWidth {uty}) {conj}\n"
             f"    {prod_s} < scalarModulus (uintBytes {uty}) {conj}\n"
             f"    evalScalarBinOp .mulUnchecked {sc_k} {sc_x} locals mem false =\n"
@@ -1207,7 +1217,7 @@ def generate_mir_bounds_certificate(
             f"    evalScalarBinOp .mulWithOverflow {sc_k} {sc_x} locals mem false =\n"
             f"      .ok (.aggregate 0 [.scalar {sc_p}, .scalar {sc_z}]) locals mem :=\n"
             f"  farkas_discharges_uint_mul_const_no_overflow {uty} {thm_name}_hyps\n"
-            f"    {scale} ({rp_ast(x_ast)}) {thm_name}_cert rfl [{', '.join(vars_)}] locals mem{p_args}"
+            f"    {scale} ({rp_ast(x_ast)}) {thm_name}_cert rfl rfl [{', '.join(vars_)}] locals mem{p_args}"
         )
         return {
             "solved": True, "mode": "mir-bounds", "preset": preset, "domain": "nat",
@@ -1232,6 +1242,7 @@ def generate_mir_bounds_certificate(
     vidx = {nm: i for i, nm in enumerate(vars_)}
     gl_le = ("add", src_ast, cnt_ast) if direction == "src-before-dst" else ("add", dst_ast, cnt_ast)
     gr_le = dst_ast if direction == "src-before-dst" else src_ast
+    _walk_ast(gl_le, "nat", caps=True)
     steps = _solve_fixed_goal("nat", le_hyps_ast, gl_le, gr_le, vidx, max_nodes)
     if steps is None:
         return {
@@ -1284,13 +1295,15 @@ def generate_entailment_certificate(
 ) -> dict[str, Any]:
     """Synthesize a reflective Entailment-Graph adequacy certificate."""
     _validate_common_args(thm_name, max_nodes)
+    if thm_name in _ENTAILMENT_SNIPPET_RESERVED:
+        raise ParseError(f"Unsupported or reserved Lean name: `{thm_name}`")
     if domain not in ("nat", "int"):
         raise ParseError(f"Unsupported `--domain`: `{domain}`")
     if not obligation_strings:
         raise ParseError("`--entailment-check` requires at least one `--obligation`.")
     if strict_witness_str is not None and check_equiv:
         raise ParseError("`--strict-witness` and `--check-equiv` are mutually exclusive.")
-    reserved = frozenset({
+    reserved = _ENTAILMENT_SNIPPET_RESERVED | frozenset({
         thm_name, f"{thm_name}_pre", f"{thm_name}_obligation",
         f"{thm_name}_fwd_certs", f"{thm_name}_sat_witness", f"{thm_name}_mode",
     })
@@ -1474,7 +1487,12 @@ def main(argv: list[str] | None = None) -> int:
         "--entailment-check", "--pre", "--obligation", "--witness", "--strict-witness",
         "--check-equiv", "--",
     }
-    neg_flags = {"--hyp", "--goal", "--pre", "--obligation", "--witness", "--strict-witness"}
+    neg_flags = {
+        "--hyp", "--goal", "--pre", "--obligation", "--witness", "--strict-witness",
+        "--offset-expr", "--len-expr", "--total-expr", "--quot-expr",
+        "--lhs-expr", "--rhs-expr", "--var", "--src-offset-expr",
+        "--dst-offset-expr", "--count-expr",
+    }
     norm, i = [], 0
     while i < len(raw):
         tok, nxt = raw[i], (raw[i + 1] if i + 1 < len(raw) else "")

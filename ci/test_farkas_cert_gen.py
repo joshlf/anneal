@@ -392,18 +392,45 @@ class FarkasCertGenTests(unittest.TestCase):
             self.assertTrue(json.loads(p_out.read_text(encoding="utf-8"))["ok"])
 
 
-def _tamper_snippet(snip: str) -> str:
-    """Replace the first certificate in a generated snippet with `[.hyp 0]`."""
-    out, n = re.subn(
-        r"(_cert(?:_le|_lo)? : List CutStep :=\n  )\[[^\]]*\]", r"\1[.hyp 0]", snip, count=1
-    )
-    if n == 0:
-        out, n = re.subn(
-            r"(_fwd_certs : List \(List CutStep\) :=\n  )\[\[[^\]]*\]", r"\1[[.hyp 0]",
-            snip, count=1,
+def _tamper_all_cert_slots(snip: str) -> list[str]:
+    """Produce one tampered copy per certificate slot (`_cert*`, each `_fwd_certs`
+    entry, and each `.equiv` reverse cert), replacing that single slot with `[]`."""
+    m_name = re.search(r"(?m)^private theorem ([A-Za-z_][A-Za-z0-9_']*)\b", snip)
+    assert m_name is not None, snip
+    base = m_name.group(1)
+
+    def rename(code: str, idx: int) -> str:
+        suf = (
+            r"(?=(?:_(?:hyps|cert(?:_le|_ge|_lo|_hi|_range)?|"
+            r"pre|obligation|fwd_certs|sat_witness|mode))?\b)"
         )
-    assert n == 1 and out != snip, snip
-    return out
+        return re.sub(rf"\b{re.escape(base)}{suf}", f"{base}_t{idx}", code)
+
+    variants: list[str] = []
+    # 1. Every standalone `List CutStep` cert (`_cert`, `_cert_le`, `_cert_ge`, `_cert_lo`, `_cert_hi`, `_cert_range`)
+    cert_pat = re.compile(r"(_cert(?:_le|_ge|_lo|_hi|_range)? : List CutStep :=\n  )(\[[^\]]*\])")
+    for m in cert_pat.finditer(snip):
+        tampered = snip[: m.start(2)] + "[]" + snip[m.end(2) :]
+        assert tampered != snip, snip
+        variants.append(rename(tampered, len(variants)))
+
+    # 2. Every individual obligation cert inside `_fwd_certs` and `.equiv [...]`
+    for list_pat in (
+        re.compile(r"(_fwd_certs : List \(List CutStep\) :=\n  \[)(.*)(\])"),
+        re.compile(r"(\.equiv \[)(.*)(\])"),
+    ):
+        for lm in list_pat.finditer(snip):
+            inner_start = lm.start(2)
+            inner = lm.group(2)
+            for sm in re.finditer(r"\[[^\]]*\]", inner):
+                s_abs = inner_start + sm.start()
+                e_abs = inner_start + sm.end()
+                tampered = snip[:s_abs] + "[]" + snip[e_abs:]
+                assert tampered != snip, snip
+                variants.append(rename(tampered, len(variants)))
+
+    assert variants, snip
+    return variants
 
 
 class FarkasMirCertGenTests(unittest.TestCase):
@@ -572,9 +599,43 @@ class FarkasMirCertGenTests(unittest.TestCase):
             {"preset": "slice-range", "hyp_strings": [], "len_expr": "some"},
             {"preset": "non-overlapping-ptrs", "hyp_strings": ["NonOverlappingPtrs <= 1"]},
             {"preset": "slice-range", "hyp_strings": [], "thm_name": "evalPtrOffset"},
+            {"preset": "uint-mul-const-no-overflow", "hyp_strings": ["UintScalarInRange <= 1"]},
         ):
             with self.assertRaises(ParseError, msg=kwargs):
                 generate_mir_bounds_certificate(**kwargs)
+
+        # Synthesized compound goal ASTs exceeding `_MAX_AST_DEPTH` (16) fail closed:
+        # 17-term sum has depth 16; adding `len` makes depth 17 > 16.
+        depth16 = " + ".join(["x"] * 17)
+        with self.assertRaisesRegex(ParseError, "kernel limits"):
+            generate_mir_bounds_certificate(
+                "slice-range", [f"{depth16} + len <= total"],
+                offset_expr=depth16, len_expr="len", total_expr="total",
+            )
+        # In `uint-sub-no-underflow`, depth-16 `lhs` makes `lhs + 1` depth 17, so
+        # range certification cleanly falls back to `hRange` without exceeding caps.
+        sub_deep = generate_mir_bounds_certificate(
+            "uint-sub-no-underflow", [f"b <= {depth16}", f"{depth16} <= 100"],
+            "sub_deep_fallback", width=32, lhs_expr=depth16, rhs_expr="b",
+        )
+        self.assertTrue(sub_deep["solved"])
+        self.assertFalse(sub_deep["range_certified"])
+
+        # Negative expression CLI arg returns clean JSON exit 2 (no argparse crash).
+        rc_neg, out_neg, err_neg = self._run_cli([
+            "--mir-bounds", "uint-add-no-overflow", "--width", "8",
+            "--lhs-expr", "-a", "--json",
+        ])
+        self.assertEqual(rc_neg, 2, err_neg)
+        self.assertEqual(err_neg, "")
+        self.assertFalse(json.loads(out_neg)["solved"])
+
+        # Entailment reserved global names cannot be shadowed by `--name` or vars.
+        for bad_ent_name in ("farkas_entailment_adequacy_cert", "NatLinSpec", "IntLinSpec"):
+            with self.assertRaises(ParseError, msg=bad_ent_name):
+                generate_entailment_certificate(
+                    "nat", ["x <= 5"], ["x <= 10"], "x=0", thm_name=bad_ent_name
+                )
 
         # A constant multiplier must itself be a valid `uN` operand (`< 2^width`):
         # `256 * x` with `x <= 0` is overflow-free but `256` is not a `u8`.
@@ -909,6 +970,27 @@ class FarkasMirCertGenTests(unittest.TestCase):
                 thm_name="live_ent_int_equiv_ascii",
                 ascii_lean=True,
             )["lean_snippet"],
+            # 0-variable constant MIR bounds and empty-pre entailment checks
+            generate_mir_bounds_certificate(
+                "slice-range", [], "live_slice_const",
+                offset_expr="4", len_expr="8", total_expr="16",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "aligned-stride", [], "live_aligned_const",
+                align=8, offset_expr="16", quot_expr="2",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-add-no-overflow", [], "live_u8_add_const",
+                width=8, lhs_expr="100", rhs_expr="150",
+            )["lean_snippet"],
+            generate_mir_bounds_certificate(
+                "uint-sub-no-underflow", [], "live_u8_sub_const_certified",
+                width=8, lhs_expr="100", rhs_expr="40",
+            )["lean_snippet"],
+            generate_entailment_certificate(
+                "nat", [], ["0 <= x"], "x=0",
+                check_equiv=True, thm_name="live_ent_empty_pre_equiv",
+            )["lean_snippet"],
         ]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -984,6 +1066,21 @@ class FarkasMirCertGenTests(unittest.TestCase):
                     "    NatLinSpec.holds env [⟨.var 0, .cst 5⟩, ⟨.var 0, .cst 0⟩] :=\n"
                     "  checkNatEntailmentEdge_sound (certs := [[.hyp 0, .hyp 2, .comb 0 1 1 1]]) rfl\n",
                 ),
+                (
+                    "NegMulScaleOutOfRange.lean",
+                    "import Anneal.FarkasMirCert\n"
+                    "open Anneal.LinearArith Anneal.AiPcc Anneal.FarkasMirCert\n"
+                    "open Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics\n"
+                    "private theorem bad_mul_k (x : Nat) (locals : List LocalSlot) (mem : Memory) (hx : x <= 0) :\n"
+                    "    UintScalarInRange .u8 ⟨256, uintBytes .u8⟩ /\\\n"
+                    "    256 * x < modPow2 (uintWidth .u8) /\\ 256 * x < scalarModulus (uintBytes .u8) /\\\n"
+                    "    evalScalarBinOp .mulUnchecked ⟨256, uintBytes .u8⟩ ⟨x, uintBytes .u8⟩ locals mem false =\n"
+                    "      .ok (.scalar ⟨256 * x, uintBytes .u8⟩) locals mem /\\\n"
+                    "    evalScalarBinOp .mulWithOverflow ⟨256, uintBytes .u8⟩ ⟨x, uintBytes .u8⟩ locals mem false =\n"
+                    "      .ok (.aggregate 0 [.scalar ⟨256 * x, uintBytes .u8⟩, .scalar ⟨0, 1⟩]) locals mem :=\n"
+                    "  farkas_discharges_uint_mul_const_no_overflow .u8 [⟨.var 0, .cst 0⟩] 256 (.var 0)\n"
+                    "    [.hyp 0, .hyp 2, .comb 0 256 1 1] rfl rfl [x] locals mem hx\n",
+                ),
             ]
             for fname, content in neg_cases:
                 nf = t / fname
@@ -995,10 +1092,15 @@ class FarkasMirCertGenTests(unittest.TestCase):
                 self.assertNotEqual(nres.returncode, 0, f"Negative control unexpectedly passed: {fname}")
                 self._assert_fails_only_at_rfl(nres.stdout + nres.stderr, 1, fname)
 
-            # Systematic tampering of EVERY generated snippet: corrupt its (first)
-            # certificate to `[.hyp 0]` and require the kernel to reject exactly
-            # that `rfl` (and nothing else, e.g. no unknown identifiers).
-            tampered = [_tamper_snippet(snip) for snip in snippets]
+            # Systematic tampering of EVERY certificate slot across EVERY generated
+            # snippet (`_cert`, `_cert_le`, `_cert_ge`, `_cert_lo`, `_cert_hi`,
+            # `_cert_range`, every `_fwd_certs` entry, and every `.equiv` reverse cert):
+            # corrupt each slot individually to `[]` and require the kernel to reject
+            # every single variant ONLY at `rfl`.
+            tampered: list[str] = []
+            for snip in snippets:
+                tampered.extend(_tamper_all_cert_slots(snip))
+            self.assertGreater(len(tampered), len(snippets))
             tbody = "\n".join(
                 ln for snip in tampered for ln in snip.splitlines()
                 if not ln.startswith(("import ", "open "))
@@ -1010,7 +1112,7 @@ class FarkasMirCertGenTests(unittest.TestCase):
                 text=True, capture_output=True, timeout=240,
             )
             self.assertNotEqual(tres.returncode, 0)
-            self._assert_fails_only_at_rfl(tres.stdout + tres.stderr, len(snippets), "NegTamperedAll")
+            self._assert_fails_only_at_rfl(tres.stdout + tres.stderr, len(tampered), "NegTamperedAll")
 
             # Confirm Anneal.FarkasMirCert and emitted ProbeMir.lean pass Pass-1 preflight.
             tb = _ANNEAL_ROOT / "trusted/audit/TrustedBoundary.lean"

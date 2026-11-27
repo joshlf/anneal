@@ -152,8 +152,7 @@ theorem checkIntCutGoal_lt_sound
     (hyps : List IntCutIneq) (lhs rhs : IntLinExpr) (steps : List CutStep)
     (hChk : checkIntCutGoal ⟨hyps, ⟨.add lhs (.cst SInt.one), rhs⟩⟩ steps = true)
     (env : List Int) :
-    HypsImp (IntCutIneq.holds env) hyps
-      (Int.add (lhs.eval env) (Int.ofNat 1) ≤ rhs.eval env) :=
+    HypsImp (IntCutIneq.holds env) hyps (lhs.eval env < rhs.eval env) :=
   checkIntCutGoal_sound ⟨hyps, ⟨.add lhs (.cst SInt.one), rhs⟩⟩ steps hChk env
 
 /-- Discharges `Int` equality `lhs = rhs` from two-sided `IntCutGoal`
@@ -427,19 +426,22 @@ theorem farkas_discharges_uint_sub_no_underflow_certified
         env locals mem hLt) hAll⟩)
 
 /-- Discharges constant-scaled unsigned multiplication overflow-freedom
-`k * x < modPow2 (uintWidth u)` for any `u : UintTy` from a `NatCutGoal`
-certificate proving `k * x + 1 ≤ modPow2 (uintWidth u)`: proves the strict
-bound, exact `.mulUnchecked` evaluation, and exact `.mulWithOverflow`
-evaluation with overflow bit `⟨0, 1⟩`. -/
+`k * x < modPow2 (uintWidth u)` for any `u : UintTy` from `k < 2^width` and a
+`NatCutGoal` certificate proving `k * x + 1 ≤ modPow2 (uintWidth u)`: proves
+`UintScalarInRange u ⟨k, uintBytes u⟩`, the strict product bound, exact
+`.mulUnchecked` evaluation, and exact `.mulWithOverflow` evaluation with
+overflow bit `⟨0, 1⟩`. -/
 theorem farkas_discharges_uint_mul_const_no_overflow
     (u : UintTy) (hyps : List NatCutIneq) (k : Nat) (xExpr : NatLinExpr)
     (steps : List CutStep)
+    (hKRange : Nat.blt k (modPow2 (uintWidth u)) = true)
     (hChk : checkNatCutGoal
       ⟨hyps, ⟨.add (.mulC k xExpr) (.cst 1), .cst (modPow2 (uintWidth u))⟩⟩
       steps = true)
     (env : List Nat) (locals : List LocalSlot) (mem : Memory) :
     HypsImp (NatCutIneq.holds env) hyps
-      (k * xExpr.eval env < modPow2 (uintWidth u) ∧
+      (UintScalarInRange u ⟨k, uintBytes u⟩ ∧
+       k * xExpr.eval env < modPow2 (uintWidth u) ∧
        k * xExpr.eval env < scalarModulus (uintBytes u) ∧
        evalScalarBinOp .mulUnchecked
          ⟨k, uintBytes u⟩ ⟨xExpr.eval env, uintBytes u⟩
@@ -453,6 +455,8 @@ theorem farkas_discharges_uint_mul_const_no_overflow
             .scalar ⟨0, 1⟩]) locals mem) :=
   hypsImp_concl_mono (fun hLt => by
     dsimp only [NatLinExpr.eval] at hLt
+    have hKInRange : UintScalarInRange u ⟨k, uintBytes u⟩ :=
+      ⟨rfl, lt_of_blt_true hKRange⟩
     have hMod : k * xExpr.eval env < scalarModulus (uintBytes u) := by
       rw [scalarModulus_uintBytes]
       exact hLt
@@ -461,7 +465,7 @@ theorem farkas_discharges_uint_mul_const_no_overflow
     have hWithOv := evalScalarBinOp_uint_mulWithOverflow (u := u)
       (a := k) (b := xExpr.eval env) locals mem
     rw [wrapVal_of_lt hLt, nat_ble_false_of_lt hLt] at hWithOv
-    exact ⟨hLt, hMod, hUnchk, hWithOv⟩)
+    exact ⟨hKInRange, hLt, hMod, hUnchk, hWithOv⟩)
     (checkNatCutGoal_lt_sound hyps (.mulC k xExpr)
       (.cst (modPow2 (uintWidth u))) steps hChk env)
 
@@ -679,6 +683,20 @@ theorem farkas_discharges_array_to_slice_cast
         ⟨hyps, ⟨.add offExpr (.mulC elemSize arrayLenExpr), allocLenExpr⟩⟩
         stepsRange hChkRange env))
 
+/-- Discharges `UnalignRawPtrSafe rp innerSize allocLen` constructively from a
+`NatCutGoal` slice-range certificate. -/
+theorem farkas_discharges_unalign_raw_ptr_safe
+    (hyps : List NatCutIneq) (offExpr innerExpr allocExpr : NatLinExpr)
+    (steps : List CutStep)
+    (hChk : checkNatCutGoal ⟨hyps, ⟨.add offExpr innerExpr, allocExpr⟩⟩ steps = true)
+    (env : List Nat) (rp : RawPtrVal)
+    (hOff : rp.offset = offExpr.eval env) :
+    HypsImp (NatCutIneq.holds env) hyps
+      (UnalignRawPtrSafe rp (innerExpr.eval env) (allocExpr.eval env)) :=
+  hypsImp_concl_mono (fun h =>
+    ⟨⟨Nat.zero_lt_succ 0, Nat.mod_one rp.offset⟩, h.1⟩)
+    (farkas_discharges_slice_bounds hyps offExpr innerExpr allocExpr steps hChk env rp hOff)
+
 /-! ## 4. `Anneal.AiPcc` Bridges (`WrappedInterval`, `AbsVal`, & `MirAbsSlot`) -/
 
 /-- Extracts `lo ≤ x`, `x ≤ hi`, and `x + 1 ≤ M` from a non-wrapping
@@ -721,6 +739,17 @@ theorem mirAbsSlot_uint_iv_bounds {ty : Ty} {locals : List LocalSlot}
       (.init (.scalar sc))) :
     lo ≤ sc.bits ∧ sc.bits ≤ hi ∧ sc.bits + 1 ≤ modPow2 (uintWidth u) :=
   absVal_denote_iv_bounds hNonWrap h.2.2
+
+/-- Extracts `lo ≤ sc.bits`, `sc.bits ≤ hi`, and
+`sc.bits + 1 ≤ modPow2 (uintWidth u)` from a `MirAbsSlot.uintCopy` denotation
+carrying a non-wrapping interval `.iv lo hi`. -/
+theorem mirAbsSlot_uintCopy_iv_bounds {ty : Ty} {locals : List LocalSlot}
+    {u : UintTy} {initDom : InitDom} {t : Tnum} {lo hi : Nat} {sg : StridedCong}
+    {src : Nat} {sc : ScalarInt} (hNonWrap : Nat.ble lo hi = true)
+    (h : (MirAbsSlot.uintCopy u ⟨initDom, t, .iv lo hi, sg⟩ src).denote ty locals
+      (.init (.scalar sc))) :
+    lo ≤ sc.bits ∧ sc.bits ≤ hi ∧ sc.bits + 1 ≤ modPow2 (uintWidth u) :=
+  absVal_denote_iv_bounds hNonWrap h.2.2.1
 
 /-- Packages extracted `WrappedInterval` bounds as `NatCutIneq.holds`
 hypotheses ready for `NatCutGoal`. -/
@@ -1217,6 +1246,114 @@ theorem checkIntEntailmentGraph_sound {g : IntEntailmentGraph}
                 exact ih (bool_and_right hE) u v certs hT
   exact hAux g.edges hChk
 
+/-- Checks whether directed edge `(u, v)` appears in `edges`. -/
+def hasEdgeInList (u v : Nat) : List (Nat × Nat × List (List CutStep)) → Bool
+  | [] => false
+  | (a, b, _) :: rest => (Nat.beq a u && Nat.beq b v) || hasEdgeInList u v rest
+
+theorem hasEdgeInList_sound {u v : Nat} :
+    ∀ {edges : List (Nat × Nat × List (List CutStep))},
+      hasEdgeInList u v edges = true → ∃ certs, (u, v, certs) ∈ edges
+  | [], h => nomatch h
+  | (a, b, cs) :: rest, h => by
+    dsimp only [hasEdgeInList] at h
+    cases hHead : (Nat.beq a u && Nat.beq b v) with
+    | true =>
+      have ha := Nat.eq_of_beq_eq_true (bool_and_left hHead)
+      have hb := Nat.eq_of_beq_eq_true (bool_and_right hHead)
+      rw [ha, hb]
+      exact ⟨cs, List.Mem.head rest⟩
+    | false =>
+      rw [hHead] at h
+      dsimp only [Bool.or] at h
+      cases hasEdgeInList_sound h with
+      | intro certs hMem => exact ⟨certs, List.Mem.tail _ hMem⟩
+
+/-- Checks a multi-hop node-index path `cur → hops → goal` inside an
+`EntailmentGraph` (reusing already-checked graph edges via transitivity). -/
+def checkGraphIndexPath {Spec : Type} (g : EntailmentGraph Spec)
+    (cur goal : Nat) : List Nat → Bool
+  | [] =>
+    match listLookup? g.nodes cur with
+    | some _ => Nat.beq cur goal
+    | none => false
+  | nxt :: rest =>
+    hasEdgeInList cur nxt g.edges && checkGraphIndexPath g nxt goal rest
+
+/-- Multi-hop reachability soundness over a verified `NatEntailmentGraph`:
+derives `nodes[start] ⟹ nodes[goal]` via `entailment_trans` without
+re-verifying `CutStep` certificates. -/
+theorem checkNatGraphIndexPath_sound {g : NatEntailmentGraph}
+    (hGraph : checkNatEntailmentGraph g = true) :
+    ∀ (hops : List Nat) (start goal : Nat),
+      checkGraphIndexPath g start goal hops = true →
+      ∃ src dst,
+        listLookup? g.nodes start = some src ∧
+        listLookup? g.nodes goal = some dst ∧
+        (∀ env : List Nat, src.holds env → dst.holds env)
+  | [], start, goal, hPath => by
+    dsimp only [checkGraphIndexPath] at hPath
+    cases hLu : listLookup? g.nodes start with
+    | none => rw [hLu] at hPath; nomatch hPath
+    | some src =>
+      rw [hLu] at hPath
+      have hEq := Nat.eq_of_beq_eq_true hPath
+      rw [← hEq]
+      exact ⟨src, src, rfl, hLu, fun _ h => h⟩
+  | nxt :: rest, start, goal, hPath => by
+    dsimp only [checkGraphIndexPath] at hPath
+    cases hasEdgeInList_sound (bool_and_left hPath) with
+    | intro certs hEdgeMem =>
+      cases checkNatEntailmentGraph_sound hGraph start nxt certs hEdgeMem with
+      | intro src h1 =>
+        cases h1 with
+        | intro mid h2 =>
+          cases checkNatGraphIndexPath_sound hGraph rest nxt goal (bool_and_right hPath) with
+          | intro mid2 h3 =>
+            cases h3 with
+            | intro dst h4 =>
+              have hMidEq : mid = mid2 := by
+                rw [h2.2.1] at h4
+                injection h4.1 with heq
+              rw [← hMidEq] at h4
+              exact ⟨src, dst, h2.1, h4.2.1, entailment_trans h2.2.2 h4.2.2⟩
+
+/-- Multi-hop reachability soundness over a verified `IntEntailmentGraph`. -/
+theorem checkIntGraphIndexPath_sound {g : IntEntailmentGraph}
+    (hGraph : checkIntEntailmentGraph g = true) :
+    ∀ (hops : List Nat) (start goal : Nat),
+      checkGraphIndexPath g start goal hops = true →
+      ∃ src dst,
+        listLookup? g.nodes start = some src ∧
+        listLookup? g.nodes goal = some dst ∧
+        (∀ env : List Int, src.holds env → dst.holds env)
+  | [], start, goal, hPath => by
+    dsimp only [checkGraphIndexPath] at hPath
+    cases hLu : listLookup? g.nodes start with
+    | none => rw [hLu] at hPath; nomatch hPath
+    | some src =>
+      rw [hLu] at hPath
+      have hEq := Nat.eq_of_beq_eq_true hPath
+      rw [← hEq]
+      exact ⟨src, src, rfl, hLu, fun _ h => h⟩
+  | nxt :: rest, start, goal, hPath => by
+    dsimp only [checkGraphIndexPath] at hPath
+    cases hasEdgeInList_sound (bool_and_left hPath) with
+    | intro certs hEdgeMem =>
+      cases checkIntEntailmentGraph_sound hGraph start nxt certs hEdgeMem with
+      | intro src h1 =>
+        cases h1 with
+        | intro mid h2 =>
+          cases checkIntGraphIndexPath_sound hGraph rest nxt goal (bool_and_right hPath) with
+          | intro mid2 h3 =>
+            cases h3 with
+            | intro dst h4 =>
+              have hMidEq : mid = mid2 := by
+                rw [h2.2.1] at h4
+                injection h4.1 with heq
+              rw [← hMidEq] at h4
+              exact ⟨src, dst, h2.1, h4.2.1, entailment_trans h2.2.2 h4.2.2⟩
+
 /-! ### 5.3 Reflective Concrete Witness Evaluators & Refuters (`Nat` and `Int`) -/
 
 /-- Computable environment lookup on `List Nat` matching `envLookupNat`. -/
@@ -1680,9 +1817,9 @@ def FarkasMirGoal.denote : FarkasMirGoal → Prop
               .scalar ⟨0, 1⟩]) locals mem)
   | .uintMulConstNoOverflow u hyps k x =>
     ∀ (env : List Nat) (locals : List LocalSlot) (mem : Memory),
-      UintScalarInRange u ⟨k, uintBytes u⟩ ∧
       HypsImp (NatCutIneq.holds env) hyps
-        (k * x.eval env < modPow2 (uintWidth u) ∧
+        (UintScalarInRange u ⟨k, uintBytes u⟩ ∧
+         k * x.eval env < modPow2 (uintWidth u) ∧
          k * x.eval env < scalarModulus (uintBytes u) ∧
          evalScalarBinOp .mulUnchecked
            ⟨k, uintBytes u⟩ ⟨x.eval env, uintBytes u⟩
@@ -1806,9 +1943,8 @@ theorem checkFarkasMirGoal_sound (goal : FarkasMirGoal) (cert : FarkasMirCert)
     | single steps =>
       dsimp only [checkFarkasMirGoal] at hChk
       intro env locals mem
-      exact ⟨⟨rfl, lt_of_blt_true (bool_and_left hChk)⟩,
-        farkas_discharges_uint_mul_const_no_overflow u hyps k x steps
-          (bool_and_right hChk) env locals mem⟩
+      exact farkas_discharges_uint_mul_const_no_overflow u hyps k x steps
+        (bool_and_left hChk) (bool_and_right hChk) env locals mem
     | pair _ _ | triple _ _ _ | edge _ => nomatch hChk
   | sliceBounds hyps off len total =>
     cases cert with
@@ -1928,9 +2064,10 @@ theorem canary_u32_sub_no_underflow (a b : Nat) (locals : List LocalSlot) (mem :
     rfl [a, b] locals mem hRange hGap
 
 /-- Canary: constant-scaled `u64` multiplication overflow-freedom (`x ≤ 1024`
-implies `8 * x < 2^64`). -/
+implies `UintScalarInRange .u64 ⟨8, 8⟩` and `8 * x < 2^64`). -/
 theorem canary_u64_mul_const_no_overflow (x : Nat) (locals : List LocalSlot) (mem : Memory)
     (hx : x ≤ 1024) :
+    UintScalarInRange .u64 ⟨8, uintBytes .u64⟩ ∧
     8 * x < modPow2 (uintWidth .u64) ∧
     8 * x < scalarModulus (uintBytes .u64) ∧
     evalScalarBinOp .mulUnchecked ⟨8, uintBytes .u64⟩ ⟨x, uintBytes .u64⟩
@@ -1942,7 +2079,7 @@ theorem canary_u64_mul_const_no_overflow (x : Nat) (locals : List LocalSlot) (me
   farkas_discharges_uint_mul_const_no_overflow .u64
     [⟨.var 0, .cst 1024⟩] 8 (.var 0)
     [.hyp 0, .hyp 2, .comb 0 8 1 1]
-    rfl [x] locals mem hx
+    rfl rfl [x] locals mem hx
 
 /-- Canary: `ValidSliceRange` and `evalPtrOffset` from Farkas bounds. -/
 theorem canary_slice_bounds (rp : RawPtrVal) (len total : Nat)
@@ -2232,9 +2369,29 @@ theorem neg_canary_invalid_witnesses_and_equiv_rejected :
       (.strict [Int.ofNat 0]) = false :=
   ⟨rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Negative canary: disconnected path, out-of-bounds graph node, zero
-alignment, malformed interval (`hi < lo` or `hi ≥ M`), mismatched cert shape,
-and `u128` over-cap bound all fail closed (`= false`). -/
+/-- Canary: multi-hop node-index reachability (`0 → 1 → 2`) over a verified
+`NatEntailmentGraph` via `checkNatGraphIndexPath_sound`. -/
+theorem canary_nat_graph_index_path_ok :
+    let g : NatEntailmentGraph :=
+      { nodes := [[⟨.var 0, .cst 3⟩], [⟨.var 0, .cst 5⟩], [⟨.var 0, .cst 10⟩]]
+        edges :=
+          [ (0, 1, [[.hyp 0, .hyp 2, .comb 0 1 1 1]])
+          , (1, 2, [[.hyp 0, .hyp 2, .comb 0 1 1 1]]) ] }
+    ∃ src dst,
+      listLookup? g.nodes 0 = some src ∧
+      listLookup? g.nodes 2 = some dst ∧
+      (∀ env : List Nat, src.holds env → dst.holds env) :=
+  checkNatGraphIndexPath_sound (g :=
+    { nodes := [[⟨.var 0, .cst 3⟩], [⟨.var 0, .cst 5⟩], [⟨.var 0, .cst 10⟩]]
+      edges :=
+        [ (0, 1, [[.hyp 0, .hyp 2, .comb 0 1 1 1]])
+        , (1, 2, [[.hyp 0, .hyp 2, .comb 0 1 1 1]]) ] })
+    rfl [1, 2] 0 2 rfl
+
+/-- Negative canary: disconnected path, out-of-bounds graph node, missing graph
+hop, empty/satisfied falsifier queries, zero alignment, malformed interval,
+mismatched cert shape, and unprovable certified subtraction range all fail
+closed (`= false`). -/
 theorem neg_canary_structural_fail_closed :
     -- Disconnected path: edge 0 ends at x ≤ 5, edge 1 starts at x ≤ 6
     checkNatEntailmentPath [⟨.var 0, .cst 3⟩] [⟨.var 0, .cst 10⟩]
@@ -2246,6 +2403,18 @@ theorem neg_canary_structural_fail_closed :
     checkNatEntailmentGraph
       { nodes := [[⟨.var 0, .cst 3⟩]]
         edges := [(0, 2, [[.hyp 0, .hyp 2, .comb 0 1 1 1]])] } = false ∧
+    -- Missing direct hop (0 -> 2) and out-of-bounds node in graph index path
+    checkGraphIndexPath
+      ({ nodes := [[⟨.var 0, .cst 3⟩], [⟨.var 0, .cst 5⟩], [⟨.var 0, .cst 10⟩]]
+         edges := [(0, 1, []), (1, 2, [])] } : NatEntailmentGraph) 0 2 [2] = false ∧
+    checkGraphIndexPath
+      ({ nodes := [[⟨.var 0, .cst 3⟩]]
+         edges := [] } : NatEntailmentGraph) 5 5 [] = false ∧
+    -- Empty and satisfied specs cannot be falsified
+    checkNatSpecFalsifies [0] [] = false ∧
+    checkNatSpecFalsifies [3] [⟨.var 0, .cst 5⟩] = false ∧
+    checkIntSpecFalsifies [Int.ofNat 0] [] = false ∧
+    checkIntSpecFalsifies [Int.negOfNat 1] [⟨.cst ⟨true, 3⟩, .var 0⟩] = false ∧
     -- alignBytes = 0 rejected
     checkFarkasMirGoal
       (.alignedStride [⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 0⟩] 0 (.var 0) (.var 1))
@@ -2268,6 +2437,6 @@ theorem neg_canary_structural_fail_closed :
       (.uintSubNoUnderflowCertified .u32
         [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst (modPow2 32)⟩] (.var 0) (.var 1))
       (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) = false :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.FarkasMirCert
