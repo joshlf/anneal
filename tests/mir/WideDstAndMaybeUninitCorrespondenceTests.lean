@@ -371,6 +371,75 @@ run_cmd do
     addThmInfer crossName crossPf
     added := added.push crossName
 
+    -- 3b. Translation fidelity (anti-mock): `lmWdToVerdict` is EXACTLY the root translation
+    -- `wdVerdictOf` after a constructor-for-constructor bijection `LmWdObs ≃ MrWdObs`; and the frozen
+    -- LeanMiri table transcribed in the root (`wdLmExpected*`) IS LeanMiri's own `lmWdExpected*`.
+    let mrObsTy0 := mkConst (mrNs ++ `MrWdObs)
+    let ctorNames : List Name :=
+      [`okScalar, `okSizeAlign, `okUninitPreserved, `okFnPtr, `ub, `unsupported, `specPanic]
+    let mkCtorMap (srcInd dstInd : Name) : MetaM Expr := do
+      let srcTy := mkConst srcInd
+      withLocalDeclD `o srcTy fun o => do
+        let motive := mkLambda `x .default srcTy (mkConst dstInd)
+        let mut minors : Array Expr := #[]
+        for c in ctorNames do
+          let cTy ← inferType (mkConst (srcInd ++ c))
+          minors := minors.push (← forallTelescope cTy fun xs _ =>
+            mkLambdaFVars xs (mkAppN (mkConst (dstInd ++ c)) xs))
+        mkLambdaFVars #[o] (mkAppN (mkConst (srcInd ++ `rec) [1]) (#[motive] ++ minors ++ #[o]))
+    let mkPointwise (ind : Name) (resTy : Expr) (lhs rhs : Expr → Expr) : MetaM (Expr × Expr) := do
+      withLocalDeclD `o (mkConst ind) fun o => do
+        let motive ← mkLambdaFVars #[o] (mkEq resTy (lhs o) (rhs o))
+        let mut minors : Array Expr := #[]
+        for c in ctorNames do
+          let cTy ← inferType (mkConst (ind ++ c))
+          minors := minors.push (← forallTelescope cTy fun xs _ =>
+            mkLambdaFVars xs (mkRefl resTy (lhs (mkAppN (mkConst (ind ++ c)) xs))))
+        let pf ← mkLambdaFVars #[o] (mkAppN (mkConst (ind ++ `rec) [0]) (#[motive] ++ minors ++ #[o]))
+        let ty ← mkForallFVars #[o] (mkEq resTy (lhs o) (rhs o))
+        return (ty, pf)
+    let lmToMrName := ns ++ `lmToMr
+    let _ ← addDef lmToMrName (← MetaM.run' <| mkCtorMap (lmNs ++ `LmWdObs) (mrNs ++ `MrWdObs))
+    let mrToLmName := ns ++ `mrToLm
+    let _ ← addDef mrToLmName (← MetaM.run' <| mkCtorMap (mrNs ++ `MrWdObs) (lmNs ++ `LmWdObs))
+    added := added.push lmToMrName |>.push mrToLmName
+    let lmToMr := mkConst lmToMrName
+    let mrToLm := mkConst mrToLmName
+    let fidelity : List (Name × Name × Expr × (Expr → Expr) × (Expr → Expr)) :=
+      [ (`translation_fidelity, lmNs ++ `LmWdObs, optVerdTy,
+          fun o => mkApp toV o, fun o => mkApp (mkConst (bNs ++ `wdVerdictOf)) (mkApp lmToMr o)),
+        (`lmToMr_mrToLm, mrNs ++ `MrWdObs, mrObsTy0,
+          fun o => mkApp lmToMr (mkApp mrToLm o), fun o => o),
+        (`mrToLm_lmToMr, lmNs ++ `LmWdObs, lmObsTy,
+          fun o => mkApp mrToLm (mkApp lmToMr o), fun o => o) ]
+    for (tag, ind, resTy, lhs, rhs) in fidelity do
+      let (ty, pf) ← MetaM.run' <| mkPointwise ind resTy lhs rhs
+      addThm (ns ++ tag) ty pf
+      added := added.push (ns ++ tag)
+    let listMrTy := mkApp (mkConst ``List [0]) mrObsTy0
+    for (rootTbl, lmTbl) in [(`wdLmExpectedBasic, `lmWdExpectedBasic), (`wdLmExpectedTb, `lmWdExpectedTb)] do
+      let lhs := mkConst (bNs ++ rootTbl)
+      let rhs := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 lmToMr (mkConst (lmNs ++ lmTbl))
+      let n := ns ++ `frozenTableLock ++ rootTbl
+      addThm n (mkEq listMrTy lhs rhs) (mkRefl listMrTy lhs)
+      added := added.push n
+    -- 3c. Direct-certificate bundle: the side certificate kernel-evaluated on the twin is transported
+    -- onto the real authority, and the bundle it closes is definitionally the unified bundle.
+    let noneSel := mkApp (mkConst ``Option.none [0]) (mkConst domNs)
+    let directChk := ns ++ `lmSideCheck_direct_unified
+    let pFn ← MetaM.run' <| withLocalDeclD `a (mkConst (bNs ++ `WdLmAuthority)) fun a =>
+      mkLambdaFVars #[a] (mkApp2 (mkConst (bNs ++ `lmCheckOf)) noneSel a)
+    addThm directChk (eqTrue (mkApp2 (mkConst (bNs ++ `lmCheckOf)) noneSel authC))
+      (mkAppN (mkConst (bNs ++ `cert_transport))
+        #[authC, authUC, mkConst eqName, pFn, mkConst (ns ++ `lmSideCheckU ++ `unified)])
+    added := added.push directChk
+    let directBundle := ns ++ `directUnifiedBundle
+    let dTy ← addDef directBundle (mkApp3 (mkConst (bNs ++ `bundleOfSel)) noneSel authC (mkConst directChk))
+    added := added.push directBundle
+    addThm (ns ++ `directUnifiedBundle_eq_unified) (mkEq dTy (mkConst directBundle) (mkConst unifiedName))
+      (mkRefl dTy (mkConst directBundle))
+    added := added.push (ns ++ `directUnifiedBundle_eq_unified)
+
     -- 4. Definitional `Eq.refl` fixture locks over EVERY shared definition in `section Fixtures`
     -- (38 items: layouts, builders, and all 25 `CapturedMir` fixtures) plus
     -- `mrWdCaseCount = lmWdCaseCount` (39 locks total).
@@ -450,6 +519,18 @@ run_cmd do
       .defnDecl { name := n, levelParams := [], type := ty, value := val,
                   hints := .regular 0, safety := .safe }
     let wdBundleTy := mkConst (bNs ++ `WdBundle)
+    -- Predicate-level `#300` controls: the pinned `checkPtr` and post-`#300` `checkPtrFnNonNull` on
+    -- the null `fn()` pointer, with terms taken from the Episode 1 theorem statements.
+    let (cpTy, cpL, cpR, nnL, nnR) ← MetaM.run' do
+      let thTy ← inferType (mkConst (mrNs ++ `mr_checkPtr_null_fnptr_ok))
+      let dom := thTy.bindingDomain!
+      let t1 ← instantiateForall thTy #[mkApp (mkConst ``Option.none [0]) dom.appArg!]
+      let some (ity, l1, r1) := t1.eq? | throwError "cross-root: unexpected checkPtr theorem shape"
+      let canTy ← inferType (mkConst (mrNs ++ `mr_minirust300_flip_canary))
+      let some (_, rest) := canTy.and? | throwError "cross-root: unexpected canary shape"
+      let some (b, _) := rest.and? | throwError "cross-root: unexpected canary shape"
+      let some (_, l2, r2) := b.eq? | throwError "cross-root: unexpected canary shape"
+      return (ity, l1, r1, l2, r2)
     let forged : List (String × Declaration × Declaration) :=
       [ ("ill-typed 0 = 1",
           thmD (ns ++ `forged.zeroEqOne) (mkEq natTy (mkNatLit 0) (mkNatLit 1)) (mkRefl natTy (mkNatLit 0)),
@@ -544,7 +625,18 @@ run_cmd do
           thmD (ns ++ `forged.case13LmOk)
             (mkEq lmObsTy (lmObsU false 13) (mkApp2 (lmObsC `okUninitPreserved) (mkNatLit 1) (mkNatLit 1)))
             (mkRefl lmObsTy (lmObsU false 13)),
-          thmD (ns ++ `honest.case13LmUb) (mkEq lmObsTy (lmObsU false 13) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU false 13))) ]
+          thmD (ns ++ `honest.case13LmUb) (mkEq lmObsTy (lmObsU false 13) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU false 13))),
+        ("forged pin delta: pinned d821c6e3 checkPtr rejects the null FnPtr",
+          thmD (ns ++ `forged.pinnedCheckPtrRejectsNull) (mkEq cpTy cpL nnR) (mkRefl cpTy cpL),
+          thmD (ns ++ `honest.pinnedCheckPtrAcceptsNull) (mkEq cpTy cpL cpR) (mkRefl cpTy cpL)),
+        ("forged #300: checkPtrFnNonNull accepts the null FnPtr",
+          thmD (ns ++ `forged.nonNullCheckAcceptsNull) (mkEq cpTy nnL cpR) (mkRefl cpTy nnL),
+          thmD (ns ++ `honest.nonNullCheckRejectsNull) (mkEq cpTy nnL nnR) (mkRefl cpTy nnL)),
+        ("forged translation fidelity (lmToMr maps ub to unsupported)",
+          thmD (ns ++ `forged.lmToMrUb) (mkEq mrObsTy0 (mkApp lmToMr (lmObsC `ub)) (mrC `unsupported))
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `ub))),
+          thmD (ns ++ `honest.lmToMrUb) (mkEq mrObsTy0 (mkApp lmToMr (lmObsC `ub)) (mrC `ub))
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `ub)))) ]
     let mut rejected : Nat := 0
     let mut twins : Nat := 0
     for (what, d, h) in forged do
@@ -674,7 +766,7 @@ run_cmd do
     { fileName := "<wd-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, twinCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 85 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 23 &&
+  unless addedCount ≥ 95 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 26 &&
       twinCount = rejectedCount do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount}, twins={twinCount})"
   logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), reached Trusted+MiniRust+Miri, axioms {crAxioms}"

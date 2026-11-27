@@ -143,6 +143,19 @@ theorem wdCodec_decode_injective_on_valid {b₁ b₂ : WdObsRep} {a : WdObs}
     (h₁ : wdDecode b₁ = some a) (h₂ : wdDecode b₂ = some a) : b₁ = b₂ :=
   (wdEncode_decode_of_valid b₁ a hv₁ h₁).symm.trans (wdEncode_decode_of_valid b₂ a hv₂ h₂)
 
+/-- `wdValidRep` is EXACTLY the decodable set: it neither over- nor under-approximates
+`wdDecode` (so the structural predicate cannot silently admit a wire `wdDecode` rejects). -/
+theorem wdValidRep_iff_decode_isSome (b : WdObsRep) : wdValidRep b ↔ (wdDecode b).isSome = true := by
+  rcases b with ⟨t, x, y⟩
+  match t, y with
+  | 0, 0 => exact ⟨fun _ => rfl, fun _ => True.intro⟩
+  | 0, _ + 1 => exact ⟨False.elim, fun h => Bool.noConfusion h⟩
+  | 1, _ => exact ⟨fun _ => rfl, fun _ => True.intro⟩
+  | 2, _ => exact ⟨fun _ => rfl, fun _ => True.intro⟩
+  | 3, 0 => exact ⟨fun _ => rfl, fun _ => True.intro⟩
+  | 3, _ + 1 => exact ⟨False.elim, fun h => Bool.noConfusion h⟩
+  | _ + 4, _ => exact ⟨False.elim, fun h => Bool.noConfusion h⟩
+
 /-- Malformed wire triples (non-zero padding, unknown tags) are rejected by both `wdDecode` and
 `wdValidRep`. -/
 theorem wdCodec_rejects_malformed :
@@ -347,6 +360,12 @@ theorem lmTableCheckOf_sound (A : WdLmAuthority) (hA : lmTableCheckOf A = true)
 of the loop-unrolled twin `lmWdObserveU` to the real `lmWdObserve` via `lmWdObserveU.eq_src`). -/
 theorem lmTableCheckOf_of_eq {A B : WdLmAuthority} (h : A = B) (hB : lmTableCheckOf B = true) :
     lmTableCheckOf A = true :=
+  h ▸ hB
+
+/-- Side certificates transport along equal authorities (moves a certificate kernel-evaluated on
+the loop-unrolled twin directly onto the real `lmWdObserve` authority). -/
+theorem cert_transport {A B : WdLmAuthority} (h : A = B)
+    (p : WdLmAuthority → Bool) (hB : p B = true) : p A = true :=
   h ▸ hB
 
 /-! ## §5. The Anneal Corpus Model and the MiniRust / LeanMiri Sides -/
@@ -800,6 +819,11 @@ theorem stepsTB_eq_runToStopM (fuel : Nat) (m : MachTB) :
     stepsTB fuel m = stopProj (MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM fuel m) :=
   stepsM_eq_runToStopM fuel m
 
+/-- On `Mach`, the driver is MiniRust's own `steps`. This is the only driver identity that is not
+choice-free: it inherits `Classical.choice` from the pre-existing upstream specialization lemma
+`MiniRustSpec.Correspondence.stepM_bm_eq`, which is outside this episode's file boundary. For that
+reason it is left out of the constructive audit list, while `stepsM_eq_runToStopM` /
+`stepsTB_eq_runToStopM` are included. -/
 theorem steps_eq_runToStopM_bm (fuel : Nat) (m : Mach) :
     steps fuel m = stopProj (MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM (M := BM) fuel m) := by
   induction fuel generalizing m with
@@ -950,7 +974,8 @@ run_cmd do
       ns ++ `wdCodec_rejects_malformed, ns ++ `WdMode.of_toTb, ns ++ `WdMode.to_ofTb,
       ns ++ `allTbModes_complete, ns ++ `allWdCases_complete, ns ++ `wdVerdictOf,
       ns ++ `wdClassOf, ns ++ `wdDomainOf, ns ++ `lmTableCheckOf, ns ++ `lmTableCheckOf_sound,
-      ns ++ `lmTableCheckOf_of_eq, ns ++ `wdModelOf, ns ++ `wdModel, ns ++ `wdAnnealEval,
+      ns ++ `lmTableCheckOf_of_eq, ns ++ `cert_transport, ns ++ `wdValidRep_iff_decode_isSome,
+      ns ++ `wdModelOf, ns ++ `wdModel, ns ++ `wdAnnealEval,
       ns ++ `wdExpectedAnnealEval, ns ++ `mrVerdict, ns ++ `trustedVerdict,
       ns ++ `mrVerdictFn, ns ++ `lmVerdictFn, ns ++ `sideOf, ns ++ `mrSide,
       ns ++ `lmSideOf, ns ++ `lmCheckOf, ns ++ `bundleOfSel,
