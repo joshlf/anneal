@@ -1247,6 +1247,69 @@ theorem reachesRet_post_of_v2026Exec {body : CapturedMir}
       rw [hStep] at h
       exact False.elim h
 
+/-- Choice-free existential return witness: every fault-free
+`execStepOutcome (v2026Step body)` derivation witnesses an actual finite
+labeled return path `ReachesRet (mirTree body s) tr out` with `post out`
+(confirming non-vacuity of `reachesRet_post_of_v2026Exec`, `{propext, Quot.sound}`
+only). -/
+theorem exists_reachesRet_of_v2026Exec {body : CapturedMir}
+    {post : MirOutcome → Prop} :
+    ∀ {fuel : Nat} {s : MachineState},
+      execStepOutcome (v2026Step body) post (fun _ => False) fuel s →
+      ∃ (tr : List (Event MirEffect)) (out : MirOutcome),
+        ReachesRet (mirTree body s) tr out ∧ post out
+  | 0, _, h => False.elim h
+  | fuel + 1, s, h => by
+    dsimp only [execStepOutcome] at h
+    rw [execStepPred_succ_iff] at h
+    have hObs := mirTree_observe body s
+    cases hStep : v2026Step body s with
+    | step s' =>
+      rw [hStep] at h
+      let ⟨tr, out, ⟨u, hR, hRet⟩, hPost⟩ := exists_reachesRet_of_v2026Exec h
+      cases v2026Step_step_iff.mp hStep with
+      | inl hTau =>
+        rw [hTau] at hObs
+        exact ⟨tr, out, ⟨u, Reaches.tau (t' := mirTree body s') hObs hR, hRet⟩, hPost⟩
+      | inr hVis =>
+        let ⟨obs, k, hv, hk⟩ := hVis
+        rw [hv] at hObs
+        refine ⟨⟨.inr (.inl (.emit obs)), PUnit.unit⟩ :: tr, out,
+          ⟨u, Reaches.vis (k := fun o => ITree.cofix (stepMirState body) (k o))
+            hObs (fun hF => hF) PUnit.unit ?_, hRet⟩, hPost⟩
+        show Reaches (ITree.cofix (stepMirState body) (k PUnit.unit)) tr u
+        rw [hk]
+        exact hR
+    | done out =>
+      rw [hStep] at h
+      cases v2026Step_done_iff.mp hStep with
+      | inl hRet =>
+        rw [hRet] at hObs
+        exact ⟨[], out, ⟨mirTree body s, Reaches.refl _, hObs⟩, h⟩
+      | inr hRest =>
+        cases hRest with
+        | inl hTauH =>
+          rw [hTauH] at hObs
+          exact ⟨[], out,
+            ⟨ITree.cofix (stepMirState body) (.halted out),
+             Reaches.tau hObs (Reaches.refl _),
+             ITree.observe_cofix _ _⟩, h⟩
+        | inr hVisH =>
+          let ⟨obs, k, hv, hk⟩ := hVisH
+          rw [hv] at hObs
+          refine ⟨[⟨.inr (.inl (.emit obs)), PUnit.unit⟩], out,
+            ⟨ITree.cofix (stepMirState body) (.halted out),
+             Reaches.vis (k := fun o => ITree.cofix (stepMirState body) (k o))
+               hObs (fun hF => hF) PUnit.unit ?_,
+             ITree.observe_cofix _ _⟩, h⟩
+          show Reaches (ITree.cofix (stepMirState body) (k PUnit.unit)) []
+            (ITree.cofix (stepMirState body) (.halted out))
+          rw [hk]
+          exact Reaches.refl _
+    | fault _ =>
+      rw [hStep] at h
+      exact False.elim h
+
 /-- A MIR interaction tree whose head node is `.ret r` is `Productive`. -/
 theorem productive_of_observe_ret_v2026 {t : ITree MirEffect MirOutcome}
     {r : MirOutcome} (h : t.observe = .ret r) : Productive t := by
@@ -1797,6 +1860,25 @@ theorem wlpOutcomeV2026_done_ret {body : CapturedMir}
     (hStep : stepMirFn body s = .ret out) (h : onDone out) :
     wlpOutcomeV2026 body onDone onFault (fuel + 1) s :=
   wlpOutcomeV2026_done_eq (v2026Step_done_iff.mpr (Or.inl hStep)) h
+
+/-- Prepend a sealed `Framework.StepWp.StepStageCut (v2026Step body)` onto
+`wlpOutcomeV2026`. -/
+theorem wlpOutcomeV2026_of_stepStageCut {body : CapturedMir}
+    {onDone : MirOutcome → Prop} {onFault : V2026StepFault → Prop}
+    {f₁ f₂ : Nat} {s₀ s₁ : MachineState}
+    (hCut : Anneal.Framework.StepWp.StepStageCut (v2026Step body) f₁ s₀ s₁)
+    (hCont : wlpOutcomeV2026 body onDone onFault f₂ s₁) :
+    wlpOutcomeV2026 body onDone onFault f₂ s₀ :=
+  wlpStepPred_of_stepStageCut (c₀ := ()) (fun _ _ => Iff.rfl) hCut hCont
+
+/-- Prepend a sealed `Framework.StepWp.StepStageCut (v2026Step body)` onto
+all-fuel strict `wlpStateV2026`. -/
+theorem forall_wlpStateV2026_of_stepStageCut {body : CapturedMir}
+    {post : MirOutcome → Prop} {f₁ : Nat} {s₀ s₁ : MachineState}
+    (hCut : Anneal.Framework.StepWp.StepStageCut (v2026Step body) f₁ s₀ s₁)
+    (hCont : ∀ f : Nat, wlpStateV2026 body f s₁ post) :
+    ∀ f : Nat, wlpStateV2026 body f s₀ post :=
+  fun f => wlpOutcomeV2026_of_stepStageCut hCut (hCont f)
 
 /-- Rule of consequence for `wlpOutcomeV2026`. -/
 theorem wlpOutcomeV2026_mono {body : CapturedMir}

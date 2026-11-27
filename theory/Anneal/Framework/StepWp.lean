@@ -1842,6 +1842,103 @@ theorem StepStageCut.ofIndexedCut {S Out F : Type}
     StepStageCut step fuel s₀ s₁ :=
   Anneal.Firewall.open_cut h
 
+/-- Prepend a sealed `StepStageCut` prefix onto deterministic `execUntilPred`
+without unsealing `StepStageCut` (`0` axioms). -/
+theorem execUntilPred_of_stepStageCut {S Out F : Type}
+    {step : S → StepResult S Out F} {stop : S → Prop}
+    {onDone : S → Out → Prop} {onFault : S → F → Prop}
+    {f₁ f₂ : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut step f₁ s₀ s₁)
+    (hCont : execUntilPred step stop onDone onFault f₂ s₁) :
+    execUntilPred step stop onDone onFault (f₁ + f₂) s₀ := by
+  let ⟨k, hk, hImp⟩ :=
+    StepStageCut.induction
+      (R := fun k a b =>
+        execUntilPred step stop onDone onFault f₂ b →
+        execUntilPred step stop onDone onFault (k + f₂) a)
+      (fun _ h => by rw [Nat.zero_add]; exact h)
+      (fun k s s' _ hStep ih hB => by
+        rw [Nat.succ_add]
+        exact execUntilPred_step hStep (ih hB))
+      hCut
+  exact execUntilPred_fuel_mono (Nat.add_le_add_right hk f₂) (hImp hCont)
+
+/-- Prepend a sealed `StepStageCut` prefix onto singleton-choice `wpUntilPred`
+without unsealing `StepStageCut`. -/
+theorem wpUntilPred_of_stepStageCut {S Out F C : Type}
+    {validChoice : S → C → Prop} {step : C → S → StepResult S Out F}
+    {c₀ : C} (hUnique : ∀ s c, validChoice s c ↔ c = c₀)
+    {stop : S → Prop} {onDone : S → Out → Prop} {onFault : S → F → Prop}
+    {f₁ f₂ : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut (step c₀) f₁ s₀ s₁)
+    (hCont : wpUntilPred validChoice step stop onDone onFault f₂ s₁) :
+    wpUntilPred validChoice step stop onDone onFault (f₁ + f₂) s₀ :=
+  wpUntilPred_of_execUntilPred hUnique
+    (execUntilPred_of_stepStageCut hCut
+      (execUntilPred_of_wpUntilPred hUnique hCont))
+
+/-- Prepend a sealed `StepStageCut` prefix onto deterministic `execWlpStepPred`
+at any fuel `f ≤ f₂` without unsealing `StepStageCut` (anti-monotonicity
+preserves `execWlpStepPred` across any finite `.step` prefix). -/
+theorem execWlpStepPred_of_stepStageCut {S Out F : Type}
+    {step : S → StepResult S Out F}
+    {onDone : S → Out → Prop} {onFault : S → F → Prop}
+    {f₁ f₂ : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut step f₁ s₀ s₁)
+    (hCont : execWlpStepPred step onDone onFault f₂ s₁) :
+    execWlpStepPred step onDone onFault f₂ s₀ := by
+  let ⟨_, _, hImp⟩ :=
+    StepStageCut.induction
+      (R := fun _ a b =>
+        ∀ f : Nat,
+          execWlpStepPred step onDone onFault f b →
+          execWlpStepPred step onDone onFault f a)
+      (fun _ _ h => h)
+      (fun _ s s' _ hStep ih f hB => by
+        cases f with
+        | zero => exact trivial
+        | succ f' =>
+          rw [execWlpStepPred_succ_iff, hStep]
+          exact ih f' (execWlpStepPred_fuel_anti (Nat.le_succ f') hB))
+      hCut
+  exact hImp f₂ hCont
+
+/-- Prepend a sealed `StepStageCut` prefix onto all-fuel deterministic
+`execWlpStepPred`. -/
+theorem forall_execWlpStepPred_of_stepStageCut {S Out F : Type}
+    {step : S → StepResult S Out F}
+    {onDone : S → Out → Prop} {onFault : S → F → Prop}
+    {f₁ : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut step f₁ s₀ s₁)
+    (hCont : ∀ f : Nat, execWlpStepPred step onDone onFault f s₁) :
+    ∀ f : Nat, execWlpStepPred step onDone onFault f s₀ :=
+  fun f => execWlpStepPred_of_stepStageCut hCut (hCont f)
+
+/-- Prepend a sealed `StepStageCut` prefix onto singleton-choice `wlpStepPred`. -/
+theorem wlpStepPred_of_stepStageCut {S Out F C : Type}
+    {validChoice : S → C → Prop} {step : C → S → StepResult S Out F}
+    {c₀ : C} (hUnique : ∀ s c, validChoice s c ↔ c = c₀)
+    {onDone : S → Out → Prop} {onFault : S → F → Prop}
+    {f₁ f₂ : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut (step c₀) f₁ s₀ s₁)
+    (hCont : wlpStepPred validChoice step onDone onFault f₂ s₁) :
+    wlpStepPred validChoice step onDone onFault f₂ s₀ :=
+  wlpStepPred_of_execWlpStepPred hUnique
+    (execWlpStepPred_of_stepStageCut hCut
+      (execWlpStepPred_of_wlpStepPred hUnique hCont))
+
+/-- Prepend a sealed `StepStageCut` prefix onto all-fuel singleton-choice
+`wlpStepPred`. -/
+theorem forall_wlpStepPred_of_stepStageCut {S Out F C : Type}
+    {validChoice : S → C → Prop} {step : C → S → StepResult S Out F}
+    {c₀ : C} (hUnique : ∀ s c, validChoice s c ↔ c = c₀)
+    {onDone : S → Out → Prop} {onFault : S → F → Prop}
+    {f₁ : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut (step c₀) f₁ s₀ s₁)
+    (hCont : ∀ f : Nat, wlpStepPred validChoice step onDone onFault f s₁) :
+    ∀ f : Nat, wlpStepPred validChoice step onDone onFault f s₀ :=
+  fun f => wlpStepPred_of_stepStageCut hUnique hCut (hCont f)
+
 /-! ## 4. Generic Loop Induction, Simulation & Early-Return Cut Loops -/
 
 /-- Well-founded (`Acc rel`) loop-invariant induction over `wpUntilPred`:

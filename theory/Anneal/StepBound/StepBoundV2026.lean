@@ -2066,6 +2066,112 @@ theorem not_mirNoUBTree_of_stepsTo_fault_fail {body : CapturedMir} {k : Nat}
       exact Trusted.ITree.Reaches.refl _
     exact hSafe _ _ (reaches_trans_v2026 hR hR₂) (faultNow_cofix_faulted body fk)
 
+/-- Exact `k + f` prefix rule for `execWlpOutcomeV2026` across an exact
+`StepsToV2026` trace. -/
+theorem execWlpOutcomeV2026_of_stepsTo_add {body : CapturedMir}
+    {onDone : MirOutcome → Prop} {onFault : V2026StepFault → Prop}
+    {k f : Nat} {s₀ s₁ : MachineState}
+    (hSteps : StepsToV2026 body k s₀ s₁)
+    (hCont : execWlpOutcomeV2026 body onDone onFault f s₁) :
+    execWlpOutcomeV2026 body onDone onFault (k + f) s₀ := by
+  induction hSteps with
+  | refl _ =>
+    rw [Nat.zero_add]
+    exact hCont
+  | step hs _ ih =>
+    rw [Nat.succ_add]
+    exact execWlpStepPred_step hs (ih hCont)
+
+/-- Return reachability exactness: any exact `StepsToV2026` prefix followed by
+`v2026Step body s' = .done out` witnesses an actual finite labeled return path
+`Trusted.ITree.ReachesRet (mirTree body s) tr out` in the unmodified trusted
+tree (`{propext, Quot.sound}` only). -/
+theorem reachesRet_mirTree_of_stepsTo_done {body : CapturedMir} {k : Nat}
+    {s s' : MachineState} {out : MirOutcome}
+    (hSteps : StepsToV2026 body k s s')
+    (hDone : v2026Step body s' = .done out) :
+    ∃ tr, Trusted.ITree.ReachesRet (mirTree body s) tr out := by
+  have hReach : ReachesDoneWithinV2026 body (fun o => o = out) (k + 1) s :=
+    reachesDoneWithinV2026_of_stepsTo hSteps (reachesDoneWithinV2026_of_done hDone rfl)
+  let ⟨tr, out', hRet, hEq⟩ :=
+    exists_reachesRet_of_v2026Exec (reachesDoneWithinV2026_iff_execStepOutcome.mp hReach)
+  rw [hEq] at hRet
+  exact ⟨tr, hRet⟩
+
+/-- Any `StepsToV2026` prefix reaching a fault (`.fail fk` or `.extCall req`)
+refutes call-free `MirNoCallWpConverges` for every postcondition. -/
+theorem not_mirNoCallWpConverges_of_stepsTo_fault {body : CapturedMir} {k : Nat}
+    {s s' : MachineState} {f : V2026StepFault}
+    (hSteps : StepsToV2026 body k s s')
+    (hFault : v2026Step body s' = .fault f)
+    (post : MirOutcome → Prop) :
+    ¬ MirNoCallWpConverges body s post := by
+  intro hConv
+  let ⟨b, hb⟩ := mirNoCallWpConverges_iff_exists_reachesDoneWithinV2026.mp hConv
+  exact not_reachesDoneWithinV2026_of_stepsTo_fault hSteps hFault hb
+
+/-- Certificate-level fault refutation: any stateless `Claim` admitting an
+input whose `v2026Step` trajectory reaches `.fault (.fail fk)` admits NO
+`VerificationResult c` (even for trivial `post := True`). -/
+theorem not_verificationResult_of_stepsTo_fault_fail (c : Claim)
+    {args : List Value} (hPre : c.pre args)
+    {k : Nat} {s' : MachineState} {fk : FailureKind}
+    (hSteps : StepsToV2026 c.body k
+      (initMachineStateWithCallees c.body args c.callees) s')
+    (hFault : v2026Step c.body s' = .fault (.fail fk)) :
+    ¬ VerificationResult c := by
+  intro hV
+  exact not_mirNoUBTree_of_stepsTo_fault_fail hSteps hFault (hV.proof args hPre).1
+
+/-- Certificate-level stateful fault refutation: any `StatefulClaim` admitting
+an `(args, mem)` input whose `v2026Step` trajectory reaches `.fault (.fail fk)`
+admits NO `StatefulVerificationResult c`. -/
+theorem not_statefulVerificationResult_of_stepsTo_fault_fail (c : StatefulClaim)
+    {args : List Value} {mem : Memory} (hPre : c.pre args mem)
+    {k : Nat} {s' : MachineState} {fk : FailureKind}
+    (hSteps : StepsToV2026 c.body k
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        c.body args mem c.callees) s')
+    (hFault : v2026Step c.body s' = .fault (.fail fk)) :
+    ¬ StatefulVerificationResult c := by
+  intro hV
+  exact not_mirNoUBTree_of_stepsTo_fault_fail hSteps hFault (hV.proof args mem hPre).1
+
+/-- Certificate-level postcondition refutation: any stateless `Claim` admitting
+an input whose `v2026Step` trajectory normally returns `(retVal, mem')` with
+`¬ c.post args retVal` admits NO `VerificationResult c`. -/
+theorem not_verificationResult_of_stepsTo_done_normal_fail (c : Claim)
+    {args : List Value} (hPre : c.pre args)
+    {k : Nat} {s' : MachineState} {retVal : Value} {mem' : Memory}
+    (hSteps : StepsToV2026 c.body k
+      (initMachineStateWithCallees c.body args c.callees) s')
+    (hDone : v2026Step c.body s' = .done (.normal (retVal, mem')))
+    (hNotPost : ¬ c.post args retVal) :
+    ¬ VerificationResult c := by
+  intro hV
+  let ⟨tr, hRet⟩ := reachesRet_mirTree_of_stepsTo_done hSteps hDone
+  let ⟨_, hVal⟩ := hV.proof args hPre
+  exact hNotPost (hVal (tr, .normal (retVal, mem')) hRet hPre retVal mem' rfl)
+
+/-- Certificate-level stateful postcondition refutation: any `StatefulClaim`
+admitting an `(args, mem)` input whose `v2026Step` trajectory normally returns
+`(retVal, mem')` with `¬ c.post args mem retVal mem'` admits NO
+`StatefulVerificationResult c`. -/
+theorem not_statefulVerificationResult_of_stepsTo_done_normal_fail
+    (c : StatefulClaim)
+    {args : List Value} {mem : Memory} (hPre : c.pre args mem)
+    {k : Nat} {s' : MachineState} {retVal : Value} {mem' : Memory}
+    (hSteps : StepsToV2026 c.body k
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+        c.body args mem c.callees) s')
+    (hDone : v2026Step c.body s' = .done (.normal (retVal, mem')))
+    (hNotPost : ¬ c.post args mem retVal mem') :
+    ¬ StatefulVerificationResult c := by
+  intro hV
+  let ⟨tr, hRet⟩ := reachesRet_mirTree_of_stepsTo_done hSteps hDone
+  let ⟨_, hVal⟩ := hV.proof args mem hPre
+  exact hNotPost (hVal (tr, .normal (retVal, mem')) hRet hPre retVal mem' rfl)
+
 /-! ## Part V: Concrete `V2026_06_01` Tight-Budget & Refutation Canaries -/
 
 /-- Minimal 1-block `CapturedMir` whose `bb0` faults immediately with
@@ -2627,5 +2733,104 @@ theorem canary_stepBoundV2026_fault_exact :
       (initMachineState canaryFaultingMirBody []) (fun _ => True) :=
   ⟨not_mirNoUBTree_of_stepsTo_fault_fail (StepsToV2026.refl _) rfl,
    fun h => (wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp h : False)⟩
+
+/-- Concrete certificate-level refutation and return-reachability non-vacuity
+canary over unmodified trusted `VerificationResult` and `ReachesRet`:
+1. `canaryFaultingMirBody` (`unreachable`) admits NO `VerificationResult` even
+   for `post := True`.
+2. `branchingTracePipelineBody` admits NO `VerificationResult` for wrong
+   postcondition `retVal = 10` on input `9`.
+3. Linked `canaryCallerMir` (`callees := [canaryExternIdMir]`) actually reaches
+   a concrete `ReachesRet` return with `retVal = 7` via
+   `exists_reachesRet_of_v2026Exec`, and composes cleanly across a sealed
+   `StepStageCut` via `wlpOutcomeV2026_of_stepStageCut` and
+   `execWlpOutcomeV2026_of_stepsTo_add`. -/
+theorem canary_stepBoundV2026_certificate_refutations_and_exists_ret :
+    ¬ VerificationResult
+      { body := canaryFaultingMirBody
+        pre := fun args => args = []
+        post := fun _ _ => True } ∧
+    ¬ VerificationResult
+      { body := branchingTracePipelineBody
+        pre := fun args => args = [.scalar { bits := 9, sizeBytes := 4 }]
+        post := fun _ retVal => retVal = .scalar { bits := 10, sizeBytes := 4 } } ∧
+    (∃ tr out,
+      Trusted.ITree.ReachesRet
+        (mirTree canaryCallerMir
+          (initMachineStateWithCallees canaryCallerMir [] [canaryExternIdMir]))
+        tr out ∧
+      mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩) out) ∧
+    wlpOutcomeV2026 branchingTracePipelineBody
+      (fun out => out = .normal (.scalar { bits := 9, sizeBytes := 4 },
+        (initMachineState branchingTracePipelineBody
+          [.scalar { bits := 9, sizeBytes := 4 }]).memory))
+      (fun _ => False) 4
+      (initMachineState branchingTracePipelineBody
+        [.scalar { bits := 9, sizeBytes := 4 }]) := by
+  have hNoFaultCert : ¬ VerificationResult
+      { body := canaryFaultingMirBody
+        pre := fun args => args = []
+        post := fun _ _ => True } :=
+    not_verificationResult_of_stepsTo_fault_fail _ (args := []) rfl
+      (StepsToV2026.refl _) rfl
+  let s0 := initMachineState branchingTracePipelineBody
+    [.scalar { bits := 9, sizeBytes := 4 }]
+  let s1 := branchingTraceMidState 9 s0.memory
+  let s2 : MachineState :=
+    { frame :=
+        { blockIdx := 1
+          stmtIdx := 1
+          locals := [.init (.scalar { bits := 9, sizeBytes := 4 }), .uninit] }
+      memory := s0.memory }
+  let s3 : MachineState :=
+    { frame :=
+        { blockIdx := 2
+          stmtIdx := 0
+          locals := [.init (.scalar { bits := 9, sizeBytes := 4 }), .uninit] }
+      memory := s0.memory }
+  have hSteps3 : StepsToV2026 branchingTracePipelineBody 3 s0 s3 :=
+    StepsToV2026.step (s' := s1) rfl
+      (StepsToV2026.step (s' := s2) rfl (StepsToV2026.single (s' := s3) rfl))
+  have hDone3 :
+      v2026Step branchingTracePipelineBody s3 =
+        .done (.normal (.scalar { bits := 9, sizeBytes := 4 }, s0.memory)) :=
+    rfl
+  have hNoBadCert : ¬ VerificationResult
+      { body := branchingTracePipelineBody
+        pre := fun args => args = [.scalar { bits := 9, sizeBytes := 4 }]
+        post := fun _ retVal => retVal = .scalar { bits := 10, sizeBytes := 4 } } :=
+    not_verificationResult_of_stepsTo_done_normal_fail _
+      (args := [.scalar { bits := 9, sizeBytes := 4 }]) rfl
+      hSteps3 hDone3 (fun hEq => by cases hEq)
+  have hExistsRet :
+      ∃ tr out,
+        Trusted.ITree.ReachesRet
+          (mirTree canaryCallerMir
+            (initMachineStateWithCallees canaryCallerMir [] [canaryExternIdMir]))
+          tr out ∧
+        mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩) out :=
+    exists_reachesRet_of_v2026Exec (fuel := 4) rfl
+  have hWlpCut :
+      wlpOutcomeV2026 branchingTracePipelineBody
+        (fun out => out = .normal (.scalar { bits := 9, sizeBytes := 4 }, s0.memory))
+        (fun _ => False) 4 s0 := by
+    have hDoneWlp :
+        wlpOutcomeV2026 branchingTracePipelineBody
+          (fun out => out = .normal (.scalar { bits := 9, sizeBytes := 4 }, s0.memory))
+          (fun _ => False) 4 s3 :=
+      wlpOutcomeV2026_done_eq (fuel := 3)
+        (onDone := fun out => out = .normal (.scalar { bits := 9, sizeBytes := 4 }, s0.memory))
+        hDone3 rfl
+    have _hAdd :
+        execWlpOutcomeV2026 branchingTracePipelineBody
+          (fun out => out = .normal (.scalar { bits := 9, sizeBytes := 4 }, s0.memory))
+          (fun _ => False) 4 s0 :=
+      execWlpOutcomeV2026_of_stepsTo_add hSteps3
+        (wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp
+          (wlpOutcomeV2026_done_eq (fuel := 0)
+            (onDone := fun out => out = .normal (.scalar { bits := 9, sizeBytes := 4 }, s0.memory))
+            hDone3 rfl))
+    exact wlpOutcomeV2026_of_stepStageCut (StepsToV2026.to_stepStageCut hSteps3) hDoneWlp
+  exact ⟨hNoFaultCert, hNoBadCert, hExistsRet, hWlpCut⟩
 
 end Anneal.StepBound
