@@ -73,14 +73,15 @@ def withTmpDir (k : System.FilePath → IO α) : IO α := do
 
 /-- Compile `src` as module `mod` rooted at `root` with the toolchain `lean`, producing its
 `.olean` parts next to the source. -/
-def compileModule (root : System.FilePath) (mod : Name) (src : String) : IO System.FilePath := do
+def compileModule (root : System.FilePath) (mod : Name) (src : String) (leanPath? : Option String := none) :
+    IO System.FilePath := do
   let rel := modRelPath mod
   let leanFile := root / (rel ++ ".lean")
   if let some p := leanFile.parent then IO.FS.createDirAll p
   IO.FS.writeFile leanFile src
   let olean := root / (rel ++ ".olean")
   let leanBin := (← findSysroot) / "bin" / "lean"
-  let leanPath := root.toString ++ ":" ++ (← sysLib).toString
+  let leanPath := leanPath?.getD (root.toString ++ ":" ++ (← sysLib).toString)
   let out ← IO.Process.output {
     cmd := leanBin.toString
     args := #["-R", root.toString, "-o", olean.toString, leanFile.toString]
@@ -804,6 +805,19 @@ end V4Opaque
 /- `accViaThm = 42` proved by `rfl` (kernel-checked directly; the elaborator does not reduce
 `Acc.rec`), plus B1 regressions: an `opaque` relying on δ-reducing `accZeroThm`, and a theorem
 whose *dependency theorem statement* relies on δ-reducing `accZeroThm`. -/
+/- A1 regression: `accViaId` is `accViaThm` with its major premise *wrapped* as
+`@id (Acc _ 0) accZeroThm` (built directly: the elaborator would abstract the wrapped proof into
+an auxiliary `_proof_1` theorem). The kernel unfolds `id` and then still needs the theorem's body,
+so a head-only structural test misses it. -/
+run_cmd liftCoreM do
+  let env ← getEnv
+  let some (.defnInfo dv) := env.find? ``V4Opaque.accViaThm | throwError "missing accViaThm"
+  let some tci := env.find? ``V4Opaque.accZeroThm | throwError "missing accZeroThm"
+  let wrapped := dv.value.replace fun e =>
+    if e.isConstOf ``V4Opaque.accZeroThm then some (mkApp2 (mkConst ``id [.zero]) tci.type e) else none
+  let n := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaId
+  addDecl (.defnDecl { dv with name := n, value := wrapped, all := [n] })
+
 run_cmd liftCoreM do
   let n42 := mkNatLit 42
   let eqTy := mkApp3 (mkConst ``Eq [1]) (mkConst ``Nat) (mkConst ``V4Opaque.accViaThm) n42
@@ -815,6 +829,9 @@ run_cmd liftCoreM do
   let stmtNeedsDeltaTy := Expr.letE `h eqTy eqRefl (mkConst ``True) false
   addDecl (.thmDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.depStmtNeedsDelta,
                       levelParams := [], type := stmtNeedsDeltaTy, value := mkConst ``True.intro })
+  addDecl (.thmDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaId_eq, levelParams := [],
+                      type := mkApp3 (mkConst ``Eq [1]) (mkConst ``Nat) (mkConst `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaId) n42,
+                      value := eqRefl })
   addDecl (.thmDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.viaDepStmt,
                       levelParams := [], type := mkConst ``True,
                       value := mkConst `OleanShadowAndOverrideAuditProtoTests.V4Opaque.depStmtNeedsDelta })
@@ -828,6 +845,9 @@ PASS T19 Layer B: dependency theorem whose statement relies on theorem body caug
 PASS T19 Layer B: definition contrast replays cleanly
 PASS T19 Layer B refuses to run the kernel when a native evaluator is reachable
 PASS T19 live audit reports opaqueTheoremDeltaReliance for the replay target
+PASS T19 Layer A flags a theorem wrapped in `id` inside the major premise
+PASS T19 head-only test alone misses the `id`-wrapped theorem
+PASS T19 Layer B catches the `id`-wrapped theorem reliance
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
@@ -851,6 +871,52 @@ PASS T19 live audit reports opaqueTheoremDeltaReliance for the replay target
   expect "T19 live audit reports opaqueTheoremDeltaReliance for the replay target"
     ((s.violations.filter (·.kind == .opaqueTheoremDeltaReliance)).map (·.decl) == #[`OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaThm_eq] &&
       s.policyFlags.any fun v => v.decl == ``V4Opaque.accViaThm) (renderAll s.violations)
+  let some idCi := env.find? `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaId | throwError "missing"
+  expect "T19 Layer A flags a theorem wrapped in `id` inside the major premise"
+    ((scanOpaqueTheoremReliance env idCi) matches .ok #[(``V4Opaque.accZeroThm, _)])
+  expect "T19 head-only test alone misses the `id`-wrapped theorem"
+    (match idCi.value? with
+     | some v => (v.find? fun e => (e.isAppOfArity ``Acc.rec 6) && (isTheoremHead env (e.getArg! 5)).isSome).isNone
+     | none => false)
+  let rId ← checkOpaqueTheoremReplay env `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaId_eq
+  expect "T19 Layer B catches the `id`-wrapped theorem reliance" (rId matches .deltaReliance ..) (repr rId |>.pretty)
+
+/-! ## T21: non-toolchain module planted next to the toolchain library (A1 regression)
+
+A build-library sweep imports through `[buildLib, sysroot]`. A module that is *not* toolchain-named
+but sits in the sysroot directory resolves there and was loaded by `importModules` without ever
+passing Vector 3. The import-boundary check now rejects it before anything is imported. A fake
+sysroot holding a copy of `Init.Prelude` (all five parts) plus the planted module is enough. -/
+
+def plantedSrc : String := "prelude\nimport Init.Prelude\ndef plantedVal : Nat := 7\n"
+def plantRootSrc : String := "prelude\nimport Init.Prelude\nimport Planted\ndef usesPlanted : Nat := plantedVal\n"
+
+/--
+info: PASS T21 planted non-toolchain sysroot module rejected before import
+PASS T21 its importer is not loaded
+PASS T21 nothing was audited from the planted closure
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  let lib ← sysLib
+  withTmpDir fun dir => do
+    let fakeSys := dir / "sys"
+    let build := dir / "build"
+    IO.FS.createDirAll (fakeSys / "Init")
+    IO.FS.createDirAll build
+    for ext in partExts do
+      let src := lib / "Init" / s!"Prelude.{ext}"
+      if ← entryExists src then IO.FS.writeBinFile (fakeSys / "Init" / s!"Prelude.{ext}") (← IO.FS.readBinFile src)
+    let _ ← compileModule fakeSys `Planted plantedSrc (some s!"{fakeSys}:{lib}")
+    IO.FS.removeFile (fakeSys / "Planted.lean")
+    let _ ← compileModule build `PlantRoot plantRootSrc (some s!"{build}:{fakeSys}:{lib}")
+    IO.FS.removeFile (build / "PlantRoot.lean")
+    let ((), s) ← AuditM.run' (auditBuildLibrary build fakeSys {} (some #[`PlantRoot]))
+    expect "T21 planted non-toolchain sysroot module rejected before import"
+      (s.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Planted) (renderAll s.violations)
+    expect "T21 its importer is not loaded"
+      (s.violations.any fun v => v.kind == .environmentLoadFailed && v.decl == `PlantRoot) (renderAll s.violations)
+    expect "T21 nothing was audited from the planted closure" (s.modulesChecked == 0 && s.importMs == 0) s!"{s.modulesChecked}"
 
 /-! ## T20: real sweep over the compiled build library of this checkout
 

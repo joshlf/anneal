@@ -1778,6 +1778,18 @@ def isTheoremHead (env : Environment) (e : Expr) (fuel : Nat := 16) : Option Nam
         if !body.hasLooseBVars then isTheoremHead env body fuel else none
       | _ => none
 
+def isTheoremConstNode (env : Environment) : Expr → Bool
+  | .const c _ => ((findAnyConst? env c) matches some (.thmInfo _))
+  | _ => false
+
+/-- Some theorem constant occurring anywhere in `e` (Lean's cached `Expr.find?`). A major premise
+that merely *wraps* a theorem (`id t`, `cast h t`, `(fun x => x) t`, `And.left t`, ...) still needs
+the theorem's body once the kernel has unfolded the wrapper, so a head-only test is not enough. -/
+def mentionedTheorem? (env : Environment) (e : Expr) : Option Name :=
+  match e.find? (isTheoremConstNode env) with
+  | some (.const c _) => some c
+  | _ => none
+
 /-- Whether inductive `S` lives in `Prop` (its type's final codomain is `Sort 0`). -/
 def isPropInductive (env : Environment) (S : Name) : Bool :=
   match findAnyConst? env S with
@@ -1798,7 +1810,14 @@ def opaqueHitAt? (env : Environment) (e : Expr) : Option (Name × String) :=
         if !rv.k && isLargeElimination env rv us then
           let args := e.getAppArgs
           if h : idx < args.size then
-            (isTheoremHead env args[idx]).map (·, s!"major premise of {fn}")
+            match isTheoremHead env args[idx] with
+            | some t => some (t, s!"major premise of {fn}")
+            | none =>
+              -- Only a `Prop` major premise can be (a wrapper around) a theorem whose body iota
+              -- reduction needs; a data major premise merely carries proofs as constructor arguments.
+              if isPropInductive env rv.getMajorInduct then
+                (mentionedTheorem? env args[idx]).map (·, s!"theorem inside the major premise of {fn}")
+              else none
           else none
         else none
       | none => none
@@ -2274,12 +2293,53 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
   -- 1. Vector 3 over build modules before loading anything.
   auditOleanResolutionAndShadowing mods
     { sysrootLibDir := sysrootLib, approvedBuildRoots := #[buildLib], searchPath? := some sp, header := hdr }
-  let bad : NameSet := (← get).violations[before:].foldl (fun acc v => acc.insert v.module) {}
+  let mut bad : NameSet := (← get).violations[before:].foldl (fun acc v => acc.insert v.module) {}
   let roots := roots?.getD (mods.filter (·.isAtomic))
   let modSet : NameSet := mods.foldl (·.insert ·) {}
   let missingRoots := roots.filter (!modSet.contains ·)
   for mr in missingRoots do
     report .oleanUnresolved mr mr "requested library root not present in build directory"
+  -- Import graph of the validated modules reachable from the roots, with an import-boundary check
+  -- *before* anything is imported: every import that is not a build-directory module must be a
+  -- toolchain-named module resolving inside the canonical sysroot. A non-toolchain module found
+  -- anywhere else on the search path (e.g. planted next to the toolchain library) would otherwise be
+  -- loaded by `importModules` without ever passing Vector 3.
+  let mut info : Std.HashMap Name BuildModuleInfo := {}
+  let mut boundary : Std.HashMap Name Bool := {}
+  let mut todo : List Name := (roots.filter fun r => modSet.contains r && !bad.contains r).toList
+  let savedG ← searchPathRef.get
+  searchPathRef.set sp
+  try
+    for _ in [0:mods.size + 1] do
+      match todo with
+      | [] => break
+      | m :: rest =>
+        todo := rest
+        if info.contains m || bad.contains m then continue
+        let (d, _) ← readModuleData (buildLib / (modRelPath m ++ ".olean"))
+        let imps := d.imports.map (·.module)
+        info := info.insert m { imports := imps, constants := d.constants }
+        for i in imps do
+          if modSet.contains i then continue
+          let ok ← match boundary[i]? with
+            | some ok => pure ok
+            | none => do
+              let ok ← if isToolchainName i then do
+                  match ← (try pure (some (← findOLean i)) catch _ => pure none) with
+                  | some p => pure ((← pathWithinRoot sysrootLib p) matches .ok _)
+                  | none => pure false
+                else pure false
+              boundary := boundary.insert i ok
+              unless ok do
+                report .oleanOutsideApprovedRoot i i
+                  s!"imported by {m} but neither a build-directory module nor a toolchain module inside the sysroot"
+              pure ok
+          unless ok do
+            report .environmentLoadFailed m m s!"imports {i}, which is outside every approved root"
+            bad := bad.insert m
+        todo := imps.toList.filter (fun i => modSet.contains i && !info.contains i) ++ todo
+  finally
+    searchPathRef.set savedG
   let validRoots := roots.filter (fun r => modSet.contains r && !bad.contains r)
   -- 2a. Fast single-batch path when all artifacts passed Vector 3 (`bad.isEmpty`).
   if bad.isEmpty && missingRoots.isEmpty && !validRoots.isEmpty then
@@ -2315,25 +2375,14 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
       modify fun s => { s with modulesChecked := audited.size, elapsedMs := t1 - t0, importMs, strayArtifacts := stray }
       return
   -- 2b. General conflict-partitioning fallback (when `bad` is non-empty or roots conflict).
-  let mut info : Std.HashMap Name BuildModuleInfo := {}
-  let mut todo : List Name := validRoots.toList
-  for _ in [0:mods.size + 1] do
-    match todo with
-    | [] => break
-    | m :: rest =>
-      todo := rest
-      if info.contains m || bad.contains m then continue
-      let (d, _) ← readModuleData (buildLib / (modRelPath m ++ ".olean"))
-      let imps := d.imports.map (·.module)
-      info := info.insert m { imports := imps, constants := d.constants }
-      todo := imps.toList.filter (fun i => modSet.contains i && !info.contains i) ++ todo
   let mut inScope : NameSet := {}
   for r in validRoots do
     match buildClosure info r with
     | some cl => inScope := cl.toList.foldl (·.insert ·) inScope
     | none => report .auditFuelExhausted r r "import closure exhausted its fuel"
   let stray := (mods.filter fun m => !inScope.contains m && !bad.contains m).size
-  let mut alive : NameSet := info.fold (fun acc m _ => if inScope.contains m then acc.insert m else acc) {}
+  let mut alive : NameSet :=
+    info.fold (fun acc m _ => if inScope.contains m && !bad.contains m then acc.insert m else acc) {}
   for m in mods do
     if !inScope.contains m then continue
     if let some i := info[m]? then
