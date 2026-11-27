@@ -859,6 +859,31 @@ theorem sel_symbolic (x : Nat) :
     exact reachesDoneWithinV2026_of_step hstep
       (symProgRunSteps_ret_sound sel_other_run (selEnv (n + 1)) trivial rfl)
 
+/-- The fork step emits EXACTLY the trusted `SwitchInt` `.vis` event carrying the
+symbolic discriminant (`symProgStep_branch_sound_obs`). -/
+theorem sel_step_branch :
+    symProgStep selCfg selEntry =
+      .branch [(.switchBranchEq vs 0 [], selZero), (.switchBranchOtherwise vs [0], selOther)] [] :=
+  rfl
+
+theorem sel_obs : symProgObs selCfg selEntry = .event vs := rfl
+
+theorem sel_emits_event_zero :
+    stepMirFn selBody (initMachineStateWithCallees selBody [.scalar ⟨0, 1⟩] []) =
+      MirStepNode.emitStep (.event 0) (selZero.toMachineState selCfg (selEnv 0)) :=
+  symProgStep_branch_sound_obs sel_step_branch (selEnv 0) _ _ (List.Mem.head _)
+    ⟨rfl, fun _ h => nomatch h⟩
+
+theorem sel_emits_event_succ (n : Nat) :
+    stepMirFn selBody (initMachineStateWithCallees selBody [.scalar ⟨n + 1, 1⟩] []) =
+      MirStepNode.emitStep (.event (n + 1)) (selOther.toMachineState selCfg (selEnv (n + 1))) :=
+  symProgStep_branch_sound_obs sel_step_branch (selEnv (n + 1)) _ _
+    (List.Mem.tail _ (List.Mem.head _))
+    (fun u hu => by
+      cases hu with
+      | head => exact Nat.succ_ne_zero n
+      | tail _ h => nomatch h)
+
 /-! ## Pillar 2: Bounded Loop via `StepBoundV2026` + `CnfOrd.Worklist` + `WlpV2026` -/
 
 /--
@@ -1088,16 +1113,12 @@ theorem cd_sym_body :
       .step (cdSymHead vcdAdd vcdSub)
         [.widthsMatch vcdI (.const ⟨1, 4⟩), .widthsMatch vcdAcc (.const ⟨2, 4⟩)] := rfl
 
-/-- Active reflective `BoolCertCut` sealing a computable check that the
-symbolic entry prefix and 3-step loop body match the expected checkpoints. -/
-def cdChunkCertCheck : Unit → Bool :=
-  fun _ =>
-    match symProgRunSteps cdCfg 2 cdSymEntry, symProgRunSteps cdCfg 3 cdSymBodyStart with
-    | .step _ [], .step _ [_, _] => true
-    | _, _ => false
-
-theorem cd_chunk_boolCert : BoolCertCut cdChunkCertCheck () :=
-  BoolCertCut.seal cdChunkCertCheck () rfl
+/-- Load-bearing reflective `BoolCertCut`: the computable static checker
+`condsStatic` certifies the loop-body side conditions for EVERY environment
+(consumed by `cd_iter_forall` through `condsHold_of_boolCert`). -/
+theorem cd_body_condsCert :
+    BoolCertCut condsStatic [.widthsMatch vcdI (.const ⟨1, 4⟩), .widthsMatch vcdAcc (.const ⟨2, 4⟩)] :=
+  BoolCertCut.seal _ _ rfl
 
 /-- Symbolic 1-step entry `cdInit n → cdHead 0 n` for every `n : Nat`. -/
 theorem cd_pre_forall (n : Nat) :
@@ -1126,9 +1147,7 @@ for EVERY `acc, k` without `u32` overflow, proved via `cd_sym_body` +
 `symProgRunSteps_sound`. -/
 theorem cd_iter_forall (acc k : Nat) (hacc : acc + 2 < M32) (hk : k < M32) :
     StepsToV2026 cdBody 4 (cdHead acc (k + 1)) (cdHead (acc + 2) k) := by
-  have hConds : condsHold (pairEnv acc (k + 1))
-      [.widthsMatch vcdI (.const ⟨1, 4⟩), .widthsMatch vcdAcc (.const ⟨2, 4⟩)] :=
-    ⟨⟨Nat.succ_ne_zero 3, rfl⟩, ⟨Nat.succ_ne_zero 3, rfl⟩, trivial⟩
+  have hConds := condsHold_of_boolCert cd_body_condsCert (pairEnv acc (k + 1))
   have hBody := symProgRunSteps_sound cdCfg (pairEnv acc (k + 1)) 3 cd_sym_body hConds
   have hSub : vcdSub.eval (pairEnv acc (k + 1)) = ⟨k, 4⟩ := by
     rw [SymScalar.eval_binOp, SymScalar.eval_var, SymScalar.eval_const]
@@ -1253,7 +1272,6 @@ combines `wlpOutcomeV2026` at `fuelWlp = n * 4 + 8` with Pass-1 safety at
 theorem cd_pass2_forall (n : Nat) (hn : 2 * n < M32) :
     wpStateV2026 cdBody (n * 4 + 4) (initMachineStateWithCallees cdBody [.scalar ⟨n, 4⟩] [])
       (mirNormalPost (fun r _ => r = .scalar ⟨2 * n, 4⟩)) := by
-  have _hCertCheck : cdChunkCertCheck () = true := BoolCertCut.unseal cd_chunk_boolCert
   have hPre := cd_pre_forall n
   have hIters := cd_iters_exact n 0 (by rw [Nat.zero_add]; exact hn)
   rw [Nat.zero_add] at hIters
@@ -1406,6 +1424,92 @@ theorem scaled_add_overflow_refuted :
   have hPreConds : condsHold ovAddEnv [.assertHolds (.const ⟨1, 1⟩) true, .noOverflowMul false vm vk] :=
     ⟨rfl, ⟨⟨eight_ne_zero, rfl⟩, by decide⟩, trivial⟩
   have h := symProgRunSteps_fault_refutes scaled_prefix19 ovAddEnv hPreConds (fk := .ub) rfl
+  rw [show addScaledCallerBody = scaledCfg.body from rfl, show [mulScaledCalleeBody] =
+    scaledCfg.callees from rfl, ← scaled_args_eval, ← symProgEntry_toMachineState]
+  exact h
+
+/-! ### 3a-iii. UNIVERSAL fail-closed UB via exact side conditions
+
+Not a single overflowing witness: for EVERY overflowing input, the violated
+recorded `SymCond` is turned by `symProgRunSteps_ub_refutes` (exactness of the
+intrinsic side conditions) into a trusted UB fault of unmodified `stepMirFn`. -/
+
+/-- Callee state right after `unchecked_mul` (`bb4`, `_0 = vm * vk`). -/
+def scaledCp1c : SymProg :=
+  { scaledCp1 with frame := { blockIdx := 4, stmtIdx := 0, locals := [I vmk, I vm, I vk, D] } }
+
+theorem scaled_mul_step :
+    symProgStep scaledCfg scaledCp1b = .step scaledCp1c [.noOverflowMul false vm vk] := rfl
+
+theorem scaled_at_mul : scaledCp1b.atCall scaledCfg = true := rfl
+
+/-- For ALL `(b, m, k)` with `2^64 ≤ m * k`, `add_scaled` has UB inside the
+inline callee: refutes `MirNoUBTree`, `MirWpConverges`, and every
+`ExecWithinStepsV2026`. -/
+theorem add_scaled_mul_overflow_ub_forall {b m k : Nat} (hm : m < M64) (hk : k < M64)
+    (hov : M64 ≤ m * k) :
+    ¬ MirNoUBTree (mirTree addScaledCallerBody
+        (initMachineStateWithCallees addScaledCallerBody [su b, su m, su k] [mulScaledCalleeBody])) ∧
+      (∀ post, ¬ MirWpConverges addScaledCallerBody
+        (initMachineStateWithCallees addScaledCallerBody [su b, su m, su k] [mulScaledCalleeBody])
+        post) ∧
+      (∀ post bound, ¬ ExecWithinStepsV2026 addScaledCallerBody [su b, su m, su k]
+        [mulScaledCalleeBody] post bound) := by
+  have hn : ¬ condsHold (scaledEnv b m k) [.noOverflowMul false vm vk] := by
+    intro h
+    have hlt : wrapScalarBits m (scalarModulus 8) * wrapScalarBits k (scalarModulus 8) <
+        scalarModulus 8 := h.1.2
+    rw [wrapScalarBits_of_lt hm, wrapScalarBits_of_lt hk] at hlt
+    exact Nat.not_le_of_gt hlt hov
+  have h := symProgRunSteps_ub_refutes scaled_prefix11 scaled_mul_step scaled_at_mul
+    (scaledEnv b m k) ⟨rfl, trivial⟩ hn
+  rw [show addScaledCallerBody = scaledCfg.body from rfl, show [mulScaledCalleeBody] =
+    scaledCfg.callees from rfl, ← scaled_args_eval, ← symProgEntry_toMachineState]
+  exact h
+
+theorem scaled_add_step :
+    symProgStep scaledCfg scaledCp2b = .step scaledCp3 [.noOverflowAdd false vb vmk] := rfl
+
+theorem scaled_at_add : scaledCp2b.atCall scaledCfg = true := rfl
+
+/-- Non-switch steps are exactly silent (`symProgStep_sound_obs`), e.g. the
+caller's `unchecked_add` call in `add_scaled`. -/
+theorem scaled_add_call_silent (b m k : Nat) (hc : condsHold (scaledEnv b m k)
+    [.noOverflowAdd false vb vmk]) :
+    stepMirFn addScaledCallerBody (scaledCp2b.toMachineState scaledCfg (scaledEnv b m k)) =
+      MirStepNode.step (scaledCp3.toMachineState scaledCfg (scaledEnv b m k)) :=
+  symProgStep_sound_obs scaled_add_step (scaledEnv b m k) hc
+
+/-- For ALL `(b, m, k)` where the callee product fits but `2^64 ≤ b + m * k`,
+`add_scaled` has UB at the caller's `unchecked_add` after the inline callee
+returned. -/
+theorem add_scaled_add_overflow_ub_forall {b m k : Nat} (hb : b < M64) (hm : m < M64)
+    (hk : k < M64) (hmk : m * k < M64) (hov : M64 ≤ b + m * k) :
+    ¬ MirNoUBTree (mirTree addScaledCallerBody
+        (initMachineStateWithCallees addScaledCallerBody [su b, su m, su k] [mulScaledCalleeBody])) ∧
+      (∀ post, ¬ MirWpConverges addScaledCallerBody
+        (initMachineStateWithCallees addScaledCallerBody [su b, su m, su k] [mulScaledCalleeBody])
+        post) ∧
+      (∀ post bound, ¬ ExecWithinStepsV2026 addScaledCallerBody [su b, su m, su k]
+        [mulScaledCalleeBody] post bound) := by
+  have hpre : condsHold (scaledEnv b m k)
+      [.assertHolds (.const ⟨1, 1⟩) true, .noOverflowMul false vm vk] := by
+    refine ⟨rfl, ⟨⟨eight_ne_zero, rfl⟩, ?_⟩, trivial⟩
+    show wrapScalarBits m (scalarModulus 8) * wrapScalarBits k (scalarModulus 8) < scalarModulus 8
+    rw [wrapScalarBits_of_lt hm, wrapScalarBits_of_lt hk]
+    exact hmk
+  have hn : ¬ condsHold (scaledEnv b m k) [.noOverflowAdd false vb vmk] := by
+    intro h
+    have hlt : scBits (vb.eval (scaledEnv b m k)) +
+        scBitsAt (vb.eval (scaledEnv b m k)) (vmk.eval (scaledEnv b m k)) <
+          scalarModulus (vb.eval (scaledEnv b m k)).sizeBytes := h.1.2
+    rw [scaled_vmk_eval hm hk hmk] at hlt
+    change wrapScalarBits b (scalarModulus 8) + wrapScalarBits (m * k) (scalarModulus 8) <
+      scalarModulus 8 at hlt
+    rw [wrapScalarBits_of_lt hb, wrapScalarBits_of_lt hmk] at hlt
+    exact Nat.not_le_of_gt hlt hov
+  have h := symProgRunSteps_ub_refutes scaled_prefix19 scaled_add_step scaled_at_add
+    (scaledEnv b m k) hpre hn
   rw [show addScaledCallerBody = scaledCfg.body from rfl, show [mulScaledCalleeBody] =
     scaledCfg.callees from rfl, ← scaled_args_eval, ← symProgEntry_toMachineState]
   exact h
@@ -1764,7 +1868,7 @@ def unsafeRecSuffix : String := "_unsafe" ++ "_rec"
 open Lean Elab Command in
 /-- Fails if any constant of module `mod` is a postulated constant, a
 compiler-generated unsafe recursive auxiliary, a `noncomputable` def (when
-`forbidNoncomputable = true`), or a theorem / definition depending on any axiom
+`forbidNoncomputable = true`), or a theorem / definition whose trust base leaves
 outside `allowed`. -/
 def auditModule (mod : Name) (allowed : Array Name)
     (forbidNoncomputable : Bool := false) : CommandElabM Unit := do
@@ -1822,7 +1926,9 @@ def keyTestTheorems : Array Lean.Name :=
     ``cd_pass1_loop, ``cd_pass2, ``cd_worklist, ``cd_not15, ``cd_verificationResult,
     ``cd_statefulVerificationResult, ``cd_pass1_forall, ``cd_pass2_forall,
     ``cd_not_tight_forall, ``cd_verificationResult_forall, ``cd_statefulVerificationResult_forall,
-    ``spin_partial_not_total]
+    ``spin_partial_not_total, ``add_scaled_mul_overflow_ub_forall,
+    ``add_scaled_add_overflow_ub_forall, ``sel_emits_event_zero, ``sel_emits_event_succ,
+    ``scaled_add_call_silent, ``cd_iter_forall]
 
 run_cmd auditAxioms keyTestTheorems choiceFreeAxioms
 
