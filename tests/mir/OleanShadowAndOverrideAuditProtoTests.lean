@@ -108,6 +108,28 @@ def auditImported (env : Environment) (cfg : FourVectorConfig := {}) (root? : Op
     return s
   finally searchPathRef.set saved
 
+/-! ## T20: real sweep over the compiled build library of this checkout
+
+The swept library roots are the `lean_lib` roots that build on this base (`lake build Trusted
+Anneal MiniRust Correspondence`); `MiniRustSpec` currently fails to build on the base (two of its
+imports realize the same equation lemma differently), so its artifacts are validated by Vector 3
+but not loaded. -/
+
+def libraryRoots : Array Name := #[`Trusted, `Anneal, `MiniRust, `Correspondence]
+
+/-- Run the build-library sweep and print its measurements; fails unless there are zero findings
+and (when `budgetMs?` is set) the sweep finishes within the budget. -/
+def sweep (label : String) (cfg : FourVectorConfig) (budgetMs? : Option Nat) : IO Unit := do
+  let buildLib := (← IO.currentDir) / ".lake" / "build" / "lib" / "lean"
+  let ((), s) ← AuditM.run' (auditBuildLibrary buildLib (← sysLib) cfg (some libraryRoots))
+  IO.println s!"{label}: modules_checked={s.modulesChecked} decls_checked={s.declsChecked} oleans_checked={s.oleansChecked} axioms_swept={s.axiomsSwept} hook_entries={s.hookEntriesChecked} false_positives={s.violations.size} structural_flags={s.policyFlags.size} stray_artifacts={s.strayArtifacts} elapsed_ms={s.elapsedMs} import_ms={s.importMs}"
+  expect s!"{label} zero false positives on the base build" s.violations.isEmpty (renderAll s.violations)
+  expect s!"{label} audited every library-root module" (s.modulesChecked ≥ 100) s!"{s.modulesChecked}"
+  if let some b := budgetMs? then
+    expect s!"{label} finished within {b} ms" (s.elapsedMs < b) s!"{s.elapsedMs}"
+
+
+
 /-! ## Vector 1 — `_private` namespace spoofing -/
 
 /-! ### T1: structural parser (pure) -/
@@ -1053,30 +1075,44 @@ PASS T21 transitive Init.Bridge -> Planted sysroot escape caught
       (sBr.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Planted)
       (renderAll sBr.violations)
 
-/-! ## T20: real sweep over the compiled build library of this checkout
+/-! ## T22: large whole-module audits screen theorem bodies in every mode (A2 regression)
 
-The swept library roots are the `lean_lib` roots that build on this base (`lake build Trusted
-Anneal MiniRust Correspondence`); `MiniRustSpec` currently fails to build on the base (two of its
-imports realize the same equation lemma differently), so its artifacts are validated by Vector 3
-but not loaded. -/
+Above `implicitClosureMaxConsts` a whole-module audit no longer computes the exact closure and
+relies on the shared kernel traversal to find direct `sorryAx` references. That traversal must see
+compiled theorem bodies in both the structural and the constant-only (fast) configuration. The
+threshold is lowered to `0` so a small compiled module takes the large-audit path. -/
 
-def libraryRoots : Array Name := #[`Trusted, `Anneal, `MiniRust, `Correspondence]
+def sorryThmSrc : String := "theorem smuggled : 1 = 2 := sorryAx _ true\ndef benign : Nat := 3\n"
 
-/-- Run the build-library sweep and print its measurements; fails unless there are zero findings
-and (when `budgetMs?` is set) the sweep finishes within the budget. -/
-def sweep (label : String) (cfg : FourVectorConfig) (budgetMs? : Option Nat) : IO Unit := do
-  let buildLib := (← IO.currentDir) / ".lake" / "build" / "lib" / "lean"
-  let ((), s) ← AuditM.run' (auditBuildLibrary buildLib (← sysLib) cfg (some libraryRoots))
-  IO.println s!"{label}: modules_checked={s.modulesChecked} decls_checked={s.declsChecked} oleans_checked={s.oleansChecked} axioms_swept={s.axiomsSwept} hook_entries={s.hookEntriesChecked} false_positives={s.violations.size} structural_flags={s.policyFlags.size} stray_artifacts={s.strayArtifacts} elapsed_ms={s.elapsedMs} import_ms={s.importMs}"
-  expect s!"{label} zero false positives on the base build" s.violations.isEmpty (renderAll s.violations)
-  expect s!"{label} audited every library-root module" (s.modulesChecked ≥ 100) s!"{s.modulesChecked}"
-  if let some b := budgetMs? then
-    expect s!"{label} finished within {b} ms" (s.elapsedMs < b) s!"{s.elapsedMs}"
+/--
+info: PASS T22 large-audit path, structural scan on: sorryAx in a compiled theorem body caught
+PASS T22 large-audit path, constant-only screen: sorryAx in a compiled theorem body caught
+PASS T22 large-audit path, theorem bodies excluded from find?: still caught by the constant screen
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  withTmpDir fun dir => do
+    let _ ← compileModule dir `SorryThm sorryThmSrc
+    let env ← importWith dir #[`SorryThm]
+    let big : AxiomPolicy := { implicitClosureMaxConsts := 0 }
+    let caught (s : AuditSummary) : Bool :=
+      s.violations.any fun v => v.kind == .referencedUnapprovedAxiom && v.decl == `sorryAx
+    let s ← auditImported env { axioms := big } dir
+    expect "T22 large-audit path, structural scan on: sorryAx in a compiled theorem body caught" (caught s) (renderAll s.violations)
+    let s ← auditImported env { axioms := big, runStructuralOpaqueScan := false } dir
+    expect "T22 large-audit path, constant-only screen: sorryAx in a compiled theorem body caught" (caught s) (renderAll s.violations)
+    let s ← auditImported env { axioms := big, kernelScanTheoremBodies := false } dir
+    expect "T22 large-audit path, theorem bodies excluded from find?: still caught by the constant screen"
+      (caught s) (renderAll s.violations)
 
--- Fast sweep (Init.ShareCommon scanned on ALL bodies including theorems; Layer A on types & defs): timed against 5 s.
-#eval sweep "T20 fast sweep" { runStructuralOpaqueScan := true, kernelScanTheoremBodies := false } (some 5000)
-
--- Deep sweep (full Layer A + Init.ShareCommon across all theorem bodies too): zero findings, time reported.
+-- Deep sweep (full Layer A + every expression via `find?`): zero findings, time reported.
 #eval sweep "T20 deep sweep" {} none
+
+-- Fast sweep, deliberately the last command of the file: the frontend elaborates later commands
+-- concurrently with a running `#eval`, which would otherwise inflate the measured wall time. Every
+-- type, value and theorem body is screened for `Init.ShareCommon` / forbidden-axiom constants by
+-- one C++ `getUsedConstants` pass per module; the Layer A walk runs in the deep sweep above.
+-- Timed against 5 s.
+#eval sweep "T20 fast sweep" { runStructuralOpaqueScan := false } (some 5000)
 
 end OleanShadowAndOverrideAuditProtoTests

@@ -761,6 +761,11 @@ structure AxiomPolicy where
   allowedAssumptions : NameSet := {}
   allowedAssumptionModules : NameSet := {}
   closureFuel : Nat := 2000000
+  /-- Whole-module audits (`roots? = none`) of at most this many constants compute the exact
+  dependency closure; larger ones screen every non-toolchain declaration's direct references to
+  forbidden toolchain axioms inside the shared kernel traversal (non-toolchain axioms are always
+  reported, reachable or not). -/
+  implicitClosureMaxConsts : Nat := 5000
   deriving Inhabited
 
 /-- Foundational axioms, admitted only together with their declaring toolchain module. -/
@@ -907,7 +912,7 @@ def auditUnreferencedAxioms (ctx : AuditContext) (views : Array ModuleView) (p :
         report .auditFuelExhausted .anonymous env.header.mainModule "axiom reachability closure exhausted its fuel"
         return
     | none =>
-      if viewConstCount ≤ 5000 || !p.allowClassicalChoice then
+      if viewConstCount ≤ p.implicitClosureMaxConsts || !p.allowClassicalChoice then
         let mut seedSet : NameSet := {}
         for v in views do
           for ci in v.data.constants do
@@ -2387,10 +2392,19 @@ def kernelScanChunk (ctx : AuditContext) (sc : Std.HashSet Name) (structural sca
       for r in rv.rules do fullExprs := fullExprs.push r.rhs
   -- Overlap the C++ `getUsedConstants` theorem-body screen with the `fullExprs.find?` traversal on
   -- separate worker threads so large modules never serialize the two region walks on a single core.
-  let fastThmTask := Task.spawn fun _ =>
-    !fastThmVals.isEmpty && ((mkAppN (.sort .zero) fastThmVals).getUsedConstants.any isBadConst)
-  let fullHit := !fullExprs.isEmpty && ((mkAppN (.sort .zero) fullExprs).find? pFull).isSome
-  let fastThmHit := fastThmTask.get
+  -- Without the structural scan the screen is a pure constant-membership test, so one C++
+  -- `getUsedConstants` pass over the whole slice (types, values, theorem bodies, recursor rules)
+  -- replaces the per-node Lean `find?` callback; with it, `find?` covers the full expressions and
+  -- `getUsedConstants` the theorem bodies excluded from the structural walk.
+  let (fullHit, fastThmHit) :=
+    if structural then
+      let fastThmTask := Task.spawn fun _ =>
+        !fastThmVals.isEmpty && ((mkAppN (.sort .zero) fastThmVals).getUsedConstants.any isBadConst)
+      let fullHit := !fullExprs.isEmpty && ((mkAppN (.sort .zero) fullExprs).find? pFull).isSome
+      (fullHit, fastThmTask.get)
+    else
+      let hit := (mkAppN (.sort .zero) (fullExprs ++ fastThmVals)).getUsedConstants.any isBadConst
+      (hit, hit)
   if !fullHit && !fastThmHit then return
   let mut reportedForbidden : NameSet := {}
   for ci in consts do
@@ -2488,7 +2502,8 @@ def runAllFourVectorAudits (ctx : AuditContext) (cfg : FourVectorConfig := {}) (
   modify fun s => { s with modulesChecked := s.modulesChecked + views.size }
   let viewConstCount := views.foldl (fun acc v => acc + v.data.constants.size) 0 +
     (ctx.env.setExporting false).constants.map₂.toList.length
-  let checkImplicitAxioms := cfg.axiomRoots?.isNone && viewConstCount > 5000 && cfg.axioms.allowClassicalChoice
+  let checkImplicitAxioms := cfg.axiomRoots?.isNone && viewConstCount > cfg.axioms.implicitClosureMaxConsts &&
+    cfg.axioms.allowClassicalChoice
   let runSub (act : AuditM Unit) : IO (Task (Except IO.Error AuditSummary)) :=
     IO.asTask do pure (← StateT.run act {}).2
   let tV1 ← runSub (auditPrivateNames ctx views)
@@ -2589,15 +2604,19 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
   try
     for _ in [0:mods.size + 1] do
       if frontier.isEmpty then break
-      let readTasks ← frontier.mapM fun m => IO.asTask do
-        let (d, _) ← readModuleData (buildLib / (modRelPath m ++ ".olean"))
-        return (m, d.imports.map (·.module), d.constants)
+      let readTasks ← frontier.mapM fun m => do
+        let t ← IO.asTask do
+          let (d, _) ← readModuleData (buildLib / (modRelPath m ++ ".olean"))
+          return (d.imports.map (·.module), d.constants)
+        return (m, t)
       let mut nextFrontier : Array Name := #[]
-      for rt in readTasks do
+      for (m, rt) in readTasks do
         match ← IO.wait rt with
         | .error e =>
-          report .environmentLoadFailed .anonymous .anonymous s!"readModuleData failed: {e}"
-        | .ok (m, imps, consts) =>
+          -- Fail closed on the module itself: it must never reach `importModules`.
+          report .environmentLoadFailed m m s!"readModuleData failed: {e}"
+          bad := bad.insert m
+        | .ok (imps, consts) =>
           info := info.insert m { imports := imps, constants := consts }
           for i in imps do
             if modSet.contains i then
