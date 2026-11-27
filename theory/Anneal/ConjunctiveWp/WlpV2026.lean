@@ -9,7 +9,6 @@
 import Anneal.Framework.StepWp
 import Anneal.Firewall
 import Anneal.MirFuelFree
-import Anneal.MirLoops
 import Anneal.PureMirExec
 import Anneal.ParametricCore.V2026Bridge
 import Anneal.ParametricCore.StageCut
@@ -34,7 +33,12 @@ unification seam:
    `PureMirExec.mirStep`, and `ParametricCore.V2026Bridge.mirDetStep`, exact
    one-step `wpMirSym` unfolding rules, and adequacy bridges into
    `MirWpConverges`, `MirNoUBTree`, `VerificationResult`, and
-   `StatefulVerificationResult`.
+   `StatefulVerificationResult`. The adapter is proved *exactly complete* for
+   call-free semantics (`v2026Exec_of_wpMirNoCallSym`,
+   `mirNoCallWpConverges_iff_exists_v2026Exec`), and `MirNoUBTree` adequacy is
+   proved directly against `Trusted.ITree.Reaches` / `TreeSafe`
+   (`treeSafe_mirTree_of_v2026Exec`) using only `{propext, Quot.sound}` — no
+   `Classical.choice`.
 2. **Deterministic `execWlp*`, Anti-Monotonicity, & Asymmetric Two-Pass Rules:**
    `wlpOutcomeV2026`, `wlpStateV2026`, `wlpProgV2026`, `wlpProgStrictV2026`,
    `execWlpOutcomeV2026`, `execWlpStateV2026`, `execWlpProgV2026`,
@@ -860,6 +864,207 @@ theorem mirNoCallWpConverges_of_v2026Exec {body : CapturedMir}
     MirNoCallWpConverges body s post :=
   ⟨fuel + 1, wpMirNoCallSym_of_v2026Exec h⟩
 
+/-! ### Choice-Free Direct `TreeSafe` Adequacy -/
+
+private theorem tauStar_eq_of_observe_ret' {t u : ITree MirEffect MirOutcome}
+    {r : MirOutcome} (h : t.observe = .ret r) (hs : TauStar t u) : u = t := by
+  cases hs with
+  | refl _ => rfl
+  | step hObs _ => rw [h] at hObs; cases hObs
+
+private theorem tauStar_eq_of_observe_vis' {t u : ITree MirEffect MirOutcome}
+    {i : MirEffect.I} {k : MirEffect.O i → ITree MirEffect MirOutcome}
+    (h : t.observe = .vis i k) (hs : TauStar t u) : u = t := by
+  cases hs with
+  | refl _ => rfl
+  | step hObs _ => rw [h] at hObs; cases hObs
+
+/-- A MIR interaction tree whose head node is `.ret r` is `TreeSafe`
+(proved directly from `Trusted.ITree.Reaches`, `0` `Classical.choice`). -/
+theorem treeSafe_of_observe_ret_v2026 {t : ITree MirEffect MirOutcome}
+    {r : MirOutcome} (h : t.observe = .ret r) : TreeSafe t := by
+  intro tr u hR hF
+  cases hR with
+  | refl _ =>
+    obtain ⟨t', i, k, hTs, hObs, _⟩ := hF
+    rw [tauStar_eq_of_observe_ret' h hTs, h] at hObs
+    cases hObs
+  | tau hObs _ => rw [h] at hObs; cases hObs
+  | vis hObs _ _ _ => rw [h] at hObs; cases hObs
+
+/-- `TreeSafe` propagates backwards across a silent `.tau` head node. -/
+theorem treeSafe_of_observe_tau_v2026 {t t' : ITree MirEffect MirOutcome}
+    (h : t.observe = .tau t') (hSafe : TreeSafe t') : TreeSafe t := by
+  intro tr u hR hF
+  cases hR with
+  | refl _ =>
+    obtain ⟨t'', i, k, hTs, hObs, hFault⟩ := hF
+    cases hTs with
+    | refl _ => rw [h] at hObs; cases hObs
+    | step hObs' hTs' =>
+      rw [h] at hObs'
+      injection hObs' with hEq
+      subst hEq
+      exact hSafe [] _ (Reaches.refl _) ⟨t'', i, k, hTs', hObs, hFault⟩
+  | tau hObs hR' =>
+    rw [h] at hObs
+    injection hObs with hEq
+    subst hEq
+    exact hSafe _ _ hR' hF
+  | vis hObs _ _ _ => rw [h] at hObs; cases hObs
+
+/-- `TreeSafe` propagates backwards across a non-fault visible head node
+(e.g. an observable `MirObsE` emission) whose every continuation is safe. -/
+theorem treeSafe_of_observe_vis_v2026 {t : ITree MirEffect MirOutcome}
+    {i : MirEffect.I} {k : MirEffect.O i → ITree MirEffect MirOutcome}
+    (h : t.observe = .vis i k) (hNF : ¬ FaultEffect.isFault i)
+    (hSafe : ∀ o, TreeSafe (k o)) : TreeSafe t := by
+  intro tr u hR hF
+  cases hR with
+  | refl _ =>
+    obtain ⟨t'', i', k', hTs, hObs, hFault⟩ := hF
+    rw [tauStar_eq_of_observe_vis' h hTs, h] at hObs
+    cases hObs
+    exact hNF hFault
+  | tau hObs _ => rw [h] at hObs; cases hObs
+  | vis hObs _ o hR' =>
+    rw [h] at hObs
+    cases hObs
+    exact hSafe o _ _ hR' hF
+
+/-- One-layer observation of `mirTree body s` over unmodified `stepMirFn`. -/
+theorem mirTree_observe (body : CapturedMir) (s : MachineState) :
+    (mirTree body s).observe =
+      (stepMirFn body s).map (ITree.cofix (stepMirState body)) :=
+  ITree.observe_cofix _ _
+
+private theorem treeSafe_cofix_halted (body : CapturedMir) (out : MirOutcome) :
+    TreeSafe (ITree.cofix (stepMirState body) (.halted out)) :=
+  treeSafe_of_observe_ret_v2026 (r := out) (ITree.observe_cofix _ _)
+
+/-- Choice-free all-prefix UB-freedom: every fault-free
+`execStepOutcome (v2026Step body)` derivation yields
+`TreeSafe (mirTree body s)` directly (`{propext, Quot.sound}` only). -/
+theorem treeSafe_mirTree_of_v2026Exec {body : CapturedMir}
+    {post : MirOutcome → Prop} :
+    ∀ {fuel : Nat} {s : MachineState},
+      execStepOutcome (v2026Step body) post (fun _ => False) fuel s →
+      TreeSafe (mirTree body s)
+  | 0, _, h => False.elim h
+  | fuel + 1, s, h => by
+    dsimp only [execStepOutcome] at h
+    rw [execStepPred_succ_iff] at h
+    have hObs := mirTree_observe body s
+    cases hStep : v2026Step body s with
+    | step s' =>
+      rw [hStep] at h
+      have ih : TreeSafe (mirTree body s') := treeSafe_mirTree_of_v2026Exec h
+      cases v2026Step_step_iff.mp hStep with
+      | inl hTau =>
+        rw [hTau] at hObs
+        exact treeSafe_of_observe_tau_v2026 (t' := mirTree body s') hObs ih
+      | inr hVis =>
+        obtain ⟨obs, k, hv, hk⟩ := hVis
+        rw [hv] at hObs
+        refine treeSafe_of_observe_vis_v2026
+          (k := fun o => ITree.cofix (stepMirState body) (k o)) hObs
+          (fun hF => hF) (fun o => ?_)
+        cases o
+        show TreeSafe (ITree.cofix (stepMirState body) (k PUnit.unit))
+        rw [hk]
+        exact ih
+    | done out =>
+      cases v2026Step_done_iff.mp hStep with
+      | inl hRet =>
+        rw [hRet] at hObs
+        exact treeSafe_of_observe_ret_v2026 (r := out) hObs
+      | inr hRest =>
+        cases hRest with
+        | inl hTauH =>
+          rw [hTauH] at hObs
+          exact treeSafe_of_observe_tau_v2026 hObs (treeSafe_cofix_halted body out)
+        | inr hVisH =>
+          obtain ⟨obs, k, hv, hk⟩ := hVisH
+          rw [hv] at hObs
+          refine treeSafe_of_observe_vis_v2026
+            (k := fun o => ITree.cofix (stepMirState body) (k o)) hObs
+            (fun hF => hF) (fun o => ?_)
+          cases o
+          show TreeSafe (ITree.cofix (stepMirState body) (k PUnit.unit))
+          rw [hk]
+          exact treeSafe_cofix_halted body out
+    | fault _ =>
+      rw [hStep] at h
+      exact False.elim h
+
+/-! ### Exact Completeness: `wpMirNoCallSym` ⇒ `execStepOutcome (v2026Step body)` -/
+
+private theorem v2026ExecSt_of_wpMirExecNoCallSym {body : CapturedMir}
+    {post : MirOutcome → Prop} :
+    ∀ {fuel : Nat} {st : MirExecState},
+      wpMirExecNoCallSym fuel body st post →
+      (match st with
+        | .running s => execStepOutcome (v2026Step body) post (fun _ => False) fuel s
+        | .halted out => post out
+        | .faulted _ => False)
+  | 0, _, h => False.elim h
+  | fuel + 1, st, h => by
+    unfold wpMirExecNoCallSym at h
+    rw [evalSymNodeTreeNoCall_eq, stepMirExecSymTree_eval, evalNodeNoCallWP_eq] at h
+    cases st with
+    | halted out => exact h
+    | faulted fk => exact h
+    | running s =>
+      dsimp only [stepMirState] at h
+      dsimp only [execStepOutcome]
+      rw [execStepPred_succ_iff]
+      unfold v2026Step
+      cases hN : stepMirFn body s with
+      | ret out =>
+        rw [hN] at h
+        exact h
+      | tau st' =>
+        rw [hN] at h
+        have ih := v2026ExecSt_of_wpMirExecNoCallSym h
+        cases st' with
+        | running s' => exact ih
+        | halted out => exact ih
+        | faulted _ => exact ih
+      | vis i k =>
+        rw [hN] at h
+        rcases i with f | (e | c)
+        · cases f
+          exact h
+        · cases e
+          have ih := v2026ExecSt_of_wpMirExecNoCallSym h
+          dsimp only [ofV2026MirStepNode]
+          cases hk : k PUnit.unit with
+          | running s' => rw [hk] at ih; exact ih
+          | halted out => rw [hk] at ih; exact ih
+          | faulted _ => rw [hk] at ih; exact ih
+        · cases c
+          exact h
+
+/-- Exact completeness of the lossless `v2026Step` adapter: every call-free
+`wpMirNoCallSym fuel` derivation over unmodified `stepMirState` yields a
+fault-free `execStepOutcome (v2026Step body)` derivation at the SAME fuel. -/
+theorem v2026Exec_of_wpMirNoCallSym {body : CapturedMir}
+    {post : MirOutcome → Prop} {fuel : Nat} {s : MachineState}
+    (h : wpMirNoCallSym fuel body s post) :
+    execStepOutcome (v2026Step body) post (fun _ => False) fuel s :=
+  v2026ExecSt_of_wpMirExecNoCallSym (st := .running s) h
+
+/-- Exact fuel-free characterization: call-free MIR convergence
+(`MirNoCallWpConverges`) holds iff some finite fault-free
+`execStepOutcome (v2026Step body)` run exists. -/
+theorem mirNoCallWpConverges_iff_exists_v2026Exec {body : CapturedMir}
+    {s : MachineState} {post : MirOutcome → Prop} :
+    MirNoCallWpConverges body s post ↔
+      ∃ fuel : Nat,
+        execStepOutcome (v2026Step body) post (fun _ => False) fuel s :=
+  ⟨fun ⟨fuel, h⟩ => ⟨fuel, v2026Exec_of_wpMirNoCallSym h⟩,
+   fun ⟨_, h⟩ => mirNoCallWpConverges_of_v2026Exec h⟩
+
 /-- Total-correctness `DWP mirDefaultWP` adequacy of
 `execStepOutcome (v2026Step body)` over `mirTree body s`. -/
 theorem dwp_of_v2026Exec {body : CapturedMir} {s : MachineState}
@@ -877,12 +1082,14 @@ theorem dwlp_of_v2026Exec {body : CapturedMir} {s : MachineState}
   dwlp_of_mirWpConverges (mirWpConverges_of_v2026Exec h)
 
 /-- All-prefix UB-freedom (`MirNoUBTree (mirTree body s)`) directly from
-`execStepOutcome (v2026Step body)`. -/
+`execStepOutcome (v2026Step body)`, via the choice-free direct `TreeSafe`
+argument `treeSafe_mirTree_of_v2026Exec` (`{propext, Quot.sound}` only; does
+NOT route through the `Classical.choice`-dependent `dwlp_pure_adequacy`). -/
 theorem mirNoUBTree_of_v2026Exec {body : CapturedMir} {s : MachineState}
     {post : MirOutcome → Prop} {fuel : Nat}
     (h : execStepOutcome (v2026Step body) post (fun _ => False) fuel s) :
     MirNoUBTree (mirTree body s) :=
-  (dwlp_pure_adequacy (dwlp_of_v2026Exec h)).1
+  treeSafe_mirTree_of_v2026Exec h
 
 /-- Whole-function stateless `VerificationResult` (`mirSafePost`) lifting from
 `execStepOutcome (v2026Step c.body)`. -/
@@ -1175,6 +1382,18 @@ theorem wpStateV2026_of_wlp_and_safety_le {body : CapturedMir}
     wpStateV2026 body fuelSafe s post :=
   wpStepPred_mono (fun _ _ h => h.1) (fun _ _ h => h.2)
     (wpOutcomeV2026_of_wlp_and_safety_le hLe hWlp hSafe)
+
+/-- Whole-function asymmetric-fuel two-pass rule (`fuelSafe ≤ fuelWlp`):
+`wlpProgV2026` at `fuelWlp` plus a `post := fun _ => True` safety
+`wpProgV2026` at `fuelSafe` yields `wpProgV2026` at `fuelSafe`. -/
+theorem wpProgV2026_of_wlp_and_safety_le {body : CapturedMir}
+    {fuelSafe fuelWlp : Nat} {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop}
+    (hLe : fuelSafe ≤ fuelWlp)
+    (hWlp : wlpProgV2026 body fuelWlp args callees post)
+    (hSafe : wpProgV2026 body fuelSafe args callees (fun _ => True)) :
+    wpProgV2026 body fuelSafe args callees post :=
+  wpStateV2026_of_wlp_and_safety_le hLe hWlp hSafe
 
 /-- Asymmetric-fuel two-pass adequacy into `Anneal.MirFuelFree.MirWpConverges`
 whenever `fuelSafe ≤ fuelWlp`. -/
@@ -1789,6 +2008,15 @@ theorem wpPow2_iff_wpOutcomeV2026 {body : CapturedMir}
       wpOutcomeV2026 body onDone onFault (pow2Fuel k) s :=
   Iff.trans wpPow2_iff_execStepOutcome wpOutcomeV2026_iff_execOutcomeV2026.symm
 
+/-- Exact equivalence between whole-function binary-doubling `wpProgPow2` at
+depth `k` and `wpProgV2026` at fuel `pow2Fuel k`. -/
+theorem wpProgPow2_iff_wpProgV2026 {body : CapturedMir} {k : Nat}
+    {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop} :
+    wpProgPow2 body k args callees post ↔
+      wpProgV2026 body (pow2Fuel k) args callees post :=
+  wpPow2_iff_wpOutcomeV2026
+
 /-- Lift a 1-step `wpPow2Cont` invariant (`k = 0`) to depth `k` (`2^k` steps)
 in $O(k)$ recursive-doubling steps without unary induction over
 `pow2Fuel k`. -/
@@ -1979,5 +2207,34 @@ theorem canary_v2026_branching_emit_and_pow2 :
   exact ⟨hPow2,
     mirWpConverges_of_wlp_and_safety_le hLe hWlp hSafe,
     mirNoUBTree_of_v2026Exec hExec⟩
+
+/-- Concrete observable-step soundness canary: the `switchInt` head step of
+`branchingTracePipelineBody` is a genuine *visible* `MirObsE` emission
+`.vis (.inr (.inl (.emit (.event 7)))) _` (NOT a silent `.tau`), `v2026Step`
+maps it to `.step` of the same successor, and `wpMirSym` unfolds across it in
+exactly one unit of fuel. -/
+theorem canary_v2026_switchInt_observable_vis :
+    let s0 := initMachineState branchingTracePipelineBody
+      [.scalar { bits := 7, sizeBytes := 4 }]
+    let s1 := branchingTraceMidState 7 s0.memory
+    stepMirFn branchingTracePipelineBody s0 =
+        MirStepNode.emitStep (.event 7) s1 ∧
+    (∀ st : MirExecState, stepMirFn branchingTracePipelineBody s0 ≠ .tau st) ∧
+    v2026Step branchingTracePipelineBody s0 = .step s1 ∧
+    (∀ (fuel : Nat) (post : MirOutcome → Prop),
+      wpMirSym (fuel + 1) branchingTracePipelineBody s0 post ↔
+        wpMirSym fuel branchingTracePipelineBody s1 post) := by
+  dsimp only
+  have hEmit : stepMirFn branchingTracePipelineBody
+      (initMachineState branchingTracePipelineBody
+        [.scalar { bits := 7, sizeBytes := 4 }]) =
+      MirStepNode.emitStep (.event 7)
+        (branchingTraceMidState 7
+          (initMachineState branchingTracePipelineBody
+            [.scalar { bits := 7, sizeBytes := 4 }]).memory) := rfl
+  refine ⟨hEmit, fun st hTau => ?_, rfl,
+    fun _ _ => wpMirSym_succ_of_emitStep hEmit⟩
+  rw [hEmit] at hTau
+  cases hTau
 
 end Anneal.ConjunctiveWp

@@ -231,6 +231,16 @@ theorem mirNoCallWpConverges_of_reachesDoneWithinV2026 {body : CapturedMir}
   mirNoCallWpConverges_of_v2026Exec
     (reachesDoneWithinV2026_iff_execStepOutcome.mp h)
 
+/-- Exact fuel-free characterization: call-free MIR convergence holds iff a
+finite quantitative step bound `ReachesDoneWithinV2026` exists. -/
+theorem mirNoCallWpConverges_iff_exists_reachesDoneWithinV2026
+    {body : CapturedMir} {s : MachineState} {post : MirOutcome → Prop} :
+    MirNoCallWpConverges body s post ↔
+      ∃ bound : Nat, ReachesDoneWithinV2026 body post bound s :=
+  Iff.trans mirNoCallWpConverges_iff_exists_v2026Exec
+    ⟨fun ⟨b, h⟩ => ⟨b, reachesDoneWithinV2026_iff_execStepOutcome.mpr h⟩,
+     fun ⟨b, h⟩ => ⟨b, reachesDoneWithinV2026_iff_execStepOutcome.mp h⟩⟩
+
 /-- Adequacy: `ReachesDoneWithinV2026` implies all-prefix UB-freedom
 `MirNoUBTree (mirTree body s)`. -/
 theorem mirNoUBTree_of_reachesDoneWithinV2026 {body : CapturedMir}
@@ -356,6 +366,24 @@ theorem StepsToV2026.trans {body : CapturedMir} {k₁ k₂ : Nat}
   | @step n _ _ _ hs _ ih =>
     rw [Nat.succ_add n k₂]
     exact StepsToV2026.step hs (ih h₂)
+
+/-- `StepsToV2026` is deterministic: exact `k`-step endpoints are unique. -/
+theorem StepsToV2026.deterministic {body : CapturedMir} :
+    ∀ {k : Nat} {s s₁ s₂ : MachineState},
+      StepsToV2026 body k s s₁ → StepsToV2026 body k s s₂ → s₁ = s₂
+  | 0, _, _, _, h₁, h₂ => by
+    cases h₁
+    cases h₂
+    rfl
+  | _ + 1, _, _, _, h₁, h₂ => by
+    cases h₁ with
+    | step hs₁ hTail₁ =>
+      cases h₂ with
+      | step hs₂ hTail₂ =>
+        rw [hs₁] at hs₂
+        injection hs₂ with hEq
+        subst hEq
+        exact StepsToV2026.deterministic hTail₁ hTail₂
 
 /-- Lift an exact `StepsToV2026` chain to
 `Anneal.Framework.StepWp.StepStageCut (v2026Step body)`. -/
@@ -841,6 +869,92 @@ theorem execWithinStepsV2026_of_setup_loop {body : CapturedMir}
     BoundedReachV2026.bind_done hSetup (fun s₁ hInv => hLoop n s₁ hInv)
   exact ⟨hReach,
     mirWpConverges_of_reachesDoneWithinV2026 hReach,
+    mirNoUBTree_of_reachesDoneWithinV2026 hReach,
+    not_divergesV2026_of_reachesDoneWithinV2026 hReach⟩
+
+/-- `execStateV2026` interface for the countdown loop rule (matches `#4400`
+`v2_loop_const_exec`). -/
+theorem v2026_loop_const_exec {body : CapturedMir} {post : MirOutcome → Prop}
+    (Inv : Nat → MachineState → Prop) (bodyBound exitBound : Nat)
+    (hExit : ∀ s, Inv 0 s → execStateV2026 body exitBound s post)
+    (hStep : ∀ n s, Inv (n + 1) s →
+      execStateV2026 body exitBound s post ∨
+      BoundedReachV2026 body (Inv n) bodyBound s) :
+    ∀ (n : Nat) (s : MachineState),
+      Inv n s → execStateV2026 body (n * bodyBound + exitBound) s post :=
+  fun n s hInv =>
+    reachesDoneWithinV2026_iff_execStepOutcome.mp
+      (v2026_loop_countdown Inv bodyBound exitBound
+        (fun st h0 => reachesDoneWithinV2026_iff_execStepOutcome.mpr (hExit st h0))
+        (fun k st hk =>
+          match hStep k st hk with
+          | .inl hE => .inl (reachesDoneWithinV2026_iff_execStepOutcome.mpr hE)
+          | .inr hB => .inr hB)
+        n s hInv)
+
+/-- `execStateV2026` interface for the byte-credit loop rule (matches `#4400`
+`v2_loop_byte_credit_exec`). -/
+theorem v2026_loop_byte_credit_exec {body : CapturedMir}
+    {post : MirOutcome → Prop}
+    (Inv : Nat → MachineState → Prop) (K C : Nat)
+    (hExit : ∀ s, Inv 0 s → execStateV2026 body C s post)
+    (hStep : ∀ m s, 0 < m → Inv m s →
+      execStateV2026 body C s post ∨
+      ∃ m' k s', m' < m ∧ k ≤ K * (m - m') ∧ StepsToV2026 body k s s' ∧
+        Inv m' s') :
+    ∀ (m : Nat) (s : MachineState),
+      Inv m s → execStateV2026 body (K * m + C) s post :=
+  fun m s hInv =>
+    reachesDoneWithinV2026_iff_execStepOutcome.mp
+      (v2026_loop_byte_credit Inv K C
+        (fun st h0 => reachesDoneWithinV2026_iff_execStepOutcome.mpr (hExit st h0))
+        (fun m' st hm hI =>
+          match hStep m' st hm hI with
+          | .inl hE => .inl (reachesDoneWithinV2026_iff_execStepOutcome.mpr hE)
+          | .inr hN => .inr hN)
+        m s hInv)
+
+/-- Strict (no early exit) byte-credit loop rule (matches `#4400`
+`v2_loop_byte_credit_strict`). -/
+theorem v2026_loop_byte_credit_strict {body : CapturedMir}
+    {post : MirOutcome → Prop}
+    (Inv : Nat → MachineState → Prop) (K C : Nat)
+    (hExit : ∀ s, Inv 0 s → execStateV2026 body C s post)
+    (hStep : ∀ m s, 0 < m → Inv m s →
+      ∃ m' k s', m' < m ∧ k ≤ K * (m - m') ∧ StepsToV2026 body k s s' ∧
+        Inv m' s') :
+    ∀ (m : Nat) (s : MachineState),
+      Inv m s → execStateV2026 body (K * m + C) s post :=
+  v2026_loop_byte_credit_exec Inv K C hExit
+    (fun m s hm hInv => .inr (hStep m s hm hInv))
+
+/-- End-to-end setup + byte-credit loop wrapper yielding
+`ExecWithinStepsV2026`, `MirWpConverges`, `MirNoCallWpConverges`,
+`MirNoUBTree`, and `¬ DivergesV2026` (matches `#4400`
+`execWithinStepsV2_of_setup_byte_credit`). -/
+theorem execWithinStepsV2026_of_setup_byte_credit {body : CapturedMir}
+    {args : List Value} {callees : List CapturedMir}
+    {post : MirOutcome → Prop} (Inv : Nat → MachineState → Prop)
+    (setupBound K C m : Nat)
+    (hSetup : BoundedReachV2026 body (Inv m) setupBound
+      (initMachineStateWithCallees body args callees))
+    (hExit : ∀ s, Inv 0 s → ReachesDoneWithinV2026 body post C s)
+    (hStep : ∀ cur s, 0 < cur → Inv cur s →
+      ReachesDoneWithinV2026 body post C s ∨
+      ∃ cur' k s', cur' < cur ∧ k ≤ K * (cur - cur') ∧
+        StepsToV2026 body k s s' ∧ Inv cur' s') :
+    ExecWithinStepsV2026 body args callees post (setupBound + (K * m + C)) ∧
+    MirWpConverges body (initMachineStateWithCallees body args callees) post ∧
+    MirNoCallWpConverges body (initMachineStateWithCallees body args callees) post ∧
+    MirNoUBTree (mirTree body (initMachineStateWithCallees body args callees)) ∧
+    ¬ DivergesV2026 body (initMachineStateWithCallees body args callees) := by
+  have hReach :
+      ExecWithinStepsV2026 body args callees post (setupBound + (K * m + C)) :=
+    BoundedReachV2026.bind_done hSetup
+      (fun s₁ hInv => v2026_loop_byte_credit Inv K C hExit hStep m s₁ hInv)
+  exact ⟨hReach,
+    mirWpConverges_of_reachesDoneWithinV2026 hReach,
+    mirNoCallWpConverges_of_reachesDoneWithinV2026 hReach,
     mirNoUBTree_of_reachesDoneWithinV2026 hReach,
     not_divergesV2026_of_reachesDoneWithinV2026 hReach⟩
 
@@ -1424,6 +1538,22 @@ theorem not_reachesDoneWithinV2026_of_divergesV2026 {body : CapturedMir}
     (bound : Nat) (post : MirOutcome → Prop) :
     ¬ ReachesDoneWithinV2026 body post bound s :=
   fun hReach => not_divergesV2026_of_reachesDoneWithinV2026 hReach hDiv
+
+/-- Infinite `.step` traces refute `ReachesDoneWithinV2026` at every budget. -/
+theorem not_reachesDoneWithinV2026_of_infinite_trace {body : CapturedMir}
+    {post : MirOutcome → Prop} (trace : Nat → MachineState)
+    (hSteps : ∀ n : Nat, v2026Step body (trace n) = .step (trace (n + 1)))
+    (bound : Nat) :
+    ¬ ReachesDoneWithinV2026 body post bound (trace 0) :=
+  not_reachesDoneWithinV2026_of_divergesV2026 ⟨trace, rfl, hSteps⟩ bound post
+
+/-- Whole-function divergence refutes `ExecWithinStepsV2026` at every budget. -/
+theorem not_execWithinStepsV2026_of_divergesV2026 {body : CapturedMir}
+    {args : List Value} {callees : List CapturedMir}
+    (hDiv : DivergesV2026 body (initMachineStateWithCallees body args callees))
+    (post : MirOutcome → Prop) (bound : Nat) :
+    ¬ ExecWithinStepsV2026 body args callees post bound :=
+  not_reachesDoneWithinV2026_of_divergesV2026 hDiv bound post
 
 /-- Any `bound ≤ k` is strictly insufficient when deterministic `v2026Step`
 execution takes `k` `.step` transitions via `StepsToV2026 body k s s'`. -/
