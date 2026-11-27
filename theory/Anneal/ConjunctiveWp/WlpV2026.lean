@@ -55,7 +55,14 @@ unification seam:
 4. **Productive State-Transition Divergence Certificates (`DivergesV2026`,
    `ProductiveStepWitness`, `divergesV2026_of_productiveWitness`):** Constructive
    `@Nat.rec` infinite `.step` trace witnesses proved to refute both
-   `execStepOutcome` and `MirWpConverges` for every finite fuel budget.
+   `execStepOutcome` and `MirWpConverges` for every finite fuel budget, and
+   proved directly against the unmodified trusted `mirTree` to be UB-free and
+   never-returning (`mirNoUBTree_of_divergesV2026`,
+   `not_reachesRet_mirTree_of_divergesV2026`) via the choice-free coinductive
+   invariant principle `MirStepClosedInv` / `treeSafe_cofix_of_closedInv`,
+   which also yields partial-correctness `VerificationResult` /
+   `StatefulVerificationResult` from strict WLP at every fuel WITHOUT any
+   termination argument (`verify*_of_forall_wlp*StrictV2026` / `_wlpStateV2026`).
 5. **Logarithmic Binary-Doubling Fuel (`pow2Fuel`, `wpPow2Cont`,
    `execPow2Cont`):** Composes up to `2^k` `V2026_06_01` steps in recursion
    depth `k` with $O(k)$ invariant lifting (`wpPow2Cont_inv`), exact equivalence
@@ -2194,6 +2201,324 @@ theorem wlpOutcomeV2026_of_productiveWitness {body : CapturedMir}
       (wlpOutcomeV2026_of_productiveWitness hw onDone onFault fuel
         (hw.preserves s hs))
 
+/-! ### Choice-Free Coinductive Invariant Principle over `mirTree` (Partial Correctness without Termination) -/
+
+/-- A predicate `Inv` on `MirExecState` is *closed* under the unmodified
+trusted coalgebra `stepMirState body` when every `Inv` state either returns,
+steps silently to an `Inv` state, or emits a NON-fault visible request all of
+whose continuations satisfy `Inv`. -/
+def MirStepClosedInv (body : CapturedMir) (Inv : MirExecState → Prop) : Prop :=
+  ∀ st : MirExecState, Inv st →
+    match stepMirState body st with
+    | .ret _ => True
+    | .tau st' => Inv st'
+    | .vis i k => ¬ FaultEffect.isFault i ∧ ∀ o, Inv (k o)
+
+private theorem tauStar_cofix_closedInv {body : CapturedMir}
+    {Inv : MirExecState → Prop} (hC : MirStepClosedInv body Inv) :
+    ∀ {t u : ITree MirEffect MirOutcome}, TauStar t u →
+      (∃ st, t = ITree.cofix (stepMirState body) st ∧ Inv st) →
+      ∃ st', u = ITree.cofix (stepMirState body) st' ∧ Inv st' := by
+  intro t u hTs
+  induction hTs with
+  | refl _ => exact fun h => h
+  | step hObs _ ih =>
+    intro ⟨st, hEq, hInv⟩
+    subst hEq
+    rw [ITree.observe_cofix] at hObs
+    have hc := hC st hInv
+    cases hN : stepMirState body st with
+    | ret _ => rw [hN] at hObs; cases hObs
+    | tau st' =>
+      rw [hN] at hObs hc
+      injection hObs with hEq'
+      exact ih ⟨st', hEq'.symm, hc⟩
+    | vis _ _ => rw [hN] at hObs; cases hObs
+
+private theorem reaches_cofix_closedInv {body : CapturedMir}
+    {Inv : MirExecState → Prop} (hC : MirStepClosedInv body Inv) :
+    ∀ {t : ITree MirEffect MirOutcome} {tr : List (Event MirEffect)}
+      {u : ITree MirEffect MirOutcome}, Reaches t tr u →
+      (∃ st, t = ITree.cofix (stepMirState body) st ∧ Inv st) →
+      ∃ st', u = ITree.cofix (stepMirState body) st' ∧ Inv st' := by
+  intro t tr u hR
+  induction hR with
+  | refl _ => exact fun h => h
+  | tau hObs _ ih =>
+    intro ⟨st, hEq, hInv⟩
+    subst hEq
+    rw [ITree.observe_cofix] at hObs
+    have hc := hC st hInv
+    cases hN : stepMirState body st with
+    | ret _ => rw [hN] at hObs; cases hObs
+    | tau st' =>
+      rw [hN] at hObs hc
+      injection hObs with hEq'
+      exact ih ⟨st', hEq'.symm, hc⟩
+    | vis _ _ => rw [hN] at hObs; cases hObs
+  | vis hObs _ o _ ih =>
+    intro ⟨st, hEq, hInv⟩
+    subst hEq
+    rw [ITree.observe_cofix] at hObs
+    have hc := hC st hInv
+    cases hN : stepMirState body st with
+    | ret _ => rw [hN] at hObs; cases hObs
+    | tau _ => rw [hN] at hObs; cases hObs
+    | vis i0 kk =>
+      rw [hN] at hObs hc
+      cases hObs
+      exact ih ⟨kk o, rfl, hc.2 o⟩
+
+/-- Choice-free coinductive `TreeSafe` principle: any `MirStepClosedInv`
+invariant holding at `st` makes `ITree.cofix (stepMirState body) st` UB-free
+along every finite prefix — WITHOUT requiring termination. -/
+theorem treeSafe_cofix_of_closedInv {body : CapturedMir}
+    {Inv : MirExecState → Prop} (hC : MirStepClosedInv body Inv)
+    {st : MirExecState} (hInv : Inv st) :
+    TreeSafe (ITree.cofix (stepMirState body) st) := by
+  intro tr u hR hF
+  obtain ⟨t', i, k, hTs, hObs, hFault⟩ := hF
+  obtain ⟨st₁, hEq₁, hI₁⟩ := reaches_cofix_closedInv hC hR ⟨st, rfl, hInv⟩
+  subst hEq₁
+  obtain ⟨st₂, hEq₂, hI₂⟩ := tauStar_cofix_closedInv hC hTs ⟨st₁, rfl, hI₁⟩
+  subst hEq₂
+  rw [ITree.observe_cofix] at hObs
+  have hc := hC st₂ hI₂
+  cases hN : stepMirState body st₂ with
+  | ret _ => rw [hN] at hObs; cases hObs
+  | tau _ => rw [hN] at hObs; cases hObs
+  | vis i0 kk =>
+    rw [hN] at hObs hc
+    cases hObs
+    exact hc.1 hFault
+
+/-- Choice-free coinductive `ReachesRet` principle: under a
+`MirStepClosedInv` invariant, every reachable return outcome satisfies any
+predicate `P` guaranteed at every `Inv`-state `.ret` node. -/
+theorem reachesRet_cofix_of_closedInv {body : CapturedMir}
+    {Inv : MirExecState → Prop} (hC : MirStepClosedInv body Inv)
+    {P : MirOutcome → Prop}
+    (hRet : ∀ st, Inv st → ∀ r, stepMirState body st = .ret r → P r)
+    {st : MirExecState} (hInv : Inv st) :
+    ∀ tr out, ReachesRet (ITree.cofix (stepMirState body) st) tr out → P out := by
+  intro tr out ⟨u, hR, hO⟩
+  obtain ⟨st₁, hEq₁, hI₁⟩ := reaches_cofix_closedInv hC hR ⟨st, rfl, hInv⟩
+  subst hEq₁
+  rw [ITree.observe_cofix] at hO
+  cases hN : stepMirState body st₁ with
+  | ret r =>
+    rw [hN] at hO
+    injection hO with hEq
+    subst hEq
+    exact hRet st₁ hI₁ r hN
+  | tau _ => rw [hN] at hO; cases hO
+  | vis _ _ => rw [hN] at hO; cases hO
+
+/-- `MirExecState`-level invariant induced by strict (fault-forbidding)
+deterministic WLP at EVERY fuel. -/
+def WlpAllFuelInvV2026 (body : CapturedMir) (post : MirOutcome → Prop) :
+    MirExecState → Prop
+  | .running s => ∀ fuel : Nat, execWlpStateV2026 body fuel s post
+  | .halted out => post out
+  | .faulted _ => False
+
+private theorem wlpAllFuel_step {body : CapturedMir} {post : MirOutcome → Prop}
+    {s : MachineState} (h : ∀ fuel : Nat, execWlpStateV2026 body fuel s post) :
+    match v2026Step body s with
+    | .step s' => ∀ fuel : Nat, execWlpStateV2026 body fuel s' post
+    | .done out => post out
+    | .fault _ => False := by
+  have h1 := h 1
+  dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome] at h1
+  rw [execWlpStepPred_succ_iff] at h1
+  cases hS : v2026Step body s with
+  | step s' =>
+    intro fuel
+    have hf := h (fuel + 1)
+    dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome] at hf ⊢
+    rw [execWlpStepPred_succ_iff, hS] at hf
+    exact hf
+  | done out => rw [hS] at h1; exact h1
+  | fault _ => rw [hS] at h1; exact h1
+
+/-- `WlpAllFuelInvV2026` is closed under unmodified `stepMirState body`
+(covering silent `.tau`, observable `.vis (.inr (.inl (.emit _)))`, and ruling
+out faults and external calls). -/
+theorem wlpAllFuelInvV2026_closed (body : CapturedMir)
+    (post : MirOutcome → Prop) :
+    MirStepClosedInv body (WlpAllFuelInvV2026 body post) := by
+  intro st hInv
+  cases st with
+  | halted out => exact trivial
+  | faulted _ => exact False.elim hInv
+  | running s =>
+    have hStep := wlpAllFuel_step hInv
+    unfold v2026Step at hStep
+    dsimp only [stepMirState]
+    cases hN : stepMirFn body s with
+    | ret _ => exact trivial
+    | tau st' =>
+      rw [hN] at hStep
+      cases st' with
+      | running s' => exact hStep
+      | halted out => exact hStep
+      | faulted _ => exact False.elim hStep
+    | vis i k =>
+      rw [hN] at hStep
+      rcases i with f | (e | c)
+      · cases f
+        exact False.elim hStep
+      · cases e
+        refine ⟨fun hF => hF, fun o => ?_⟩
+        cases o
+        dsimp only [ofV2026MirStepNode] at hStep
+        cases hk : k PUnit.unit with
+        | running s' => rw [hk] at hStep; exact hStep
+        | halted out => rw [hk] at hStep; exact hStep
+        | faulted _ => rw [hk] at hStep; exact False.elim hStep
+      · cases c
+        exact False.elim hStep
+
+/-- Choice-free partial-correctness `TreeSafe` adequacy WITHOUT termination:
+strict deterministic WLP at every fuel implies `TreeSafe (mirTree body s)`. -/
+theorem treeSafe_mirTree_of_forall_execWlpStateV2026 {body : CapturedMir}
+    {post : MirOutcome → Prop} {s : MachineState}
+    (h : ∀ fuel : Nat, execWlpStateV2026 body fuel s post) :
+    TreeSafe (mirTree body s) :=
+  treeSafe_cofix_of_closedInv (wlpAllFuelInvV2026_closed body post)
+    (st := .running s) h
+
+/-- Choice-free partial-correctness return adequacy WITHOUT termination:
+strict deterministic WLP at every fuel implies `post out` for every
+`ReachesRet (mirTree body s) tr out`. -/
+theorem reachesRet_post_of_forall_execWlpStateV2026 {body : CapturedMir}
+    {post : MirOutcome → Prop} {s : MachineState}
+    (h : ∀ fuel : Nat, execWlpStateV2026 body fuel s post) :
+    ∀ tr out, ReachesRet (mirTree body s) tr out → post out := by
+  refine reachesRet_cofix_of_closedInv (wlpAllFuelInvV2026_closed body post)
+    (fun st hInv r hR => ?_) (st := .running s) h
+  cases st with
+  | halted out =>
+    injection hR with hEq
+    subst hEq
+    exact hInv
+  | faulted _ => exact False.elim hInv
+  | running s₁ =>
+    have hStep := wlpAllFuel_step hInv
+    have hDone : v2026Step body s₁ = .done r :=
+      v2026Step_done_iff.mpr (Or.inl hR)
+    rw [hDone] at hStep
+    exact hStep
+
+/-- `MirNoUBTree` from strict WLP at every fuel (no termination needed). -/
+theorem mirNoUBTree_of_forall_wlpStateV2026 {body : CapturedMir}
+    {post : MirOutcome → Prop} {s : MachineState}
+    (h : ∀ fuel : Nat, wlpStateV2026 body fuel s post) :
+    MirNoUBTree (mirTree body s) :=
+  treeSafe_mirTree_of_forall_execWlpStateV2026
+    (fun fuel => wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp (h fuel))
+
+/-- Whole-function stateless partial-correctness `VerificationResult`
+(`mirSafePost`) from strict WLP `wlpProgStrictV2026` at EVERY fuel — no
+termination or step bound required (`{propext, Quot.sound}` only). -/
+theorem verifyMirSafe_of_forall_wlpProgStrictV2026 (c : Claim)
+    (h : ∀ args : List Value, c.pre args → ∀ fuel : Nat,
+      wlpProgStrictV2026 c.body fuel args c.callees
+        (mirSafePost (fun retVal _ => c.post args retVal))) :
+    VerificationResult c := by
+  refine ⟨fun args hPre => ?_⟩
+  have hAll := fun fuel =>
+    wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp (h args hPre fuel)
+  refine ⟨treeSafe_mirTree_of_forall_execWlpStateV2026 hAll,
+    fun outPair hRet _ retVal mem' hEq => ?_⟩
+  have hSafe := reachesRet_post_of_forall_execWlpStateV2026 hAll
+    outPair.1 outPair.2 hRet
+  rw [hEq] at hSafe
+  exact hSafe
+
+/-- Whole-function stateless panic-forbidding partial-correctness
+`VerificationResult` (`mirNormalPost`) from `wlpProgStrictV2026` at every
+fuel. -/
+theorem verifyMirNoPanic_of_forall_wlpProgStrictV2026 (c : Claim)
+    (h : ∀ args : List Value, c.pre args → ∀ fuel : Nat,
+      wlpProgStrictV2026 c.body fuel args c.callees
+        (mirNormalPost (fun retVal _ => c.post args retVal))) :
+    VerificationResult c :=
+  verifyMirSafe_of_forall_wlpProgStrictV2026 c (fun args hPre fuel =>
+    wlpOutcomeV2026_mono (fun _ ho => mirNormalPost_imp_mirSafePost ho)
+      (fun _ hf => hf) (h args hPre fuel))
+
+/-- Whole-function stateful partial-correctness `StatefulVerificationResult`
+(`mirSafePost`) from strict WLP at every fuel. -/
+theorem verifyStatefulMirSafe_of_forall_wlpStateV2026 (c : StatefulClaim)
+    (h : ∀ (args : List Value) (mem : Memory), c.pre args mem → ∀ fuel : Nat,
+      wlpStateV2026 c.body fuel
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees)
+        (mirSafePost (c.post args mem))) :
+    StatefulVerificationResult c := by
+  refine ⟨fun args mem hPre => ?_⟩
+  have hAll := fun fuel =>
+    wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp (h args mem hPre fuel)
+  refine ⟨treeSafe_mirTree_of_forall_execWlpStateV2026 hAll,
+    fun outPair hRet _ retVal mem' hEq => ?_⟩
+  have hSafe := reachesRet_post_of_forall_execWlpStateV2026 hAll
+    outPair.1 outPair.2 hRet
+  rw [hEq] at hSafe
+  exact hSafe
+
+/-- Whole-function stateful panic-forbidding partial-correctness
+`StatefulVerificationResult` (`mirNormalPost`) from strict WLP at every fuel. -/
+theorem verifyStatefulMirNoPanic_of_forall_wlpStateV2026 (c : StatefulClaim)
+    (h : ∀ (args : List Value) (mem : Memory), c.pre args mem → ∀ fuel : Nat,
+      wlpStateV2026 c.body fuel
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          c.body args mem c.callees)
+        (mirNormalPost (c.post args mem))) :
+    StatefulVerificationResult c :=
+  verifyStatefulMirSafe_of_forall_wlpStateV2026 c (fun args mem hPre fuel =>
+    wlpOutcomeV2026_mono (fun _ ho => mirNormalPost_imp_mirSafePost ho)
+      (fun _ hf => hf) (h args mem hPre fuel))
+
+/-! ### Divergence Certificates against the Unmodified Trusted `mirTree` -/
+
+private theorem execWlp_of_infinite_trace {body : CapturedMir}
+    {post : MirOutcome → Prop} (trace : Nat → MachineState)
+    (hSteps : ∀ n : Nat, v2026Step body (trace n) = .step (trace (n + 1))) :
+    ∀ (fuel n : Nat), execWlpStateV2026 body fuel (trace n) post
+  | 0, _ => trivial
+  | fuel + 1, n => by
+    dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome]
+    rw [execWlpStepPred_succ_iff, hSteps n]
+    exact execWlp_of_infinite_trace trace hSteps fuel (n + 1)
+
+/-- Every `DivergesV2026` witness satisfies strict deterministic WLP at every
+fuel for every postcondition. -/
+theorem forall_execWlpStateV2026_of_divergesV2026 {body : CapturedMir}
+    {s : MachineState} (hDiv : DivergesV2026 body s)
+    (post : MirOutcome → Prop) (fuel : Nat) :
+    execWlpStateV2026 body fuel s post := by
+  obtain ⟨trace, hTr0, hSteps⟩ := hDiv
+  rw [← hTr0]
+  exact execWlp_of_infinite_trace trace hSteps fuel 0
+
+/-- A productive `DivergesV2026` certificate implies the unmodified trusted
+`mirTree body s` is UB-free along every finite prefix. -/
+theorem mirNoUBTree_of_divergesV2026 {body : CapturedMir} {s : MachineState}
+    (hDiv : DivergesV2026 body s) : MirNoUBTree (mirTree body s) :=
+  treeSafe_mirTree_of_forall_execWlpStateV2026
+    (post := fun _ => False) (forall_execWlpStateV2026_of_divergesV2026 hDiv _)
+
+/-- A productive `DivergesV2026` certificate implies the unmodified trusted
+`mirTree body s` NEVER returns along any finite interaction trace. -/
+theorem not_reachesRet_mirTree_of_divergesV2026 {body : CapturedMir}
+    {s : MachineState} (hDiv : DivergesV2026 body s)
+    (tr : List (Event MirEffect)) (out : MirOutcome) :
+    ¬ ReachesRet (mirTree body s) tr out :=
+  reachesRet_post_of_forall_execWlpStateV2026
+    (post := fun _ => False) (forall_execWlpStateV2026_of_divergesV2026 hDiv _)
+    tr out
+
 /-! ## Part V: Logarithmic Binary-Doubling Fuel (`pow2Fuel`, `wpPow2Cont`, `execPow2Cont`) -/
 
 /-- Exact power-of-two fuel count `2^k` computed via `@Nat.rec` doubling. -/
@@ -2810,5 +3135,28 @@ theorem canary_v2026_wlp_strict_pow2_inv_and_verify (k : Nat) :
     subst hPre
     exact ⟨2, wpProgPow2_of_execProgPow2 rfl⟩
   exact ⟨hRelax, hStrict, hWlpPowK, hVerify⟩
+
+/-- Concrete partial-correctness canary over unmodified trusted semantics:
+`canaryDivergingMirBody` (`goto 0`) is UB-free and never returns, and hence
+satisfies the partial-correctness `VerificationResult` for the UNSATISFIABLE
+postcondition `fun _ _ => False` — proved via `forall`-fuel strict WLP with no
+termination argument (confirming `VerificationResult` is partial correctness
+and that `TotalVerificationResult` is required to rule out divergence). -/
+theorem canary_v2026_diverging_partial_correctness :
+    MirNoUBTree (mirTree canaryDivergingMirBody
+      (initMachineState canaryDivergingMirBody [])) ∧
+    (∀ tr out, ¬ ReachesRet (mirTree canaryDivergingMirBody
+      (initMachineState canaryDivergingMirBody [])) tr out) ∧
+    VerificationResult
+      { body := canaryDivergingMirBody
+        pre := fun args => args = []
+        post := fun _ _ => False } := by
+  have hDiv := (canary_v2026_diverging_witness 0 (fun _ => True)).1
+  refine ⟨mirNoUBTree_of_divergesV2026 hDiv,
+    not_reachesRet_mirTree_of_divergesV2026 hDiv,
+    verifyMirSafe_of_forall_wlpProgStrictV2026 _ (fun args hArgs fuel => ?_)⟩
+  subst hArgs
+  exact wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
+    (forall_execWlpStateV2026_of_divergesV2026 hDiv _ fuel)
 
 end Anneal.ConjunctiveWp

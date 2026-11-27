@@ -46,7 +46,10 @@ onto unmodified `Trusted.Rustc.V2026_06_01.MirSemantics` via `v2026Step`,
    `< ω^ω` budget extraction (`v2026_loop_cnfOrd_exists`,
    `execWithinStepsV2026_of_cnfOrd`), worklist-to-MIR bridges
    (`v2026_steps_of_cnfStepConverges`, `v2026_steps_of_worklist_terminates`),
-   and reactive per-frame contracts (`ReactiveStepContractV2026`).
+   and reactive per-frame contracts (`ReactiveStepContractV2026`) with
+   choice-free trusted partial-correctness adequacy for non-terminating
+   reactive loops (`partialCorrectness_of_reactiveStepContractV2026`,
+   `verifyMirSafe_of_reactiveStepContractV2026`).
 4. **Tight-Budget & Non-Vacuity Refutation Lemmas:** Refutation of
    `ReachesDoneWithinV2026` on diverging traces, under-budget bounds
    (`bound ≤ k`), postcondition failures, and fault trajectories, exercised on
@@ -1585,6 +1588,110 @@ theorem ReactiveStepContractV2026.iterate_prefix {body : CapturedMir}
         · rw [← hArith]
           exact Nat.add_le_add hk hkMax
 
+/-! ### Partial-Correctness Adequacy of Reactive Contracts (No Termination Required) -/
+
+/-- Any bounded terminating `ReachesDoneWithinV2026` run implies strict
+deterministic WLP at EVERY fuel. -/
+theorem forall_execWlpStateV2026_of_reachesDoneWithinV2026
+    {body : CapturedMir} {post : MirOutcome → Prop} :
+    ∀ {bound : Nat} {s : MachineState},
+      ReachesDoneWithinV2026 body post bound s →
+      ∀ fuel : Nat, execWlpStateV2026 body fuel s post
+  | 0, _, h, _ => False.elim h
+  | _ + 1, _, _, 0 => trivial
+  | b + 1, s, h, fuel + 1 => by
+    dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome]
+    rw [execWlpStepPred_succ_iff]
+    cases h with
+    | inl hDone =>
+      obtain ⟨out, hEq, hPost⟩ := hDone
+      rw [hEq]
+      exact hPost
+    | inr hStep =>
+      obtain ⟨s', hEq, hRest⟩ := hStep
+      rw [hEq]
+      exact forall_execWlpStateV2026_of_reachesDoneWithinV2026 (bound := b) hRest fuel
+
+/-- Prepending an exact `StepsToV2026 body k s s'` prefix onto strict
+deterministic WLP: `execWlp g s'` for every `g` with `g + k = f` yields
+`execWlp f s` (short fuels `f < k` hold trivially along the `.step` prefix). -/
+theorem execWlpStateV2026_of_stepsTo {body : CapturedMir}
+    {post : MirOutcome → Prop} {k : Nat} {s s' : MachineState}
+    (hSteps : StepsToV2026 body k s s') :
+    ∀ f : Nat, (∀ g : Nat, g + k = f → execWlpStateV2026 body g s' post) →
+      execWlpStateV2026 body f s post := by
+  induction hSteps with
+  | refl _ => exact fun f hG => hG f rfl
+  | @step n s₀ s₁ _ hs _ ih =>
+    intro f hG
+    cases f with
+    | zero => exact trivial
+    | succ f' =>
+      dsimp only [execWlpStateV2026, execWlpOutcomeV2026, execWlpStepOutcome]
+      rw [execWlpStepPred_succ_iff, hs]
+      exact ih f' (fun g hg => hG g (by rw [← hg, Nat.add_succ]))
+
+private theorem forall_execWlp_of_reactive_aux {body : CapturedMir}
+    {inv yieldPred : MachineState → Prop} {post : MirOutcome → Prop}
+    {frameBound : Nat}
+    (hContract : ReactiveStepContractV2026 body inv yieldPred post frameBound) :
+    ∀ (cap g : Nat), g ≤ cap → ∀ s : MachineState, inv s →
+      execWlpStateV2026 body g s post
+  | 0, g, hg, s, _ => by
+    rw [Nat.eq_zero_of_le_zero hg]
+    exact trivial
+  | cap + 1, g, hg, s, hInv => by
+    cases hContract s hInv with
+    | inl hDone => exact forall_execWlpStateV2026_of_reachesDoneWithinV2026 hDone g
+    | inr hTick =>
+      obtain ⟨k, s', hPos, _, hSteps, hInv', _⟩ := hTick
+      refine execWlpStateV2026_of_stepsTo hSteps g (fun h hh => ?_)
+      have hLe : h + 1 ≤ cap + 1 :=
+        Nat.le_trans (Nat.add_le_add_left hPos h) (hh ▸ hg)
+      exact forall_execWlp_of_reactive_aux hContract cap h
+        (Nat.le_of_succ_le_succ hLe) s' hInv'
+
+/-- Every `ReactiveStepContractV2026` invariant state satisfies strict
+deterministic WLP at EVERY fuel. -/
+theorem forall_execWlpStateV2026_of_reactiveStepContractV2026
+    {body : CapturedMir} {inv yieldPred : MachineState → Prop}
+    {post : MirOutcome → Prop} {frameBound : Nat}
+    (hContract : ReactiveStepContractV2026 body inv yieldPred post frameBound)
+    {s : MachineState} (hInv : inv s) (fuel : Nat) :
+    execWlpStateV2026 body fuel s post :=
+  forall_execWlp_of_reactive_aux hContract fuel fuel (Nat.le_refl fuel) s hInv
+
+/-- Choice-free trusted adequacy of reactive per-frame contracts: from any
+`inv s`, the unmodified trusted `mirTree body s` is UB-free along every finite
+prefix and every reachable return satisfies `post` — even for non-terminating
+reactive loops (`{propext, Quot.sound}` only). -/
+theorem partialCorrectness_of_reactiveStepContractV2026 {body : CapturedMir}
+    {inv yieldPred : MachineState → Prop} {post : MirOutcome → Prop}
+    {frameBound : Nat}
+    (hContract : ReactiveStepContractV2026 body inv yieldPred post frameBound)
+    {s : MachineState} (hInv : inv s) :
+    MirNoUBTree (mirTree body s) ∧
+      ∀ tr out, Trusted.ITree.ReachesRet (mirTree body s) tr out → post out :=
+  ⟨treeSafe_mirTree_of_forall_execWlpStateV2026
+      (forall_execWlpStateV2026_of_reactiveStepContractV2026 hContract hInv),
+   reachesRet_post_of_forall_execWlpStateV2026
+      (forall_execWlpStateV2026_of_reactiveStepContractV2026 hContract hInv)⟩
+
+/-- Whole-function stateless partial-correctness `VerificationResult` from a
+`ReactiveStepContractV2026` whose invariant holds at every admissible entry
+state (`{propext, Quot.sound}` only). -/
+theorem verifyMirSafe_of_reactiveStepContractV2026 (c : Claim)
+    {inv yieldPred : MachineState → Prop} {frameBound : Nat}
+    (hContract : ∀ args : List Value, c.pre args →
+      ReactiveStepContractV2026 c.body inv yieldPred
+        (mirSafePost (fun retVal _ => c.post args retVal)) frameBound ∧
+      inv (initMachineStateWithCallees c.body args c.callees)) :
+    VerificationResult c :=
+  verifyMirSafe_of_forall_wlpProgStrictV2026 c (fun args hPre fuel =>
+    wlpOutcomeV2026_iff_execWlpOutcomeV2026.mpr
+      (forall_execWlpStateV2026_of_reactiveStepContractV2026
+        (hContract args hPre).1 (hContract args hPre).2 fuel))
+
 /-! ## Part IV: Tight-Budget & Non-Vacuity Refutation Lemmas -/
 
 /-- Divergence (`DivergesV2026 body s`) refutes `ReachesDoneWithinV2026` at
@@ -1968,5 +2075,27 @@ theorem canary_stepBoundV2026_loops_reactive_and_verify (frames : Nat) :
     exact ⟨4, ReachesDoneWithinV2026.weaken
       (fun out hEq => by rw [hEq]) hCutReach⟩
   exact ⟨hCount, hLex, ⟨4, hCutReach⟩, hReact, hVerify⟩
+
+/-- Concrete reactive canary: `canaryDivergingMirBody` (`goto 0`) satisfies a
+`ReactiveStepContractV2026` with `frameBound = 1` ticking forever, hence its
+unmodified trusted `mirTree` is UB-free and never returns. -/
+theorem canary_stepBoundV2026_reactive_partialCorrectness :
+    let s0 := initMachineState canaryDivergingMirBody []
+    ReactiveStepContractV2026 canaryDivergingMirBody (fun s => s = s0)
+      (fun _ => True) (fun _ => False) 1 ∧
+    MirNoUBTree (mirTree canaryDivergingMirBody s0) ∧
+    (∀ tr out, ¬ Trusted.ITree.ReachesRet (mirTree canaryDivergingMirBody s0) tr out) := by
+  dsimp only
+  have hStep : v2026Step canaryDivergingMirBody
+      (initMachineState canaryDivergingMirBody []) =
+      .step (initMachineState canaryDivergingMirBody []) := rfl
+  have hC : ReactiveStepContractV2026 canaryDivergingMirBody
+      (fun s => s = initMachineState canaryDivergingMirBody [])
+      (fun _ => True) (fun _ => False) 1 := fun s hs => by
+    subst hs
+    exact Or.inr ⟨1, _, Nat.le_refl 1, Nat.le_refl 1,
+      StepsToV2026.single hStep, rfl, trivial⟩
+  have hPC := partialCorrectness_of_reactiveStepContractV2026 hC rfl
+  exact ⟨hC, hPC.1, fun tr out hR => hPC.2 tr out hR⟩
 
 end Anneal.StepBound
