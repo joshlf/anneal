@@ -953,6 +953,53 @@ theorem test_preorder_monotonicity_and_classifyAnyTrap :
     mirExactOutcomeClass_toPartial_monotone (show (MirExactOutcomeClass.trap .panic) ≤ .ub from trivial),
     mirExactOutcomeEquiv_trans (mirExactOutcomeEquiv_refl _) (mirExactOutcomeEquiv_symm (mirExactOutcomeEquiv_refl _))⟩
 
+/-- Tree-level (Layer 1A `ITree.toPartial` and coinductive `WeakRef`) reverse `iff` instances on
+both sides of the `u8` overflow boundary (`255 + 0` vs `255 + 1`, `5 - 5` vs `5 - 6`, `15 * 17`
+vs `16 * 16`, `0 + 4 * 63` vs `4 + 4 * 63`), plus exact `add_scaled` failure-site pinning. -/
+theorem test_tree_level_reverse_iff_and_failure_sites :
+    (mirCallTree (mkUncheckedArithBody .u8 .add) (uintArgs2 .u8 255 0)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .add .terminate) (uintArgs2 .u8 255 0)).toPartial ∧
+    (¬ (mirCallTree (mkUncheckedArithBody .u8 .add) (uintArgs2 .u8 255 1)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .add .continue_) (uintArgs2 .u8 255 1)).toPartial) ∧
+    (mirCallTree (mkUncheckedArithBody .u8 .sub) (uintArgs2 .u8 5 5)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .sub .continue_) (uintArgs2 .u8 5 5)).toPartial ∧
+    (¬ (mirCallTree (mkUncheckedArithBody .u8 .sub) (uintArgs2 .u8 5 6)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .sub .terminate) (uintArgs2 .u8 5 6)).toPartial) ∧
+    (mirCallTree (mkUncheckedArithBody .u8 .mul) (uintArgs2 .u8 15 17)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .mul .terminate) (uintArgs2 .u8 15 17)).toPartial ∧
+    (¬ (mirCallTree (mkUncheckedArithBody .u8 .mul) (uintArgs2 .u8 16 16)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u8 .mul .continue_) (uintArgs2 .u8 16 16)).toPartial) ∧
+    (mirCallTree (mkUncheckedAddScaledBody .u8 4) (uintArgs2 .u8 3 63)).toPartial ≤
+      (mirCallTree (mkCheckedAddScaledBody .u8 4 .terminate) (uintArgs2 .u8 3 63)).toPartial ∧
+    (¬ (mirCallTree (mkUncheckedAddScaledBody .u8 4) (uintArgs2 .u8 4 63)).toPartial ≤
+      (mirCallTree (mkCheckedAddScaledBody .u8 4 .continue_) (uintArgs2 .u8 4 63)).toPartial) ∧
+    (¬ WeakRef (mirCallTree (mkUncheckedArithBody .u8 .sub) (uintArgs2 .u8 5 6))
+      (mirCallTree (mkCheckedArithBody .u8 .sub .continue_) (uintArgs2 .u8 5 6))) ∧
+    runMirCall (mkCheckedAddScaledBody .u8 4 .terminate) 3 (uintArgs2 .u8 1 70) = .halted .abort ∧
+    runMirCall (mkCheckedAddScaledBody .u8 4 .continue_) 8 (uintArgs2 .u8 200 20) =
+      .faulted .outOfFuel := by
+  have h5 : (5 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  have h6 : (6 : Nat) < modPow2 (uintWidth .u8) := Nat.le_of_ble_eq_true rfl
+  refine ⟨(checked_add_toPartial_refines_unchecked_iff .u8 .abort 255 0).2
+            (Nat.le_of_ble_eq_true rfl),
+          fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+            ((checked_add_toPartial_refines_unchecked_iff .u8 .unwind 255 1).1 h),
+          (checked_sub_toPartial_refines_unchecked_iff .u8 .unwind 5 5 h5 h5).2 (Nat.le_refl 5),
+          fun h => Nat.not_le_of_gt (Nat.lt_succ_self 5)
+            ((checked_sub_toPartial_refines_unchecked_iff .u8 .abort 5 6 h5 h6).1 h),
+          (checked_mul_toPartial_refines_unchecked_iff .u8 .abort 15 17).2
+            (Nat.le_of_ble_eq_true rfl),
+          fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+            ((checked_mul_toPartial_refines_unchecked_iff .u8 .unwind 16 16).1 h),
+          (checked_add_scaled_toPartial_refines_unchecked_iff .u8 4 .abort 3 63).2
+            (Nat.le_of_ble_eq_true rfl),
+          fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+            ((checked_add_scaled_toPartial_refines_unchecked_iff .u8 4 .unwind 4 63).1 h),
+          fun h => Nat.not_le_of_gt (Nat.lt_succ_self 5)
+            ((checked_toWeakRef_refines_unchecked_iff .u8 .unwind 5 6 4 h5 h6).2.1.1 h),
+          (add_scaled_failure_sites_pinned .abort).2.1,
+          (add_scaled_failure_sites_pinned .unwind).2.2.2.2.1⟩
+
 /-! ## 4. Programmatic `run_cmd` Hygiene Audit & `#print axioms` Checks -/
 
 open Lean Elab Command in
@@ -1045,7 +1092,12 @@ run_cmd do
     , ``Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_distinct
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_overflow_not_refines_unchecked
     , ``Anneal.Mir.OverflowTrapRefinement.checked_sub_out_of_range_lhs_not_refines_unchecked
-    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_inner_mul_overflow_not_refines_unchecked ]
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_inner_mul_overflow_not_refines_unchecked
+    , ``Anneal.Mir.OverflowTrapRefinement.add_scaled_failure_sites_pinned
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_toPartial_refines_unchecked_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_sub_toPartial_refines_unchecked_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_mul_toPartial_refines_unchecked_iff
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_toPartial_refines_unchecked_iff ]
   -- Exact allowlist of coinductive `Anneal.ITree.WeakRef` / `Eutt` bridge corollaries in
   -- `Anneal.Mir.OverflowTrapRefinement` (these use `Classical.choice` solely via Lean 4
   -- `coinductive_fixpoint` in `Anneal.ITree`; NO other declaration in either module may).
@@ -1062,7 +1114,9 @@ run_cmd do
     , ``Anneal.Mir.OverflowTrapRefinement.unchecked_sub_weakRef_to_checked
     , ``Anneal.Mir.OverflowTrapRefinement.unchecked_mul_weakRef_to_checked
     , ``Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_weakRef_unchecked_of_farkas_cert
-    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_overflow_not_weakRef_corollaries ]
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_add_overflow_not_weakRef_corollaries
+    , ``Anneal.Mir.OverflowTrapRefinement.weakRef_reverse_iff_of_dichotomy
+    , ``Anneal.Mir.OverflowTrapRefinement.checked_toWeakRef_refines_unchecked_iff ]
   let keyWeakRefBridgeDecls : List Name := allowedOverflowCoinductiveThms
   for d in keyFarkasDecls ++ keyTrapConstructiveDecls do
     let axs ← liftCoreM <| Lean.collectAxioms d
@@ -1126,9 +1180,13 @@ run_cmd do
       throwError "module defn sweep vacuous for {mod}: {nConstDefn + nCoindAuxDefn} < {minDefns}"
     if allowedCoindThms.isEmpty && (nCoindThm != 0 || nCoindAuxDefn != 0) then
       throwError "module {mod} must be 100% constructive, found coinductive decls"
+    -- Allowlist exactness: every allowlisted theorem must genuinely depend on
+    -- `Classical.choice` in THIS module (no over-broad or stale entries).
     for expected in allowedCoindThms do
-      unless env.contains expected do
-        throwError "stale coinductive allowlist entry {expected} not in {mod}"
+      unless seenCoind.contains expected do
+        throwError "over-broad coinductive allowlist: {expected} is not a Classical-dependent theorem of {mod}"
+    unless seenCoind.length == allowedCoindThms.length do
+      throwError "coinductive allowlist mismatch in {mod}: seen {seenCoind.length}, allowlisted {allowedCoindThms.length}"
     return s!"{mod}: {nConstThm}c+{nCoindThm}w thms, {nConstDefn}c+{nCoindAuxDefn}aux defs"
   let sFarkas ← auditDeclsInModule `Anneal.FarkasMirCert 190 350 []
   let sTrap ← auditDeclsInModule `Anneal.Mir.OverflowTrapRefinement 220 250

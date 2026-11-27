@@ -2764,6 +2764,137 @@ theorem unchecked_sub_refines_to_checked_of_fuel (u : UintTy) (strat : PanicStra
       runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hNV.1)]
   exact (unchecked_sub_refines_to_checked u strat a b ha hb).1
 
+/-! ## 5.2 Tree-Level (Layer 1A `ITree.toPartial` & Coinductive `WeakRef`) Reverse `iff`
+
+The classifier-level reverse `iff` theorems above are lifted here to the coinductive
+`mirCallTree` semantics: eliminating the overflow check (`unchecked` impl refining `checked`
+spec) is sound at the ITree level *if and only if* the no-overflow condition holds, for ALL
+`u`, ALL inputs (in range for `sub`), and BOTH panic strategies. -/
+
+private theorem toPartial_reverse_iff_of_dichotomy {bC bU : CapturedMir} {fC fU : Nat}
+    {args : List Value} {P : Prop} (hDec : P ∨ ¬ P)
+    (hYes : P → ∃ o, runMirCall bC fC args = .halted o ∧ runMirCall bU fU args = .halted o)
+    (hNo : ¬ P → ∃ o, runMirCall bC fC args = .halted o ∧ runMirCall bU fU args = .faulted .ub) :
+    (mirCallTree bU args).toPartial ≤ (mirCallTree bC args).toPartial ↔ P := by
+  constructor
+  · intro hLe
+    cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨o, hC, hU⟩ := hNo hnp
+      have ⟨uC, hTauC, hObsC⟩ := runMirSteps_halted_to_tauStar _ fC _ o hC
+      exact False.elim (not_toPartial_le_of_faultNow_ret (runMirCall_ub_faultNow hU) hTauC hObsC hLe)
+  · intro hp
+    have ⟨_, hC, hU⟩ := hYes hp
+    exact (mirCallTree_toPartial_equiv_of_same_halted hU hC).1
+
+/-- Generic coinductive `WeakRef` reverse-refinement dichotomy `iff` helper. -/
+theorem weakRef_reverse_iff_of_dichotomy {bC bU : CapturedMir} {fC fU : Nat}
+    {args : List Value} {P : Prop} (hDec : P ∨ ¬ P)
+    (hYes : P → ∃ o, runMirCall bC fC args = .halted o ∧ runMirCall bU fU args = .halted o)
+    (hNo : ¬ P → ∃ o, runMirCall bC fC args = .halted o ∧ runMirCall bU fU args = .faulted .ub) :
+    WeakRef (mirCallTree bU args) (mirCallTree bC args) ↔ P := by
+  constructor
+  · intro hW
+    cases hDec with
+    | inl hp => exact hp
+    | inr hnp =>
+      have ⟨o, hC, hU⟩ := hNo hnp
+      have ⟨uC, hTauC, hObsC⟩ := runMirSteps_halted_to_tauStar _ fC _ o hC
+      exact False.elim (not_weakRef_of_faultNow_ret (runMirCall_ub_faultNow hU) hTauC hObsC hW)
+  · intro hp
+    have ⟨_, hC, hU⟩ := hYes hp
+    exact (mirCallTree_weakRef_equiv_of_same_halted hU hC).1
+
+private theorem lt_dec (x y : Nat) : x < y ∨ ¬ x < y :=
+  (Nat.lt_or_ge x y).imp_right Nat.not_lt_of_ge
+
+private theorem le_dec (x y : Nat) : x ≤ y ∨ ¬ x ≤ y :=
+  (Nat.lt_or_ge y x).symm.imp_right Nat.not_le_of_gt
+
+/-- **Tree-level panic-preserving check elimination `iff` for `add`**: the unchecked tree
+refines the checked tree under Layer 1A `ITree.toPartial` iff `a + b < 2^w`. -/
+theorem checked_add_toPartial_refines_unchecked_iff (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) :
+    (mirCallTree (mkUncheckedArithBody u .add) (uintArgs2 u a b)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody u .add strat.toUnwindAction) (uintArgs2 u a b)).toPartial
+      ↔ a + b < modPow2 (uintWidth u) :=
+  toPartial_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_add_ok u strat a b h, runMirCall_unchecked_add_ok u a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_add_trap u strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_add_ub u a b (Nat.not_lt.mp h)⟩)
+
+/-- **Tree-level panic-preserving check elimination `iff` for in-range `sub`** (`↔ b ≤ a`). -/
+theorem checked_sub_toPartial_refines_unchecked_iff (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    (mirCallTree (mkUncheckedArithBody u .sub) (uintArgs2 u a b)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody u .sub strat.toUnwindAction) (uintArgs2 u a b)).toPartial
+      ↔ b ≤ a :=
+  toPartial_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (le_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_sub_ok u strat a b ha hb h,
+                  runMirCall_unchecked_sub_ok u a b ha h⟩)
+    (fun h => ⟨_, runMirCall_checked_sub_trap u strat a b ha hb (Nat.not_le.mp h),
+                  runMirCall_unchecked_sub_ub u a b (Nat.not_le.mp h)⟩)
+
+/-- **Tree-level panic-preserving check elimination `iff` for `mul`** (`↔ a * b < 2^w`). -/
+theorem checked_mul_toPartial_refines_unchecked_iff (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) :
+    (mirCallTree (mkUncheckedArithBody u .mul) (uintArgs2 u a b)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody u .mul strat.toUnwindAction) (uintArgs2 u a b)).toPartial
+      ↔ a * b < modPow2 (uintWidth u) :=
+  toPartial_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_mul_ok u strat a b h, runMirCall_unchecked_mul_ok u a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_mul_trap u strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_mul_ub u a b (Nat.not_lt.mp h)⟩)
+
+/-- **Tree-level panic-preserving check elimination `iff` for composite `add_scaled`**
+(`↔ a + k * b < 2^w`). -/
+theorem checked_add_scaled_toPartial_refines_unchecked_iff (u : UintTy) (k : Nat)
+    (strat : PanicStrategy) (a b : Nat) :
+    (mirCallTree (mkUncheckedAddScaledBody u k) (uintArgs2 u a b)).toPartial ≤
+      (mirCallTree (mkCheckedAddScaledBody u k strat.toUnwindAction) (uintArgs2 u a b)).toPartial
+      ↔ a + k * b < modPow2 (uintWidth u) :=
+  toPartial_reverse_iff_of_dichotomy (fC := 13) (fU := 5) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_add_scaled_ok u k strat a b h,
+                  runMirCall_unchecked_add_scaled_ok u k a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_add_scaled_trap u k strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_add_scaled_ub u k a b (Nat.not_lt.mp h)⟩)
+
+/-- Coinductive `WeakRef` tree-level reverse `iff` for `add`, `in-range sub`, `mul`, and
+composite `add_scaled`. -/
+theorem checked_toWeakRef_refines_unchecked_iff (u : UintTy) (strat : PanicStrategy)
+    (a b k : Nat) (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    (WeakRef (mirCallTree (mkUncheckedArithBody u .add) (uintArgs2 u a b))
+        (mirCallTree (mkCheckedArithBody u .add strat.toUnwindAction) (uintArgs2 u a b))
+      ↔ a + b < modPow2 (uintWidth u)) ∧
+    (WeakRef (mirCallTree (mkUncheckedArithBody u .sub) (uintArgs2 u a b))
+        (mirCallTree (mkCheckedArithBody u .sub strat.toUnwindAction) (uintArgs2 u a b))
+      ↔ b ≤ a) ∧
+    (WeakRef (mirCallTree (mkUncheckedArithBody u .mul) (uintArgs2 u a b))
+        (mirCallTree (mkCheckedArithBody u .mul strat.toUnwindAction) (uintArgs2 u a b))
+      ↔ a * b < modPow2 (uintWidth u)) ∧
+    (WeakRef (mirCallTree (mkUncheckedAddScaledBody u k) (uintArgs2 u a b))
+        (mirCallTree (mkCheckedAddScaledBody u k strat.toUnwindAction) (uintArgs2 u a b))
+      ↔ a + k * b < modPow2 (uintWidth u)) :=
+  ⟨weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_add_ok u strat a b h, runMirCall_unchecked_add_ok u a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_add_trap u strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_add_ub u a b (Nat.not_lt.mp h)⟩),
+   weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (le_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_sub_ok u strat a b ha hb h,
+                  runMirCall_unchecked_sub_ok u a b ha h⟩)
+    (fun h => ⟨_, runMirCall_checked_sub_trap u strat a b ha hb (Nat.not_le.mp h),
+                  runMirCall_unchecked_sub_ub u a b (Nat.not_le.mp h)⟩),
+   weakRef_reverse_iff_of_dichotomy (fC := 6) (fU := 2) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_mul_ok u strat a b h, runMirCall_unchecked_mul_ok u a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_mul_trap u strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_mul_ub u a b (Nat.not_lt.mp h)⟩),
+   weakRef_reverse_iff_of_dichotomy (fC := 13) (fU := 5) (lt_dec _ _)
+    (fun h => ⟨_, runMirCall_checked_add_scaled_ok u k strat a b h,
+                  runMirCall_unchecked_add_scaled_ok u k a b h⟩)
+    (fun h => ⟨_, runMirCall_checked_add_scaled_trap u k strat a b (Nat.not_lt.mp h),
+                  runMirCall_unchecked_add_scaled_ub u k a b (Nat.not_lt.mp h)⟩)⟩
+
 /-! ## 6. Explicit Non-Vacuous Negative Soundness Theorems (17 Theorems) -/
 
 /-- Negative Soundness #1: a deterministic trap never refines a normal return. -/
@@ -3078,6 +3209,31 @@ theorem checked_add_scaled_inner_mul_overflow_not_refines_unchecked (strat : Pan
   · rw [hC, hU, classify_trapOutcome_eq strat]
     exact trap_not_refines_ub
   · exact not_toPartial_le_of_faultNow_ret (runMirCall_ub_faultNow hU) hTauC hObsC
+
+set_option maxHeartbeats 4000000 in
+/-- Exact failure-site pinning for composite `add_scaled` (strengthening #15 and #17, whose
+generic trap/UB lemmas do not by themselves identify WHICH check fires). Fuel acts as a
+step counter, so the exact step at which each run settles identifies the failing statement:
+- inner-mul site (`1 + 4 * 70`): checked is still running after 2 steps and traps at step 3
+  (`bb0`'s assert); unchecked is still running after 1 step and faults `.ub` at step 2
+  (`bb0`'s `MulUnchecked`);
+- outer-add site (`200 + 4 * 20`): checked passes `bb0`'s assert, is still running after 8
+  steps and traps at step 9 (`bb1`'s assert); unchecked is still running after 2 steps and
+  faults `.ub` at step 3 (`bb0`'s `AddUnchecked`). -/
+theorem add_scaled_failure_sites_pinned (strat : PanicStrategy) :
+    runMirCall (mkCheckedAddScaledBody .u8 4 strat.toUnwindAction) 2 (uintArgs2 .u8 1 70) =
+      .faulted .outOfFuel ∧
+    runMirCall (mkCheckedAddScaledBody .u8 4 strat.toUnwindAction) 3 (uintArgs2 .u8 1 70) =
+      .halted strat.toTrapOutcome ∧
+    runMirCall (mkUncheckedAddScaledBody .u8 4) 1 (uintArgs2 .u8 1 70) = .faulted .outOfFuel ∧
+    runMirCall (mkUncheckedAddScaledBody .u8 4) 2 (uintArgs2 .u8 1 70) = .faulted .ub ∧
+    runMirCall (mkCheckedAddScaledBody .u8 4 strat.toUnwindAction) 8 (uintArgs2 .u8 200 20) =
+      .faulted .outOfFuel ∧
+    runMirCall (mkCheckedAddScaledBody .u8 4 strat.toUnwindAction) 9 (uintArgs2 .u8 200 20) =
+      .halted strat.toTrapOutcome ∧
+    runMirCall (mkUncheckedAddScaledBody .u8 4) 2 (uintArgs2 .u8 200 20) = .faulted .outOfFuel ∧
+    runMirCall (mkUncheckedAddScaledBody .u8 4) 3 (uintArgs2 .u8 200 20) = .faulted .ub := by
+  cases strat <;> refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> rfl
 
 /-- Coinductive `WeakRef` negative soundness corollaries (overflowing add & strategy separation). -/
 theorem checked_add_overflow_not_weakRef_corollaries (strat : PanicStrategy) :
