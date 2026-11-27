@@ -2485,6 +2485,22 @@ theorem canary_syntactic_beq :
       [⟨.add (.var 0) (.neg (.var 1)), .cst SInt.zero⟩] = false :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-- Canary: isolates the `alignBytes ≥ 1` guard of the unified `alignedStride`
+goal. With `alignBytes = 0` both two-sided certificates are genuinely valid
+(`0 * q = off` is derivable from `0 ≤ off ≤ 0`, with the `natGoalVars`
+nonnegativity rows for `off` and `q` placing the negated goal at index `4`),
+yet `checkFarkasMirGoal` still rejects: an `AlignedPtr rp 0` claim would be
+false (`AlignedPtr` requires `alignBytes > 0`). -/
+theorem canary_align_zero_guard_isolated :
+    checkNatCutGoal ⟨[⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 0⟩], ⟨.mulC 0 (.var 1), .var 0⟩⟩
+      [.hyp 0, .hyp 4, .comb 0 1 1 1] = true ∧
+    checkNatCutGoal ⟨[⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 0⟩], ⟨.var 0, .mulC 0 (.var 1)⟩⟩
+      [.hyp 1, .hyp 4, .comb 0 1 1 1] = true ∧
+    checkFarkasMirGoal
+      (.alignedStride [⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 0⟩] 0 (.var 0) (.var 1))
+      (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) = false :=
+  ⟨rfl, rfl, rfl⟩
+
 /-! ### Fail-Closed Negative `rfl` Controls (`= false`) -/
 
 /-- Negative canary: truncated or overlong `certs` lists are rejected fail-closed
@@ -2597,10 +2613,11 @@ theorem neg_canary_structural_fail_closed :
     checkNatSpecFalsifies [3] [⟨.var 0, .cst 5⟩] = false ∧
     checkIntSpecFalsifies [Int.ofNat 0] [] = false ∧
     checkIntSpecFalsifies [Int.negOfNat 1] [⟨.cst ⟨true, 3⟩, .var 0⟩] = false ∧
-    -- alignBytes = 0 rejected
+    -- alignBytes = 0 rejected (both certificates below are valid -- see
+    -- `canary_align_zero_guard_isolated` -- so only the `Nat.ble 1` guard fires)
     checkFarkasMirGoal
       (.alignedStride [⟨.cst 0, .var 0⟩, ⟨.var 0, .cst 0⟩] 0 (.var 0) (.var 1))
-      (.pair [.hyp 0, .hyp 3, .comb 0 1 1 1] [.hyp 1, .hyp 3, .comb 0 1 1 1]) = false ∧
+      (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) = false ∧
     -- WrappedInterval lo > hi rejected
     checkFarkasMirGoal
       (.aipccIntervalRefine [⟨.cst 10, .var 0⟩, ⟨.var 0, .cst 5⟩] 256 10 5 (.var 0))
@@ -2782,24 +2799,70 @@ theorem canary_checkFarkasMirGoal_all_variants :
    checkFarkasMirGoal_sound _ (.edge [[.hyp 0, .hyp 1, .comb 0 1 1 1]]) rfl⟩
 
 /-- Negative canary: mismatched `FarkasMirCert` payload constructors fail closed
-across all four certificate shapes (`.single`, `.pair`, `.triple`, `.edge`). -/
+across all four certificate shapes (`.single`, `.pair`, `.triple`, `.edge`).
+
+Each rejected payload re-packages certificates that are *valid* for that very
+goal (every group starts with the accepted, correctly-shaped positive control),
+so the payload shape is the sole reason for rejection. (Empty `[]` payloads
+would be rejected even in the right shape and so could not distinguish a
+missing shape guard from an ordinary certificate failure.) -/
 theorem neg_canary_checkFarkasMirGoal_mismatched_payloads :
+    -- `.single`-shaped goal: valid cert accepted only as `.single`
     checkFarkasMirGoal
-      (.uintAddNoOverflow .u8 [⟨.var 0, .cst 1⟩] (.var 0) (.cst 0))
-      (.pair [] []) = false ∧
+      (.uintAddNoOverflow .u8 [⟨.var 0, .cst 100⟩, ⟨.var 1, .cst 150⟩] (.var 0) (.var 1))
+      (.single [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1]) = true ∧
     checkFarkasMirGoal
-      (.sliceSplit [⟨.var 0, .var 0⟩] (.var 0) (.cst 0) (.var 0))
-      (.single []) = false ∧
+      (.uintAddNoOverflow .u8 [⟨.var 0, .cst 100⟩, ⟨.var 1, .cst 150⟩] (.var 0) (.var 1))
+      (.pair [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1]
+             [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1]) = false ∧
     checkFarkasMirGoal
-      (.arrayToSliceCast [] 8 8 (.cst 0) (.cst 0) (.cst 0) (.cst 0))
-      (.pair [] []) = false ∧
+      (.uintAddNoOverflow .u8 [⟨.var 0, .cst 100⟩, ⟨.var 1, .cst 150⟩] (.var 0) (.var 1))
+      (.edge [[.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1]]) = false ∧
+    -- `.pair`-shaped goal: valid le/ge certs accepted only as `.pair`
     checkFarkasMirGoal
-      (.natEntailmentAdequacy [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩] [0] .sufficientOnly)
-      (.triple [] [] []) = false ∧
+      (.sliceSplit [⟨.add (.var 0) (.var 1), .var 2⟩, ⟨.var 2, .add (.var 0) (.var 1)⟩]
+        (.var 0) (.var 1) (.var 2))
+      (.pair [.hyp 0, .hyp 5, .comb 0 1 1 1] [.hyp 1, .hyp 5, .comb 0 1 1 1]) = true ∧
     checkFarkasMirGoal
-      (.intEntailmentAdequacy [⟨.var 0, .cst SInt.zero⟩] [⟨.var 0, .cst SInt.zero⟩]
-        [Int.ofNat 0] .sufficientOnly)
-      (.single []) = false :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+      (.sliceSplit [⟨.add (.var 0) (.var 1), .var 2⟩, ⟨.var 2, .add (.var 0) (.var 1)⟩]
+        (.var 0) (.var 1) (.var 2))
+      (.single [.hyp 0, .hyp 5, .comb 0 1 1 1]) = false ∧
+    checkFarkasMirGoal
+      (.sliceSplit [⟨.add (.var 0) (.var 1), .var 2⟩, ⟨.var 2, .add (.var 0) (.var 1)⟩]
+        (.var 0) (.var 1) (.var 2))
+      (.triple [.hyp 0, .hyp 5, .comb 0 1 1 1] [.hyp 1, .hyp 5, .comb 0 1 1 1]
+               [.hyp 1, .hyp 5, .comb 0 1 1 1]) = false ∧
+    -- `.triple`-shaped goal: dropping the range cert (`.pair`) is rejected
+    checkFarkasMirGoal
+      (.arrayToSliceCast
+        [⟨.mulC 8 (.var 1), .var 0⟩, ⟨.var 0, .mulC 8 (.var 1)⟩,
+         ⟨.var 0, .cst 16⟩, ⟨.var 2, .cst 4⟩, ⟨.cst 48, .var 3⟩]
+        8 8 (.var 0) (.var 1) (.var 2) (.var 3))
+      (.triple [.hyp 0, .hyp 9, .comb 0 1 1 1] [.hyp 1, .hyp 9, .comb 0 1 1 1]
+               [.hyp 2, .hyp 3, .comb 0 1 1 8, .hyp 4, .comb 2 1 3 1, .hyp 9, .comb 4 1 5 1])
+      = true ∧
+    checkFarkasMirGoal
+      (.arrayToSliceCast
+        [⟨.mulC 8 (.var 1), .var 0⟩, ⟨.var 0, .mulC 8 (.var 1)⟩,
+         ⟨.var 0, .cst 16⟩, ⟨.var 2, .cst 4⟩, ⟨.cst 48, .var 3⟩]
+        8 8 (.var 0) (.var 1) (.var 2) (.var 3))
+      (.pair [.hyp 0, .hyp 9, .comb 0 1 1 1] [.hyp 1, .hyp 9, .comb 0 1 1 1]) = false ∧
+    -- `.edge`-shaped goals: valid forward certs accepted only as `.edge`
+    checkFarkasMirGoal
+      (.natEntailmentAdequacy [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩] [0] (.strict [6]))
+      (.edge [[.hyp 0, .hyp 2, .comb 0 1 1 1]]) = true ∧
+    checkFarkasMirGoal
+      (.natEntailmentAdequacy [⟨.var 0, .cst 5⟩] [⟨.var 0, .cst 10⟩] [0] (.strict [6]))
+      (.single [.hyp 0, .hyp 2, .comb 0 1 1 1]) = false ∧
+    checkFarkasMirGoal
+      (.intEntailmentAdequacy [⟨.cst ⟨true, 3⟩, .var 0⟩] [⟨.cst ⟨true, 5⟩, .var 0⟩]
+        [Int.negOfNat 1] (.strict [Int.negOfNat 4]))
+      (.edge [[.hyp 0, .hyp 1, .comb 0 1 1 1]]) = true ∧
+    checkFarkasMirGoal
+      (.intEntailmentAdequacy [⟨.cst ⟨true, 3⟩, .var 0⟩] [⟨.cst ⟨true, 5⟩, .var 0⟩]
+        [Int.negOfNat 1] (.strict [Int.negOfNat 4]))
+      (.triple [.hyp 0, .hyp 1, .comb 0 1 1 1] [.hyp 0, .hyp 1, .comb 0 1 1 1]
+               [.hyp 0, .hyp 1, .comb 0 1 1 1]) = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.FarkasMirCert
