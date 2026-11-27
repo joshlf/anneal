@@ -1919,6 +1919,34 @@ theorem lm_scalarMayBeNull_zero_usize :
     | .error _ => False := by
   exact rfl
 
+/-- `D4` **universal vendored validity law for function pointers**: `Validity.checkScalar` at the
+`pointerLayoutData true` valid range accepts an 8-byte integer scalar iff its bits are non-null,
+and otherwise faults with exactly `invalidScalarBits` (every scalar, every hook state). -/
+theorem lm_checkScalar_fnptr_int {HS : Type} (i : ScalarInt) (bits : U128)
+    (hb : i.toBits (Size.ofBytes 8) = .ok bits)
+    (cb : Scalar Provenance → HS → EStateM.Result Unit HS Bool) (st : HS) :
+    Validity.checkScalar
+        ⟨Size.ofBytes 8, ⟨BitVec.ofNat 128 1, BitVec.ofNat 128 (2 ^ 64 - 1)⟩⟩
+        (Scalar.fromScalarInt (Prov := Provenance) i) cb st =
+      if 1 ≤ bits.toNat ∧ bits.toNat ≤ 2 ^ 64 - 1 then .ok () st
+      else .error (.failure (.invalidScalarBits bits
+        ⟨Size.ofBytes 8, ⟨BitVec.ofNat 128 1, BitVec.ofNat 128 (2 ^ 64 - 1)⟩⟩)) st := by
+  simp only [Validity.checkScalar]
+  split
+  next x c hc =>
+    have htry : (Scalar.fromScalarInt (Prov := Provenance) i).tryToScalarInt = .ok (.integer i) := rfl
+    simp only [htry, hb]
+    by_cases h : 1 ≤ bits.toNat ∧ bits.toNat ≤ 2 ^ 64 - 1
+    · have hc' : WrappingRange.contains ⟨BitVec.ofNat 128 1, BitVec.ofNat 128 (2 ^ 64 - 1)⟩ bits = true :=
+        (lm_fnptr_range_contains_iff bits).mpr h
+      simp [hc', h]
+    · have hc' : WrappingRange.contains ⟨BitVec.ofNat 128 1, BitVec.ofNat 128 (2 ^ 64 - 1)⟩ bits = false := by
+        cases hh : WrappingRange.contains ⟨BitVec.ofNat 128 1, BitVec.ofNat 128 (2 ^ 64 - 1)⟩ bits
+        · rfl
+        · exact absurd ((lm_fnptr_range_contains_iff bits).mp hh) h
+      simp [hc', h]
+  next e he => cases he
+
 end UniversalLaws
 
 /-! ## §4. Capstone -/
@@ -2007,7 +2035,8 @@ run_cmd do
       (ns ++ `lm_initMask_applyCopy_uninit_preserves, `Miri.Memory.InitMask.applyCopy),
       (ns ++ `lm_readScalar_uninit_witness, `Miri.Memory.InitMask.prepareCopy),
       (ns ++ `lm_scalarMayBeNull_int, `Miri.Interpreter.ValidityMachine.scalarMayBeNull),
-      (ns ++ `lm_readScalar_uninit_ub, `Miri.Memory.Allocation.readScalar) ]
+      (ns ++ `lm_readScalar_uninit_ub, `Miri.Memory.Allocation.readScalar),
+      (ns ++ `lm_checkScalar_fnptr_int, `Miri.Memory.Validity.checkScalar) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
     let mut seen : NameSet := {}

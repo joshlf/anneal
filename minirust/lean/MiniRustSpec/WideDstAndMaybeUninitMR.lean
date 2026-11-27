@@ -552,6 +552,42 @@ theorem mrTrustedWdObserve_out_of_range (tb : Bool) (idx : Nat) (h : mrWdCaseCou
   rw [hNone]
 
 
+/-! ### Trusted root causes of the documented `D1` / `D4` cells -/
+
+section TrustedRootCauses
+
+open Trusted.Rustc.V2026_06_01 Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics
+
+/-- `D4` **Trusted root cause (universal)**: a provenance-free pointer image never decodes at a
+function-pointer type (`decodeTypedValueFromBytes` routes `.fnPtr` to
+`decodePtrBytesNoForge true`), so the null `fn()` of cases `21` / `22` is UB in Trusted. -/
+theorem trusted_decodePtrBytesNoForge_fnptr_provless (ptrBytes : Nat) (bytes : List AbstractByte)
+    (sv : ScalarVal) (hdec : decodeScalarBytes bytes false = some (sv, none)) :
+    decodePtrBytesNoForge true (.tuple []) ptrBytes bytes = none := by
+  unfold decodePtrBytesNoForge
+  simp only [hdec]
+  split <;> (try split) <;> simp_all
+
+/-- `D4` **Trusted raw-pointer contrast (universal)**: the same provenance-free image decodes to
+its address at a raw `*const u8` (`decodePtrBytesNoForge false`), as in case `23`. -/
+theorem trusted_decodePtrBytesNoForge_raw_provless (pointee : RigidTy) (ptrBytes : Nat)
+    (bytes : List AbstractByte) (sv : ScalarVal)
+    (hthin : pointee = .uint .u8)
+    (hlen : Trusted.Sequence.length bytes = ptrBytes) (hdec : decodeScalarBytes bytes false = some (sv, none)) :
+    decodePtrBytesNoForge false pointee ptrBytes bytes = some (.scalar ⟨sv.bits, ptrBytes⟩) := by
+  subst hthin
+  unfold decodePtrBytesNoForge
+  simp only [hdec]
+  split <;> (try split) <;> simp_all
+
+/-- `D1` **honest Trusted boundary**: `size_of_val` / `align_of_val` on the custom trailing-slice
+ADTs of cases `6` / `7` reach `intrinsicWidePointeeStep`, which is `.unsupported`. -/
+theorem trusted_intrinsicWidePointeeStep_dst_unsupported :
+    intrinsicWidePointeeStep wdHeaderSliceRigid = .unsupported ∧
+    intrinsicWidePointeeStep wdAlign8TailU16Rigid = .unsupported := ⟨rfl, rfl⟩
+
+end TrustedRootCauses
+
 /-! ## §2. Post-`minirust#300` Non-Null `FnPtr` Validity Predicate (Defined Here, Zero
 `Interp.lean` Edits)
 
@@ -1438,6 +1474,8 @@ run_cmd do
       (ns ++ `mr_ptrOffsetInboundsM_ok_eq_wrapping, `MiniRustSpec.Interp.ptrOffsetInboundsM),
       (ns ++ `mr_evalPtrOffsetM_wrapping_compose, `MiniRustSpec.Interp.evalPtrOffsetM),
       (ns ++ `mr_decodeM_union_single_chunk, `MiniRustSpec.Interp.Type.decodeM),
+      (ns ++ `trusted_decodePtrBytesNoForge_fnptr_provless, `Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge),
+      (ns ++ `trusted_intrinsicWidePointeeStep_dst_unsupported, `Trusted.Rustc.V2026_06_01.MirSemantics.intrinsicWidePointeeStep),
       (ns ++ `mr_encodeM_union_single_chunk, `MiniRustSpec.Interp.Type.encodeM) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
