@@ -94,7 +94,7 @@ def wdCombine (a b : LmWdObs) : LmWdObs := if a = b then a else .unsupported
 /-! ### Shared `CapturedMir` fixtures
 
 Every definition in this section is shared verbatim (same text, same opened namespaces) with
-`LeanMiriSpec.WideDstAndMaybeUninitLM`, so Episode 2's cross-root bridge can lock each fixture
+`MiniRustSpec.WideDstAndMaybeUninitMR`, so Episode 2's cross-root bridge can lock each fixture
 by `Eq.refl`. -/
 
 section Fixtures
@@ -454,11 +454,19 @@ def lmWdTySliceU16 : Miri.MIR.TyId := 4013
 def lmWdTyHeaderSlice : Miri.MIR.TyId := 4020
 /-- `#[repr(C)] struct Align8TailU16 { hdr: u64, tail: [u16] }`. -/
 def lmWdTyAlign8TailU16 : Miri.MIR.TyId := 4021
+/-- `core::mem::ManuallyDrop<u32>` (transparent single-field wrapper `FieldsShape.Arbitrary #[0] #[0]`). -/
+def lmWdTyMdU32 : Miri.MIR.TyId := 4030
+/-- `fn() -> u32` function pointer type identity (`pointerLayoutData true`). -/
+def lmWdTyFnPtr : Miri.MIR.TyId := 4031
 
 def lmWdU8Lay : LayoutData := scalarLayoutData 1 false
 def lmWdU16Lay : LayoutData := scalarLayoutData 2 false
 def lmWdU32Lay : LayoutData := scalarLayoutData 4 false
 def lmWdU64Lay : LayoutData := scalarLayoutData 8 false
+
+/-- `ManuallyDrop<u32>` transparent single-field struct layout (`FieldsShape.Arbitrary #[0] #[0]`). -/
+def lmWdMdU32Lay : LayoutData :=
+  { lmWdU32Lay with fields := .Arbitrary #[Size.ZERO] #[0] }
 
 /-- The unsized `[T]` layout (`FieldsShape.Array stride 0`, `BackendRepr.Memory (sized := false)`). -/
 def lmWdSliceLay (elem : LayoutData) : LayoutData :=
@@ -508,6 +516,7 @@ def lmWdField (l : TyAndLayout Miri.MIR.TyId) (i : Nat) : Except StepError (TyAn
   else if l.ty == lmWdTyHeaderSlice && i == 1 then .ok ⟨lmWdTySliceU32, lmWdSliceU32Lay⟩
   else if l.ty == lmWdTyAlign8TailU16 && i == 0 then .ok ⟨lmWdTyU64, lmWdU64Lay⟩
   else if l.ty == lmWdTyAlign8TailU16 && i == 1 then .ok ⟨lmWdTySliceU16, lmWdSliceU16Lay⟩
+  else if l.ty == lmWdTyMdU32 && i == 0 then .ok ⟨lmWdTyU32, lmWdU32Lay⟩
   else .error (.invalidProgram "field query outside the fragment")
 
 /-- The compiler's type classification (`ty.kind()`) on the fragment's unsized types. -/
@@ -587,7 +596,7 @@ def lmWdProjCx (st : LmState) : ProjectionCx Provenance where
   variant := fun _ _ => .error (.invariant "no variants in this fragment")
   dynamicAlign := fun _ _ => .error (.invariant "no dynamic alignment in this fragment")
   packedAlign := fun _ => .ok none
-  immediateOffset := fun _ _ _ _ => .error (.invariant "no immediates in this fragment")
+  immediateOffset := projectionImmediateOffset (fun _ _ => .ok ())
   memoryOffset := projectionMemoryOffset lmPtrArith lmResolvePure st.mem.getAllocInfo
   subsliceLayout := fun _ _ => .error (.invariant "no subslices in this fragment")
   layoutOf := fun _ => .error (.invariant "no layoutOf in this fragment")
@@ -663,6 +672,19 @@ def lmWdUnionReadU32 (tb : Bool) (init : Option (Nat × Nat)) : LmWdM LmWdObs :=
   let (dst, st) ← lmWdUnionCopy tb 4 init
   let (v, _) ← lmWdMem (lmLoad st dst 4)
   pure (.okScalar v)
+
+/-- Case `11`: `ManuallyDrop<u32>` transparent single-field wrapper write `val`, copy through
+vendored `Allocation.copy`, project field `0` through vendored `Projection.projectField`
+(`FieldsShape.Arbitrary #[0] #[0]`), then load the inner `u32`. -/
+def lmWdManuallyDropReadU32 (tb : Bool) (val : Nat) : LmWdM LmWdObs := do
+  let (dst, st) ← lmWdUnionCopy tb 4 (some (4, val))
+  let base : OpTy Provenance := ⟨.indirect ⟨dst, .none, none⟩, ⟨lmWdTyMdU32, lmWdMdU32Lay⟩⟩
+  let fld ← (projectField (lmWdProjCx st) base 0).mapError .proj
+  match fld.op with
+  | .indirect place =>
+    let (v, _) ← lmWdMem (lmLoad st place.ptr 4)
+    pure (.okScalar v)
+  | .immediate _ => .error (.harness "immediate ManuallyDrop field")
 
 /-- `bool`'s scalar validity layout (`valid_range = 0..=1`). -/
 def lmWdBoolValidity : ScalarValidityLayout :=
@@ -748,20 +770,59 @@ def lmWdCheckPtr (nonNull : Bool) (s : Scalar Provenance) : LmWdM Unit := do
   | .ok () _ => pure ()
   | .error e _ => .error (.validity e)
 
-/-- Case `20`: a reified function pointer into a live allocation, validated at `fn() -> u32`. -/
-def lmWdCase20 (tb : Bool) : LmWdM LmWdObs := do
-  let (p, _) ← lmWdMem (lmAllocate (lmInit tb) 1 1)
-  let s ← (Scalar.fromMaybePointer lmLayout p).mapError (fun e => .mem (.scalar e))
-  lmWdCheckPtr true s
-  match p.provenance with
-  | some (.concrete id _) => pure (.okFnPtr id.value.toNat)
-  | _ => .error (.harness "function pointer without provenance")
+/-- Byte-level transmute of an 8-byte scalar through a live allocation (`Allocation.writeScalar`
+followed by `Allocation.readScalar` with provenance, plus Tree Borrows write/read hooks and
+vendored `Validity.checkScalar` at `pointerLayoutData nonNull`). -/
+def lmWdTransmutePtrOn (st : LmState) (sIn : Scalar Provenance) (nonNull : Bool) :
+    LmWdM (Scalar Provenance) := do
+  let (slot, st) ← lmWdMem (lmAllocate st 8 8)
+  let (id, off, prov, alloc) ← lmWdMem (lmAccessTarget st slot 8)
+  let range : AllocRange := ⟨off, Size.ofBytes 8⟩
+  let st ← lmWdMem (lmTreeAccess st true alloc slot id prov range)
+  let st ← match st.mem.live.find? (fun e => e.1 == id) with
+    | none => .error (.harness "dead transmute slot")
+    | some (_, entry) =>
+      match Allocation.writeScalar lmLayout range sIn entry.allocation with
+      | .error e _ => .error (.mem (.allocation e))
+      | .ok () updated =>
+        match st.mem.setLiveAllocation id updated with
+        | .error e => .error (.mem (.access (.allocationLookup e)))
+        | .ok mem => pure { st with mem := mem }
+  let (id', off', prov', alloc') ← lmWdMem (lmAccessTarget st slot 8)
+  let st ← lmWdMem (lmTreeAccess st false alloc' slot id' prov' ⟨off', Size.ofBytes 8⟩)
+  let sOut ← match st.mem.live.find? (fun e => e.1 == id') with
+    | none => .error (.harness "dead transmute slot")
+    | some (_, entry) =>
+      match entry.allocation.readScalar lmLayout ⟨off', Size.ofBytes 8⟩ true with
+      | .error e => .error (.mem (.allocation e))
+      | .ok s => pure s
+  lmWdCheckPtr nonNull sOut
+  pure sOut
 
-/-- Cases `21`–`23`: `transmute::<usize, P>(0)` validated at `P` (`nonNull` for `fn() -> u32`). -/
-def lmWdNullPtr (nonNull : Bool) : LmWdM LmWdObs := do
-  let s ← lmWdUsize 0
-  lmWdCheckPtr nonNull s
-  let a ← (s.toTargetUsize (Size.ofBytes 8)).mapError (fun e => .mem (.scalar e))
+/-- Case `20`: a reified function pointer into a live allocation, transmuted through vendored
+`OpTy.transmute` / `projectionImmediateOffset` at `pointerLayoutData true` (`fn() -> u32`),
+validated via vendored `Validity.checkScalar`, and checked for intact concrete provenance. -/
+def lmWdCase20 (tb : Bool) : LmWdM LmWdObs := do
+  let (p, st) ← lmWdMem (lmAllocate (lmInit tb) 1 1)
+  let sIn ← (Scalar.fromMaybePointer lmLayout p).mapError (fun e => .mem (.scalar e))
+  let fnLay : TyAndLayout Miri.MIR.TyId := ⟨lmWdTyFnPtr, pointerLayoutData true⟩
+  let base : OpTy Provenance := ⟨.immediate (.scalar sIn), fnLay⟩
+  let out ← (base.transmute (lmWdProjCx st) fnLay).mapError .proj
+  match out.op with
+  | .immediate (.scalar sOut) =>
+    lmWdCheckPtr true sOut
+    let pOut ← (sOut.toPointer lmLayout).mapError (fun e => .mem (.scalar e))
+    match pOut.provenance with
+    | some (.concrete id _) => pure (.okFnPtr id.value.toNat)
+    | _ => .error (.harness "function pointer lost provenance across transmute")
+  | _ => .error (.harness "transmuted function pointer not scalar immediate")
+
+/-- Cases `21`–`23`: `transmute::<usize, P>(0)` via real byte round-trip (`Allocation.writeScalar`
++ `Allocation.readScalar`) validated at `P` (`nonNull = true` for `fn() -> u32`, `false` for raw). -/
+def lmWdNullPtr (tb : Bool) (nonNull : Bool) : LmWdM LmWdObs := do
+  let sIn ← lmWdUsize 0
+  let sOut ← lmWdTransmutePtrOn (lmInit tb) sIn nonNull
+  let a ← (sOut.toTargetUsize (Size.ofBytes 8)).mapError (fun e => .mem (.scalar e))
   pure (.okFnPtr a.toNat)
 
 /-! ### The observer -/
@@ -780,7 +841,7 @@ def lmWdCase (tb : Bool) : Nat → Option LmWdObs
   | 8 => some (lmWdRun (lmWdUnionCopyObs tb 4 none))
   | 9 => some (lmWdRun (lmWdUnionCopyObs tb 4 (some (1, 42))))
   | 10 => some (lmWdRun (lmWdUnionReadU32 tb (some (4, 305419896))))
-  | 11 => some (lmWdRun (lmWdUnionReadU32 tb (some (4, 77))))
+  | 11 => some (lmWdRun (lmWdManuallyDropReadU32 tb 77))
   | 12 => some (lmWdRun (lmWdUnionReadU32 tb none))
   | 13 => some (lmWdRun (lmWdUnionReadBool tb))
   | 14 => some (lmWdRun (lmWdCase14 tb))
@@ -790,9 +851,9 @@ def lmWdCase (tb : Bool) : Nat → Option LmWdObs
   | 18 => some (lmWdRun (lmWdCase18 tb))
   | 19 => some (lmWdRun (lmWdCase19 tb))
   | 20 => some (lmWdRun (lmWdCase20 tb))
-  | 21 => some (lmWdRun (lmWdNullPtr true))
-  | 22 => some (lmWdRun (lmWdNullPtr true))
-  | 23 => some (lmWdRun (lmWdNullPtr false))
+  | 21 => some (lmWdRun (lmWdNullPtr tb true))
+  | 22 => some (lmWdRun (lmWdNullPtr tb true))
+  | 23 => some (lmWdRun (lmWdNullPtr tb false))
   | _ => none
 
 /-- **Real LeanMiri observer** (fail-closed `.unsupported` for `idx ≥ 24`). -/
@@ -817,6 +878,8 @@ unroll_loops lmWdUnionCopyU := lmWdUnionCopy fuel 0
 unroll_loops lmWdInitCountU := lmWdInitCount fuel 0 with lmAccessTargetU
 unroll_loops lmWdUnionCopyObsU := lmWdUnionCopyObs fuel 0 with lmWdUnionCopyU, lmWdInitCountU
 unroll_loops lmWdUnionReadU32U := lmWdUnionReadU32 fuel 0 with lmWdUnionCopyU, lmLoadU
+unroll_loops lmWdManuallyDropReadU32U := lmWdManuallyDropReadU32 fuel 0
+  with lmWdUnionCopyU, lmWdProjCxU, lmLoadU
 unroll_loops lmWdUnionReadBoolU := lmWdUnionReadBool fuel 0 with lmWdUnionCopyU, lmLoadU
 unroll_loops lmWdLoadObsU := lmWdLoadObs fuel 0 with lmLoadU
 unroll_loops lmWdCase14U := lmWdCase14 fuel 0 with lmWdArrayU, lmWdInbU, lmWdLoadObsU
@@ -825,10 +888,14 @@ unroll_loops lmWdCase16U := lmWdCase16 fuel 0 with lmWdArrayU, lmWdInbU
 unroll_loops lmWdCase17U := lmWdCase17 fuel 0 with lmWdArrayU, lmWdLoadObsU
 unroll_loops lmWdCase18U := lmWdCase18 fuel 0 with lmWdArrayU, lmWdInbU, lmWdLoadObsU
 unroll_loops lmWdCase19U := lmWdCase19 fuel 0 with lmWdArrayU, lmRetagU, lmWdInbU, lmStoreU, lmWdLoadObsU
-unroll_loops lmWdCase20U := lmWdCase20 fuel 0 with lmAllocateU
+unroll_loops lmWdTransmutePtrOnU := lmWdTransmutePtrOn fuel 0
+  with lmAllocateU, lmAccessTargetU, lmTreeAccessU
+unroll_loops lmWdCase20U := lmWdCase20 fuel 0 with lmAllocateU, lmWdProjCxU
+unroll_loops lmWdNullPtrU := lmWdNullPtr fuel 0 with lmWdTransmutePtrOnU
 unroll_loops lmWdCaseU := lmWdCase fuel 0
-  with lmWdSliceIndexU, lmWdUnionCopyObsU, lmWdUnionReadU32U, lmWdUnionReadBoolU, lmWdCase14U,
-    lmWdCase15U, lmWdCase16U, lmWdCase17U, lmWdCase18U, lmWdCase19U, lmWdCase20U
+  with lmWdSliceIndexU, lmWdUnionCopyObsU, lmWdUnionReadU32U, lmWdManuallyDropReadU32U,
+    lmWdUnionReadBoolU, lmWdCase14U, lmWdCase15U, lmWdCase16U, lmWdCase17U, lmWdCase18U,
+    lmWdCase19U, lmWdCase20U, lmWdNullPtrU
 unroll_loops lmWdObserveU := lmWdObserve fuel 0 with lmWdCaseU
 
 end Twins
@@ -958,11 +1025,12 @@ theorem lm_wd_exact_ub_diagnostics :
     lmWdIsDerefOOB (lmWdCase17 false) = true ∧
     lmWdIsDerefOOB (lmWdCase17 true) = true ∧
     lmWdIsTreeAccessUb (lmWdCase19 true) = true ∧
-    lmWdIsInvalidScalar (lmWdNullPtr true) = true ∧
+    lmWdIsInvalidScalar (lmWdNullPtr false true) = true ∧
+    lmWdIsInvalidScalar (lmWdNullPtr true true) = true ∧
     lmWdIsTooBig (lmWdSizeAlign lmWdTyHeaderSlice lmWdHeaderSliceLay 2305843009213693951) = true := by
   rw [lmWdSliceIndexU.eq_src, lmWdUnionReadU32U.eq_src, lmWdUnionReadBoolU.eq_src,
-    lmWdCase16U.eq_src, lmWdCase17U.eq_src, lmWdCase19U.eq_src]
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+    lmWdCase16U.eq_src, lmWdCase17U.eq_src, lmWdCase19U.eq_src, lmWdNullPtrU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- **Case `13` companion (`kani#5205` / `#5196`)**: copying the whole `MaybeUninit<bool>` that
 holds the invalid byte `2` succeeds in both modes and preserves that initialized byte; only the
@@ -980,6 +1048,7 @@ end Diagnostics
 
 section UniversalLaws
 open Miri.ABI Miri.Memory Miri.Interpreter LeanMiriSpec.HeapAllocAndWidePtrLM
+open LeanMiriSpec.Correspondence (scalarLayoutData zstLayoutData translateAlignBytes)
 
 /-- `D1` (vendored fast path): every sized layout's dynamic size/align is its static one, for all hooks, fuel, and metadata. -/
 theorem lm_sizeAndAlign_sized {P S C : Type} [PointerProvenance P] (h : DynamicLayoutHooks P S C)
@@ -1054,7 +1123,663 @@ theorem lm_sizeAndAlign_sliceU32 (n : Nat) (s : Scalar Provenance) (len : UInt64
       next e s2 hl => cases hl
     next e s1 hm => cases hm
 
-/-- `D2` **universal read-time UB law**: vendored `Allocation.readScalar` faults with `invalidUninitBytes` whenever the `InitMask` reports an uninitialized sub-range, for every allocation, layout, and range. -/
+/-- `D1` **universal `str` law** of vendored `sizeAndAlignFromMeta` (`.str` arm): for every
+metadata scalar of length `len`, `size_of_val = len` (`align = 1`) when `len ≤ isize::MAX`, and
+`InvalidMeta(SliceTooBig)` UB otherwise. -/
+theorem lm_sizeAndAlign_str (n : Nat) (s : Scalar Provenance) (len : UInt64)
+    (hs : s.toTargetUsize (Size.fromBits lmLayout.pointerWidth.bits) = .ok len) :
+    lmRun (DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+        ⟨lmWdTyStr, lmWdStrLay⟩) =
+      if len.toNat ≤ lmIsizeMax then
+        .ok (some (Size.ofBytes len, lmWdU8Lay.align.abi))
+      else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") := by
+  have h1 : lmWdU8Lay.size.bytes.toNat = 1 := rfl
+  have hm : lmWdMaxSize.bytes = 9223372036854775807 := rfl
+  have hlt : len.toNat ≤ 18446744073709551615 := by have := len.toNat_lt; omega
+  have hmin : min (1 * len.toNat) 18446744073709551615 = len.toNat := by omega
+  have hkey : (9223372036854775807 : UInt64) < len ↔ ¬ len.toNat ≤ lmIsizeMax := by
+    rw [UInt64.lt_iff_toNat_lt]; unfold lmIsizeMax; simp
+  unfold DynamicLayout.sizeAndAlignFromMeta
+  simp [lmRun, lmWdDynHooks, lmWdClassify, lmWdField, lmWdLift, lmWdStrLay, lmWdSliceLay,
+    lmWdTySliceU32, lmWdTyHeaderSlice, lmWdTyAlign8TailU16, lmWdTyStr, lmWdTySliceUnit, lmWdTySliceU16,
+    LayoutData.isSized, BackendRepr.isSized, BackendRepr.isUnsized, lmLayout]
+  have hs' : s.toTargetUsize (Size.fromBits PointerWidth.w64.bits) = .ok len := hs
+  simp only [bind, EStateM.bind, pure]
+  split
+  next a st heq =>
+    split at heq
+    next x s1 h_m =>
+      cases h_m
+      rw [hs'] at heq
+      simp only [Except.mapError] at heq
+      split at heq
+      next b s2 hl =>
+        cases hl
+        rw [h1, hm, hmin, UInt64.ofNat_toNat] at heq
+        by_cases hc : len.toNat ≤ lmIsizeMax
+        · have hnot : ¬ ((9223372036854775807 : UInt64) < len) := fun h => (hkey.mp h) hc
+          simp only [Size.ofBytes, hnot, ↓reduceIte] at heq
+          cases heq
+          simp [hc, Size.ofBytes]
+        · have hbig : (9223372036854775807 : UInt64) < len := hkey.mpr hc
+          simp only [Size.ofBytes, hbig, ↓reduceIte] at heq
+          cases heq
+      next e s2 hl => cases hl
+    next e s1 h_m => cases h_m
+  next e st heq =>
+    split at heq
+    next x s1 h_m =>
+      cases h_m
+      rw [hs'] at heq
+      simp only [Except.mapError] at heq
+      split at heq
+      next b s2 hl =>
+        cases hl
+        rw [h1, hm, hmin, UInt64.ofNat_toNat] at heq
+        by_cases hc : len.toNat ≤ lmIsizeMax
+        · have hnot : ¬ ((9223372036854775807 : UInt64) < len) := fun h => (hkey.mp h) hc
+          simp only [Size.ofBytes, hnot, ↓reduceIte] at heq
+          cases heq
+        · have hbig : (9223372036854775807 : UInt64) < len := hkey.mpr hc
+          simp only [Size.ofBytes, hbig, ↓reduceIte] at heq
+          cases heq
+          simp [hc]
+      next e s2 hl => cases hl
+    next e s1 h_m => cases h_m
+
+/-- `D1` **universal ZST `[()]` law**: vendored `sizeAndAlignFromMeta` on `[()]` ALWAYS returns
+`(Size.ZERO, Align.ONE)` for EVERY 64-bit length `len` (never overflows `isize::MAX`). -/
+theorem lm_sizeAndAlign_sliceUnit (n : Nat) (s : Scalar Provenance) (len : UInt64)
+    (hs : s.toTargetUsize (Size.fromBits lmLayout.pointerWidth.bits) = .ok len) :
+    lmRun (DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+        ⟨lmWdTySliceUnit, lmWdSliceUnitLay⟩) = .ok (some (Size.ZERO, Align.ONE)) := by
+  have h0 : zstLayoutData.size.bytes.toNat = 0 := rfl
+  have ha : zstLayoutData.align.abi = Align.ONE := rfl
+  have hm : lmWdMaxSize.bytes = 9223372036854775807 := rfl
+  unfold DynamicLayout.sizeAndAlignFromMeta
+  simp [lmRun, lmWdDynHooks, lmWdClassify, lmWdField, lmWdLift, lmWdSliceUnitLay, lmWdSliceLay,
+    lmWdTySliceU32, lmWdTyHeaderSlice, lmWdTyAlign8TailU16, lmWdTyStr, lmWdTySliceUnit, lmWdTySliceU16,
+    LayoutData.isSized, BackendRepr.isSized, BackendRepr.isUnsized, lmLayout]
+  have hs' : s.toTargetUsize (Size.fromBits PointerWidth.w64.bits) = .ok len := hs
+  simp only [bind, EStateM.bind, pure]
+  split
+  next a st heq =>
+    split at heq
+    next x s1 h_m =>
+      cases h_m; rw [hs'] at heq; simp only [Except.mapError] at heq
+      split at heq
+      next b s2 hl =>
+        cases hl; simp [h0, ha, hm, Size.ofBytes] at heq; cases heq; rfl
+      next e s2 hl => cases hl
+    next e s1 h_m => cases h_m
+  next e st heq =>
+    split at heq
+    next x s1 h_m =>
+      cases h_m; rw [hs'] at heq; simp only [Except.mapError] at heq
+      split at heq
+      next b s2 hl =>
+        cases hl; simp [h0, hm, Size.ofBytes, EStateM.pure] at heq
+      next e s2 hl => cases hl
+    next e s1 h_m => cases h_m
+
+private theorem lm_sizeAndAlign_sliceU16 (n : Nat) (s : Scalar Provenance) (len : UInt64)
+    (hs : s.toTargetUsize (Size.fromBits lmLayout.pointerWidth.bits) = .ok len) :
+    lmRun (DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+        ⟨lmWdTySliceU16, lmWdSliceU16Lay⟩) =
+      if 2 * len.toNat ≤ lmIsizeMax then
+        .ok (some (Size.ofBytes (UInt64.ofNat (2 * len.toNat)), lmWdU16Lay.align.abi))
+      else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") := by
+  have h2 : lmWdU16Lay.size.bytes.toNat = 2 := rfl
+  have hm : lmWdMaxSize.bytes = 9223372036854775807 := rfl
+  have hkey : (9223372036854775807 : UInt64) <
+      (Size.ofBytes (UInt64.ofNat (min (2 * len.toNat) 18446744073709551615))).bytes ↔
+      ¬ 2 * len.toNat ≤ lmIsizeMax := by
+    show (9223372036854775807 : UInt64) < UInt64.ofNat (min (2 * len.toNat) 18446744073709551615) ↔ _
+    rw [UInt64.lt_iff_toNat_lt]; simp; unfold lmIsizeMax; omega
+  have hmin : 2 * len.toNat ≤ lmIsizeMax → min (2 * len.toNat) 18446744073709551615 = 2 * len.toNat := by
+    unfold lmIsizeMax; omega
+  unfold DynamicLayout.sizeAndAlignFromMeta
+  simp [lmRun, lmWdDynHooks, lmWdClassify, lmWdField, lmWdLift, lmWdSliceU16Lay, lmWdSliceLay,
+    lmWdTySliceU32, lmWdTyHeaderSlice, lmWdTyAlign8TailU16, lmWdTyStr, lmWdTySliceUnit, lmWdTySliceU16,
+    LayoutData.isSized, BackendRepr.isSized, BackendRepr.isUnsized, lmLayout]
+  have hs' : s.toTargetUsize (Size.fromBits PointerWidth.w64.bits) = .ok len := hs
+  simp only [bind, EStateM.bind, pure]
+  split
+  next a st heq =>
+    split at heq
+    next x s1 h_m =>
+      cases h_m; rw [hs'] at heq; simp only [Except.mapError] at heq
+      split at heq
+      next b s2 hl =>
+        cases hl; rw [h2, hm] at heq
+        by_cases hc : 2 * len.toNat ≤ lmIsizeMax
+        · rw [ite_eq_right_of_eq_false _ _ (eq_false (fun h => (hkey.mp h) hc)), hmin hc] at heq
+          cases heq; rw [ite_eq_left_of_eq_true _ _ (eq_true hc)]; simp
+        · rw [ite_eq_left_of_eq_true _ _ (eq_true (hkey.mpr hc))] at heq; cases heq
+      next e s2 hl => cases hl
+    next e s1 h_m => cases h_m
+  next e st heq =>
+    split at heq
+    next x s1 h_m =>
+      cases h_m; rw [hs'] at heq; simp only [Except.mapError] at heq
+      split at heq
+      next b s2 hl =>
+        cases hl; rw [h2, hm] at heq
+        by_cases hc : 2 * len.toNat ≤ lmIsizeMax
+        · rw [ite_eq_right_of_eq_false _ _ (eq_false (fun h => (hkey.mp h) hc))] at heq; cases heq
+        · rw [ite_eq_left_of_eq_true _ _ (eq_true (hkey.mpr hc))] at heq
+          cases heq; rw [ite_eq_right_of_eq_false _ _ (eq_false hc)]
+      next e s2 hl => cases hl
+    next e s1 h_m => cases h_m
+
+private theorem u64_land_clear_low2 (x : Nat) (hx : x < 2 ^ 64) :
+    UInt64.land (UInt64.ofNat x) (~~~(3 : UInt64)) = UInt64.ofNat (x / 4 * 4) := by
+  apply UInt64.toNat_inj.mp
+  change ((UInt64.ofNat x) &&& (~~~(3 : UInt64))).toNat = (UInt64.ofNat (x / 4 * 4)).toNat
+  rw [UInt64.toNat_and]
+  have hx1 : (UInt64.ofNat x).toNat = x := by simp [Nat.mod_eq_of_lt hx]
+  have hx2 : (UInt64.ofNat (x / 4 * 4)).toNat = x / 4 * 4 := by
+    simp [Nat.mod_eq_of_lt (by omega : x / 4 * 4 < 2 ^ 64)]
+  rw [hx1, hx2]
+  have hm : (~~~(3 : UInt64)).toNat = 18446744073709551612 := by decide
+  rw [hm]
+  apply Nat.eq_of_testBit_eq
+  intro k
+  rw [Nat.testBit_and]
+  have h1 : (x / 4 * 4).testBit k = (decide (2 ≤ k) && x.testBit k) := by
+    rw [Nat.mul_comm, show (4 : Nat) = 2 ^ 2 from rfl, Nat.testBit_two_pow_mul]
+    by_cases hk : 2 ≤ k
+    · rw [decide_eq_true hk, show x / 4 = x / 2 ^ 2 from rfl,
+        Nat.testBit_div_two_pow, Nat.sub_add_cancel hk, Bool.true_and]
+    · simp [hk]
+  rw [h1]
+  by_cases hk2 : k < 2
+  · have : k = 0 ∨ k = 1 := by omega
+    rcases this with rfl | rfl
+    · have hb0 : (18446744073709551612 : Nat).testBit 0 = false := by decide
+      simp [hb0]
+    · have hb1 : (18446744073709551612 : Nat).testBit 1 = false := by decide
+      simp [hb1]
+  · by_cases hk64 : k < 64
+    · have hb : (18446744073709551612 : Nat).testBit k = true := by
+        have hmul : (18446744073709551612 : Nat) = 2 ^ 2 * (2 ^ 62 - 1) := by decide
+        rw [hmul, Nat.testBit_two_pow_mul]
+        have hge : 2 ≤ k := by omega
+        rw [decide_eq_true hge, Bool.true_and, Nat.testBit_two_pow_sub_one]
+        exact decide_eq_true (by omega)
+      simp [hb, show 2 ≤ k by omega]
+    · have hxk : x.testBit k = false :=
+        Nat.testBit_lt_two_pow (Nat.lt_of_lt_of_le hx (Nat.pow_le_pow_right (by omega) (by omega)))
+      simp [hxk]
+
+private theorem u64_land_clear_low3 (x : Nat) (hx : x < 2 ^ 64) :
+    UInt64.land (UInt64.ofNat x) (~~~(7 : UInt64)) = UInt64.ofNat (x / 8 * 8) := by
+  apply UInt64.toNat_inj.mp
+  change ((UInt64.ofNat x) &&& (~~~(7 : UInt64))).toNat = (UInt64.ofNat (x / 8 * 8)).toNat
+  rw [UInt64.toNat_and]
+  have hx1 : (UInt64.ofNat x).toNat = x := by simp [Nat.mod_eq_of_lt hx]
+  have hx2 : (UInt64.ofNat (x / 8 * 8)).toNat = x / 8 * 8 := by
+    simp [Nat.mod_eq_of_lt (by omega : x / 8 * 8 < 2 ^ 64)]
+  rw [hx1, hx2]
+  have hm : (~~~(7 : UInt64)).toNat = 18446744073709551608 := by decide
+  rw [hm]
+  apply Nat.eq_of_testBit_eq
+  intro k
+  rw [Nat.testBit_and]
+  have h1 : (x / 8 * 8).testBit k = (decide (3 ≤ k) && x.testBit k) := by
+    rw [Nat.mul_comm, show (8 : Nat) = 2 ^ 3 from rfl, Nat.testBit_two_pow_mul]
+    by_cases hk : 3 ≤ k
+    · rw [decide_eq_true hk, show x / 8 = x / 2 ^ 3 from rfl,
+        Nat.testBit_div_two_pow, Nat.sub_add_cancel hk, Bool.true_and]
+    · simp [hk]
+  rw [h1]
+  by_cases hk3 : k < 3
+  · have : k = 0 ∨ k = 1 ∨ k = 2 := by omega
+    rcases this with rfl | rfl | rfl
+    · have hb0 : (18446744073709551608 : Nat).testBit 0 = false := by decide
+      simp [hb0]
+    · have hb1 : (18446744073709551608 : Nat).testBit 1 = false := by decide
+      simp [hb1]
+    · have hb2 : (18446744073709551608 : Nat).testBit 2 = false := by decide
+      simp [hb2]
+  · by_cases hk64 : k < 64
+    · have hb : (18446744073709551608 : Nat).testBit k = true := by
+        have hmul : (18446744073709551608 : Nat) = 2 ^ 3 * (2 ^ 61 - 1) := by decide
+        rw [hmul, Nat.testBit_two_pow_mul]
+        have hge : 3 ≤ k := by omega
+        rw [decide_eq_true hge, Bool.true_and, Nat.testBit_two_pow_sub_one]
+        exact decide_eq_true (by omega)
+      simp [hb, show 3 ≤ k by omega]
+    · have hxk : x.testBit k = false :=
+        Nat.testBit_lt_two_pow (Nat.lt_of_lt_of_le hx (Nat.pow_le_pow_right (by omega) (by omega)))
+      simp [hxk]
+
+private theorem size_alignTo4_eq (x : Nat) (hx : x + 3 < 2 ^ 64) :
+    Size.alignTo (Size.ofBytes (UInt64.ofNat x)) ⟨2⟩ = .ok (Size.ofBytes (UInt64.ofNat ((x + 3) / 4 * 4))) := by
+  have hb : Align.bytes ⟨2⟩ = .ok (4 : UInt64) := rfl
+  have h3 : (4 : UInt64) - 1 = 3 := rfl
+  have hadd : UInt64.ofNat x + (3 : UInt64) = UInt64.ofNat (x + 3) :=
+    UInt64.toNat_inj.mp (by simp)
+  have hlt : ¬ (UInt64.ofNat (x + 3) < UInt64.ofNat x) := by
+    rw [UInt64.lt_iff_toNat_lt]; simp; omega
+  unfold Size.alignTo
+  simp only [hb, Size.ofBytes, bind, Except.bind, pure, Except.pure, h3]
+  rw [hadd]
+  simp only [hlt, ↓reduceIte]
+  exact congrArg (Except.ok ∘ Size.mk) (u64_land_clear_low2 (x + 3) hx)
+
+private theorem size_alignTo8_eq (x : Nat) (hx : x + 7 < 2 ^ 64) :
+    Size.alignTo (Size.ofBytes (UInt64.ofNat x)) ⟨3⟩ = .ok (Size.ofBytes (UInt64.ofNat ((x + 7) / 8 * 8))) := by
+  have hb : Align.bytes ⟨3⟩ = .ok (8 : UInt64) := rfl
+  have h7 : (8 : UInt64) - 1 = 7 := rfl
+  have hadd : UInt64.ofNat x + (7 : UInt64) = UInt64.ofNat (x + 7) :=
+    UInt64.toNat_inj.mp (by simp)
+  have hlt : ¬ (UInt64.ofNat (x + 7) < UInt64.ofNat x) := by
+    rw [UInt64.lt_iff_toNat_lt]; simp; omega
+  unfold Size.alignTo
+  simp only [hb, Size.ofBytes, bind, Except.bind, pure, Except.pure, h7]
+  rw [hadd]
+  simp only [hlt, ↓reduceIte]
+  exact congrArg (Except.ok ∘ Size.mk) (u64_land_clear_low3 (x + 7) hx)
+
+private theorem size_add_ofNat_eq (a b : Nat) (hab : a + b < 2 ^ 64) :
+    Size.add (Size.ofBytes (UInt64.ofNat a)) (Size.ofBytes (UInt64.ofNat b)) =
+      .ok (Size.ofBytes (UInt64.ofNat (a + b))) := by
+  have hadd : UInt64.ofNat a + UInt64.ofNat b = UInt64.ofNat (a + b) :=
+    UInt64.toNat_inj.mp (by simp)
+  have hlt : ¬ (UInt64.ofNat (a + b) < UInt64.ofNat a) := by
+    rw [UInt64.lt_iff_toNat_lt]; simp; omega
+  unfold Size.add
+  simp only [Size.ofBytes, hadd, hlt, ↓reduceIte]
+
+section DynPrivUnfold
+open Lean Elab Tactic Meta in
+/-- Delta-unfold the vendored `DynamicLayout` private `addSize` / `alignTo` / `liftResult`
+wrappers in a local hypothesis (pure definitional unfolding, zero axioms). -/
+local elab "unfold_dyn_priv" "at" h:ident : tactic => do
+  let mvarId ← getMainGoal
+  mvarId.withContext do
+    let env ← getEnv
+    let mut privs : Array Name := #[]
+    for target in [`Miri.Interpreter.DynamicLayout.addSize,
+                   `Miri.Interpreter.DynamicLayout.alignTo,
+                   `Miri.Interpreter.DynamicLayout.liftResult] do
+      for (c, _) in env.constants.map₁.toList do
+        if privateToUserName? c == some target then
+          privs := privs.push c
+    let lctx ← getLCtx
+    let some ldecl := lctx.findFromUserName? h.getId
+      | throwError "unknown local hypothesis {h}"
+    let mut ty := ldecl.type
+    for p in privs do
+      ty := (← Lean.Meta.unfold ty p).expr
+    let mvarId' ← mvarId.replaceLocalDeclDefEq ldecl.fvarId ty
+    replaceMainGoal [mvarId']
+
+/-- `D1` **TRUE UNIVERSAL `HeaderSlice` law** (`#[repr(C)] struct HeaderSlice { tag: u8, data: [u32] }`):
+for EVERY 64-bit `len` (not just `n < 32`!), vendored `sizeAndAlignFromMeta` (`.adt false` arm)
+computes `size = 4 + 4 * len`, `align = 4` when `4 + 4 * len ≤ isize::MAX`,
+`InvalidMeta(TooBig)` when the struct header pushes `4 + 4 * len` past `isize::MAX`, and
+`InvalidMeta(SliceTooBig)` when `4 * len > isize::MAX`. -/
+theorem lm_sizeAndAlign_headerSlice (n : Nat) (s : Scalar Provenance) (len : UInt64)
+    (hs : s.toTargetUsize (Size.fromBits lmLayout.pointerWidth.bits) = .ok len) :
+    lmRun (DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 2) (.metadata s)
+        ⟨lmWdTyHeaderSlice, lmWdHeaderSliceLay⟩) =
+      if 4 * len.toNat ≤ lmIsizeMax then
+        if 4 + 4 * len.toNat ≤ lmIsizeMax then
+          .ok (some (Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat)), ⟨2⟩))
+        else .error (.undefinedBehavior "InvalidMeta(TooBig)")
+      else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") := by
+  have hTail := lm_sizeAndAlign_sliceU32 n s len hs
+  have hAlignU32 : lmWdU32Lay.align.abi = ⟨2⟩ := rfl
+  have hTailRaw :
+      DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+          ⟨lmWdTySliceU32, lmWdSliceU32Lay⟩ () =
+        if 4 * len.toNat ≤ lmIsizeMax then
+          .ok (some (Size.ofBytes (UInt64.ofNat (4 * len.toNat)), ⟨2⟩)) ()
+        else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") () := by
+    unfold lmRun at hTail
+    rw [hAlignU32] at hTail
+    cases hr : DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+        ⟨lmWdTySliceU32, lmWdSliceU32Lay⟩ () with
+    | ok v u =>
+      cases u; rw [hr] at hTail
+      by_cases h4 : 4 * len.toNat ≤ lmIsizeMax
+      · simp only [h4, ↓reduceIte, Except.ok.injEq] at hTail; simp [h4, hTail]
+      · simp [h4] at hTail
+    | error e u =>
+      cases u; rw [hr] at hTail
+      by_cases h4 : 4 * len.toNat ≤ lmIsizeMax
+      · simp [h4] at hTail
+      · simp only [h4, ↓reduceIte, Except.error.injEq] at hTail; simp [h4, hTail]
+  have hAlignOff : Size.alignTo (Size.ofBytes 4) ⟨2⟩ = .ok (Size.ofBytes 4) := by decide
+  have hmax : lmWdMaxSize.bytes = 9223372036854775807 := rfl
+  unfold lmRun
+  by_cases h4 : 4 * len.toNat ≤ lmIsizeMax
+  · have hTailOk :
+        DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+            ⟨lmWdTySliceU32, lmWdSliceU32Lay⟩ () =
+          .ok (some (Size.ofBytes (UInt64.ofNat (4 * len.toNat)), ⟨2⟩)) () := by
+      simpa [h4] using hTailRaw
+    have h4lt : 4 + 4 * len.toNat + 3 < 2 ^ 64 := by unfold lmIsizeMax at h4; omega
+    have hAdd : Size.add (Size.ofBytes 4) (Size.ofBytes (UInt64.ofNat (4 * len.toNat))) =
+        .ok (Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat))) :=
+      size_add_ofNat_eq 4 (4 * len.toNat) (by omega)
+    have hAlignFull : Size.alignTo (Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat))) ⟨2⟩ =
+        .ok (Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat))) := by
+      rw [size_alignTo4_eq (4 + 4 * len.toNat) h4lt]
+      have hdiv : (4 + 4 * len.toNat + 3) / 4 * 4 = 4 + 4 * len.toNat := by omega
+      rw [hdiv]
+    have hExec :
+        DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 2) (.metadata s)
+            ⟨lmWdTyHeaderSlice, lmWdHeaderSliceLay⟩ () =
+          if (Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat))).bytes > lmWdMaxSize.bytes then
+            .error (.undefinedBehavior "InvalidMeta(TooBig)") ()
+          else .ok (some (Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat)), ⟨2⟩)) () := by
+      have hSized : lmWdHeaderSliceLay.isSized = false := rfl
+      have hCls : lmWdDynHooks.classify () lmWdTyHeaderSlice = pure (.adt false) := rfl
+      have hCnt : lmWdHeaderSliceLay.fields.count = 2 := rfl
+      have h20 : ((2 : Nat) == 0) = false := rfl
+      have hOff : lmWdHeaderSliceLay.fields.offset (2 - 1) = .ok (Size.ofBytes 4) := rfl
+      have hFld : lmWdDynHooks.field () ⟨lmWdTyHeaderSlice, lmWdHeaderSliceLay⟩ (2 - 1) =
+          pure ⟨lmWdTySliceU32, lmWdSliceU32Lay⟩ := rfl
+      have hPack : lmWdDynHooks.packedAlign () lmWdTyHeaderSlice = pure none := rfl
+      have hAbi : lmWdHeaderSliceLay.align.abi = ⟨2⟩ := rfl
+      unfold DynamicLayout.sizeAndAlignFromMeta
+      simp only [hSized, Bool.false_eq_true, ↓reduceIte, hCls, hCnt, h20, hOff, hFld, hPack, hAbi,
+        Except.mapError, bind, EStateM.bind, pure, EStateM.pure]
+      split
+      next a s1 hl =>
+        cases hl
+        rw [hTailOk]
+        simp only [EStateM.bind, EStateM.pure]
+        split
+        next adj s2 hl1 =>
+          unfold_dyn_priv at hl1; rw [hAlignOff] at hl1
+          simp only [Except.mapError, pure, EStateM.pure] at hl1; cases hl1
+          split
+          next sum1 s3 hl2 =>
+            unfold_dyn_priv at hl2; rw [hAdd] at hl2
+            simp only [Except.mapError, pure, EStateM.pure] at hl2; cases hl2
+            split
+            next fs s4 hl3 =>
+              unfold_dyn_priv at hl3
+              have hMax22 : Align.max ⟨2⟩ ⟨2⟩ = ⟨2⟩ := rfl
+              rw [hMax22, hAlignFull] at hl3
+              simp only [Except.mapError, pure, EStateM.pure] at hl3; cases hl3
+              split
+              next sum2 s5 hl4 =>
+                unfold_dyn_priv at hl4; rw [hAdd] at hl4
+                simp only [Except.mapError, pure, EStateM.pure] at hl4; cases hl4
+                split
+                next cs s6 hl5 =>
+                  unfold_dyn_priv at hl5; rw [hMax22, hAlignFull] at hl5
+                  simp only [Except.mapError, pure, EStateM.pure] at hl5; cases hl5
+                  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+                  by_cases hgt : (Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat))).bytes > lmWdMaxSize.bytes
+                  · have hgt' : (Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat))).bytes >
+                        lmWdDynHooks.maxSizeOfVal.bytes := hgt
+                    simp only [hgt, hgt', ↓reduceIte]; rfl
+                  · have hgt' : ¬ ((Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat))).bytes >
+                        lmWdDynHooks.maxSizeOfVal.bytes) := hgt
+                    simp only [hgt, hgt', ↓reduceIte]; rfl
+                next e s6 hl5 =>
+                  unfold_dyn_priv at hl5; rw [hMax22, hAlignFull] at hl5
+                  simp only [Except.mapError, pure, EStateM.pure] at hl5; cases hl5
+              next e s5 hl4 =>
+                unfold_dyn_priv at hl4; rw [hAdd] at hl4
+                simp only [Except.mapError, pure, EStateM.pure] at hl4; cases hl4
+            next e s4 hl3 =>
+              unfold_dyn_priv at hl3
+              have hMax22 : Align.max ⟨2⟩ ⟨2⟩ = ⟨2⟩ := rfl
+              rw [hMax22, hAlignFull] at hl3
+              simp only [Except.mapError, pure, EStateM.pure] at hl3; cases hl3
+          next e s3 hl2 =>
+            unfold_dyn_priv at hl2; rw [hAdd] at hl2
+            simp only [Except.mapError, pure, EStateM.pure] at hl2; cases hl2
+        next e s2 hl1 =>
+          unfold_dyn_priv at hl1; rw [hAlignOff] at hl1
+          simp only [Except.mapError, pure, EStateM.pure] at hl1; cases hl1
+      next e s1 hl => cases hl
+    rw [hExec]
+    have hcmp : (9223372036854775807 : UInt64) < UInt64.ofNat (4 + 4 * len.toNat) ↔
+        ¬ (4 + 4 * len.toNat ≤ lmIsizeMax) := by
+      rw [UInt64.lt_iff_toNat_lt]; unfold lmIsizeMax; simp; omega
+    simp only [h4, ↓reduceIte, Size.ofBytes, hmax, gt_iff_lt]
+    by_cases hfull : 4 + 4 * len.toNat ≤ lmIsizeMax
+    · have hnot : ¬ ((9223372036854775807 : UInt64) < UInt64.ofNat (4 + 4 * len.toNat)) :=
+        fun h => (hcmp.mp h) hfull
+      simp only [hfull, ↓reduceIte, hnot]
+    · have hgt : (9223372036854775807 : UInt64) < UInt64.ofNat (4 + 4 * len.toNat) := hcmp.mpr hfull
+      simp only [hfull, ↓reduceIte, hgt]
+  · have hTailErr :
+        DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+            ⟨lmWdTySliceU32, lmWdSliceU32Lay⟩ () =
+          .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") () := by
+      simpa [h4] using hTailRaw
+    have hExec :
+        DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 2) (.metadata s)
+            ⟨lmWdTyHeaderSlice, lmWdHeaderSliceLay⟩ () =
+          .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") () := by
+      have hSized : lmWdHeaderSliceLay.isSized = false := rfl
+      have hCls : lmWdDynHooks.classify () lmWdTyHeaderSlice = pure (.adt false) := rfl
+      have hCnt : lmWdHeaderSliceLay.fields.count = 2 := rfl
+      have h20 : ((2 : Nat) == 0) = false := rfl
+      have hOff : lmWdHeaderSliceLay.fields.offset (2 - 1) = .ok (Size.ofBytes 4) := rfl
+      have hFld : lmWdDynHooks.field () ⟨lmWdTyHeaderSlice, lmWdHeaderSliceLay⟩ (2 - 1) =
+          pure ⟨lmWdTySliceU32, lmWdSliceU32Lay⟩ := rfl
+      unfold DynamicLayout.sizeAndAlignFromMeta
+      simp only [hSized, Bool.false_eq_true, ↓reduceIte, hCls, hCnt, h20, hOff, hFld,
+        Except.mapError, bind, EStateM.bind, pure, EStateM.pure]
+      split
+      next a s1 hl => cases hl; simp [hTailErr]
+      next e s1 hl => cases hl
+    simp [hExec, h4]
+
+/-- `D1` **TRUE UNIVERSAL `Align8TailU16` law** (`#[repr(C)] struct Align8TailU16 { hdr: u64, tail: [u16] }`):
+for EVERY 64-bit `len` (not just `n < 32`!), vendored `sizeAndAlignFromMeta` (`.adt false` arm)
+computes the exact struct-alignment tail padding `size = align_to(8 + 2 * len, 8)`, `align = 8`
+when `align_to(8 + 2 * len, 8) ≤ isize::MAX`, `InvalidMeta(TooBig)` in the tail-padding overflow
+window, and `InvalidMeta(SliceTooBig)` when `2 * len > isize::MAX`. -/
+theorem lm_sizeAndAlign_align8TailU16 (n : Nat) (s : Scalar Provenance) (len : UInt64)
+    (hs : s.toTargetUsize (Size.fromBits lmLayout.pointerWidth.bits) = .ok len) :
+    lmRun (DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 2) (.metadata s)
+        ⟨lmWdTyAlign8TailU16, lmWdAlign8TailU16Lay⟩) =
+      if 2 * len.toNat ≤ lmIsizeMax then
+        if (8 + 2 * len.toNat + 7) / 8 * 8 ≤ lmIsizeMax then
+          .ok (some (Size.ofBytes (UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8)), ⟨3⟩))
+        else .error (.undefinedBehavior "InvalidMeta(TooBig)")
+      else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") := by
+  have hTail := lm_sizeAndAlign_sliceU16 n s len hs
+  have hAlignU16 : lmWdU16Lay.align.abi = ⟨1⟩ := rfl
+  have hTailRaw :
+      DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+          ⟨lmWdTySliceU16, lmWdSliceU16Lay⟩ () =
+        if 2 * len.toNat ≤ lmIsizeMax then
+          .ok (some (Size.ofBytes (UInt64.ofNat (2 * len.toNat)), ⟨1⟩)) ()
+        else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") () := by
+    unfold lmRun at hTail
+    rw [hAlignU16] at hTail
+    cases hr : DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+        ⟨lmWdTySliceU16, lmWdSliceU16Lay⟩ () with
+    | ok v u =>
+      cases u; rw [hr] at hTail
+      by_cases h2 : 2 * len.toNat ≤ lmIsizeMax
+      · simp only [h2, ↓reduceIte, Except.ok.injEq] at hTail; simp [h2, hTail]
+      · simp [h2] at hTail
+    | error e u =>
+      cases u; rw [hr] at hTail
+      by_cases h2 : 2 * len.toNat ≤ lmIsizeMax
+      · simp [h2] at hTail
+      · simp only [h2, ↓reduceIte, Except.error.injEq] at hTail; simp [h2, hTail]
+  have hAlignOff : Size.alignTo (Size.ofBytes 8) ⟨1⟩ = .ok (Size.ofBytes 8) := by decide
+  have hmax : lmWdMaxSize.bytes = 9223372036854775807 := rfl
+  unfold lmRun
+  by_cases h2 : 2 * len.toNat ≤ lmIsizeMax
+  · have hTailOk :
+        DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+            ⟨lmWdTySliceU16, lmWdSliceU16Lay⟩ () =
+          .ok (some (Size.ofBytes (UInt64.ofNat (2 * len.toNat)), ⟨1⟩)) () := by
+      simpa [h2] using hTailRaw
+    have h8lt : 8 + 2 * len.toNat + 7 < 2 ^ 64 := by unfold lmIsizeMax at h2; omega
+    have hAdd : Size.add (Size.ofBytes 8) (Size.ofBytes (UInt64.ofNat (2 * len.toNat))) =
+        .ok (Size.ofBytes (UInt64.ofNat (8 + 2 * len.toNat))) :=
+      size_add_ofNat_eq 8 (2 * len.toNat) (by omega)
+    have hAlignFull : Size.alignTo (Size.ofBytes (UInt64.ofNat (8 + 2 * len.toNat))) ⟨3⟩ =
+        .ok (Size.ofBytes (UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8))) :=
+      size_alignTo8_eq (8 + 2 * len.toNat) h8lt
+    have hExec :
+        DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 2) (.metadata s)
+            ⟨lmWdTyAlign8TailU16, lmWdAlign8TailU16Lay⟩ () =
+          if (Size.ofBytes (UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8))).bytes > lmWdMaxSize.bytes then
+            .error (.undefinedBehavior "InvalidMeta(TooBig)") ()
+          else .ok (some (Size.ofBytes (UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8)), ⟨3⟩)) () := by
+      have hSized : lmWdAlign8TailU16Lay.isSized = false := rfl
+      have hCls : lmWdDynHooks.classify () lmWdTyAlign8TailU16 = pure (.adt false) := rfl
+      have hCnt : lmWdAlign8TailU16Lay.fields.count = 2 := rfl
+      have h20 : ((2 : Nat) == 0) = false := rfl
+      have hOff : lmWdAlign8TailU16Lay.fields.offset (2 - 1) = .ok (Size.ofBytes 8) := rfl
+      have hFld : lmWdDynHooks.field () ⟨lmWdTyAlign8TailU16, lmWdAlign8TailU16Lay⟩ (2 - 1) =
+          pure ⟨lmWdTySliceU16, lmWdSliceU16Lay⟩ := rfl
+      have hPack : lmWdDynHooks.packedAlign () lmWdTyAlign8TailU16 = pure none := rfl
+      have hAbi : lmWdAlign8TailU16Lay.align.abi = ⟨3⟩ := rfl
+      unfold DynamicLayout.sizeAndAlignFromMeta
+      simp only [hSized, Bool.false_eq_true, ↓reduceIte, hCls, hCnt, h20, hOff, hFld, hPack, hAbi,
+        Except.mapError, bind, EStateM.bind, pure, EStateM.pure]
+      split
+      next a s1 hl =>
+        cases hl
+        rw [hTailOk]
+        simp only [EStateM.bind, EStateM.pure]
+        split
+        next adj s2 hl1 =>
+          unfold_dyn_priv at hl1; rw [hAlignOff] at hl1
+          simp only [Except.mapError, pure, EStateM.pure] at hl1; cases hl1
+          split
+          next sum1 s3 hl2 =>
+            unfold_dyn_priv at hl2; rw [hAdd] at hl2
+            simp only [Except.mapError, pure, EStateM.pure] at hl2; cases hl2
+            split
+            next fs s4 hl3 =>
+              unfold_dyn_priv at hl3
+              have hMax31 : Align.max ⟨3⟩ ⟨1⟩ = ⟨3⟩ := rfl
+              rw [hMax31, hAlignFull] at hl3
+              simp only [Except.mapError, pure, EStateM.pure] at hl3; cases hl3
+              split
+              next sum2 s5 hl4 =>
+                unfold_dyn_priv at hl4; rw [hAdd] at hl4
+                simp only [Except.mapError, pure, EStateM.pure] at hl4; cases hl4
+                split
+                next cs s6 hl5 =>
+                  unfold_dyn_priv at hl5; rw [hMax31, hAlignFull] at hl5
+                  simp only [Except.mapError, pure, EStateM.pure] at hl5; cases hl5
+                  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+                  by_cases hgt : (Size.ofBytes (UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8))).bytes >
+                      lmWdMaxSize.bytes
+                  · have hgt' : (Size.ofBytes (UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8))).bytes >
+                        lmWdDynHooks.maxSizeOfVal.bytes := hgt
+                    simp only [hgt, hgt', ↓reduceIte]; rfl
+                  · have hgt' : ¬ ((Size.ofBytes (UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8))).bytes >
+                        lmWdDynHooks.maxSizeOfVal.bytes) := hgt
+                    simp only [hgt, hgt', ↓reduceIte]; rfl
+                next e s6 hl5 =>
+                  unfold_dyn_priv at hl5; rw [hMax31, hAlignFull] at hl5
+                  simp only [Except.mapError, pure, EStateM.pure] at hl5; cases hl5
+              next e s5 hl4 =>
+                unfold_dyn_priv at hl4; rw [hAdd] at hl4
+                simp only [Except.mapError, pure, EStateM.pure] at hl4; cases hl4
+            next e s4 hl3 =>
+              unfold_dyn_priv at hl3
+              have hMax31 : Align.max ⟨3⟩ ⟨1⟩ = ⟨3⟩ := rfl
+              rw [hMax31, hAlignFull] at hl3
+              simp only [Except.mapError, pure, EStateM.pure] at hl3; cases hl3
+          next e s3 hl2 =>
+            unfold_dyn_priv at hl2; rw [hAdd] at hl2
+            simp only [Except.mapError, pure, EStateM.pure] at hl2; cases hl2
+        next e s2 hl1 =>
+          unfold_dyn_priv at hl1; rw [hAlignOff] at hl1
+          simp only [Except.mapError, pure, EStateM.pure] at hl1; cases hl1
+      next e s1 hl => cases hl
+    rw [hExec]
+    have hcmp : (9223372036854775807 : UInt64) < UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8) ↔
+        ¬ ((8 + 2 * len.toNat + 7) / 8 * 8 ≤ lmIsizeMax) := by
+      rw [UInt64.lt_iff_toNat_lt]; unfold lmIsizeMax; simp; omega
+    simp only [h2, ↓reduceIte, Size.ofBytes, hmax, gt_iff_lt]
+    by_cases hfull : (8 + 2 * len.toNat + 7) / 8 * 8 ≤ lmIsizeMax
+    · have hnot : ¬ ((9223372036854775807 : UInt64) < UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8)) :=
+        fun h => (hcmp.mp h) hfull
+      simp only [hfull, ↓reduceIte, hnot]
+    · have hgt : (9223372036854775807 : UInt64) < UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8) := hcmp.mpr hfull
+      simp only [hfull, ↓reduceIte, hgt]
+  · have hTailErr :
+        DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 1) (.metadata s)
+            ⟨lmWdTySliceU16, lmWdSliceU16Lay⟩ () =
+          .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") () := by
+      simpa [h2] using hTailRaw
+    have hExec :
+        DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 2) (.metadata s)
+            ⟨lmWdTyAlign8TailU16, lmWdAlign8TailU16Lay⟩ () =
+          .error (.undefinedBehavior "InvalidMeta(SliceTooBig)") () := by
+      have hSized : lmWdAlign8TailU16Lay.isSized = false := rfl
+      have hCls : lmWdDynHooks.classify () lmWdTyAlign8TailU16 = pure (.adt false) := rfl
+      have hCnt : lmWdAlign8TailU16Lay.fields.count = 2 := rfl
+      have h20 : ((2 : Nat) == 0) = false := rfl
+      have hOff : lmWdAlign8TailU16Lay.fields.offset (2 - 1) = .ok (Size.ofBytes 8) := rfl
+      have hFld : lmWdDynHooks.field () ⟨lmWdTyAlign8TailU16, lmWdAlign8TailU16Lay⟩ (2 - 1) =
+          pure ⟨lmWdTySliceU16, lmWdSliceU16Lay⟩ := rfl
+      unfold DynamicLayout.sizeAndAlignFromMeta
+      simp only [hSized, Bool.false_eq_true, ↓reduceIte, hCls, hCnt, h20, hOff, hFld,
+        Except.mapError, bind, EStateM.bind, pure, EStateM.pure]
+      split
+      next a s1 hl => cases hl; simp [hTailErr]
+      next e s1 hl => cases hl
+    simp [hExec, h2]
+
+end DynPrivUnfold
+
+/-- `D2` **universal `InitMask` uninit-byte query law**: every byte of a fresh uninitialized
+`InitMask` reads `false` via `InitMask.get`. -/
+theorem lm_initMask_uninit_get (size idx : Size) :
+    (InitMask.new size false).get idx = .ok false :=
+  InitMask.lazy_get size idx false
+
+/-- `D2` **universal `InitMask` uninit-range law**: every in-bounds range in a fresh uninitialized
+`InitMask` reports uninitialized (`isRangeInitialized = .ok (.error range)`). -/
+theorem lm_initMask_uninit_isRangeInitialized (size finish : Size) (range : AllocRange)
+    (hEnd : range.endExclusive = .ok finish) (hIn : finish.bytes ≤ size.bytes) :
+    (InitMask.new size false).isRangeInitialized range = .ok (.error range) :=
+  InitMask.lazy_uninitialized_query size range finish hEnd hIn
+
+/-- `D2` **universal `InitMask.applyCopy` uninit-preservation law**: applying a single-run
+uninitialized copy (`InitCopy ⟨false, #[n]⟩`, `n ≠ 0`, `noBytesInit = true`) over a full
+destination `InitMask` (even one that was previously initialized!) succeeds and leaves the
+destination lazily uninitialized (`InitMask.new finish false`), preserving uninit bytes without UB. -/
+theorem lm_initMask_applyCopy_uninit_preserves (size finish : Size) (oldState : Bool)
+    (range : AllocRange) (n : UInt64)
+    (hNonZero : n ≠ 0)
+    (hEnd : range.endExclusive = .ok finish)
+    (hStart : range.start.bytes = 0)
+    (hFull : size.bytes ≤ finish.bytes) :
+    (InitMask.new size oldState).applyCopy ⟨false, #[n]⟩ range 1 =
+      .ok (InitMask.new finish false) ∧
+    InitCopy.noBytesInit ⟨false, #[n]⟩ = true := by
+  have hMul : Size.mul range.size 1 = .ok range.size := by
+    have h1 : range.size.bytes * 1 = range.size.bytes := UInt64.mul_one _
+    have hd : range.size.bytes / 1 = range.size.bytes := UInt64.div_one
+    simp [Size.mul, h1, hd, Size.ofBytes]
+  have hEmpty : (#[n] : Array UInt64).isEmpty = false := rfl
+  have hSize : (#[n] : Array UInt64).size = 1 := rfl
+  have hNotAny : (#[n].any (fun a => a == 0) 0 1) = false := by
+    simp [hNonZero]
+  have hRangeEq : allocRange range.start range.size = range := by
+    cases range; rfl
+  refine ⟨?_, rfl⟩
+  unfold InitMask.applyCopy
+  simp only [hEmpty, Bool.false_or, hSize, Nat.le_refl, hMul, Except.mapError, bind, Except.bind,
+    hRangeEq, hNotAny, Bool.false_eq_true, ↓reduceIte]
+  exact InitMask.full_overwrite_stays_lazy size finish oldState false range hEnd hStart hFull
+
+/-- `D2` **universal `readScalar` UB law**: vendored `Allocation.readScalar` faults with `invalidUninitBytes` whenever the `InitMask` reports an uninitialized sub-range, for every allocation, layout, and range. -/
 theorem lm_readScalar_uninit_ub {Prov Extra : Type} [DecidableEq Prov] [PointerProvenance Prov]
     (a : Allocation Prov Extra) (layout : TargetDataLayout) (range : AllocRange) (rp : Bool)
     (bad : AllocRange) (h : a.initializationMask.isRangeInitialized range = .ok (.error bad)) :
@@ -1140,6 +1865,46 @@ theorem lm_dst_struct_isize_boundaries :
   refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 
+/-- `D1` companion: `ptr::metadata` (`Scalar.toTargetUsize` / `OpTy.len`) on a null/provenance-free
+wide raw pointer `(0, 77)` succeeds without dereferencing memory. -/
+theorem lm_null_dangling_ptr_metadata_ok :
+    (do
+      let m ← lmWdUsize 77
+      let base : OpTy Provenance :=
+        ⟨.indirect ⟨Pointer.withoutProvenance 0, .metadata m, none⟩,
+          ⟨lmWdTySliceU32, lmWdSliceU32Lay⟩⟩
+      let l ← (base.len (lmWdProjCx (lmInit false))).mapError .proj
+      pure l.toNat) = (.ok 77 : LmWdM Nat) := by
+  kernel_rfl
+
+/-- `D1` non-vacuity witness for `lm_sizeAndAlign_sized`: `u32` is sized (`4`, align `4`). -/
+theorem lm_sizeAndAlign_sized_u32_witness :
+    lmWdU32Lay.isSized = true ∧
+    lmRun (DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () 1 .none ⟨lmWdTyU32, lmWdU32Lay⟩) =
+      .ok (some (lmWdU32Lay.size, lmWdU32Lay.align.abi)) :=
+  ⟨rfl, by rw [lm_sizeAndAlign_sized lmWdDynHooks () 1 .none ⟨lmWdTyU32, lmWdU32Lay⟩ rfl]; rfl⟩
+
+/-- `D2` non-vacuity witness for `lm_readScalar_uninit_ub` and `lm_initMask_prepareCopy_lazy_uninit`:
+a fresh 4-byte uninitialized allocation reports `isRangeInitialized = .ok (.error range)` and
+`prepareCopy = .ok ⟨false, #[4]⟩` (`noBytesInit = true`), so `readScalar` faults with
+`invalidUninitBytes`. -/
+theorem lm_readScalar_uninit_witness :
+    let r : AllocRange := ⟨Size.ZERO, Size.ofBytes 4⟩
+    (InitMask.new (Size.ofBytes 4) false).prepareCopy r = .ok ⟨false, #[4]⟩ ∧
+    (InitMask.new (Size.ofBytes 4) false).isRangeInitialized r = .ok (.error r) := by
+  refine ⟨?_, ?_⟩ <;> decide +kernel
+
+/-- `D3` non-vacuity witness for `lm_ptrOffsetInbounds_eq_wrapping`: in-bounds `+4` on a live
+12-byte allocation succeeds and equals `wrappingSignedOffset`. -/
+theorem lm_ptrOffsetInbounds_ok_witness :
+    (do
+      let (p, st) ← lmWdArray false 100 200 300
+      let q ← lmWdInb st p 4
+      let q' ← lmWdWrap p 4
+      pure (decide (q = q'))) = (.ok true : LmWdM Bool) := by
+  rw [lmWdArrayU.eq_src, lmWdInbU.eq_src]
+  kernel_rfl
+
 /-- `D2` non-vacuity: the byte `2` is not a `bool` (vendored `Scalar.toBool`). -/
 theorem lm_scalar_two_not_bool :
     ((Scalar.fromUInt (Prov := Provenance) (BitVec.ofNat 128 2) (Size.ofBytes 1)).bind
@@ -1159,7 +1924,8 @@ end UniversalLaws
 /-! ## §4. Capstone -/
 
 /-- **Episode 1 LeanMiri capstone**: the 48-cell table, fail-closed range, exact mode
-sensitivity, and the universal `D1`–`D4` laws of the vendored definitions. -/
+sensitivity, and the universal `D1`–`D4` laws of the vendored definitions (including the
+universal `∀ len` trailing-slice DST struct laws and `InitMask.prepareCopy` uninit preservation). -/
 theorem ep1_lean_miri_widedst_maybeuninit_capstone :
     ((List.range lmWdCaseCount).map (lmWdObserve false) = lmWdExpectedBasic ∧
       (List.range lmWdCaseCount).map (lmWdObserve true) = lmWdExpectedTb) ∧
@@ -1174,6 +1940,26 @@ theorem ep1_lean_miri_widedst_maybeuninit_capstone :
         if 4 * len.toNat ≤ LeanMiriSpec.HeapAllocAndWidePtrLM.lmIsizeMax then
           .ok (some (Miri.ABI.Size.ofBytes (UInt64.ofNat (4 * len.toNat)), lmWdU32Lay.align.abi))
         else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)")) ∧
+    (∀ (n : Nat) (s : Miri.Memory.Scalar Miri.Memory.Provenance) (len : UInt64),
+      s.toTargetUsize (Miri.ABI.Size.fromBits LeanMiriSpec.HeapAllocAndWidePtrLM.lmLayout.pointerWidth.bits) = .ok len →
+      LeanMiriSpec.HeapAllocAndWidePtrLM.lmRun
+          (Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 2) (.metadata s)
+            ⟨lmWdTyHeaderSlice, lmWdHeaderSliceLay⟩) =
+        if 4 * len.toNat ≤ LeanMiriSpec.HeapAllocAndWidePtrLM.lmIsizeMax then
+          if 4 + 4 * len.toNat ≤ LeanMiriSpec.HeapAllocAndWidePtrLM.lmIsizeMax then
+            .ok (some (Miri.ABI.Size.ofBytes (UInt64.ofNat (4 + 4 * len.toNat)), ⟨2⟩))
+          else .error (.undefinedBehavior "InvalidMeta(TooBig)")
+        else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)")) ∧
+    (∀ (n : Nat) (s : Miri.Memory.Scalar Miri.Memory.Provenance) (len : UInt64),
+      s.toTargetUsize (Miri.ABI.Size.fromBits LeanMiriSpec.HeapAllocAndWidePtrLM.lmLayout.pointerWidth.bits) = .ok len →
+      LeanMiriSpec.HeapAllocAndWidePtrLM.lmRun
+          (Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta lmWdDynHooks () (n + 2) (.metadata s)
+            ⟨lmWdTyAlign8TailU16, lmWdAlign8TailU16Lay⟩) =
+        if 2 * len.toNat ≤ LeanMiriSpec.HeapAllocAndWidePtrLM.lmIsizeMax then
+          if (8 + 2 * len.toNat + 7) / 8 * 8 ≤ LeanMiriSpec.HeapAllocAndWidePtrLM.lmIsizeMax then
+            .ok (some (Miri.ABI.Size.ofBytes (UInt64.ofNat ((8 + 2 * len.toNat + 7) / 8 * 8)), ⟨3⟩))
+          else .error (.undefinedBehavior "InvalidMeta(TooBig)")
+        else .error (.undefinedBehavior "InvalidMeta(SliceTooBig)")) ∧
     (∀ (p : Miri.Memory.Pointer (Option Miri.Memory.Provenance)) (a b : Int64),
       (p.wrappingSignedOffset a LeanMiriSpec.HeapAllocAndWidePtrLM.lmPtrArith >>= fun q =>
           q.wrappingSignedOffset b LeanMiriSpec.HeapAllocAndWidePtrLM.lmPtrArith) =
@@ -1185,8 +1971,8 @@ theorem ep1_lean_miri_widedst_maybeuninit_capstone :
       lmWdRun (lmWdUnionCopyObs true 1 (some (1, 2))) = .okUninitPreserved 1 1 ∧
       lmWdObserve false 13 = .ub ∧ lmWdObserve true 13 = .ub) :=
   ⟨lmWdObserve_table, lmWdObserve_out_of_range, lmWdObserve_mode_sensitivity.2.2,
-   lm_sizeAndAlign_sliceU32, lm_wrapping_compose, lm_fnptr_range_contains_iff,
-   lm_case13_union_copy_of_invalid_bool_byte_ok⟩
+   lm_sizeAndAlign_sliceU32, lm_sizeAndAlign_headerSlice, lm_sizeAndAlign_align8TailU16,
+   lm_wrapping_compose, lm_fnptr_range_contains_iff, lm_case13_union_copy_of_invalid_bool_byte_ok⟩
 
 section AxiomAudit
 open Lean Elab Command
@@ -1202,9 +1988,13 @@ run_cmd do
   let bridgeReq : List (Lean.Name × Lean.Name) :=
     [ (ns ++ `lmWdObserve_table, `Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta),
       (ns ++ `lmWdObserve_table, `Miri.Interpreter.projectIndex),
+      (ns ++ `lmWdObserve_table, `Miri.Interpreter.projectField),
+      (ns ++ `lmWdObserve_table, `Miri.Interpreter.OpTy.transmute),
       (ns ++ `lmWdObserve_table, `Miri.Interpreter.OpTy.len),
       (ns ++ `lmWdObserve_table, `Miri.Interpreter.projectionMemoryOffset),
       (ns ++ `lmWdObserve_table, `Miri.Memory.Allocation.copy),
+      (ns ++ `lmWdObserve_table, `Miri.Memory.Allocation.writeScalar),
+      (ns ++ `lmWdObserve_table, `Miri.Memory.Allocation.readScalar),
       (ns ++ `lmWdObserve_table, `Miri.Memory.InitMask.get),
       (ns ++ `lmWdObserve_table, `Miri.Interpreter.ptrOffsetInbounds),
       (ns ++ `lmWdObserve_table, `Miri.Memory.Pointer.wrappingSignedOffset),
@@ -1214,6 +2004,8 @@ run_cmd do
       (ns ++ `lmWdObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmRetag),
       (ns ++ `lmWdObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmLoad),
       (ns ++ `lmWdObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmTreeAccess),
+      (ns ++ `lm_initMask_applyCopy_uninit_preserves, `Miri.Memory.InitMask.applyCopy),
+      (ns ++ `lm_readScalar_uninit_witness, `Miri.Memory.InitMask.prepareCopy),
       (ns ++ `lm_scalarMayBeNull_int, `Miri.Interpreter.ValidityMachine.scalarMayBeNull),
       (ns ++ `lm_readScalar_uninit_ub, `Miri.Memory.Allocation.readScalar) ]
   for (thm, req) in bridgeReq do

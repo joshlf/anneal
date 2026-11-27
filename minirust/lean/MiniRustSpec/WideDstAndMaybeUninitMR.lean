@@ -1009,6 +1009,31 @@ theorem mr_case13_union_copy_of_invalid_bool_byte_ok :
     mrWdObserve false 13 = .ub ∧ mrWdObserve true 13 = .ub := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
+/-- `D1` companion: `ptr::metadata` (`UnOp.GetMetadata`) on a null/provenance-free wide raw
+pointer `(0, 77)` succeeds in BOTH `Mach` and `MachTB` without dereferencing memory. -/
+def mrWdProgNullMeta : Program :=
+  wdProg [rawThinTy, mrWideRawTy, mrUsizeTy]
+    ([.Assign (wdLc 3) (.Constant (.PointerWithoutProvenance 0) rawThinTy),
+      .Assign (wdLc 4) (.UnOp (.Cast (.Transmute mrWideRawTy))
+        (.Tuple [wdLd 3, wdCUsize 77] mrPairTy)),
+      .Assign (wdLc 5) (.UnOp .GetMetadata (wdLd 4))] ++
+     wdFinish 0 (wdToU64 (wdLd 5)) (wdCU64 0))
+
+theorem mr_null_dangling_ptr_metadata_ok :
+    wdRun false mrWdProgNullMeta = .okScalar 77 ∧
+    wdRun true mrWdProgNullMeta = .okScalar 77 := by
+  constructor <;> kernel_rfl
+
+/-- Non-vacuity witness for `mrWdProg_tb_wfLive`: `mrWdProg19` boots cleanly on `MachTB`. -/
+theorem mr_wdProg19_boot_tb_ok :
+    ∃ m0 : MachTB,
+      bootProgramM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams) mrWdProg19 = .ok m0 := by
+  have hne : (bootProgramM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams) mrWdProg19).toBool = true := by
+    kernel_rfl
+  cases h : bootProgramM (M := TBM) ({ implicit_writes := true } : TreeBorrowsParams) mrWdProg19 with
+  | ok m0 => exact ⟨m0, rfl⟩
+  | error e => rw [h] at hne; cases hne
+
 end MiniRustPrograms
 
 /-! ## §4. Universal Laws of the Unmodified MiniRust Interpreter (`D1`–`D4`) -/
@@ -1080,6 +1105,79 @@ theorem mr_inBounds_signed_ptr (i : Int) :
   · rintro ⟨h1, h2⟩
     exact ⟨decide_eq_true (by omega), decide_eq_true (by omega)⟩
 
+private theorem ensureElseUb_true (msg : String) : ensureElseUb true msg = pure () := rfl
+private theorem ensureElseUb_false (msg : String) : ensureElseUb false msg = ub msg := rfl
+private theorem interp_bind_ok {α β : Type} (a : α) (f : α → Interp β) :
+    (pure a >>= f) = f a := rfl
+private theorem interp_bind_err {α β : Type} (e : Stop) (f : α → Interp β) :
+    ((Except.error e : Interp α) >>= f) = Except.error e := rfl
+
+/-- `D1` **universal `checkPtrM` `isize::MAX` overflow UB law**: for EVERY safe slice pointer
+(`&[T]`, `&mut [T]`, `Box<[T]>`) with in-bounds unsigned address and element count `n ≥ 0` whose
+total size exceeds `isize::MAX`, `checkPtrM` rejects with `"Value::Ptr: total size exeeds isize::MAX"`. -/
+theorem mr_checkPtrM_slice_isize_overflow_ub {M : Type} [Memory M] [MemoryOps M]
+    (tp : ThinPointer (Memory.Provenance M)) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (e : Size) (a : Align) (n : Int) (m : Option (Machine M))
+    (hAddr : inBounds tp.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hMetaKind : PtrType.meta_kind ptrTy = .ElementCount)
+    (hSafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hLay : pointee.layout = .Slice e a)
+    (hN0 : 0 ≤ n) (hNBound : inBounds n .Unsigned x86_64.PTR_SIZE = true)
+    (hBig : 9223372036854775807 < n * (e.bytes : Int)) :
+    checkPtrM ⟨tp, some (.ElementCount n)⟩ ptrTy m =
+      ub "Value::Ptr: total size exeeds isize::MAX" := by
+  have hSign : inBounds ((n * (e.bytes : Int)).toNat : Int) .Signed x86_64.PTR_SIZE = false :=
+    Bool.eq_false_iff.mpr fun h => by
+      have h' := (mr_inBounds_signed_ptr _).mp h
+      omega
+  have hRep : IntType.can_represent IntType.usize_ty n = true := by
+    rw [IntType.can_represent, IntType.usize_ty]
+    exact hNBound
+  have hMeta : checkPtrMetadataM (Provenance := Memory.Provenance M) (some (.ElementCount n))
+      .ElementCount (m.map (vtableFromPtrM ·)) = pure () := by
+    simp only [checkPtrMetadataM, hRep, ensureElseUb_true]
+  rw [checkPtrM.eq_def, hAddr, ensureElseUb_true, interp_bind_ok, hMetaKind, hMeta,
+    interp_bind_ok, hSafe]
+  dsimp only
+  rw [hLay, mr_compute_size_and_align_slice _ e a n hN0, interp_bind_ok]
+  dsimp only
+  rw [hSign, ensureElseUb_false]
+  exact interp_bind_err _ _
+
+/-- `D1` **universal `checkPtrM` trailing-slice DST `isize::MAX` overflow UB law**: for EVERY
+safe pointer to a trailing-slice struct (`Tuple head (.Slice e a)`) whose aligned total size
+exceeds `isize::MAX`, `checkPtrM` rejects with `"Value::Ptr: total size exeeds isize::MAX"`. -/
+theorem mr_checkPtrM_tuple_slice_isize_overflow_ub {M : Type} [Memory M] [MemoryOps M]
+    (tp : ThinPointer (Memory.Provenance M)) (ptrTy : PtrType) (pointee : PointeeInfo)
+    (head : TupleHeadLayout) (e : Size) (a : Align) (n : Int) (m : Option (Machine M))
+    (hAddr : inBounds tp.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hMetaKind : PtrType.meta_kind ptrTy = .ElementCount)
+    (hSafe : PtrType.safe_pointee ptrTy = some pointee)
+    (hLay : pointee.layout = .Tuple head (.Slice e a))
+    (hN0 : 0 ≤ n) (hNBound : inBounds n .Unsigned x86_64.PTR_SIZE = true)
+    (hBig : 9223372036854775807 <
+      (TupleHeadLayout.full_size_and_align head ⟨(n * (e.bytes : Int)).toNat⟩ a).1.bytes) :
+    checkPtrM ⟨tp, some (.ElementCount n)⟩ ptrTy m =
+      ub "Value::Ptr: total size exeeds isize::MAX" := by
+  have hSign :
+      inBounds ((TupleHeadLayout.full_size_and_align head ⟨(n * (e.bytes : Int)).toNat⟩ a).1.bytes : Int)
+        .Signed x86_64.PTR_SIZE = false :=
+    Bool.eq_false_iff.mpr fun h => by
+      have h' := (mr_inBounds_signed_ptr _).mp h
+      omega
+  have hRep : IntType.can_represent IntType.usize_ty n = true := by
+    rw [IntType.can_represent, IntType.usize_ty]
+    exact hNBound
+  have hMeta : checkPtrMetadataM (Provenance := Memory.Provenance M) (some (.ElementCount n))
+      .ElementCount (m.map (vtableFromPtrM ·)) = pure () := by
+    simp only [checkPtrMetadataM, hRep, ensureElseUb_true]
+  rw [checkPtrM.eq_def, hAddr, ensureElseUb_true, interp_bind_ok, hMetaKind, hMeta,
+    interp_bind_ok, hSafe]
+  dsimp only
+  rw [hLay, mr_compute_size_and_align_tuple_slice _ head e a n hN0, interp_bind_ok]
+  rw [hSign, ensureElseUb_false]
+  exact interp_bind_err _ _
+
 /-- `D3` **universal multi-step composition law** of wrapping pointer offsets (every provenance type). -/
 theorem mr_ptrOffsetWrappingM_compose {P : Type} (ptr : ThinPointer P) (a b : Int) :
     ptrOffsetWrappingM (ptrOffsetWrappingM ptr a) b = ptrOffsetWrappingM ptr (a + b) := by
@@ -1087,6 +1185,59 @@ theorem mr_ptrOffsetWrappingM_compose {P : Type} (ptr : ThinPointer P) (a b : In
   | mk addr prov =>
     simp [ptrOffsetWrappingM, ThinPointer.wrapping_offsetM, bringInBounds, Size.bits, x86_64.PTR_SIZE]
     rw [Int.add_assoc]
+
+/-- `D3` **universal `ptrOffsetInboundsM` coincidence law**: whenever in-bounds pointer offset
+succeeds on `Mach` or `MachTB`, the result equals `ptrOffsetWrappingM ptr offset` (with exact
+signed offset and unsigned address bounds). -/
+theorem mr_ptrOffsetInboundsM_ok_eq_wrapping {M : Type} [Memory M] [MemoryOps M]
+    (m : Machine M) (ptr q : ThinPointer (Memory.Provenance M)) (offset : Int)
+    (h : ptrOffsetInboundsM m ptr offset = .ok q) :
+    q = { ptr with addr := ptr.addr + offset } ∧
+    q = ptrOffsetWrappingM ptr offset ∧
+    inBounds offset .Signed x86_64.PTR_SIZE = true ∧
+    inBounds (ptr.addr + offset) .Unsigned x86_64.PTR_SIZE = true := by
+  unfold ptrOffsetInboundsM at h
+  cases hd : ConcurrentMemory.signed_dereferenceable m.mem ptr offset with
+  | error e => simp [hd, bind, Except.bind] at h
+  | ok u =>
+    cases u
+    simp only [hd, bind, Except.bind] at h
+    cases ho : inBounds offset .Signed x86_64.PTR_SIZE with
+    | false => simp [ho, specPanic] at h
+    | true =>
+      cases ha : inBounds (ptr.addr + offset) .Unsigned x86_64.PTR_SIZE with
+      | false => simp [ho, ha, specPanic] at h
+      | true =>
+        simp only [ho, ha, Bool.not_true, Bool.false_eq_true, ↓reduceIte, pure, Except.pure,
+          Except.ok.injEq] at h
+        have hWrap : ptrOffsetWrappingM ptr offset = { ptr with addr := ptr.addr + offset } := by
+          simp only [inBounds, Size.bits, x86_64.PTR_SIZE, Bool.and_eq_true] at ha
+          have h1 := of_decide_eq_true ha.1
+          have h2 := of_decide_eq_true ha.2
+          cases ptr with
+          | mk addr prov =>
+            simp only [ptrOffsetWrappingM, ThinPointer.wrapping_offsetM, bringInBounds, Size.bits,
+              x86_64.PTR_SIZE]
+            congr 1
+            exact Int.emod_eq_of_lt h1 h2
+        exact ⟨h.symm, h.symm.trans hWrap.symm, rfl, rfl⟩
+
+/-- `D3` **universal `ptrOffsetInboundsM` OOB UB law**: any UB from `signed_dereferenceable`
+propagates directly out of `ptrOffsetInboundsM`. -/
+theorem mr_ptrOffsetInboundsM_oob_ub {M : Type} [Memory M] [MemoryOps M]
+    (m : Machine M) (ptr : ThinPointer (Memory.Provenance M)) (offset : Int) (msg : String)
+    (h : ConcurrentMemory.signed_dereferenceable m.mem ptr offset = .error (.ub msg)) :
+    ptrOffsetInboundsM m ptr offset = .error (.ub msg) := by
+  simp [ptrOffsetInboundsM, h, bind, Except.bind]
+
+/-- `D3` **universal `evalPtrOffsetM` multi-step wrapping composition**: two wrapping `PtrOffset`
+operations compose to a single wrapping `PtrOffset` by `a + b`, preserving the left pointer type. -/
+theorem mr_evalPtrOffsetM_wrapping_compose {M : Type} [Memory M] [MemoryOps M]
+    (m : Machine M) (ptr : ThinPointer (Memory.Provenance M)) (lTy rTy : «Type») (a b : Int) :
+    (evalPtrOffsetM m false (.Ptr ⟨ptr, none⟩, lTy) (.Int a, rTy) >>= fun mid =>
+      evalPtrOffsetM m false mid (.Int b, rTy)) =
+      evalPtrOffsetM m false (.Ptr ⟨ptr, none⟩, lTy) (.Int (a + b), rTy) := by
+  simp [evalPtrOffsetM, ThinPointer.widen, mr_ptrOffsetWrappingM_compose]
 
 /-- `D4` **pre-`#300` pin delta**: pinned `d821c6e3` `checkPtr` ACCEPTS the null pointer at `PtrType.FnPtr` (with or without a machine). -/
 theorem mr_checkPtr_null_fnptr_ok (m : Option Mach) :
@@ -1140,6 +1291,11 @@ theorem mr_decodeM_bool_invalid {M : Type} [Memory M] [MemoryOps M] (b : UInt8) 
   simp only [Type.decodeM, List.length_singleton, ne_eq, not_true_eq_false, ↓reduceIte]
   split <;> simp_all
 
+/-- `D2`: decoding an uninitialized byte at `bool` yields no value (an invalid load). -/
+theorem mr_decodeM_bool_uninit {M : Type} [Memory M] [MemoryOps M] :
+    Type.decodeM (M := M) .Bool [.Uninit] = pure none := by
+  simp [Type.decodeM]
+
 /-- `D2` **universal uninit-preserving union decode**: a single-chunk union decodes EVERY byte list of its size verbatim (uninitialized bytes, invalid bytes, provenance), on every memory model. -/
 theorem mr_decodeM_union_single_chunk {M : Type} [Memory M] [MemoryOps M]
     (fs : List (Offset × «Type»)) (n : Nat) (al : Align)
@@ -1148,6 +1304,28 @@ theorem mr_decodeM_union_single_chunk {M : Type} [Memory M] [MemoryOps M]
   subst h
   simp [Type.decodeM, subsliceWithLength]
 
+/-- `D2` **universal uninit-preserving union encode**: encoding a single-chunk union restores the
+exact byte list (preserving `.Uninit`, invalid `bool` bytes, and provenance). -/
+theorem mr_encodeM_union_single_chunk {M : Type} [Memory M] [MemoryOps M]
+    (fs : List (Offset × «Type»)) (n : Nat) (al : Align)
+    (bytes : List (AbstractByte (Memory.Provenance M))) (h : bytes.length = n) :
+    Type.encodeM (M := M) (.Union fs [(⟨0⟩, ⟨n⟩)] ⟨n⟩ al) (.Union [bytes]) = pure bytes := by
+  subst h
+  simp [Type.encodeM, Type.encodeUnionChunksM, writeSubsliceAtIndex]
+
+/-- `D2` **universal `Type.Union` decode → encode round-trip**: decoding and re-encoding any byte
+sequence of length `n` through a single-chunk union is the identity, preserving uninitialized bytes
+and invalid-bit payloads without UB. -/
+theorem mr_union_single_chunk_decode_encode_roundtrip {M : Type} [Memory M] [MemoryOps M]
+    (fs : List (Offset × «Type»)) (n : Nat) (al : Align)
+    (bytes : List (AbstractByte (Memory.Provenance M))) (h : bytes.length = n) :
+    (do
+      match ← Type.decodeM (M := M) (.Union fs [(⟨0⟩, ⟨n⟩)] ⟨n⟩ al) bytes with
+      | some v => Type.encodeM (M := M) (.Union fs [(⟨0⟩, ⟨n⟩)] ⟨n⟩ al) v
+      | none => ub "unexpected union decode failure") = pure bytes := by
+  rw [mr_decodeM_union_single_chunk fs n al bytes h]
+  exact mr_encodeM_union_single_chunk fs n al bytes h
+
 /-- `D2` **universal read-time UB law**: decoding bytes with any uninitialized byte at an integer type yields no value (an invalid load), on every memory model. -/
 theorem mr_decodeM_int_uninit_none {M : Type} [Memory M] [MemoryOps M] (t : IntType)
     (bytes : List (AbstractByte (Memory.Provenance M))) (hl : bytes.length = t.size.bytes)
@@ -1155,6 +1333,30 @@ theorem mr_decodeM_int_uninit_none {M : Type} [Memory M] [MemoryOps M] (t : IntT
     Type.decodeM (M := M) (.Int t) bytes = pure none := by
   cases t
   simp_all [Type.decodeM, Type.decodeIntM]
+
+/-- `D2` non-vacuity witness for `mr_decodeM_int_uninit_none`: 4 uninitialized bytes fail `u32` decode. -/
+theorem mr_decodeM_u32_uninit_witness :
+    (List.replicate 4 (.Uninit : AbstractByte Prov)).length = (⟨.Unsigned, ⟨4⟩⟩ : IntType).size.bytes ∧
+    (List.replicate 4 (.Uninit : AbstractByte Prov)).mapM AbstractByte.dataM = none ∧
+    Type.decodeM (M := BM) (.Int ⟨.Unsigned, ⟨4⟩⟩) (List.replicate 4 .Uninit) = pure none :=
+  ⟨rfl, rfl, mr_decodeM_int_uninit_none (M := BM) ⟨.Unsigned, ⟨4⟩⟩ _ rfl rfl⟩
+
+/-- `D3` non-vacuity witness for `mr_ptrOffsetInboundsM_oob_ub`: offsetting a provenance-free
+pointer by `100` fails `signed_dereferenceable` with UB, propagating directly through
+`ptrOffsetInboundsM`. -/
+theorem mr_ptrOffsetInboundsM_oob_witness :
+    ∃ m0 : Mach,
+      MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM (M := BM) () mrWdProg16 = .ok m0 ∧
+      ptrOffsetInboundsM m0 ⟨0, none⟩ 100 =
+        .error (.ub "dereferencing pointer without provenance") := by
+  have hok : (MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM (M := BM) () mrWdProg16).toBool = true := by
+    kernel_rfl
+  cases h : MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM (M := BM) () mrWdProg16 with
+  | ok m0 =>
+    refine ⟨m0, rfl, mr_ptrOffsetInboundsM_oob_ub m0 ⟨0, none⟩ 100 _ ?_⟩
+    simp [ConcurrentMemory.signed_dereferenceable, MemoryOps.signed_dereferenceable,
+      BM.signed_dereferenceable, BM.dereferenceable, BM.check_ptr, ub]
+  | error e => rw [h] at hok; cases hok
 
 
 /-- **`minirust#300` flip canary**: this theorem holds exactly while the pin predates upstream
@@ -1233,7 +1435,10 @@ run_cmd do
       (ns ++ `mr_header_slice_full_size, `MiniRustSpec.Interp.TupleHeadLayout.full_size_and_align),
       (ns ++ `mr_checkPtr_null_fnptr_ok, `MiniRustSpec.Interp.checkPtr),
       (ns ++ `mr_ptrOffsetWrappingM_compose, `MiniRustSpec.Interp.ptrOffsetWrappingM),
-      (ns ++ `mr_decodeM_union_single_chunk, `MiniRustSpec.Interp.Type.decodeM) ]
+      (ns ++ `mr_ptrOffsetInboundsM_ok_eq_wrapping, `MiniRustSpec.Interp.ptrOffsetInboundsM),
+      (ns ++ `mr_evalPtrOffsetM_wrapping_compose, `MiniRustSpec.Interp.evalPtrOffsetM),
+      (ns ++ `mr_decodeM_union_single_chunk, `MiniRustSpec.Interp.Type.decodeM),
+      (ns ++ `mr_encodeM_union_single_chunk, `MiniRustSpec.Interp.Type.encodeM) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
     let mut seen : NameSet := {}
