@@ -47,6 +47,14 @@ closes every finite certificate by kernel evaluation of small table lookups.
   Episode 1 post-`#300` emulation predicate `checkPtrFnNonNullM`, applied at observation time.
 * `outOfRange` (`idx ≥ 24`): all three authorities fail closed (`.unsupported`).
 
+Beyond the verdict-level bundles, the module proves:
+* observer-level (raw `MrWdObs`) agreement for any certified authority whose translation factors
+  through `wdVerdictOf` (`observer_level_three_way`, `observer_level_exact_all_nat`);
+* the machine-level provenance of the `#300` delta (`dual_minirust300_machine_level_pin_delta`);
+* per-half pinning of the two-query case `2` (`dual_case2_two_query_halves_agree`);
+* the identities `runToStopM` = `stepsM` / `stepsTB` / `steps` (no shadow MiniRust driver);
+* a root-side non-vacuity witness for every hypothesis of the capstone.
+
 Strict import isolation: imports `Anneal.DualCorrespondenceBundle`,
 `Anneal.Mir.DropBinderAndSubtypeBundle` (authority-agnostic `Corpus` layer), and
 `MiniRustSpec.WideDstAndMaybeUninitMR` only; zero `Miri.*` / `LeanMiriSpec.*` modules (checked by

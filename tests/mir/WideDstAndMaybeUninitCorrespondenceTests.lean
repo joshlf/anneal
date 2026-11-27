@@ -28,10 +28,19 @@ import MiniRustSpec.WideDstAndMaybeUninitMR
    `LmWdObs.rec.{1}`, zero mocks), kernel-evaluates its 48-cell certificate on the loop-unrolled
    twin `lmWdObserveU` and transports it along `lmWdObserveU.eq_src`, discharges fail-closedness
    from `lmWdObserve_out_of_range`, and closes the unified + 4 per-domain bundles, all lifted
-   theorems, projections, and the Episode 2 capstone; locks every shared `CapturedMir` fixture by
-   `Eq.refl`; verifies ≥ 10 forged controls are REJECTED by the kernel (each paired with an
-   accepted honest twin where meaningful); and checks transitive reachability of Trusted,
-   MiniRust, and vendored Miri.
+   theorems, projections, and the Episode 2 capstone. It also:
+   - locks all 39 shared `section Fixtures` definitions (layouts, builders, every `CapturedMir`,
+     and the case count) by `Eq.refl`;
+   - proves translation fidelity: `lmWdToVerdict = wdVerdictOf ∘ lmToMr`, with `lmToMr` /
+     `mrToLm` a constructor bijection, and locks the root-transcribed frozen LeanMiri tables to
+     `lmWdExpected*`;
+   - transports the side certificates kernel-evaluated on the twin onto the real authority as
+     five direct bundles, each `Eq.refl` to its derived bundle;
+   - closes observer-level (raw `MrWdObs`) 3-way agreement over `lmWdObserve`, the machine-level
+     `#300` pin delta, case-2 two-query anti-masking, and 3-engine UB root-cause alignment;
+   - verifies that EVERY forged control is REJECTED by the kernel while its paired honest twin is
+     ACCEPTED (`twins = rejected`);
+   - checks transitive reachability of Trusted, MiniRust, and vendored Miri.
 3. **§3 Audits**: constructive (`[propext, Quot.sound]`) purity of the Episode 2 combinators,
    standard-3-axiom purity of this module, and auditor self-tests.
 -/
