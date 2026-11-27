@@ -91,7 +91,6 @@ arguments by `Terminator::Call` and left by `Terminator::Return`.
   and `FnMut` closures and passes the address `1` without provenance as the
   environment; MiniRust's function of arity `N` has no environment at all. The
   observable results agree because a non-capturing body never reads `_1`.
-
 * **Pointer and `usize`/`u64` ABI divergences (characterized & kernel-witnessed
   by `cf_ptr_and_usize_abi_divergence_witness`).** For fixed-width integers
   (`i8..i128`, `u8..u128`) and `bool`, `Trusted` (`rigidTyMatchesCalleeDecl`)
@@ -112,6 +111,20 @@ arguments by `Terminator::Call` and left by `Terminator::Return`.
   MiniRust-side ABI rejection as a premise, while
   `closure_fixedInt_sig_call_correspondence_M` derives it directly through
   `cfTranslateAbiTy`.
+  Classification: Rust's documented function-pointer ABI-compatibility rules
+  (the "ABI compatibility" section of the `fn` primitive type documentation)
+  treat thin pointers to sized types, and `usize` / the unsigned integer of the
+  same width, as ABI-compatible, so these `Trusted` faults are *false-positive*
+  UB (the difftest class `false_positive_ub` of the reproducer): sound for
+  proving UB-freedom, but incomplete. The check is not closure-specific: it is
+  `calleeLocalDeclsCompatible`, shared by `checkFnPtrTargetCompatible` (`fn`
+  items) and `closureCalleeDeclsCompatible` (closure bodies), plus the
+  `rigidTyListEq` signature comparison of `fnEntryCompatibleWithCallSite`
+  (`cf_abi_divergence_not_closure_specific_witness` shows the same `.ub` for a
+  non-closure `fn` item). Episode 2 keeps the Episode 1 TCB frozen (only soundness defects may change
+  it) and records this as a follow-up divergence; unlike the reproducer, this
+  gap IS caught by the dual-authority correspondence (vendored Miri accepts the same
+  transmutations, `LeanMiriSpec.ClosureFnPtrLM`).
 
 ## Why the earlier correspondence did not catch the reproducer
 
@@ -3939,6 +3952,48 @@ theorem cf_ptr_and_usize_abi_divergence_witness :
    by decide +kernel, by decide +kernel, rfl, rfl,
    cfMrAgrees_of_decide (by decide +kernel) (by decide +kernel)⟩
 
+/-- Non-closure `fn` item `fn(_1 : u64) -> u32 { 77 }` (no environment parameter). -/
+def cfUsizeAbiFnItemPath : String := "cf::usize_abi_fn_item"
+def cfUsizeAbiFnItemBody : CapturedMir :=
+  { cfUsizeAbiClosBody with
+    defPath := cfUsizeAbiFnItemPath, argCount := 1,
+    localDecls := [cfDecl cfU32K 0, cfDecl (.uint .u64) 3] }
+
+/-- Non-closure `fn` item `fn(_1 : *const u32) -> u32 { 77 }` (no environment parameter). -/
+def cfPtrAbiFnItemPath : String := "cf::ptr_abi_fn_item"
+def cfPtrAbiFnItemBody : CapturedMir :=
+  { cfPtrAbiClosBody with
+    defPath := cfPtrAbiFnItemPath, argCount := 1,
+    localDecls := [cfDecl cfU32K 0, cfDecl (.rawPtr .not cfU32K) 1] }
+
+/-- **The pointer / `usize` ABI divergence is not closure-specific.** The same
+`.ub` arises for an indirect call through a pointer to an ordinary (non-closure)
+`fn` item, whose dispatch goes through `checkFnPtrTargetCompatible` rather than
+the closure path: with positive controls (`fn(u64)` / `fn(*const u32)` pointers
+run to `77`), a `usize` argument for a `u64` parameter and a `*const u64`
+argument for a `*const u32` parameter are `.ub` in `Trusted` — the same
+false-positive UB that `cf_ptr_and_usize_abi_divergence_witness` exhibits for
+closure bodies, where MiniRust accepts. -/
+theorem cf_abi_divergence_not_closure_specific_witness :
+    cfShapeTag (calleeOwnClosureShape? cfUsizeAbiFnItemBody) = 0 ∧
+    cfShapeTag (calleeOwnClosureShape? cfPtrAbiFnItemBody) = 0 ∧
+    cfRun (cfAbiDivCaller (.fnPtr [.uint .u64] cfU32K .safe .rust) (.uint .u64) 3) 16
+      (cfInitPtrs (cfAbiDivCaller (.fnPtr [.uint .u64] cfU32K .safe .rust) (.uint .u64) 3) [cfFnPtrVal, .scalar ⟨5, 8⟩]
+        [cfUsizeAbiFnItemBody] [cfEntry cfUsizeAbiFnItemPath (.fnPtr [.uint .u64] cfU32K .safe .rust)]) = .scalar 77 4 ∧
+    cfRun (cfAbiDivCaller (.fnPtr [.uint .usize] cfU32K .safe .rust) (.uint .usize) 3) 16
+      (cfInitPtrs (cfAbiDivCaller (.fnPtr [.uint .usize] cfU32K .safe .rust) (.uint .usize) 3) [cfFnPtrVal, .scalar ⟨5, 8⟩]
+        [cfUsizeAbiFnItemBody] [cfEntry cfUsizeAbiFnItemPath (.fnPtr [.uint .usize] cfU32K .safe .rust)]) = .ub ∧
+    cfRun (cfAbiDivCaller (.fnPtr [.rawPtr .not cfU32K] cfU32K .safe .rust) (.rawPtr .not cfU32K) 1) 16
+      (cfInitPtrs (cfAbiDivCaller (.fnPtr [.rawPtr .not cfU32K] cfU32K .safe .rust) (.rawPtr .not cfU32K) 1)
+        [cfFnPtrVal, .scalar ⟨0, 8⟩] [cfPtrAbiFnItemBody]
+        [cfEntry cfPtrAbiFnItemPath (.fnPtr [.rawPtr .not cfU32K] cfU32K .safe .rust)]) = .scalar 77 4 ∧
+    cfRun (cfAbiDivCaller (.fnPtr [.rawPtr .not (.uint .u64)] cfU32K .safe .rust) (.rawPtr .not (.uint .u64)) 1) 16
+      (cfInitPtrs (cfAbiDivCaller (.fnPtr [.rawPtr .not (.uint .u64)] cfU32K .safe .rust) (.rawPtr .not (.uint .u64)) 1)
+        [cfFnPtrVal, .scalar ⟨0, 8⟩] [cfPtrAbiFnItemBody]
+        [cfEntry cfPtrAbiFnItemPath (.fnPtr [.rawPtr .not (.uint .u64)] cfU32K .safe .rust)]) = .ub :=
+  ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+   by decide +kernel⟩
+
 /-! ## §6. Exhaustive Axiom, Import-Isolation, & `Classical.choice`-Free Audit -/
 
 section AxiomAudit
@@ -4011,7 +4066,7 @@ elab "#assert_closure_fn_ptr_mr_audit" : command => do
     ``closure_typed_sig_instances_mach_and_tb,
     ``closure_fixedInt_sig_instances_mach_and_tb,
     ``closure_forged_and_tailCall_law_instances_mach_and_tb,
-    ``cf_ptr_and_usize_abi_divergence_witness ]
+    ``cf_ptr_and_usize_abi_divergence_witness, ``cf_abi_divergence_not_closure_specific_witness ]
   for c in headline do
     match env.find? c with
     | some (.thmInfo _) => pure ()

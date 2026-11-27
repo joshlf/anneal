@@ -19184,6 +19184,7 @@ verbatim `rustc-capture` bodies (including the `9147` difftest reproducer). -/
   MiniRustSpec.ClosureFnPtrMR.closure_fixedInt_sig_instances_mach_and_tb
   MiniRustSpec.ClosureFnPtrMR.closure_forged_and_tailCall_law_instances_mach_and_tb
   MiniRustSpec.ClosureFnPtrMR.cf_ptr_and_usize_abi_divergence_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_abi_divergence_not_closure_specific_witness
 
 #assert_minirustspec_import_isolation
 

@@ -203,6 +203,18 @@ and frames are pushed and popped by the vendored `Stack` operations.
   `*const u32` closure) and accepts `usize` for `u64` on 64-bit `x86_64`.
   `Trusted` therefore fails closed with `.ub` on both transmutations while
   vendored `Step.step` runs to completion (`77 : u32`), matching `MiniRustSpec`.
+  Classification: Rust's documented function-pointer ABI-compatibility rules
+  (the "ABI compatibility" section of the `fn` primitive type documentation)
+  treat thin pointers to sized types, and `usize` / the unsigned integer of the
+  same width, as ABI-compatible, so these `Trusted` faults are *false-positive*
+  UB (the difftest class `false_positive_ub` of the reproducer): sound for
+  proving UB-freedom, but incomplete. The check is not closure-specific: it is
+  `calleeLocalDeclsCompatible`, shared by `checkFnPtrTargetCompatible` (`fn`
+  items) and `closureCalleeDeclsCompatible` (closure bodies), plus the
+  `rigidTyListEq` signature comparison of `fnEntryCompatibleWithCallSite`.
+  Episode 2 keeps the Episode 1 TCB frozen (only soundness defects may change
+  it) and records this as a follow-up divergence; unlike the reproducer, this
+  gap IS caught by the dual-authority correspondence.
 * **Root unwinding.** Unwinding out of the root frame is UB in Miri
   ("unwinding past the topmost stack frame") and `.panic` in `Trusted`.
 
