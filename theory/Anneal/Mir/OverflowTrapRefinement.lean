@@ -31,7 +31,8 @@ Formalizes asymmetric `Trap`-vs-`UB` refinement directly over
 2. **Multi-Step `stepMirState` Runner & Coinductive `mirCallTree` / `WeakRef` Bridge**:
    `runMirSteps` steps `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirState` with fuel
    monotonicity and exact soundness bridges to `mirTree`, `mirCallTree`, `TauStar`,
-   `FaultNow`, `Eutt`, `Anneal.ITree.WeakRef`, and `Trusted.ITree.ITree.toPartial`.
+   `FaultNow`, `Eutt`, `Anneal.ITree.WeakRef`, and `Trusted.ITree.ITree.toPartial`, including an
+   exact characterization of EVERY `.faulted fk` runner result (`runMirSteps_faulted_to_tauStar`).
 3. **Exact `stepMirState` Checked-vs-Unchecked Arithmetic Refinement**:
    Parametric `CapturedMir` bodies for all `u : UintTy`, all three unsigned operations
    (`add`, `sub`, `mul`), and both `-C panic=abort` (`UnwindAction.terminate`) and
@@ -41,6 +42,10 @@ Formalizes asymmetric `Trap`-vs-`UB` refinement directly over
    - **One-`rfl` `Anneal.FarkasMirCert` panic-preserving elimination** for `add`, `sub`
      (both range-hypothesized and fully certified), `mul_const` (left and right), and a
      composite multi-statement `add_scaled` (`a + k * b`) body.
+   - **Fuel-independence & non-vacuity**: every canonical run classifies to a
+     non-`.unsupported` outcome under its own panic strategy for ALL inputs (so no refinement
+     verdict ever comes from fuel truncation, an unmodeled construct, or a strategy-mismatched
+     trap), and every verdict holds verbatim at any larger fuel.
 4. **Explicit Non-Vacuous Negative Soundness Suite**:
    Constructive disproofs of every forbidden refinement edge and concrete `stepMirState`
    overflowing/underflowing counterexamples for `add`, `sub`, `mul`, `add_scaled`, and
@@ -680,6 +685,92 @@ theorem runMirSteps_ub_to_tauStar (body : CapturedMir) :
             funext o
             exact PEmpty.elim o
         | inr _ => nomatch h
+
+/-- Exact `TauStar` characterization of EVERY `.faulted fk` result of `runMirSteps`
+(generalizing `runMirSteps_ub_to_tauStar`): `mirExecTree body st` reduces via silent `.tau`s
+to a node `u` that is either
+- the genuine fail node `.vis (.inl (.fail fk)) PEmpty.elim` emitted by `stepMirState`, or
+- (only when `fk = .unsupported`) a non-fault observation/call request `.vis (.inr e) k`
+  that the fuel-bounded runner conservatively refuses to model, or
+- (only when `fk = .outOfFuel`) a still-running state that the runner truncated.
+So `runMirSteps` never fabricates a fault: every runner-introduced fault kind is
+precisely accounted for. -/
+theorem runMirSteps_faulted_to_tauStar (body : CapturedMir) :
+    ∀ (fuel : Nat) (st : MirExecState) (fk : FailureKind),
+      runMirSteps body fuel st = .faulted fk →
+      ∃ u : ITree MirEffect MirOutcome,
+        TauStar (mirExecTree body st) u ∧
+        (u.observe = .vis (.inl (.fail fk)) PEmpty.elim ∨
+         (fk = .unsupported ∧ ∃ e k, u.observe = .vis (.inr e) k) ∨
+         (fk = .outOfFuel ∧ ∃ s, u = mirExecTree body (.running s)))
+  | 0, st, fk, h => by
+    cases st with
+    | running s =>
+      dsimp only [runMirSteps] at h
+      injection h with hfk
+      subst hfk
+      exact ⟨mirExecTree body (.running s), .refl _, .inr (.inr ⟨rfl, s, rfl⟩)⟩
+    | halted _ => nomatch h
+    | faulted fk' =>
+      dsimp only [runMirSteps] at h
+      injection h with hfk
+      subst hfk
+      refine ⟨mirExecTree body (.faulted fk'), .refl _, .inl ?_⟩
+      unfold mirExecTree
+      rw [ITree.observe_cofix]
+      dsimp only [stepMirState, MirStepNode.fail, ITreeF.map]
+      congr
+      funext o
+      exact PEmpty.elim o
+  | fuel + 1, st, fk, h => by
+    cases st with
+    | halted _ => nomatch h
+    | faulted fk' =>
+      dsimp only [runMirSteps] at h
+      injection h with hfk
+      subst hfk
+      refine ⟨mirExecTree body (.faulted fk'), .refl _, .inl ?_⟩
+      unfold mirExecTree
+      rw [ITree.observe_cofix]
+      dsimp only [stepMirState, MirStepNode.fail, ITreeF.map]
+      congr
+      funext o
+      exact PEmpty.elim o
+    | running s =>
+      dsimp only [runMirSteps] at h
+      cases hStep : stepMirState body (.running s) with
+      | ret _ => rw [hStep] at h; nomatch h
+      | tau next =>
+        rw [hStep] at h
+        have ⟨u, hTau, hObs⟩ := runMirSteps_faulted_to_tauStar body fuel next fk h
+        have hStepObs : (mirExecTree body (.running s)).observe = .tau (mirExecTree body next) := by
+          unfold mirExecTree
+          rw [ITree.observe_cofix, hStep]
+          rfl
+        exact ⟨u, .step hStepObs hTau, hObs⟩
+      | vis i k =>
+        rw [hStep] at h
+        cases i with
+        | inl req =>
+          cases req with
+          | fail fk' =>
+            injection h with hfk
+            subst hfk
+            refine ⟨mirExecTree body (.running s), .refl _, .inl ?_⟩
+            unfold mirExecTree
+            rw [ITree.observe_cofix, hStep]
+            dsimp only [ITreeF.map]
+            congr
+            funext o
+            exact PEmpty.elim o
+        | inr e =>
+          injection h with hfk
+          subst hfk
+          refine ⟨mirExecTree body (.running s), .refl _,
+            .inr (.inl ⟨rfl, e, fun x => mirExecTree body (k x), ?_⟩)⟩
+          unfold mirExecTree
+          rw [ITree.observe_cofix, hStep]
+          rfl
 
 /-- `.faulted .ub` from `runMirCall` implies `FaultNow (mirCallTree body args)`. -/
 theorem runMirCall_ub_faultNow {body : CapturedMir} {fuel : Nat}
@@ -2179,6 +2270,43 @@ theorem checked_mul_const_refines_unchecked_of_farkas_cert
     (farkas_discharges_uint_mul_const_no_overflow u hyps k xExpr steps hKRange hChk env
       [] canonInitMemory)
 
+/-- Right-constant variant (`x * k`) of `checked_mul_const_refines_unchecked_of_farkas_cert`:
+the SAME `k * x + 1 ≤ 2^w` certificate eliminates the checked multiplication when the constant
+is the right operand (`uintArgs2 u x k`), via
+`Anneal.FarkasMirCert.farkas_discharges_uint_mul_const_right_no_overflow`. -/
+theorem checked_mul_const_right_refines_unchecked_of_farkas_cert
+    (u : UintTy) (strat : PanicStrategy)
+    (hyps : List NatCutIneq) (xExpr : NatLinExpr) (k : Nat) (steps : List CutStep)
+    (hKRange : Nat.blt k (modPow2 (uintWidth u)) = true)
+    (hChk : checkNatCutGoal
+      ⟨hyps, ⟨.add (.mulC k xExpr) (.cst 1), .cst (modPow2 (uintWidth u))⟩⟩
+      steps = true)
+    (env : List Nat) :
+    HypsImp (NatCutIneq.holds env) hyps
+      (UintScalarInRange u ⟨k, uintBytes u⟩ ∧
+       MirOutcomeEquiv
+        (classifyMirExecState strat
+          (runMirCall (mkCheckedArithBody u .mul strat.toUnwindAction) 6
+            (uintArgs2 u (xExpr.eval env) k)))
+        (classifyMirExecState strat
+          (runMirCall (mkUncheckedArithBody u .mul) 2
+            (uintArgs2 u (xExpr.eval env) k))) ∧
+       (mirCallTree (mkUncheckedArithBody u .mul) (uintArgs2 u (xExpr.eval env) k)).toPartial ≤
+         (mirCallTree (mkCheckedArithBody u .mul strat.toUnwindAction)
+           (uintArgs2 u (xExpr.eval env) k)).toPartial) :=
+  hypsImp_concl_mono (fun hFarkas => by
+    have hKIn : UintScalarInRange u ⟨k, uintBytes u⟩ := hFarkas.1
+    have hProdLt : xExpr.eval env * k < modPow2 (uintWidth u) := hFarkas.2.1
+    have hC := runMirCall_checked_mul_ok u strat (xExpr.eval env) k hProdLt
+    have hU := runMirCall_unchecked_mul_ok u (xExpr.eval env) k hProdLt
+    have hTree := mirCallTree_toPartial_equiv_of_same_halted hU hC
+    exact ⟨hKIn,
+           ⟨(checked_mul_refines_unchecked_iff u strat _ k).2 hProdLt,
+            (unchecked_mul_refines_to_checked u strat _ k).1⟩,
+           hTree.1⟩)
+    (farkas_discharges_uint_mul_const_right_no_overflow u hyps xExpr k steps hKRange hChk env
+      [] canonInitMemory)
+
 /-- One-`rfl` constructive Farkas discharge of composite multi-statement `add_scaled`
 (`a + k * b`) checked-to-unchecked elimination: a single Farkas certificate for
 `a + k * b + 1 ≤ 2^w` eliminates BOTH the checked multiplication and the checked addition
@@ -2238,6 +2366,241 @@ theorem checked_add_scaled_weakRef_unchecked_of_farkas_cert
       (runMirCall_checked_add_scaled_ok u k strat (aExpr.eval env) (bExpr.eval env) hSumLt)).1)
     (farkas_discharges_uint_add_no_overflow u hyps aExpr (.mulC k bExpr) steps hChk env
       [] canonInitMemory)
+
+/-! ## 5.1 Fuel-Independence & Non-Vacuity of Every Canonical Run
+
+`.unsupported` is a top element of `MirOutcomeRefines` (like `.ub`), so a fuel-truncated
+(`.outOfFuel`), still-`.running`, unmodeled (`.unsupported`), or strategy-mismatched trap on the
+SPEC side would make a refinement claim hold vacuously. This section proves that this NEVER
+happens for any canonical body: every canonical run classifies to a non-`.unsupported` outcome
+under its own panic strategy, for ALL inputs, and is therefore *settled* (a genuine halting
+outcome or a genuine `.ub` fault). Settled runs are fuel-independent, so every refinement
+theorem above holds verbatim at ANY fuel at least the canonical step count. -/
+
+/-- A `MirExecState` is *settled* when it is a genuine halting outcome or a genuine UB fault
+(never an `.outOfFuel` truncation, an `.unsupported` boundary, or a still-`.running` state). -/
+def SettledExec : MirExecState → Prop
+  | .halted _ => True
+  | .faulted .ub => True
+  | _ => False
+
+/-- A non-`.unsupported` classification under ANY strategy implies the state is settled. -/
+theorem settledExec_of_classify_ne_unsupported {strat : PanicStrategy} {st : MirExecState}
+    (h : classifyMirExecState strat st ≠ .unsupported) : SettledExec st := by
+  cases st with
+  | halted _ => trivial
+  | running _ => exact False.elim (h rfl)
+  | faulted fk =>
+    cases fk with
+    | ub => trivial
+    | unsupported => exact False.elim (h rfl)
+    | outOfFuel => exact False.elim (h rfl)
+
+/-- Settled `runMirSteps` results are invariant under additional fuel. -/
+theorem runMirSteps_settled_mono (body : CapturedMir) (fuel extra : Nat) (st : MirExecState)
+    (h : SettledExec (runMirSteps body fuel st)) :
+    runMirSteps body (fuel + extra) st = runMirSteps body fuel st := by
+  generalize hR : runMirSteps body fuel st = r at h ⊢
+  cases r with
+  | halted o => exact runMirSteps_halted_mono body fuel extra st o hR
+  | running _ => exact False.elim h
+  | faulted fk =>
+    cases fk with
+    | ub => exact runMirSteps_ub_mono body fuel extra st hR
+    | unsupported => exact False.elim h
+    | outOfFuel => exact False.elim h
+
+/-- Settled `runMirCall` results are identical at every larger fuel `fuel' ≥ fuel`. -/
+theorem runMirCall_fuel_stable {body : CapturedMir} {fuel fuel' : Nat} {args : List Value}
+    (hle : fuel ≤ fuel') (h : SettledExec (runMirCall body fuel args)) :
+    runMirCall body fuel' args = runMirCall body fuel args := by
+  obtain ⟨extra, rfl⟩ := Nat.exists_eq_add_of_le hle
+  exact runMirSteps_settled_mono body fuel extra _ h
+
+private theorem classify_ret_ne_unsupported (strat : PanicStrategy) (v : Value) (m : Memory) :
+    classifyMirExecState strat (.halted (.normal (v, m))) ≠ .unsupported :=
+  fun h => nomatch h
+
+private theorem classify_ub_ne_unsupported (strat : PanicStrategy) :
+    classifyMirExecState strat (.faulted .ub) ≠ .unsupported :=
+  fun h => nomatch h
+
+private theorem classify_trap_ne_unsupported (strat : PanicStrategy) :
+    classifyMirExecState strat (.halted strat.toTrapOutcome) ≠ .unsupported := by
+  rw [classify_trapOutcome_eq strat]
+  exact fun h => nomatch h
+
+/-- Non-vacuity of the canonical `add` pair: for ALL `u`, `a`, `b`, and BOTH strategies,
+neither run classifies to `.unsupported` (no fuel truncation, no unmodeled construct, no
+strategy-mismatched trap). -/
+theorem canonical_add_runs_nonvacuous (u : UintTy) (strat : PanicStrategy) (a b : Nat) :
+    classifyMirExecState strat
+      (runMirCall (mkUncheckedArithBody u .add) 2 (uintArgs2 u a b)) ≠ .unsupported ∧
+    classifyMirExecState strat
+      (runMirCall (mkCheckedArithBody u .add strat.toUnwindAction) 6 (uintArgs2 u a b)) ≠
+      .unsupported := by
+  cases hB : Nat.ble (modPow2 (uintWidth u)) (a + b) with
+  | true =>
+    have hOv := Nat.le_of_ble_eq_true hB
+    rw [runMirCall_unchecked_add_ub u a b hOv, runMirCall_checked_add_trap u strat a b hOv]
+    exact ⟨classify_ub_ne_unsupported strat, classify_trap_ne_unsupported strat⟩
+  | false =>
+    have hNoOv := nat_lt_of_ble_false hB
+    rw [runMirCall_unchecked_add_ok u a b hNoOv, runMirCall_checked_add_ok u strat a b hNoOv]
+    exact ⟨classify_ret_ne_unsupported _ _ _, classify_ret_ne_unsupported _ _ _⟩
+
+/-- Non-vacuity of the canonical `sub` pair for ALL in-range `a`, `b` and BOTH strategies. -/
+theorem canonical_sub_runs_nonvacuous (u : UintTy) (strat : PanicStrategy) (a b : Nat)
+    (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u)) :
+    classifyMirExecState strat
+      (runMirCall (mkUncheckedArithBody u .sub) 2 (uintArgs2 u a b)) ≠ .unsupported ∧
+    classifyMirExecState strat
+      (runMirCall (mkCheckedArithBody u .sub strat.toUnwindAction) 6 (uintArgs2 u a b)) ≠
+      .unsupported := by
+  cases hB : Nat.ble b a with
+  | true =>
+    have hLe := Nat.le_of_ble_eq_true hB
+    rw [runMirCall_unchecked_sub_ok u a b ha hLe, runMirCall_checked_sub_ok u strat a b ha hb hLe]
+    exact ⟨classify_ret_ne_unsupported _ _ _, classify_ret_ne_unsupported _ _ _⟩
+  | false =>
+    have hUnd := nat_lt_of_ble_false hB
+    rw [runMirCall_unchecked_sub_ub u a b hUnd, runMirCall_checked_sub_trap u strat a b ha hb hUnd]
+    exact ⟨classify_ub_ne_unsupported strat, classify_trap_ne_unsupported strat⟩
+
+/-- Non-vacuity of the canonical `mul` pair for ALL `u`, `a`, `b` and BOTH strategies. -/
+theorem canonical_mul_runs_nonvacuous (u : UintTy) (strat : PanicStrategy) (a b : Nat) :
+    classifyMirExecState strat
+      (runMirCall (mkUncheckedArithBody u .mul) 2 (uintArgs2 u a b)) ≠ .unsupported ∧
+    classifyMirExecState strat
+      (runMirCall (mkCheckedArithBody u .mul strat.toUnwindAction) 6 (uintArgs2 u a b)) ≠
+      .unsupported := by
+  cases hB : Nat.ble (modPow2 (uintWidth u)) (a * b) with
+  | true =>
+    have hOv := Nat.le_of_ble_eq_true hB
+    rw [runMirCall_unchecked_mul_ub u a b hOv, runMirCall_checked_mul_trap u strat a b hOv]
+    exact ⟨classify_ub_ne_unsupported strat, classify_trap_ne_unsupported strat⟩
+  | false =>
+    have hNoOv := nat_lt_of_ble_false hB
+    rw [runMirCall_unchecked_mul_ok u a b hNoOv, runMirCall_checked_mul_ok u strat a b hNoOv]
+    exact ⟨classify_ret_ne_unsupported _ _ _, classify_ret_ne_unsupported _ _ _⟩
+
+/-- Non-vacuity of the composite `add_scaled` pair for ALL `u`, `k`, `a`, `b` and BOTH strategies. -/
+theorem canonical_add_scaled_runs_nonvacuous (u : UintTy) (k : Nat) (strat : PanicStrategy)
+    (a b : Nat) :
+    classifyMirExecState strat
+      (runMirCall (mkUncheckedAddScaledBody u k) 5 (uintArgs2 u a b)) ≠ .unsupported ∧
+    classifyMirExecState strat
+      (runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) 13 (uintArgs2 u a b)) ≠
+      .unsupported := by
+  cases hB : Nat.ble (modPow2 (uintWidth u)) (a + k * b) with
+  | true =>
+    have hOv := Nat.le_of_ble_eq_true hB
+    rw [runMirCall_unchecked_add_scaled_ub u k a b hOv,
+        runMirCall_checked_add_scaled_trap u k strat a b hOv]
+    exact ⟨classify_ub_ne_unsupported strat, classify_trap_ne_unsupported strat⟩
+  | false =>
+    have hNoOv := nat_lt_of_ble_false hB
+    rw [runMirCall_unchecked_add_scaled_ok u k a b hNoOv,
+        runMirCall_checked_add_scaled_ok u k strat a b hNoOv]
+    exact ⟨classify_ret_ne_unsupported _ _ _, classify_ret_ne_unsupported _ _ _⟩
+
+/-- Fuel-independent necessary & sufficient reverse refinement for `add`: holds verbatim at
+EVERY fuel `fC ≥ 6` (checked) and `fU ≥ 2` (unchecked). -/
+theorem checked_add_refines_unchecked_iff_of_fuel (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) {fC fU : Nat} (hfC : 6 ≤ fC) (hfU : 2 ≤ fU) :
+    MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .add strat.toUnwindAction) fC (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .add) fU (uintArgs2 u a b)))
+      ↔ a + b < modPow2 (uintWidth u) := by
+  have hNV := canonical_add_runs_nonvacuous u strat a b
+  rw [runMirCall_fuel_stable hfC (settledExec_of_classify_ne_unsupported hNV.2),
+      runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hNV.1)]
+  exact checked_add_refines_unchecked_iff u strat a b
+
+/-- Fuel-independent necessary & sufficient reverse refinement for `sub`. -/
+theorem checked_sub_refines_unchecked_iff_of_fuel (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u))
+    {fC fU : Nat} (hfC : 6 ≤ fC) (hfU : 2 ≤ fU) :
+    MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .sub strat.toUnwindAction) fC (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .sub) fU (uintArgs2 u a b)))
+      ↔ b ≤ a := by
+  have hNV := canonical_sub_runs_nonvacuous u strat a b ha hb
+  rw [runMirCall_fuel_stable hfC (settledExec_of_classify_ne_unsupported hNV.2),
+      runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hNV.1)]
+  exact checked_sub_refines_unchecked_iff u strat a b ha hb
+
+/-- Fuel-independent necessary & sufficient reverse refinement for `mul`. -/
+theorem checked_mul_refines_unchecked_iff_of_fuel (u : UintTy) (strat : PanicStrategy)
+    (a b : Nat) {fC fU : Nat} (hfC : 6 ≤ fC) (hfU : 2 ≤ fU) :
+    MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .mul strat.toUnwindAction) fC (uintArgs2 u a b)))
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .mul) fU (uintArgs2 u a b)))
+      ↔ a * b < modPow2 (uintWidth u) := by
+  have hNV := canonical_mul_runs_nonvacuous u strat a b
+  rw [runMirCall_fuel_stable hfC (settledExec_of_classify_ne_unsupported hNV.2),
+      runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hNV.1)]
+  exact checked_mul_refines_unchecked_iff u strat a b
+
+/-- Fuel-independent necessary & sufficient reverse refinement for composite `add_scaled`. -/
+theorem checked_add_scaled_refines_unchecked_iff_of_fuel (u : UintTy) (k : Nat)
+    (strat : PanicStrategy) (a b : Nat) {fC fU : Nat} (hfC : 13 ≤ fC) (hfU : 5 ≤ fU) :
+    MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) fC (uintArgs2 u a b)))
+      (classifyMirExecState strat
+        (runMirCall (mkUncheckedAddScaledBody u k) fU (uintArgs2 u a b)))
+      ↔ a + k * b < modPow2 (uintWidth u) := by
+  have hNV := canonical_add_scaled_runs_nonvacuous u k strat a b
+  rw [runMirCall_fuel_stable hfC (settledExec_of_classify_ne_unsupported hNV.2),
+      runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hNV.1)]
+  exact checked_add_scaled_refines_unchecked_iff u k strat a b
+
+/-- Fuel-independent unconditional forward refinement (`unchecked ⊑ checked`) for all three
+binary operations and composite `add_scaled`, at EVERY fuel at least the canonical step count. -/
+theorem unchecked_refines_to_checked_of_fuel (u : UintTy) (strat : PanicStrategy) (a b k : Nat)
+    {fC fU fCs fUs : Nat} (hfC : 6 ≤ fC) (hfU : 2 ≤ fU) (hfCs : 13 ≤ fCs) (hfUs : 5 ≤ fUs) :
+    MirOutcomeRefines
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .add) fU (uintArgs2 u a b)))
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .add strat.toUnwindAction) fC (uintArgs2 u a b))) ∧
+    MirOutcomeRefines
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .mul) fU (uintArgs2 u a b)))
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .mul strat.toUnwindAction) fC (uintArgs2 u a b))) ∧
+    MirOutcomeRefines
+      (classifyMirExecState strat
+        (runMirCall (mkUncheckedAddScaledBody u k) fUs (uintArgs2 u a b)))
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedAddScaledBody u k strat.toUnwindAction) fCs (uintArgs2 u a b))) := by
+  have hA := canonical_add_runs_nonvacuous u strat a b
+  have hM := canonical_mul_runs_nonvacuous u strat a b
+  have hS := canonical_add_scaled_runs_nonvacuous u k strat a b
+  rw [runMirCall_fuel_stable hfC (settledExec_of_classify_ne_unsupported hA.2),
+      runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hA.1),
+      runMirCall_fuel_stable hfC (settledExec_of_classify_ne_unsupported hM.2),
+      runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hM.1),
+      runMirCall_fuel_stable hfCs (settledExec_of_classify_ne_unsupported hS.2),
+      runMirCall_fuel_stable hfUs (settledExec_of_classify_ne_unsupported hS.1)]
+  exact ⟨(unchecked_add_refines_to_checked u strat a b).1,
+         (unchecked_mul_refines_to_checked u strat a b).1,
+         (unchecked_add_scaled_refines_to_checked u k strat a b).1⟩
+
+/-- Fuel-independent unconditional forward refinement for in-range `sub`. -/
+theorem unchecked_sub_refines_to_checked_of_fuel (u : UintTy) (strat : PanicStrategy) (a b : Nat)
+    (ha : a < modPow2 (uintWidth u)) (hb : b < modPow2 (uintWidth u))
+    {fC fU : Nat} (hfC : 6 ≤ fC) (hfU : 2 ≤ fU) :
+    MirOutcomeRefines
+      (classifyMirExecState strat (runMirCall (mkUncheckedArithBody u .sub) fU (uintArgs2 u a b)))
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody u .sub strat.toUnwindAction) fC (uintArgs2 u a b))) := by
+  have hNV := canonical_sub_runs_nonvacuous u strat a b ha hb
+  rw [runMirCall_fuel_stable hfC (settledExec_of_classify_ne_unsupported hNV.2),
+      runMirCall_fuel_stable hfU (settledExec_of_classify_ne_unsupported hNV.1)]
+  exact (unchecked_sub_refines_to_checked u strat a b ha hb).1
 
 /-! ## 6. Explicit Non-Vacuous Negative Soundness Theorems (15 Theorems) -/
 

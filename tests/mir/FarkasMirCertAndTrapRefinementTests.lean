@@ -318,6 +318,25 @@ theorem test_e2e_uint_mul_const_elim (strat : PanicStrategy) (n : Nat) (hn : n �
   checked_mul_const_refines_unchecked_of_farkas_cert
     .u64 strat uintMulConstHyps 16 (.var 0) uintMulConstCert rfl rfl [n] hn
 
+/-! ### 1.8 Right-Constant `uint-mul-const-no-overflow` (`n * 16`) + `stepMirState` Mul Elimination -/
+
+-- Same generated certificate as 1.7 (the right-constant bridge reuses the `k * x + 1 <= 2^w` goal):
+--   python3 -B ci/farkas_cert_gen.py --mir-bounds uint-mul-const-no-overflow --width 64 \
+--     --hyp "n <= 4096" --scale 16 --var n --json
+/-- End-to-end `u64` right-constant multiplication (`n * 16 < 2^64`) checked-to-unchecked
+elimination with the constant as the RIGHT `BinOp` operand. -/
+theorem test_e2e_uint_mul_const_right_elim (strat : PanicStrategy) (n : Nat) (hn : n ≤ 4096) :
+    UintScalarInRange .u64 ⟨16, uintBytes .u64⟩ ∧
+    MirOutcomeEquiv
+      (classifyMirExecState strat
+        (runMirCall (mkCheckedArithBody .u64 .mul strat.toUnwindAction) 6 (uintArgs2 .u64 n 16)))
+      (classifyMirExecState strat
+        (runMirCall (mkUncheckedArithBody .u64 .mul) 2 (uintArgs2 .u64 n 16))) ∧
+    (mirCallTree (mkUncheckedArithBody .u64 .mul) (uintArgs2 .u64 n 16)).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u64 .mul strat.toUnwindAction) (uintArgs2 .u64 n 16)).toPartial :=
+  checked_mul_const_right_refines_unchecked_of_farkas_cert
+    .u64 strat uintMulConstHyps (.var 0) 16 uintMulConstCert rfl rfl [n] hn
+
 /-! ## 2. Entailment-Graph Adequacy Non-Vacuity, Strictness, Transitivity, & Negative Checks -/
 
 -- Generated via:
@@ -607,6 +626,121 @@ theorem test_all_fifteen_negative_soundness_theorems :
    panic_strategy_abort_vs_unwind_distinct.2.2.1,
    (checked_add_scaled_overflow_not_refines_unchecked .abort).2.2.1⟩
 
+/-! ### 3.1 Fuel-Independence, Non-Vacuity, Strategy-Mismatch, Fault-Bridge, & Mutation Canaries -/
+
+/-- Fuel-independence and fail-closed detection of fuel truncation / strategy mismatch:
+refinement verdicts are identical at large fuel, while under-fuelled or strategy-mismatched
+runs are visibly `.unsupported` (and are proven never to arise for canonical runs). -/
+theorem test_fuel_independence_and_nonvacuity :
+    -- Reverse refinement verdicts at fuel 100 / 1000 (far above the canonical step counts)
+    MirOutcomeRefines
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u8 .add .terminate) 100 (uintArgs2 .u8 100 50)))
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u8 .add) 100 (uintArgs2 .u8 100 50))) ∧
+    (¬ MirOutcomeRefines
+      (classifyMirExecState .unwind
+        (runMirCall (mkCheckedArithBody .u8 .mul .continue_) 1000 (uintArgs2 .u8 20 20)))
+      (classifyMirExecState .unwind
+        (runMirCall (mkUncheckedArithBody .u8 .mul) 1000 (uintArgs2 .u8 20 20)))) ∧
+    MirOutcomeRefines
+      (classifyMirExecState .unwind
+        (runMirCall (mkUncheckedAddScaledBody .u8 4) 64 (uintArgs2 .u8 200 20)))
+      (classifyMirExecState .unwind
+        (runMirCall (mkCheckedAddScaledBody .u8 4 .continue_) 64 (uintArgs2 .u8 200 20))) ∧
+    -- Under-fuelled runs are visibly truncated (one step short of the canonical count)
+    runMirCall (mkCheckedArithBody .u8 .add .terminate) 5 (uintArgs2 .u8 100 50) =
+      .faulted .outOfFuel ∧
+    runMirCall (mkCheckedAddScaledBody .u8 4 .terminate) 12 (uintArgs2 .u8 1 2) =
+      .faulted .outOfFuel ∧
+    -- Strategy mismatch is visible: an abort-compiled trap is `.unsupported` under `.unwind`,
+    -- while the strategy-exact classifier reports `.trap .abort`
+    classifyMirExecState .unwind
+      (runMirCall (mkCheckedArithBody .u8 .add .terminate) 6 (uintArgs2 .u8 200 100)) =
+      .unsupported ∧
+    classifyMirExecStateExact
+      (runMirCall (mkCheckedArithBody .u8 .add .terminate) 6 (uintArgs2 .u8 200 100)) =
+      .trap .abort ∧
+    -- Matched-strategy canonical runs are never `.unsupported`
+    classifyMirExecState .abort
+      (runMirCall (mkCheckedArithBody .u8 .add .terminate) 6 (uintArgs2 .u8 200 100)) ≠
+      .unsupported := by
+  have hOv : modPow2 (uintWidth .u8) ≤ 200 + 100 := Nat.le_of_ble_eq_true rfl
+  have hA := runMirCall_checked_add_trap .u8 .abort 200 100 hOv
+  dsimp only [PanicStrategy.toUnwindAction, PanicStrategy.toTrapOutcome] at hA
+  refine ⟨(checked_add_refines_unchecked_iff_of_fuel .u8 .abort 100 50
+            (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)).2
+            (Nat.le_of_ble_eq_true rfl),
+          fun h => Nat.not_lt_of_le (Nat.le_of_ble_eq_true rfl)
+            ((checked_mul_refines_unchecked_iff_of_fuel .u8 .unwind 20 20
+              (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)).1 h),
+          (unchecked_refines_to_checked_of_fuel .u8 .unwind 200 20 4
+            (fC := 6) (fU := 2) (Nat.le_refl 6) (Nat.le_refl 2)
+            (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)).2.2,
+          rfl, rfl, ?_, ?_, (canonical_add_runs_nonvacuous .u8 .abort 200 100).2⟩
+  · rw [hA]; rfl
+  · rw [hA]; rfl
+
+/-- The general `runMirSteps_faulted_to_tauStar` bridge, instantiated on an underflowing
+unchecked `u8` subtraction: the runner-introduced disjuncts (`.unsupported` observation and
+`.outOfFuel` truncation) are refuted, leaving the genuine `stepMirState` UB fail node. -/
+theorem test_faulted_bridge_ub_instance :
+    ∃ u : ITree MirEffect MirOutcome,
+      TauStar (mirCallTree (mkUncheckedArithBody .u8 .sub) (uintArgs2 .u8 3 5)) u ∧
+      u.observe = .vis (.inl (.fail .ub)) PEmpty.elim := by
+  have hU := runMirCall_unchecked_sub_ub .u8 3 5 (Nat.le_of_ble_eq_true rfl)
+  have ⟨u, hTau, hCase⟩ := runMirSteps_faulted_to_tauStar _ 2 _ .ub hU
+  refine ⟨u, hTau, ?_⟩
+  rcases hCase with hObs | ⟨hEq, _⟩ | ⟨hEq, _⟩
+  · exact hObs
+  · nomatch hEq
+  · nomatch hEq
+
+/-- Mutation operator: flip the `expected` polarity of every `TerminatorKind.assert`. -/
+def flipAssertPolarity (b : CapturedMir) : CapturedMir :=
+  { b with basicBlocks := b.basicBlocks.map fun bb =>
+      match bb.terminator.kind with
+      | .assert c e t uw =>
+        { bb with terminator := { bb.terminator with kind := .assert c (!e) t uw } }
+      | _ => bb }
+
+/-- Mutation-testing canaries proving the refinement theorems are sensitive to the exact
+operational content of the checked bodies (and hence are not vacuous):
+- (M1) flipping `assert` polarity (`expected := true`) traps on NON-overflowing `100 + 50`,
+  breaking the unconditional forward direction, and silently returns the wrapped `44` on
+  overflowing `200 + 100`, breaking panic preservation;
+- (M2) `UnwindAction.unreachable` turns the overflow trap into UB, which collapses the
+  asymmetric separation: the refinement refuted by `checked_add_overflow_not_refines_unchecked`
+  now HOLDS, so that negative theorem fails specifically because of the trap-vs-UB rule. -/
+theorem test_mutation_canaries :
+    runMirCall (flipAssertPolarity (mkCheckedArithBody .u8 .add .terminate)) 6
+      (uintArgs2 .u8 100 50) = .halted .abort ∧
+    (¬ MirOutcomeRefines
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u8 .add) 2 (uintArgs2 .u8 100 50)))
+      (classifyMirExecState .abort
+        (runMirCall (flipAssertPolarity (mkCheckedArithBody .u8 .add .terminate)) 6
+          (uintArgs2 .u8 100 50)))) ∧
+    runMirCall (flipAssertPolarity (mkCheckedArithBody .u8 .add .terminate)) 6
+      (uintArgs2 .u8 200 100) = .halted (.normal (.scalar ⟨44, 1⟩, canonInitMemory)) ∧
+    runMirCall (mkCheckedArithBody .u8 .add .unreachable) 6 (uintArgs2 .u8 200 100) =
+      .faulted .ub ∧
+    MirOutcomeRefines
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u8 .add .unreachable) 6 (uintArgs2 .u8 200 100)))
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u8 .add) 2 (uintArgs2 .u8 200 100))) := by
+  have hM1 : runMirCall (flipAssertPolarity (mkCheckedArithBody .u8 .add .terminate)) 6
+      (uintArgs2 .u8 100 50) = .halted .abort := rfl
+  have hU := runMirCall_unchecked_add_ok .u8 100 50 (Nat.le_of_ble_eq_true rfl)
+  have hM2 : runMirCall (mkCheckedArithBody .u8 .add .unreachable) 6 (uintArgs2 .u8 200 100) =
+      .faulted .ub := rfl
+  refine ⟨hM1, ?_, rfl, hM2, ?_⟩
+  · rw [hU, hM1]
+    exact ret_not_refines_trap _
+  · rw [hM2]
+    trivial
+
 /-! ## 4. Programmatic `run_cmd` Hygiene Audit & `#print axioms` Checks -/
 
 open Lean Elab Command in
@@ -702,27 +836,63 @@ run_cmd do
     for a in axs do
       unless isStandard a do
         throwError "weakRef bridge audit failure: {d} depends on non-standard symbol {a}"
-  -- Also audit every theorem defined in this test module:
+  -- Exhaustive sweep: audit EVERY theorem constant (public, private, and auxiliary) defined in
+  -- the `Anneal.FarkasMirCert` and `Anneal.Mir.OverflowTrapRefinement` modules, plus every
+  -- theorem of this test module. `Classical.choice` is tolerated ONLY for theorems whose
+  -- statement mentions the coinductive `Anneal.ITree.WeakRef` / `Anneal.ITree.Eutt` relations
+  -- (whose `coinductive_fixpoint` construction uses it); every other theorem must be
+  -- constructive (`propext` / `Quot.sound` only).
   let env ← getEnv
+  let coinductiveRels : List Name := [``Anneal.ITree.WeakRef, ``Anneal.ITree.Eutt]
+  let mentionsCoinductive (ty : Expr) : Bool :=
+    ty.getUsedConstants.any (fun c => coinductiveRels.contains c)
+  let auditThm (c : Name) (ty : Expr) : CommandElabM Bool := do
+    let axs ← liftCoreM <| Lean.collectAxioms c
+    if mentionsCoinductive ty then
+      for a in axs do
+        unless isStandard a do
+          throwError "coinductive audit failure: {c} depends on non-standard symbol {a}"
+      return true
+    else
+      for a in axs do
+        unless isConstructive a do
+          throwError "constructive audit failure: {c} depends on disallowed symbol {a}"
+      return false
+  let mut sweepSummary : Array String := #[]
+  for (mod, minThms) in [(`Anneal.FarkasMirCert, 190), (`Anneal.Mir.OverflowTrapRefinement, 215)] do
+    let some idx := env.header.moduleNames.findIdx? (· == mod)
+      | throwError "audit: module {mod} is not imported"
+    let mut nConstructive : Nat := 0
+    let mut nCoinductive : Nat := 0
+    for c in env.header.moduleData[idx]!.constNames do
+      if let some (.thmInfo info) := env.find? c then
+        if ← auditThm c info.type then
+          nCoinductive := nCoinductive + 1
+        else
+          nConstructive := nConstructive + 1
+    if nConstructive + nCoinductive < minThms then
+      throwError "module sweep is vacuous for {mod}: only {nConstructive + nCoinductive} theorems (expected ≥ {minThms})"
+    sweepSummary := sweepSummary.push
+      s!"{mod}: {nConstructive} constructive + {nCoinductive} coinductive"
+  -- Every curated key declaration must also be covered by the module sweep.
+  for d in keyFarkasDecls ++ keyTrapConstructiveDecls ++ keyWeakRefBridgeDecls do
+    let some mIdx := env.getModuleIdxFor? d
+      | throwError "audit: curated declaration {d} is not imported"
+    let modName := env.header.moduleNames[mIdx.toNat]!
+    unless modName == `Anneal.FarkasMirCert || modName == `Anneal.Mir.OverflowTrapRefinement do
+      throwError "audit: curated declaration {d} lives outside the swept modules ({modName})"
+  -- Also audit every theorem defined in this test module (same coinductive rule):
   let mut constructiveTestTheorems : Nat := 0
   let mut weakRefTestTheorems : Nat := 0
   for (c, info) in env.constants.map₂.toList do
-    if (`Anneal.Mir.FarkasMirCertAndTrapRefinementTests).isPrefixOf c then
-      if let .thmInfo _ := info then
-        let axs ← liftCoreM <| Lean.collectAxioms c
-        if c == ``Anneal.Mir.FarkasMirCertAndTrapRefinementTests.test_weakRef_bridge_canaries then
-          weakRefTestTheorems := weakRefTestTheorems + 1
-          for a in axs do
-            unless isStandard a do
-              throwError "test-module weakRef audit failure: {c} depends on {a}"
-        else
-          constructiveTestTheorems := constructiveTestTheorems + 1
-          for a in axs do
-            unless isConstructive a do
-              throwError "test-module constructive audit failure: {c} depends on {a}"
-  if constructiveTestTheorems < 12 || weakRefTestTheorems < 1 then
+    if let .thmInfo thm := info then
+      if ← auditThm c thm.type then
+        weakRefTestTheorems := weakRefTestTheorems + 1
+      else
+        constructiveTestTheorems := constructiveTestTheorems + 1
+  if constructiveTestTheorems < 16 || weakRefTestTheorems < 1 then
     throwError "test audit is vacuous: constructive={constructiveTestTheorems}, weakRef={weakRefTestTheorems}"
-  logInfo m!"hygiene audit passed: {keyFarkasDecls.length} FarkasMirCert + {keyTrapConstructiveDecls.length} constructive OverflowTrapRefinement + {constructiveTestTheorems} constructive test theorems in [propext, Quot.sound] (0 Classical.choice, 0 sorryAx, 0 ofReduceBool); {keyWeakRefBridgeDecls.length} WeakRef bridges + {weakRefTestTheorems} WeakRef canary in [propext, Quot.sound, Classical.choice]"
+  logInfo m!"hygiene audit passed: module sweep [{", ".intercalate sweepSummary.toList}]; curated {keyFarkasDecls.length} FarkasMirCert + {keyTrapConstructiveDecls.length} constructive OverflowTrapRefinement + {keyWeakRefBridgeDecls.length} WeakRef bridges; test module {constructiveTestTheorems} constructive + {weakRefTestTheorems} coinductive (0 sorryAx, 0 ofReduceBool, 0 trustCompiler, Classical.choice only under WeakRef/Eutt)"
 
 #print axioms Anneal.Mir.OverflowTrapRefinement.mirOutcomeRefines_iff_partial_le
 #print axioms Anneal.Mir.OverflowTrapRefinement.unchecked_add_refines_to_checked
@@ -730,6 +900,9 @@ run_cmd do
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_scaled_refines_unchecked_of_farkas_cert
 #print axioms Anneal.Mir.OverflowTrapRefinement.checked_add_overflow_not_refines_wrapping
 #print axioms Anneal.Mir.OverflowTrapRefinement.panic_strategy_abort_vs_unwind_distinct
+#print axioms Anneal.Mir.OverflowTrapRefinement.runMirSteps_faulted_to_tauStar
+#print axioms Anneal.Mir.OverflowTrapRefinement.checked_mul_const_right_refines_unchecked_of_farkas_cert
+#print axioms Anneal.Mir.OverflowTrapRefinement.unchecked_refines_to_checked_of_fuel
 #print axioms Anneal.FarkasMirCert.checkFarkasMirGoal_sound
 
 end Anneal.Mir.FarkasMirCertAndTrapRefinementTests
