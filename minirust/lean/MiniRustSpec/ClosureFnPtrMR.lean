@@ -88,6 +88,15 @@ arguments by `Terminator::Call` and left by `Terminator::Return`.
   environment; MiniRust's function of arity `N` has no environment at all. The
   observable results agree because a non-capturing body never reads `_1`.
 
+* In `closure_typed_sig_call_correspondence_M` the MiniRust-side mismatched
+  types (`badMrRet`, `badMrArg`) are premises, not images of the Trusted
+  transmuted types under `cfTranslateAbiTy`. The two checks genuinely differ on
+  pointers: MiniRust `check_abi_compatibility` compares only the pointer
+  metadata kind, so a transmuted `&u32` / `*const u64` argument is accepted by
+  MiniRust while `Trusted` (`calleeParamTysMatch`) rejects it; for integers both
+  require the same signedness and width. The law is therefore stated for the
+  mismatches MiniRust also rejects.
+
 ## Why the earlier correspondence did not catch the reproducer
 
 The earlier `C8` correspondence of `MiniRustSpec.UnwindSetDiscrAndFnPtrMR`

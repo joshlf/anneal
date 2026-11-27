@@ -147,6 +147,15 @@ and frames are pushed and popped by the vendored `Stack` operations.
   `core::panicking::panic_fmt`) are modeled by a small stub body and an unwind
   entry hook invoking vendored `ControlFlow.unwindToBlock` for the unwinding
   witnesses.
+* Non-vacuity of the universal vendored `Call` laws: the premises of
+  `cfCall_passArgument_abiMismatch_vendored_law` and
+  `cfCall_initStackFrame_convMismatch_vendored_law` are discharged on concrete
+  arguments (`cfCall_passArgument_abiMismatch_instance`,
+  `cfCall_initStackFrame_convMismatch_instance`); the intermediate-state
+  premises of `cfCall_initStackFrame_forged_closure_self_vendored_law` and
+  `cfCall_initStackFrame_zero_arg_closure_vendored_law` are NOT instantiated
+  here (their concrete counterparts are the kernel-checked runs
+  `cf_neg_forged_call_ub` and `cf_zero_and_two_arg_stutter_sim`).
 * The `ClosureOnceShim` MIR (`cfShimBody`) is hand-constructed from rustc's
   `make_shim` output for `FnOnce::call_once` (it is not a `rustc-capture`
   capture), and the shim's `drop(_1)` is executed by `cfDrop` as
@@ -3467,6 +3476,52 @@ theorem cfCall_initStackFrame_zero_arg_closure_vendored_law
       simp only [EStateM.bind, EStateM.pure, hGet3, hSet4, hOkRet, ↓reduceIte, hSet5,
         beq_self_eq_true, Nat.lt_irrefl]
 
+/-! ### Non-vacuity instances of the universal vendored `Call` laws -/
+
+/-- The `u64` argument ABI of a transmuted `fn(u64) -> u32` caller. -/
+def cfU64ArgAbi : CfArgAbi :=
+  ⟨.uint .u64, ⟨translateTy { kind := .uint .u64, layoutIdx := 0 } { emptyLayoutTable with entries := [cfU64Layout] },
+    .Direct Miri.ABI.ArgAttributes.new⟩⟩
+
+/-- The `u32` parameter ABI of the verbatim `fn_shared::{closure#0}` body. -/
+def cfU32ArgAbi : CfArgAbi :=
+  ⟨.uint .u32, ⟨translateTy { kind := .uint .u32, layoutIdx := 0 } cfFx_fn_shared_closure_0_layouts,
+    .Direct Miri.ABI.ArgAttributes.new⟩⟩
+
+/-- **Non-vacuity of `cfCall_passArgument_abiMismatch_vendored_law`**: its premises hold for a
+`u64` caller argument passed to a `u32` closure parameter, so vendored `passArgument` reports
+`AbiMismatchArgument 1` on every state. -/
+theorem cfCall_passArgument_abiMismatch_instance (prog : CfProg) (directUnwind : Bool)
+    (dest : Miri.MIR.Place) (st : AnnealStepState) :
+    cfCheckArgumentCompat cfU64ArgAbi cfU32ArgAbi st = .ok false st ∧
+    Miri.Interpreter.Call.passArgument (cfCallHooks prog directUnwind) ()
+        (.Copy ⟨.immediate .uninit, cfU64ArgAbi.abi.layout⟩) cfU64ArgAbi cfU32ArgAbi 1 dest
+        cfU32ArgAbi.abi.layout.ty false st =
+      .error (.undefinedBehavior "AbiMismatchArgument 1") st :=
+  have hBad : cfCheckArgumentCompat cfU64ArgAbi cfU32ArgAbi st = .ok false st := rfl
+  ⟨hBad, cfCall_passArgument_abiMismatch_vendored_law prog directUnwind _ _ _ 1 dest _ false st rfl rfl hBad⟩
+
+/-- **Non-vacuity of `cfCall_initStackFrame_convMismatch_vendored_law`**: its premises hold for
+the verbatim `FnOnce` closure body of `fn_once_kind` called with a C-ABI caller signature, so
+vendored `initStackFrame` reports the calling-convention mismatch before pushing a frame. -/
+theorem cfCall_initStackFrame_convMismatch_instance (directUnwind : Bool)
+    (loadedBody : Miri.Interpreter.LoadedBody) (args : Array (Miri.Interpreter.FnArg AnnealProv))
+    (destination : Miri.Interpreter.RuntimeStackPlace AnnealProv)
+    (cont : Miri.Interpreter.ReturnContinuation) (st : AnnealStepState) :
+    ∃ calleeFnAbi, cfFnAbiOfInstance cfProgFnOnce (cfItemInstance 2) = some calleeFnAbi ∧
+      calleeFnAbi.conv = .Rust ∧
+      Miri.Interpreter.Call.initStackFrame (cfCallHooks cfProgFnOnce directUnwind) () (cfItemInstance 2)
+          loadedBody { calleeFnAbi with conv := .C } args false destination cont st =
+        .error (.undefinedBehavior "caller/callee calling convention mismatch") st := by
+  have hSome : (cfFnAbiOfInstance cfProgFnOnce (cfItemInstance 2)).isSome = true := rfl
+  obtain ⟨a, ha⟩ := Option.isSome_iff_exists.mp hSome
+  have hConv : (cfFnAbiOfInstance cfProgFnOnce (cfItemInstance 2)).map (·.conv) = some .Rust := rfl
+  rw [ha] at hConv
+  have hRust : a.conv = .Rust := by simpa using hConv
+  refine ⟨a, ha, hRust, ?_⟩
+  exact cfCall_initStackFrame_convMismatch_vendored_law cfProgFnOnce directUnwind (cfItemInstance 2) loadedBody
+    { a with conv := .C } a args destination cont st rfl ha (by rw [hRust]; rfl)
+
 /-! ## §15. Kernel-checked simulation, `finding_0007` parity, unwinding, and negative witnesses
 
 Every theorem of this section is closed by `decide +kernel` on closed terms (zero `#guard`s,
@@ -3981,7 +4036,8 @@ elab "#assert_closure_fn_ptr_lm_audit" : command => do
     ``cfCall_passArgument_abiMismatch_vendored_law, ``cfCall_initStackFrame_convMismatch_vendored_law,
     ``cfCall_initStackFrame_forged_closure_self_vendored_law,
     ``cfCall_initStackFrame_zero_arg_closure_vendored_law,
-    ``cf_fn_once_certificate, ``cf_fn_once_lockstep, ``cf_closure_entry_frames_witness,
+    ``cf_fn_once_certificate, ``cf_fn_once_lockstep, ``cf_closure_entry_frames_witness, ``cfCall_passArgument_abiMismatch_instance,
+    ``cfCall_initStackFrame_convMismatch_instance,
     ``cf_finding_0007_driver_stutter_sim, ``cf_finding_0007_main_stutter_sim,
     ``cf_trusted_finding_parity, ``cf_fn_shared_stutter_sim, ``cf_fn_mut_stutter_sim,
     ``cf_zero_and_two_arg_stutter_sim, ``cf_unsafe_and_widen_identity_stutter_sim,
