@@ -60,6 +60,7 @@ import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
 import LeanMiriSpec.UnwindSetDiscrAndFnPtrLM
 import LeanMiriSpec.FloatArithLM
+import LeanMiriSpec.ClosureFnPtrLM
 import LeanMiriSpec.Audit
 
 /-!
@@ -512,6 +513,17 @@ import LeanMiriSpec.Audit
   IEEE-754 indeterminate forms, real `binary64` `Step.step`, and the mixed
   `const/copy` vs. `copy/const` `.sub` candidate order; 71 public theorems, all
   pinned by `axiomAudit_floatArithLM` and `#assert_float_arith_lm_standard_axioms`).
+* `LeanMiriSpec.ClosureFnPtrLM`: Episode 2 dual-authority correspondence for
+  non-capturing closure function pointers between the real `stepMirFn` and the
+  unmodified vendored `Step.step` / `Cast.cast` / `Call.evalCallTerminator`:
+  frame-directed closure-aware `CastHooks` / `CallHooks` (`resolve_closure` to
+  the body item for `FnOnce` and to `ClosureOnceShim` for `Fn` / `FnMut`, the
+  vendored `nonCapturingClosure`), the stuttering simulation `CfStutterSim`
+  with a universally sound certificate checker (`cfStutterCheck_sound`,
+  `cfStutterSim_zero_lockstep`), the kernel-checked `FnOnce` 1-to-1 lockstep
+  witness, kernel-checked fail-closed negatives and boundaries, build-time
+  (`#guard`, not kernel-checked) `Fn` / `FnMut` stuttering certificates, the
+  correspondence-gap postmortem, and `#assert_closure_fn_ptr_lm_audit`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

@@ -60,6 +60,7 @@ import LeanMiriSpec.Correspondence.WitLM4_2
 import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
+import LeanMiriSpec.ClosureFnPtrLM
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -27096,6 +27097,47 @@ example :
   div_ptrMetadata_invalidSafeWideRef
 
 end StatementPins
+
+-- Episode 2 closure function-pointer correspondence (`LeanMiriSpec.ClosureFnPtrLM`).
+open LeanMiriSpec.ClosureFnPtrLM in
+#assert_standard_axioms
+  cfStepHooks
+  cfCastHooks
+  cfCallHooks
+  cfStepHooks_eq_K
+  cfMiriStutter_sound
+  cfStutterCheck_sound
+  cfCertificate_sound
+  cfStutterSim_zero_lockstep
+  cfStutterSim_trusted_run
+  cfStutterSim_miri_run
+  cfInstanceOfAllocNat_item
+  cfInstanceOfAllocNat_shim
+  cfFnAllocNat_injective
+  cfResolveClosure_fnOnce_is_item
+  cfResolveClosure_fn_is_shim
+  cfResolveClosure_generic_unsupported
+  cf_fn_once_certificate
+  cf_fn_once_lockstep
+  cf_trusted_finding_parity
+  cf_miri_finding_main_boundary
+  cf_trusted_matrix
+  cf_generic_closure_r1_unsupported
+  cf_direct_closure_call_trusted_external
+  cf_unwind_boundary
+  cf_neg_capturing_fail_closed
+  cf_neg_forged_call_ub
+  cf_neg_transmuted_sig_fail_closed
+  cf_neg_extern_c_ub
+  cf_neg_safety_boundary
+  cf_normal_spelling_boundary
+
+open LeanMiriSpec.ClosureFnPtrLM in
+example :
+    cfCertificate (cfStepHooks cfProgFnOnce) cfProgFnOnce cfFx_fn_once_kind
+      [cfFx_id_once, cfFx_fn_once_kind_closure_0] [cfU32 5] [cfU32Imm 5] 200 =
+      some (.scalar 8 4, 0) :=
+  cf_fn_once_certificate
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
 -- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.
