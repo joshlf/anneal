@@ -469,6 +469,63 @@ theorem farkas_discharges_uint_mul_const_no_overflow
     (checkNatCutGoal_lt_sound hyps (.mulC k xExpr)
       (.cst (modPow2 (uintWidth u))) steps hChk env)
 
+/-- From `0 < k` and `k * x < modPow2 (uintWidth u)`, derives
+`UintScalarInRange u ⟨x, uintBytes u⟩` (so the variable operand of a positive
+constant-scaled multiplication is automatically in-range). -/
+theorem uintScalarInRange_rhs_of_mul_const_pos {u : UintTy} {k x : Nat}
+    (hkPos : 0 < k) (hProd : k * x < modPow2 (uintWidth u)) :
+    UintScalarInRange u ⟨x, uintBytes u⟩ := by
+  have hxLe : x ≤ k * x := by
+    have h1 : 1 * x ≤ k * x := Nat.mul_le_mul_right x hkPos
+    rw [Nat.one_mul] at h1
+    exact h1
+  exact ⟨rfl, Nat.lt_of_le_of_lt hxLe hProd⟩
+
+/-- Right-constant variant of `farkas_discharges_uint_mul_const_no_overflow`:
+discharges `x * k < modPow2 (uintWidth u)` and exact `.mulUnchecked` /
+`.mulWithOverflow` evaluation for `⟨x, uintBytes u⟩ * ⟨k, uintBytes u⟩` from
+the same `k * x + 1 ≤ modPow2 (uintWidth u)` certificate. -/
+theorem farkas_discharges_uint_mul_const_right_no_overflow
+    (u : UintTy) (hyps : List NatCutIneq) (xExpr : NatLinExpr) (k : Nat)
+    (steps : List CutStep)
+    (hKRange : Nat.blt k (modPow2 (uintWidth u)) = true)
+    (hChk : checkNatCutGoal
+      ⟨hyps, ⟨.add (.mulC k xExpr) (.cst 1), .cst (modPow2 (uintWidth u))⟩⟩
+      steps = true)
+    (env : List Nat) (locals : List LocalSlot) (mem : Memory) :
+    HypsImp (NatCutIneq.holds env) hyps
+      (UintScalarInRange u ⟨k, uintBytes u⟩ ∧
+       xExpr.eval env * k < modPow2 (uintWidth u) ∧
+       xExpr.eval env * k < scalarModulus (uintBytes u) ∧
+       evalScalarBinOp .mulUnchecked
+         ⟨xExpr.eval env, uintBytes u⟩ ⟨k, uintBytes u⟩
+         locals mem false =
+         .ok (.scalar ⟨xExpr.eval env * k, uintBytes u⟩) locals mem ∧
+       evalScalarBinOp .mulWithOverflow
+         ⟨xExpr.eval env, uintBytes u⟩ ⟨k, uintBytes u⟩
+         locals mem false =
+         .ok (.aggregate 0
+           [.scalar ⟨xExpr.eval env * k, uintBytes u⟩,
+            .scalar ⟨0, 1⟩]) locals mem) :=
+  hypsImp_concl_mono (fun hLt => by
+    dsimp only [NatLinExpr.eval] at hLt
+    have hKInRange : UintScalarInRange u ⟨k, uintBytes u⟩ :=
+      ⟨rfl, lt_of_blt_true hKRange⟩
+    have hLtR : xExpr.eval env * k < modPow2 (uintWidth u) := by
+      rw [Nat.mul_comm]
+      exact hLt
+    have hMod : xExpr.eval env * k < scalarModulus (uintBytes u) := by
+      rw [scalarModulus_uintBytes]
+      exact hLtR
+    have hUnchk := evalScalarBinOp_uint_mulUnchecked (u := u) locals mem hLtR
+    rw [wrapVal_of_lt hLtR] at hUnchk
+    have hWithOv := evalScalarBinOp_uint_mulWithOverflow (u := u)
+      (a := xExpr.eval env) (b := k) locals mem
+    rw [wrapVal_of_lt hLtR, nat_ble_false_of_lt hLtR] at hWithOv
+    exact ⟨hKInRange, hLtR, hMod, hUnchk, hWithOv⟩)
+    (checkNatCutGoal_lt_sound hyps (.mulC k xExpr)
+      (.cst (modPow2 (uintWidth u))) steps hChk env)
+
 /-! ## 3. `Anneal.UnsafeObligations` Bridges -/
 
 /-- Discharges `ValidSliceRange rp len totalLen` and the operational
@@ -842,6 +899,47 @@ theorem farkas_refines_mirAbsSlot_uint
              WrappedInterval.meet (modPow2 (uintWidth u)) a.wi (.iv lo₂ hi₂),
              a.sc⟩)).denote ty locals (.init (.scalar sc)) :=
       ⟨hSlot.1, hSlot.2.1, absVal_refine_wi_sound hSlot.2.2 hWi⟩
+    exact ⟨hDirect, hReduced⟩)
+    (farkas_discharges_aipcc_interval_refinement hyps (modPow2 (uintWidth u))
+      lo₂ hi₂ xExpr stepsLo stepsHi hLoLeHi hHiLtM hChkLo hChkHi env)
+
+/-- Lifts `farkas_discharges_aipcc_interval_refinement` to a `MirAbsSlot.uintCopy`
+slot while preserving the copy-alias fact `localUintNat? locals src u = some sc.bits`. -/
+theorem farkas_refines_mirAbsSlot_uintCopy
+    (u : UintTy) (hyps : List NatCutIneq) (lo₂ hi₂ : Nat) (xExpr : NatLinExpr)
+    (stepsLo stepsHi : List CutStep)
+    (hLoLeHi : Nat.ble lo₂ hi₂ = true)
+    (hHiLtM : Nat.blt hi₂ (modPow2 (uintWidth u)) = true)
+    (hChkLo : checkNatCutGoal ⟨hyps, ⟨.cst lo₂, xExpr⟩⟩ stepsLo = true)
+    (hChkHi : checkNatCutGoal ⟨hyps, ⟨xExpr, .cst hi₂⟩⟩ stepsHi = true)
+    (env : List Nat) (ty : Ty) (locals : List LocalSlot) (a : AbsVal)
+    (src : Nat) (sc : ScalarInt)
+    (hSlot : (MirAbsSlot.uintCopy u a src).denote ty locals (.init (.scalar sc)))
+    (hBits : sc.bits = xExpr.eval env) :
+    HypsImp (NatCutIneq.holds env) hyps
+      ((MirAbsSlot.uintCopy u ⟨.init, a.tnum, .iv lo₂ hi₂, a.sc⟩ src).denote ty locals
+         (.init (.scalar sc)) ∧
+       (MirAbsSlot.uintCopy u
+         (reduceAbsVal (uintWidth u)
+           ⟨.init, a.tnum,
+            WrappedInterval.meet (modPow2 (uintWidth u)) a.wi (.iv lo₂ hi₂),
+            a.sc⟩) src).denote ty locals (.init (.scalar sc))) :=
+  hypsImp_concl_mono (fun hWiEval => by
+    have hWi : WrappedInterval.denote (modPow2 (uintWidth u)) (.iv lo₂ hi₂) sc.bits := by
+      rw [hBits]
+      exact hWiEval
+    have hE := absVal_some_elim hSlot.2.2.1
+    have hDirect :
+        (MirAbsSlot.uintCopy u ⟨.init, a.tnum, .iv lo₂ hi₂, a.sc⟩ src).denote ty locals
+          (.init (.scalar sc)) :=
+      ⟨hSlot.1, hSlot.2.1, ⟨⟨sc.bits, rfl, hE.1⟩, hE.2.1, hWi, hE.2.2.2⟩, hSlot.2.2.2⟩
+    have hReduced :
+        (MirAbsSlot.uintCopy u
+          (reduceAbsVal (uintWidth u)
+            ⟨.init, a.tnum,
+             WrappedInterval.meet (modPow2 (uintWidth u)) a.wi (.iv lo₂ hi₂),
+             a.sc⟩) src).denote ty locals (.init (.scalar sc)) :=
+      ⟨hSlot.1, hSlot.2.1, absVal_refine_wi_sound hSlot.2.2.1 hWi, hSlot.2.2.2⟩
     exact ⟨hDirect, hReduced⟩)
     (farkas_discharges_aipcc_interval_refinement hyps (modPow2 (uintWidth u))
       lo₂ hi₂ xExpr stepsLo stepsHi hLoLeHi hHiLtM hChkLo hChkHi env)
@@ -2510,5 +2608,104 @@ theorem neg_canary_structural_fail_closed :
         [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst (modPow2 32)⟩] (.var 0) (.var 1))
       (.pair [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]) = false :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Canary: `farkas_discharges_aligned_base_plus_stride` and
+`farkas_discharges_unalign_raw_ptr_safe` (both `UnsafeObligations` bridges). -/
+theorem canary_aligned_base_plus_stride_and_unalign
+    (delta q off inner alloc : Nat) (rp : RawPtrVal)
+    (hBaseAligned : AlignedPtr rp 8)
+    (hLo : 8 * q ≤ delta) (hHi : delta ≤ 8 * q)
+    (hOff : rp.offset = off) (hBound : off + inner ≤ alloc) :
+    AlignedPtr { rp with offset := rp.offset + delta } 8 ∧
+    UnalignRawPtrSafe rp inner alloc :=
+  ⟨farkas_discharges_aligned_base_plus_stride
+     [⟨.mulC 8 (.var 1), .var 0⟩, ⟨.var 0, .mulC 8 (.var 1)⟩] 8
+     (.var 0) (.var 1)
+     [.hyp 0, .hyp 4, .comb 0 1 1 1] [.hyp 1, .hyp 4, .comb 0 1 1 1]
+     rfl rfl [delta, q] rp hBaseAligned hLo hHi,
+   farkas_discharges_unalign_raw_ptr_safe
+     [⟨.add (.var 0) (.var 1), .var 2⟩] (.var 0) (.var 1) (.var 2)
+     [.hyp 0, .hyp 4, .comb 0 1 1 1] rfl [off, inner, alloc] rp hOff hBound⟩
+
+/-- Canary: right-constant multiplication `x * 8 < 2^64` plus automatic
+in-range derivation `UintScalarInRange .u64 ⟨x, uintBytes .u64⟩`. -/
+theorem canary_uint_mul_const_right_and_rhs_inRange
+    (x : Nat) (locals : List LocalSlot) (mem : Memory) (hx : x ≤ 1024) :
+    UintScalarInRange .u64 ⟨8, uintBytes .u64⟩ ∧
+    UintScalarInRange .u64 ⟨x, uintBytes .u64⟩ ∧
+    evalScalarBinOp .mulUnchecked ⟨x, uintBytes .u64⟩ ⟨8, uintBytes .u64⟩ locals mem false =
+      .ok (.scalar ⟨x * 8, uintBytes .u64⟩) locals mem ∧
+    evalScalarBinOp .mulWithOverflow ⟨x, uintBytes .u64⟩ ⟨8, uintBytes .u64⟩ locals mem false =
+      .ok (.aggregate 0 [.scalar ⟨x * 8, uintBytes .u64⟩, .scalar ⟨0, 1⟩]) locals mem := by
+  have h := farkas_discharges_uint_mul_const_right_no_overflow .u64
+    [⟨.var 0, .cst 1024⟩] (.var 0) 8
+    [.hyp 0, .hyp 2, .comb 0 8 1 1] rfl rfl [x] locals mem hx
+  have hProdComm : 8 * x < modPow2 (uintWidth .u64) := by
+    rw [Nat.mul_comm]
+    exact h.2.1
+  have hXInRange : UintScalarInRange .u64 ⟨x, uintBytes .u64⟩ :=
+    uintScalarInRange_rhs_of_mul_const_pos (Nat.zero_lt_succ 7) hProdComm
+  exact ⟨h.1, hXInRange, h.2.2.2.1, h.2.2.2.2⟩
+
+/-- Canary: `checkIntCutGoal_lt_sound`, `checkIntCutGoal_eq_sound`, and
+`checkIntGraphIndexPath_sound` (multi-hop `0 → 1 → 2` over `IntEntailmentGraph`). -/
+theorem canary_int_cut_lt_eq_and_graph_index_path (x : Int)
+    (hLo : Int.negOfNat 3 ≤ x) (hHi : x ≤ Int.negOfNat 3) :
+    x < Int.ofNat 0 ∧ x = Int.negOfNat 3 ∧
+    (let g : IntEntailmentGraph :=
+      { nodes := [[⟨.cst ⟨true, 3⟩, .var 0⟩], [⟨.cst ⟨true, 5⟩, .var 0⟩],
+                  [⟨.cst ⟨true, 10⟩, .var 0⟩]]
+        edges :=
+          [ (0, 1, [[.hyp 0, .hyp 1, .comb 0 1 1 1]])
+          , (1, 2, [[.hyp 0, .hyp 1, .comb 0 1 1 1]]) ] }
+     ∃ src dst,
+       listLookup? g.nodes 0 = some src ∧
+       listLookup? g.nodes 2 = some dst ∧
+       (∀ env : List Int, src.holds env → dst.holds env)) :=
+  ⟨checkIntCutGoal_lt_sound
+     [⟨.var 0, .cst ⟨true, 3⟩⟩] (.var 0) (.cst SInt.zero)
+     [.hyp 0, .hyp 1, .comb 0 1 1 1] rfl [x] hHi,
+   checkIntCutGoal_eq_sound
+     [⟨.cst ⟨true, 3⟩, .var 0⟩, ⟨.var 0, .cst ⟨true, 3⟩⟩]
+     (.var 0) (.cst ⟨true, 3⟩)
+     [.hyp 1, .hyp 2, .comb 0 1 1 1] [.hyp 0, .hyp 2, .comb 0 1 1 1]
+     rfl rfl [x] hLo hHi,
+   checkIntGraphIndexPath_sound (g :=
+     { nodes := [[⟨.cst ⟨true, 3⟩, .var 0⟩], [⟨.cst ⟨true, 5⟩, .var 0⟩],
+                 [⟨.cst ⟨true, 10⟩, .var 0⟩]]
+       edges :=
+         [ (0, 1, [[.hyp 0, .hyp 1, .comb 0 1 1 1]])
+         , (1, 2, [[.hyp 0, .hyp 1, .comb 0 1 1 1]]) ] })
+     rfl [1, 2] 0 2 rfl⟩
+
+/-- End-to-end MIR-to-AiPcc-to-Farkas composition canary: extracts interval
+bounds from `MirAbsSlot.uint` and `MirAbsSlot.uintCopy`, refines the copy slot
+via `farkas_refines_mirAbsSlot_uintCopy`, and discharges `u64` `.addUnchecked`
+/ `.addWithOverflow` overflow-freedom for `sa.bits + sb.bits`. -/
+theorem canary_e2e_mirAbsSlot_to_uint_add_no_overflow
+    (tyA tyB : Ty) (locals : List LocalSlot) (mem : Memory) (src : Nat)
+    (sa sb : ScalarInt)
+    (hA : (MirAbsSlot.uint .u64 ⟨.init, Tnum.top 64, .iv 0 1000, .top⟩).denote
+      tyA locals (.init (.scalar sa)))
+    (hB : (MirAbsSlot.uintCopy .u64 ⟨.init, Tnum.top 64, .iv 10 2000, .top⟩ src).denote
+      tyB locals (.init (.scalar sb)))
+    (hTight : sb.bits ≤ 500) :
+    (MirAbsSlot.uintCopy .u64 ⟨.init, Tnum.top 64, .iv 10 500, .top⟩ src).denote
+      tyB locals (.init (.scalar sb)) ∧
+    evalScalarBinOp .addUnchecked
+      ⟨sa.bits, uintBytes .u64⟩ ⟨sb.bits, uintBytes .u64⟩ locals mem false =
+      .ok (.scalar ⟨sa.bits + sb.bits, uintBytes .u64⟩) locals mem := by
+  have hAb := mirAbsSlot_uint_iv_bounds rfl hA
+  have hBb := mirAbsSlot_uintCopy_iv_bounds rfl hB
+  have hRef := farkas_refines_mirAbsSlot_uintCopy .u64
+    [⟨.cst 10, .var 0⟩, ⟨.var 0, .cst 500⟩] 10 500 (.var 0)
+    [.hyp 0, .hyp 3, .comb 0 1 1 1] [.hyp 1, .hyp 3, .comb 0 1 1 1]
+    rfl rfl rfl rfl [sb.bits] tyB locals ⟨.init, Tnum.top 64, .iv 10 2000, .top⟩ src sb hB rfl
+    hBb.1 hTight
+  have hAdd := farkas_discharges_u64_add_no_overflow
+    [⟨.var 0, .cst 1000⟩, ⟨.var 1, .cst 500⟩] (.var 0) (.var 1)
+    [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1]
+    rfl [sa.bits, sb.bits] locals mem hAb.2.1 hTight
+  exact ⟨hRef.1, hAdd.2.2.1⟩
 
 end Anneal.FarkasMirCert

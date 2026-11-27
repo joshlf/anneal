@@ -627,16 +627,31 @@ def _to_sparse_fixed(
     return terms, delta
 
 
-def _check_fixed_goal_caps(
-    le_hyps: list[tuple[Any, Any]], gl_le: Any, gr_le: Any,
-    steps: list[dict[str, Any]], domain: str,
-) -> None:
+def _check_fixed_goal_input_caps(
+    le_hyps: list[tuple[Any, Any]], gl_le: Any, gr_le: Any, domain: str
+) -> tuple[int, int, int]:
     vset: dict[str, None] = {}
     nodes = voccs = 0
     for la, ra in [*le_hyps, (gl_le, gr_le)]:
         _, ln, lv, _ = _walk_ast(la, domain, vset, caps=True)
         _, rn, rv, _ = _walk_ast(ra, domain, vset, caps=True)
         nodes, voccs = nodes + ln + rn, voccs + lv + rv
+    mv, mh, mn, mvo, _ = _KERNEL_CAPS[domain]
+    base_jwork = 2 * len(vset) + 2 * len(le_hyps) + nodes + voccs
+    if (len(vset) > mv or len(le_hyps) > mh or nodes > mn or voccs > mvo
+            or (domain == "nat" and base_jwork > _NAT_MAX_JOINT_WORK)):
+        raise ParseError(
+            f"Certificate exceeds Lean maxRecDepth bounds (`--domain {domain}`: "
+            f"vars {len(vset)}/{mv}, hyps {len(le_hyps)}/{mh}, nodes {nodes}/{mn})."
+        )
+    return len(vset), nodes, voccs
+
+
+def _check_fixed_goal_caps(
+    le_hyps: list[tuple[Any, Any]], gl_le: Any, gr_le: Any,
+    steps: list[dict[str, Any]], domain: str,
+) -> None:
+    nvars, nodes, voccs = _check_fixed_goal_input_caps(le_hyps, gl_le, gr_le, domain)
     depths: list[int] = []
     for st in steps:
         depths.append(
@@ -644,14 +659,13 @@ def _check_fixed_goal_caps(
             else (1 + depths[st["s"]] if st["op"] == "divCut"
                   else 1 + max(depths[st["s1"]], depths[st["s2"]]))
         )
-    mv, mh, mn, mvo, ms = _KERNEL_CAPS[domain]
-    jwork = 2 * len(vset) + 2 * len(le_hyps) + nodes + voccs + len(steps)
-    if (len(vset) > mv or len(le_hyps) > mh or nodes > mn or voccs > mvo
-            or len(steps) > ms or max(depths, default=0) > _MAX_CERT_DEPTH
+    mv, mh, mn, _, ms = _KERNEL_CAPS[domain]
+    jwork = 2 * nvars + 2 * len(le_hyps) + nodes + voccs + len(steps)
+    if (len(steps) > ms or max(depths, default=0) > _MAX_CERT_DEPTH
             or (domain == "nat" and jwork > _NAT_MAX_JOINT_WORK)):
         raise ParseError(
             f"Certificate exceeds Lean maxRecDepth bounds (`--domain {domain}`: "
-            f"vars {len(vset)}/{mv}, hyps {len(le_hyps)}/{mh}, nodes {nodes}/{mn})."
+            f"vars {nvars}/{mv}, hyps {len(le_hyps)}/{mh}, nodes {nodes}/{mn})."
         )
 
 
@@ -659,6 +673,7 @@ def _solve_fixed_goal(
     domain: str, le_hyps: list[tuple[Any, Any]], gl_le: Any, gr_le: Any,
     vidx: dict[str, int], max_nodes: int,
 ) -> list[dict[str, Any]] | None:
+    _check_fixed_goal_input_caps(le_hyps, gl_le, gr_le, domain)
     hyp_rows = [_to_sparse_fixed(la, ra, vidx) for la, ra in le_hyps]
     neg_row = _to_sparse_fixed(("add", gr_le, ("cst", 1)), gl_le, vidx)
     g_var_ids = _nat_goal_var_order(le_hyps, gl_le, gr_le, vidx) if domain == "nat" else []
@@ -1453,24 +1468,24 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-nodes", type=int, default=2500)
     p.add_argument("--json", action="store_true")
     p.add_argument("--mir-bounds", choices=_MIR_BOUNDS_PRESETS, default=None)
-    p.add_argument("--width", type=int, default=64)
-    p.add_argument("--align", type=int, default=8)
-    p.add_argument("--scale", type=int, default=1)
-    p.add_argument("--offset-expr", default="off")
-    p.add_argument("--len-expr", default="len")
-    p.add_argument("--total-expr", default="total")
-    p.add_argument("--quot-expr", default="q")
-    p.add_argument("--lhs-expr", default="a")
-    p.add_argument("--rhs-expr", default="b")
-    p.add_argument("--var", default="x")
+    p.add_argument("--width", type=int, default=None)
+    p.add_argument("--align", type=int, default=None)
+    p.add_argument("--scale", type=int, default=None)
+    p.add_argument("--offset-expr", default=None)
+    p.add_argument("--len-expr", default=None)
+    p.add_argument("--total-expr", default=None)
+    p.add_argument("--quot-expr", default=None)
+    p.add_argument("--lhs-expr", default=None)
+    p.add_argument("--rhs-expr", default=None)
+    p.add_argument("--var", default=None)
     p.add_argument("--target-lo", type=int, default=None)
     p.add_argument("--target-hi", type=int, default=None)
     p.add_argument("--src-lo", type=int, default=None)
     p.add_argument("--src-hi", type=int, default=None)
-    p.add_argument("--src-offset-expr", default="src_off")
-    p.add_argument("--dst-offset-expr", default="dst_off")
-    p.add_argument("--count-expr", default="count")
-    p.add_argument("--direction", choices=("src-before-dst", "dst-before-src"), default="src-before-dst")
+    p.add_argument("--src-offset-expr", default=None)
+    p.add_argument("--dst-offset-expr", default=None)
+    p.add_argument("--count-expr", default=None)
+    p.add_argument("--direction", choices=("src-before-dst", "dst-before-src"), default=None)
     p.add_argument("--entailment-check", action="store_true")
     p.add_argument("--pre", action="append", default=[], dest="pres")
     p.add_argument("--obligation", action="append", default=[], dest="obligations")
@@ -1515,6 +1530,37 @@ def main(argv: list[str] | None = None) -> int:
         print(out if ns.json else f"[ERROR] {err}", file=(sys.stdout if ns.json else sys.stderr))
         return rc
 
+    mir_flag_map = (
+        ("width", "--width"),
+        ("align", "--align"),
+        ("scale", "--scale"),
+        ("offset_expr", "--offset-expr"),
+        ("len_expr", "--len-expr"),
+        ("total_expr", "--total-expr"),
+        ("quot_expr", "--quot-expr"),
+        ("lhs_expr", "--lhs-expr"),
+        ("rhs_expr", "--rhs-expr"),
+        ("var", "--var"),
+        ("target_lo", "--target-lo"),
+        ("target_hi", "--target-hi"),
+        ("src_lo", "--src-lo"),
+        ("src_hi", "--src-hi"),
+        ("src_offset_expr", "--src-offset-expr"),
+        ("dst_offset_expr", "--dst-offset-expr"),
+        ("count_expr", "--count-expr"),
+        ("direction", "--direction"),
+    )
+    preset_allowed_flags = {
+        "slice-range": {"offset_expr", "len_expr", "total_expr"},
+        "aligned-stride": {"align", "offset_expr", "quot_expr"},
+        "uint-add-no-overflow": {"width", "lhs_expr", "rhs_expr"},
+        "uint-sub-no-underflow": {"width", "lhs_expr", "rhs_expr"},
+        "aipcc-interval-refine": {"width", "var", "target_lo", "target_hi", "src_lo", "src_hi"},
+        "uint-mul-const-no-overflow": {"width", "scale", "var"},
+        "non-overlapping-ptrs": {"src_offset_expr", "dst_offset_expr", "count_expr", "direction"},
+    }
+    used_mir_flags = [(attr, flag) for attr, flag in mir_flag_map if getattr(ns, attr) is not None]
+
     try:
         for tok in raw:
             tok.encode("utf-8", errors="strict")
@@ -1528,19 +1574,38 @@ def main(argv: list[str] | None = None) -> int:
                 raise ParseError("`--mir-bounds` presets require `--domain nat`.")
             if ns.pres or ns.obligations or ns.witness is not None or ns.strict_witness is not None or ns.check_equiv:
                 raise ParseError("Entailment flags cannot be combined with `--mir-bounds`.")
+            allowed = preset_allowed_flags[ns.mir_bounds]
+            bad_flags = [flag for attr, flag in used_mir_flags if attr not in allowed]
+            if bad_flags:
+                raise ParseError(
+                    f"Flag(s) {', '.join(bad_flags)} are not supported by `--mir-bounds {ns.mir_bounds}`."
+                )
             res = generate_mir_bounds_certificate(
                 ns.mir_bounds, ns.hyps, ns.name, max_nodes=ns.max_nodes,
-                width=ns.width, align=ns.align, scale=ns.scale,
-                offset_expr=ns.offset_expr, len_expr=ns.len_expr,
-                total_expr=ns.total_expr, quot_expr=ns.quot_expr,
-                lhs_expr=ns.lhs_expr, rhs_expr=ns.rhs_expr, var_name=ns.var,
+                width=64 if ns.width is None else ns.width,
+                align=8 if ns.align is None else ns.align,
+                scale=1 if ns.scale is None else ns.scale,
+                offset_expr="off" if ns.offset_expr is None else ns.offset_expr,
+                len_expr="len" if ns.len_expr is None else ns.len_expr,
+                total_expr="total" if ns.total_expr is None else ns.total_expr,
+                quot_expr="q" if ns.quot_expr is None else ns.quot_expr,
+                lhs_expr="a" if ns.lhs_expr is None else ns.lhs_expr,
+                rhs_expr="b" if ns.rhs_expr is None else ns.rhs_expr,
+                var_name="x" if ns.var is None else ns.var,
                 target_lo=ns.target_lo, target_hi=ns.target_hi,
                 src_lo=ns.src_lo, src_hi=ns.src_hi,
-                src_offset_expr=ns.src_offset_expr, dst_offset_expr=ns.dst_offset_expr,
-                count_expr=ns.count_expr, direction=ns.direction,
+                src_offset_expr="src_off" if ns.src_offset_expr is None else ns.src_offset_expr,
+                dst_offset_expr="dst_off" if ns.dst_offset_expr is None else ns.dst_offset_expr,
+                count_expr="count" if ns.count_expr is None else ns.count_expr,
+                direction="src-before-dst" if ns.direction is None else ns.direction,
                 ascii_lean=ascii_lean,
             )
         elif ns.entailment_check:
+            if used_mir_flags:
+                raise ParseError(
+                    f"MIR-bounds flag(s) {', '.join(f for _, f in used_mir_flags)} "
+                    "cannot be combined with `--entailment-check`."
+                )
             if ns.goal is not None:
                 raise ParseError("`--goal` cannot be combined with `--entailment-check`.")
             if ns.pres and ns.hyps:
@@ -1554,6 +1619,11 @@ def main(argv: list[str] | None = None) -> int:
                 thm_name=ns.name, max_nodes=ns.max_nodes, ascii_lean=ascii_lean,
             )
         else:
+            if used_mir_flags:
+                raise ParseError(
+                    f"MIR-bounds flag(s) {', '.join(f for _, f in used_mir_flags)} "
+                    "require `--mir-bounds`."
+                )
             if ns.pres or ns.obligations or ns.witness is not None or ns.strict_witness is not None or ns.check_equiv:
                 raise ParseError("Entailment flags require `--entailment-check`.")
             if ns.goal is None:

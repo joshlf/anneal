@@ -480,6 +480,17 @@ def _semantic_tamper_variants(snip: str) -> list[str]:
     if sw and st:
         emit(snip[: st.start(2)] + sw.group(2) + snip[st.end(2) :])
         emit(snip[: sw.start(2)] + st.group(2) + snip[sw.end(2) :])
+    eq = re.search(r"(\.equiv \[)(.*)(\])", snip)
+    if fm and eq and fm.group(2) != eq.group(2):
+        # Asymmetric `.equiv`: swapping forward and reverse cert lists must fail at `rfl`.
+        (m1, m2) = (fm, eq) if fm.start(2) < eq.start(2) else (eq, fm)
+        emit(snip[: m1.start(2)] + m2.group(2) + snip[m1.end(2) : m2.start(2)]
+             + m1.group(2) + snip[m2.end(2) :])
+    if "farkas_discharges_uint_add_no_overflow .u128" in snip:
+        # Narrowing the target width `.u128` -> `.u8` invalidates the overflow bound at `rfl`.
+        emit(snip.replace(".u128", ".u8"))
+    if "farkas_discharges_uint_add_no_overflow .u16" in snip:
+        emit(snip.replace(".u16", ".u8"))
     return out
 
 
@@ -622,15 +633,29 @@ class FarkasMirCertGenTests(unittest.TestCase):
             with self.assertRaises(ParseError, msg=kwargs):
                 generate_mir_bounds_certificate(**kwargs)
 
-        # CLI mutual exclusion & domain guard -> exit 2
+        # CLI mutual exclusion, stray mode/preset flags, & domain guard -> exit 2
         for bad_argv in (
             ["--mir-bounds", "slice-range", "--entailment-check", "--obligation", "0 <= 1", "--witness", ""],
             ["--mir-bounds", "slice-range", "--domain", "int", "--hyp", "off <= 1"],
             ["--mir-bounds", "slice-range", "--goal", "0 <= 1"],
+            ["--mir-bounds", "slice-range", "--width", "32"],
+            ["--mir-bounds", "uint-add-no-overflow", "--target-lo", "0"],
+            ["--mir-bounds", "aligned-stride", "--scale", "4"],
+            ["--entailment-check", "--pre", "x <= 1", "--obligation", "x <= 2",
+             "--witness", "x=0", "--width", "32"],
+            ["--goal", "x <= 1", "--width", "32"],
         ):
             rc, out, _ = self._run_cli([*bad_argv, "--json"])
             self.assertEqual(rc, 2, bad_argv)
             self.assertFalse(json.loads(out)["solved"])
+
+        # Oversized MIR-bounds system (>30 hyps) fails closed upfront with ParseError
+        # even when the goal is unprovable (rather than returning solved=False).
+        too_many_hyps = [f"v{i} <= 1" for i in range(35)]
+        with self.assertRaisesRegex(ParseError, "maxRecDepth"):
+            generate_mir_bounds_certificate(
+                "uint-add-no-overflow", too_many_hyps, "too_many", width=8
+            )
         # Missing `--goal` in default mode keeps the baseline argparse contract
         # (`required=True`): usage error on stderr and `SystemExit(2)`, no JSON.
         for argv in (["--hyp", "x <= 1", "--json"], ["--hyp", "x <= 1"]):
@@ -1064,6 +1089,22 @@ class FarkasMirCertGenTests(unittest.TestCase):
             generate_entailment_certificate(
                 "nat", [], ["0 <= x"], "x=0",
                 check_equiv=True, thm_name="live_ent_empty_pre_equiv",
+            )["lean_snippet"],
+            # 128-bit max WrappedInterval refinement and signed 128-bit entailment boundaries
+            generate_mir_bounds_certificate(
+                "aipcc-interval-refine",
+                ["100 <= x"],
+                "live_aipcc_u128_max", width=128, var_name="x",
+                src_lo=0, src_hi=(1 << 128) - 1,
+                target_lo=100, target_hi=(1 << 128) - 1,
+            )["lean_snippet"],
+            generate_entailment_certificate(
+                "int",
+                [f"-{(1 << 128) - 1} <= x", f"x <= {(1 << 128) - 2}"],
+                [f"-{(1 << 128) - 1} <= x", f"x <= {(1 << 128) - 1}"],
+                "x=0",
+                strict_witness_str=f"x={(1 << 128) - 1}",
+                thm_name="live_ent_int_128bit_boundary",
             )["lean_snippet"],
         ]
 
