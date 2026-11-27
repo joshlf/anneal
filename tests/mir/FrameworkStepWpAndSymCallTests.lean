@@ -1714,7 +1714,6 @@ theorem cd_symLoop (n : Nat) :
         have hk1 : k ≤ 2 * (k + 1) := by
           rw [h2k]; exact Nat.le_trans (Nat.le_mul_of_pos_left k (by decide)) (Nat.le_add_right _ _)
         exact Nat.lt_of_le_of_lt (Nat.le_trans hk1 (Nat.le_add_left _ acc)) (hsum ▸ hn)
-      have hEnd := cd_iter_forall acc k hacc hk
       have hL : (cdSymHead vcdAdd vcdSub).toMachineState cdCfg (pairEnv acc (k + 1)) =
           cdHead (acc + 2) k := by
         have hSub : vcdSub.eval (pairEnv acc (k + 1)) = ⟨k, 4⟩ := by
@@ -1780,6 +1779,132 @@ theorem cd_pass1_symLoop (n : Nat) (hn : 2 * n < M32) :
     rw [Nat.add_comm 2 (n * 4 + 2), Nat.add_assoc]
   rw [hEq] at hTot
   exact hTot
+
+/-- Helper: one symbolic loop body evaluation agrees with `cdSigma` over ANY
+base memory `base`. -/
+theorem cd_sym_body_mem_eq (base : Memory) {acc k : Nat} (hacc : acc + 2 < M32) (hk : k < M32) :
+    (cdSymHead vcdAdd vcdSub).toMachineStateOver base (pairEnv acc (k + 1)) =
+      (cdSymHead vcdAcc vcdI).toMachineStateOver base (cdSigma (pairEnv acc (k + 1))) := by
+  have hSub : vcdSub.eval (pairEnv acc (k + 1)) = ⟨k, 4⟩ := by
+    rw [SymScalar.eval_binOp, SymScalar.eval_var, SymScalar.eval_const]
+    have hle : Nat.ble 1 (k + 1) = true :=
+      Nat.ble_eq_true_of_le (Nat.succ_le_succ (Nat.zero_le k))
+    show (match (match Nat.ble 1 (k + 1) with
+      | true => RvalueEvalResult.ok (.scalar ⟨wrapScalarBits (Nat.sub (k + 1) 1)
+          (scalarModulus 4), 4⟩) [] emptyMemory
+      | false => RvalueEvalResult.ok (.scalar ⟨wrapScalarBits (Nat.sub (Nat.add
+          (scalarModulus 4) (wrapScalarBits (k + 1) (scalarModulus 4)))
+          (wrapScalarBits 1 (scalarModulus 4))) (scalarModulus 4), 4⟩) [] emptyMemory) with
+      | .ok (.scalar sc) _ _ => some sc | _ => none).getD symDefaultScalar = _
+    rw [hle]
+    have hsub1 : Nat.sub (k + 1) 1 = k := Nat.add_sub_cancel k 1
+    dsimp only; rw [hsub1, wrapScalarBits_of_lt hk]; rfl
+  have hAdd : vcdAdd.eval (pairEnv acc (k + 1)) = ⟨acc + 2, 4⟩ := by
+    rw [SymScalar.eval_binOp, SymScalar.eval_var, SymScalar.eval_const]
+    show (some { bits := wrapScalarBits (acc + 2) (scalarModulus 4), sizeBytes := 4 }).getD
+      symDefaultScalar = _
+    rw [wrapScalarBits_of_lt hacc]; rfl
+  have hsub1 : k + 1 - 1 = k := Nat.add_sub_cancel k 1
+  unfold cdSymHead cdSigma SymProg.toMachineStateOver SymProg.toMemoryOver SymFrame.eval
+    symSlotsEval SymSlot.eval SymVal.eval
+  simp only [List.map, hAdd, hSub, SymScalar.eval_var, pairEnv, hsub1]
+  rfl
+
+/-- Universal stateless `VerificationResult` for `countdown(n)` directly via
+`verificationResult_of_symLoop` (zero hand-written loop induction). -/
+theorem cd_verificationResult_symLoop :
+    VerificationResult
+      { body := cdBody
+        pre := fun args => ∃ n, args = [.scalar ⟨n, 4⟩] ∧ 2 * n < M32
+        post := fun args r => ∃ n, args = [.scalar ⟨n, 4⟩] ∧ r = .scalar ⟨2 * n, 4⟩ } := by
+  refine verificationResult_of_symLoop _ cdCfg rfl rfl cd_sym_pre cd_sym_fork
+    (List.Mem.tail _ (List.Mem.head _)) (List.Mem.head _) cd_sym_body cd_sym_exit ?_
+  intro args ⟨n, hArgs, hn⟩
+  subst hArgs
+  refine ⟨pairEnv 0 n, (fun e => e 1), cdLoopInv n, cdSigma, rfl, trivial,
+    ⟨0, n, rfl, Nat.zero_add _, hn⟩, rfl, ?_, ?_⟩
+  · intro env ⟨acc, j, henv, hsum, _⟩ hr
+    subst henv
+    cases j with
+    | zero => exact absurd rfl hr
+    | succ k =>
+      have h2k : 2 * (k + 1) = 2 * k + 2 := Nat.mul_succ 2 k
+      have hacc : acc + 2 < M32 := by
+        have : acc + 2 ≤ acc + 2 * (k + 1) := by
+          rw [h2k, ← Nat.add_assoc]; exact Nat.add_le_add_right (Nat.le_add_right acc (2 * k)) 2
+        exact Nat.lt_of_le_of_lt this (hsum ▸ hn)
+      have hk : k < M32 := by
+        have hk1 : k ≤ 2 * (k + 1) := by
+          rw [h2k]; exact Nat.le_trans (Nat.le_mul_of_pos_left k (by decide)) (Nat.le_add_right _ _)
+        exact Nat.lt_of_le_of_lt (Nat.le_trans hk1 (Nat.le_add_left _ acc)) (hsum ▸ hn)
+      refine ⟨fun u hu => ?_, condsHold_of_boolCert cd_body_condsCert _, ?_, ?_,
+        cd_sym_body_mem_eq (symEntryMemory cdCfg) hacc hk⟩
+      · cases hu with
+        | head => exact Nat.succ_ne_zero k
+        | tail _ h => nomatch h
+      · show k + 1 - 1 < k + 1
+        rw [Nat.add_sub_cancel]; exact Nat.lt_succ_self k
+      · refine ⟨acc + 2, k + 1 - 1, rfl, ?_, hn⟩
+        rw [Nat.add_sub_cancel, Nat.add_assoc, Nat.add_comm 2 (2 * k), ← h2k]; exact hsum
+  · intro env ⟨acc, j, henv, hsum, _⟩ hr
+    subst henv
+    have hj : j = 0 := hr; subst hj
+    refine ⟨⟨rfl, fun _ h => nomatch h⟩, trivial, ⟨n, rfl, ?_⟩⟩
+    show Value.scalar ⟨acc, 4⟩ = .scalar ⟨2 * n, 4⟩
+    rw [Nat.mul_zero, Nat.add_zero] at hsum; rw [hsum]
+
+/-- Family-wide `StatefulVerificationResult` for `countdown(n)` directly via
+`statefulVerificationResult_of_symLoop_mem` over EVERY compatible memory
+(`SymStatefulMemCompat cdCfg mem`), proving exact `mem' = mem` preservation. -/
+theorem cd_statefulVerificationResult_symLoop_mem :
+    StatefulVerificationResult
+      { body := cdBody
+        pre := fun args mem => (∃ n, args = [.scalar ⟨n, 4⟩] ∧ 2 * n < M32) ∧
+          SymStatefulMemCompat cdCfg mem
+        post := fun args mem r mem' =>
+          (∃ n, args = [.scalar ⟨n, 4⟩] ∧ r = .scalar ⟨2 * n, 4⟩) ∧ mem' = mem } := by
+  refine statefulVerificationResult_of_symLoop_mem _ cdCfg rfl rfl cd_sym_pre cd_sym_fork
+    (List.Mem.tail _ (List.Mem.head _)) (List.Mem.head _) cd_sym_body cd_sym_exit ?_
+  intro args mem ⟨⟨n, hArgs, hn⟩, hMem⟩
+  subst hArgs
+  have hMemEq : ∀ env,
+      { mem with callStack := symStackEval env [], activeCallee := none } = mem := by
+    intro _
+    cases mem with
+    | mk _ _ _ _ _ _ cs ac _ _ _ _ _ _ =>
+      obtain ⟨_, _, _, hcs, hac, _⟩ := hMem
+      dsimp only at hcs hac; subst hcs; subst hac; rfl
+  refine ⟨hMem, pairEnv 0 n, (fun e => e 1), cdLoopInv n, cdSigma, rfl, trivial,
+    ⟨0, n, rfl, Nat.zero_add _, hn⟩, rfl, ?_, ?_⟩
+  · intro env ⟨acc, j, henv, hsum, _⟩ hr
+    subst henv
+    cases j with
+    | zero => exact absurd rfl hr
+    | succ k =>
+      have h2k : 2 * (k + 1) = 2 * k + 2 := Nat.mul_succ 2 k
+      have hacc : acc + 2 < M32 := by
+        have : acc + 2 ≤ acc + 2 * (k + 1) := by
+          rw [h2k, ← Nat.add_assoc]; exact Nat.add_le_add_right (Nat.le_add_right acc (2 * k)) 2
+        exact Nat.lt_of_le_of_lt this (hsum ▸ hn)
+      have hk : k < M32 := by
+        have hk1 : k ≤ 2 * (k + 1) := by
+          rw [h2k]; exact Nat.le_trans (Nat.le_mul_of_pos_left k (by decide)) (Nat.le_add_right _ _)
+        exact Nat.lt_of_le_of_lt (Nat.le_trans hk1 (Nat.le_add_left _ acc)) (hsum ▸ hn)
+      refine ⟨fun u hu => ?_, condsHold_of_boolCert cd_body_condsCert _, ?_, ?_,
+        cd_sym_body_mem_eq mem hacc hk⟩
+      · cases hu with
+        | head => exact Nat.succ_ne_zero k
+        | tail _ h => nomatch h
+      · show k + 1 - 1 < k + 1
+        rw [Nat.add_sub_cancel]; exact Nat.lt_succ_self k
+      · refine ⟨acc + 2, k + 1 - 1, rfl, ?_, hn⟩
+        rw [Nat.add_sub_cancel, Nat.add_assoc, Nat.add_comm 2 (2 * k), ← h2k]; exact hsum
+  · intro env ⟨acc, j, henv, hsum, _⟩ hr
+    subst henv
+    have hj : j = 0 := hr; subst hj
+    refine ⟨⟨rfl, fun _ h => nomatch h⟩, trivial, ⟨⟨n, rfl, ?_⟩, hMemEq _⟩⟩
+    show Value.scalar ⟨acc, 4⟩ = .scalar ⟨2 * n, 4⟩
+    rw [Nat.mul_zero, Nat.add_zero] at hsum; rw [hsum]
 
 /-! ## Pillar 3: Negative Non-Vacuity & Fail-Closed Falsification Canaries -/
 
@@ -2527,6 +2652,15 @@ theorem assert_continue_panic_forall (x : Nat) (Q : Value → Memory → Prop) (
 #print axioms symExploreChunks_mirCallTree_sound
 #print axioms verificationResult_of_symExploreChunks
 #print axioms statefulVerificationResult_of_symExploreChunks_mem
+#print axioms symLoop_rank_sound
+#print axioms symLoop_rank_sound_over
+#print axioms symLoop_steps_sound_over
+#print axioms verificationResult_of_symLoop
+#print axioms statefulVerificationResult_of_symLoop_mem
+#print axioms cd_symLoop
+#print axioms cd_pass1_symLoop
+#print axioms cd_verificationResult_symLoop
+#print axioms cd_statefulVerificationResult_symLoop_mem
 #print axioms add_scaled_symbolic
 #print axioms add_scaled_execStepOutcome
 #print axioms add_scaled_blockCtx_firewall
@@ -2630,7 +2764,9 @@ def keyTestTheorems : Array Lean.Name :=
     ``cd_not_tight_forall, ``cd_verificationResult_forall, ``cd_statefulVerificationResult_forall,
     ``spin_partial_not_total, ``add_scaled_mul_overflow_ub_forall,
     ``add_scaled_add_overflow_ub_forall, ``sel_emits_event_zero, ``sel_emits_event_succ,
-    ``scaled_add_call_silent, ``cd_iter_forall, ``sel_verificationResult_explore, ``cd_symLoop, ``cd_pass1_symLoop,
+    ``scaled_add_call_silent, ``cd_iter_forall, ``sel_verificationResult_explore,
+    ``cd_symLoop, ``cd_pass1_symLoop, ``cd_verificationResult_symLoop,
+    ``cd_statefulVerificationResult_symLoop_mem,
     ``sel_mirCallTree_explore, ``sel_statefulVerificationResult_explore_mem,
     ``add_scaled_statefulVerificationResult_mem,
     ``addScaledBranch_verificationResult_exploreChunks,
