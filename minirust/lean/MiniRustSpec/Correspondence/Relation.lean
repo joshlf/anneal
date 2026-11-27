@@ -126,7 +126,7 @@ theorem encodePtrBytes_length (prov : Option Prov) (i : Nat) (data : List UInt8)
     (encodePtrBytes prov i data).length = data.length := by
   induction data generalizing i with
   | nil => rfl
-  | cons b rest ih => simp [encodePtrBytes, ih]
+  | cons b rest ih => simp [Interp.encodePtrBytes, ih]
 
 theorem ptrBytes_length (addr : Nat) (prov : Option Prov) : (ptrBytes addr prov).length = 8 := by
   simp [ptrBytes, encodePtrBytes_length, leBytes_length]

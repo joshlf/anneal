@@ -692,39 +692,54 @@ theorem replicateUninitBytes_eq_replicate :
   | 0 => rfl
   | n + 1 => congrArg (.uninit :: ·) (replicateUninitBytes_eq_replicate n)
 
+private theorem encodePtrBytesAux_length_sim (a t o pb : Nat) :
+    ∀ (x idx n : Nat), (encodePtrBytesAux a t o pb x idx n).length = n
+  | _, _, 0 => rfl
+  | x, idx, n + 1 => congrArg (· + 1) (encodePtrBytesAux_length_sim a t o pb (Nat.div x 256) (idx + 1) n)
+
+@[simp]
+private theorem encodePlainLittleEndianBytes_length :
+    ∀ (x n : Nat), (encodePlainLittleEndianBytes x n).length = n
+  | _, 0 => rfl
+  | x, n + 1 => congrArg (· + 1) (encodePlainLittleEndianBytes_length (Nat.div x 256) n)
+
+@[simp]
+private theorem encodePlainLittleEndianBytes_seq_length (x n : Nat) :
+    length (encodePlainLittleEndianBytes x n) = n :=
+  encodePlainLittleEndianBytes_length x n
+
 theorem encodeLittleEndianBytes_length :
     ∀ (x n : Nat) (p : Option (Nat × Nat)), (encodeLittleEndianBytes x n p).length = n
-  | _, 0, _ => rfl
-  | x, n + 1, p => congrArg (· + 1) (encodeLittleEndianBytes_length (Nat.div x 256) n p)
+  | _, 0, none => rfl
+  | x, n + 1, none => congrArg (· + 1) (encodeLittleEndianBytes_length (Nat.div x 256) n none)
+  | x, n, some (a, t) => encodePtrBytesAux_length_sim a t (normPtrByteOffset n x) n x 0 n
 
 theorem takeAbstractBytes_encodeLittleEndianBytes :
-    ∀ (w k x : Nat) (p : Option (Nat × Nat)), w ≤ k →
-      takeAbstractBytes w (encodeLittleEndianBytes x k p) = encodeLittleEndianBytes x w p
-  | 0, _, _, _, _ => rfl
-  | _ + 1, 0, _, _, h => absurd h (by omega)
-  | w + 1, k + 1, x, p, h =>
-    congrArg (.init (UInt8.ofNat x) p :: ·)
-      (takeAbstractBytes_encodeLittleEndianBytes w k (Nat.div x 256) p (Nat.le_of_succ_le_succ h))
+    ∀ (w k x : Nat), w ≤ k →
+      takeAbstractBytes w (encodeLittleEndianBytes x k none) = encodeLittleEndianBytes x w none
+  | 0, _, _, _ => rfl
+  | _ + 1, 0, _, h => absurd h (by omega)
+  | w + 1, k + 1, x, h =>
+    congrArg (.init (UInt8.ofNat x) none :: ·)
+      (takeAbstractBytes_encodeLittleEndianBytes w k (Nat.div x 256) (Nat.le_of_succ_le_succ h))
 
-theorem decodeLittleEndianBytes_encodeLittleEndianBytes_none :
+private theorem decodeLittleEndianBits_encodeLittleEndianBytes_none :
     ∀ (w x : Nat),
-      decodeLittleEndianBytes (encodeLittleEndianBytes x w none) =
-        some (x % scalarModulus w, none)
+      decodeLittleEndianBits (encodeLittleEndianBytes x w none) =
+        some (x % scalarModulus w)
   | 0, x => by
     rw [scalarModulus_eq_two_pow]
-    exact congrArg (fun v => some (v, none)) (Nat.mod_one x).symm
+    exact congrArg some (Nat.mod_one x).symm
   | w + 1, x => by
-    unfold encodeLittleEndianBytes decodeLittleEndianBytes
-    change (match decodeLittleEndianBytes (encodeLittleEndianBytes (x / 256) w none) with
-      | some (highBits, restProv) =>
-        some ((UInt8.ofNat x).toBitVec.toNat + 256 * highBits, mergeByteProvenance none restProv)
-      | none => none) = _
-    rw [decodeLittleEndianBytes_encodeLittleEndianBytes_none w (x / 256)]
-    dsimp only [mergeByteProvenance]
+    show (match decodeLittleEndianBits (encodeLittleEndianBytes (x / 256) w none) with
+      | some highBits => some ((UInt8.ofNat x).toBitVec.toNat + 256 * highBits)
+      | none => none) = some (x % scalarModulus (w + 1))
+    rw [decodeLittleEndianBits_encodeLittleEndianBytes_none w (x / 256)]
+    dsimp only
     simp only [scalarModulus_eq_two_pow]
     have hu8 : (UInt8.ofNat x).toBitVec.toNat = x % 256 := by simp [UInt8.ofNat]
     rw [hu8]
-    congr 1; congr 1
+    congr 1
     let M := 2 ^ (8 * w)
     have hpow : 2 ^ (8 * (w + 1)) = 256 * M := by
       dsimp only [M]
@@ -746,12 +761,27 @@ theorem decodeLittleEndianBytes_encodeLittleEndianBytes_none :
     conv => rhs; rw [hx]
     rw [Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt hlt]
 
-theorem decodeLittleEndianBytes_append_uninit :
-    ∀ (xs ys : List AbstractByte), decodeLittleEndianBytes (xs ++ .uninit :: ys) = none
+theorem decodeLittleEndianBytes_encodeLittleEndianBytes_none :
+    ∀ (w x : Nat),
+      decodeLittleEndianBytes (encodeLittleEndianBytes x w none) =
+        some (x % scalarModulus w, none)
+  | w, x => by
+    unfold decodeLittleEndianBytes
+    rw [decodeLittleEndianBits_encodeLittleEndianBytes_none]
+    cases w <;> rfl
+
+private theorem decodeLittleEndianBits_append_uninit :
+    ∀ (xs ys : List AbstractByte), decodeLittleEndianBits (xs ++ .uninit :: ys) = none
   | [], _ => rfl
   | .uninit :: _, _ => rfl
   | .init b p :: rest, ys => by
-    simp [decodeLittleEndianBytes, decodeLittleEndianBytes_append_uninit rest ys]
+    simp [decodeLittleEndianBits, decodeLittleEndianBits_append_uninit rest ys]
+
+theorem decodeLittleEndianBytes_append_uninit :
+    ∀ (xs ys : List AbstractByte), decodeLittleEndianBytes (xs ++ .uninit :: ys) = none
+  | xs, ys => by
+    unfold decodeLittleEndianBytes
+    rw [decodeLittleEndianBits_append_uninit]
 
 theorem abstractBytesHaveProv_encodeLittleEndian_none :
     ∀ (x n : Nat), abstractBytesHaveProv (encodeLittleEndianBytes x n none) = false
@@ -878,28 +908,36 @@ private theorem primScalar_width_eq {layouts : LayoutTable} {fty : Ty} {w : Nat}
 theorem tyByteSize_primScalar {localDecls : List LocalDecl} {layouts : LayoutTable}
     {fty rTy : Ty} {w : Nat} (hprim : IsPrimScalarTy fty) (hw : ValidScalarBytes w)
     (hsz : (translateTy fty layouts).layout.size = translateSizeBytes w)
-    (hrk : rTy.kind = fty.kind) :
+    (hrk : rTy.kind = fty.kind)
+    (hptr8 : layoutPointerBytes layouts = 8 := by rfl) :
     tyByteSize localDecls layouts rTy = some w := by
   obtain ⟨hbool_w, hchar_w, hint_w, huint_w⟩ := primScalar_width_eq hprim hw hsz
   have hrk' : (resolveTyWithLocalDecls localDecls layouts rTy).kind = fty.kind := by
     rw [resolveTyWithLocalDecls_kind_eq, hrk]
-  have hkind_sz : rigidTyKindByteSize fty.kind = some w := by
-    rcases hprim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
-    · rw [hk, hbool_w hk]
-    · rw [hk, hchar_w hk]
-    · rw [hk]; unfold rigidTyKindByteSize; exact hint_w it hk
-    · rw [hk]; unfold rigidTyKindByteSize; exact huint_w ut hk
-  unfold tyByteSize tyByteSizeAndAlignAux
-  generalize resolveTyWithLocalDecls localDecls layouts rTy = rResolved at hrk' ⊢
-  rcases hprim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩ <;>
-    rw [hk] at hrk' hkind_sz <;>
-    simp [hrk', rigidTyByteSize, hkind_sz]
+  have h4 : Nat.beq (layoutPointerBytes layouts) 4 = false := by rw [hptr8]; rfl
+  show (match tyByteSizeAndAlignAux localDecls layouts (7 + 1) rTy with
+    | .some (s, _) => .some s | .none => .none) = some w
+  unfold tyByteSizeAndAlignAux
+  dsimp only
+  rcases hr : resolveTyWithLocalDecls localDecls layouts rTy with ⟨rk_res, rl_res⟩
+  rw [hr] at hrk'
+  dsimp only at hrk' ⊢
+  rcases hprim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
+  · rw [hk] at hrk'; subst hrk'; simp [h4, rigidTyByteSize, hbool_w hk]
+  · rw [hk] at hrk'; subst hrk'; simp [h4, rigidTyByteSize, hchar_w hk]
+  · have hw' := hint_w it hk
+    rw [hk] at hrk'; subst hrk'
+    cases it <;> (dsimp only [intCastTargetBytes] at hw'; injection hw' with hw_eq; subst hw_eq; simp [hptr8, rigidTyByteSize, rigidTyKindByteSize, intCastTargetBytes])
+  · have hw' := huint_w ut hk
+    rw [hk] at hrk'; subst hrk'
+    cases ut <;> (dsimp only [intCastTargetBytes] at hw'; injection hw' with hw_eq; subst hw_eq; simp [hptr8, rigidTyByteSize, rigidTyKindByteSize, intCastTargetBytes])
 
 theorem encodeTypedValueToBytes_primScalar {layouts : LayoutTable} {fty rTy : Ty}
     {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
     (hprim : IsPrimScalarTy fty)
     (himm : ImmediateRel fty layouts (.scalar sc) (.scalar (.fromScalarInt msc)))
-    (hrk : rTy.kind = fty.kind) :
+    (hrk : rTy.kind = fty.kind)
+    (hptr8 : layoutPointerBytes layouts = 8 := by rfl) :
     encodeTypedValueToBytes layouts rTy (.scalar sc) =
       some (encodeLittleEndianBytes sc.bits sc.sizeBytes none) := by
   cases himm with
@@ -908,6 +946,7 @@ theorem encodeTypedValueToBytes_primScalar {layouts : LayoutTable} {fty rTy : Ty
   obtain ⟨_, _, hint_w, huint_w⟩ := primScalar_width_eq hprim hvb hsz_ty
   have h0 : Nat.beq sc.sizeBytes 0 = false := by
     rcases hvb with h | h | h | h | h <;> (rw [h]; rfl)
+  have h4 : Nat.beq (layoutPointerBytes layouts) 4 = false := by rw [hptr8]; rfl
   unfold encodeTypedValueToBytes
   dsimp only
   rcases hprim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩
@@ -918,27 +957,29 @@ theorem encodeTypedValueToBytes_primScalar {layouts : LayoutTable} {fty rTy : Ty
       unfold Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout; rw [hrk']
     rw [hnr, hu]
     rcases hb with hb0 | hb1
-    · simp [encodeValueToBytes, hrk', h1, hb0, encodeLittleEndianBytes]
-    · simp [encodeValueToBytes, hrk', h1, hb1, encodeLittleEndianBytes]
+    · simp [h4, encodeValueToBytes, hrk', h1, hb0, encodeLittleEndianBytes]
+    · simp [h4, encodeValueToBytes, hrk', h1, hb1, encodeLittleEndianBytes]
   · have hrk' : rTy.kind = .char := hrk.trans hk
-    obtain ⟨h4, hc⟩ := hchar hk
+    obtain ⟨h4c, hc⟩ := hchar hk
     have hnr : normalizeCodecTy rTy = rTy := by unfold normalizeCodecTy; rw [hrk']
     have hu : Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout layouts rTy = false := by
       unfold Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout; rw [hrk']
     rw [hnr, hu]
-    simp [encodeValueToBytes, hrk', h4, hc, encodeScalarBytes]
+    simp [h4, encodeValueToBytes, hrk', h4c, hc, encodeScalarBytes]
   · have hrk' : rTy.kind = .int it := hrk.trans hk
     have hnr : normalizeCodecTy rTy = rTy := by unfold normalizeCodecTy; rw [hrk']
     have hu : Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout layouts rTy = false := by
       unfold Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout; rw [hrk']
     rw [hnr, hu]
-    simp [encodeValueToBytes, hrk', hint_w it hk, encodeScalarBytes, h0]
+    have hw' := hint_w it hk
+    cases it <;> (dsimp only [intCastTargetBytes] at hw'; injection hw' with hw_eq; simp [h4, hptr8, encodeValueToBytes, scalarLayoutByteWidth, intCastTargetBytes, hrk', ← hw_eq, encodeScalarBytes, h0])
   · have hrk' : rTy.kind = .uint ut := hrk.trans hk
     have hnr : normalizeCodecTy rTy = rTy := by unfold normalizeCodecTy; rw [hrk']
     have hu : Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout layouts rTy = false := by
       unfold Trusted.Rustc.V2026_06_01.MirSemantics.isUnionLayout; rw [hrk']
     rw [hnr, hu]
-    simp [encodeValueToBytes, hrk', huint_w ut hk, encodeScalarBytes, h0]
+    have hw' := huint_w ut hk
+    cases ut <;> (dsimp only [intCastTargetBytes] at hw'; injection hw' with hw_eq; simp [h4, hptr8, encodeValueToBytes, scalarLayoutByteWidth, intCastTargetBytes, hrk', ← hw_eq, encodeScalarBytes, h0])
 
 theorem decodeTypedValueFromBytes_primScalar {layouts : LayoutTable} {fty rTy : Ty}
     {x w : Nat} (hprim : IsPrimScalarTy fty) (hw : ValidScalarBytes w)
@@ -1126,14 +1167,30 @@ private theorem mergeMaskedAbstractBytes_fresh :
       (dsimp only [replicateUninitBytes, replicateBool, mergeMaskedAbstractBytes] at hih ⊢;
        rw [hih])
 
+private theorem encodePlainLittleEndianBytes_all_init :
+    ∀ (x n : Nat) (b : AbstractByte),
+      b ∈ encodePlainLittleEndianBytes x n → ∃ y q, b = .init y q
+  | _, 0, _, h => nomatch h
+  | x, n + 1, b, h => by
+    rcases List.mem_cons.mp h with rfl | hrest
+    · exact ⟨_, _, rfl⟩
+    · exact encodePlainLittleEndianBytes_all_init (Nat.div x 256) n b hrest
+
+private theorem encodePtrBytesAux_all_init (a t o pb : Nat) :
+    ∀ (x idx n : Nat) (b : AbstractByte),
+      b ∈ encodePtrBytesAux a t o pb x idx n → ∃ y q, b = .init y q
+  | _, _, 0, _, h => nomatch h
+  | x, idx, n + 1, b, h => by
+    rcases List.mem_cons.mp h with rfl | hrest
+    · exact ⟨_, _, rfl⟩
+    · exact encodePtrBytesAux_all_init a t o pb (Nat.div x 256) (idx + 1) n b hrest
+
 private theorem encodeLittleEndianBytes_all_init :
     ∀ (x n : Nat) (p : Option (Nat × Nat)) (b : AbstractByte),
       b ∈ encodeLittleEndianBytes x n p → ∃ y q, b = .init y q
-  | _, 0, _, _, h => nomatch h
-  | x, n + 1, p, b, h => by
-    rcases List.mem_cons.mp h with rfl | hrest
-    · exact ⟨_, _, rfl⟩
-    · exact encodeLittleEndianBytes_all_init (Nat.div x 256) n p b hrest
+  | x, n, none, b, h => encodePlainLittleEndianBytes_all_init x n b h
+  | x, n, some (a, t), b, h =>
+    encodePtrBytesAux_all_init a t (normPtrByteOffset n x) n x 0 n b h
 
 private theorem mergeUnionTypedSlotsAux_units (layouts : LayoutTable)
     (enc : Nat → Value → Option (List AbstractByte)) (fb : Nat) (ov : Bool) (S : Nat) :
@@ -1369,24 +1426,12 @@ private theorem overlayRawAbstractByteVals_encode_none :
     have hih := overlayRawAbstractByteVals_encode_none bs buf
       (fun b' hb' => hinit b' (List.mem_cons_of_mem _ hb')) hlen'
     rcases hinit b List.mem_cons_self with rfl | ⟨x, rfl⟩
-    · show (match overlayRawAbstractByteVals (encodeRawAbstractByteVals bs) buf with
-          | some tail => some (.uninit :: tail)
-          | none => none) = some (.uninit :: bs)
-      rw [hih]
+    · simp only [encodeRawAbstractByteVals, overlayRawAbstractByteVals,
+        encodeRawAbstractByteVal, decodeRawAbstractByteVal?, hih]
     · have hx : UInt8.ofNat x.toBitVec.toNat = x := by
         cases x with | ofBitVec bv => simp [UInt8.ofNat]
-      dsimp only [encodeRawAbstractByteVals]
-      cases hb : x.toBitVec.toNat with
-      | zero =>
-        show (match overlayRawAbstractByteVals (encodeRawAbstractByteVals bs) buf with
-            | some tail => some (.init (UInt8.ofNat 0) none :: tail)
-            | none => none) = some (.init x none :: bs)
-        rw [hih, ← hb, hx]
-      | succ k =>
-        show (match overlayRawAbstractByteVals (encodeRawAbstractByteVals bs) buf with
-            | some tail => some (.init (UInt8.ofNat (k + 1)) none :: tail)
-            | none => none) = some (.init x none :: bs)
-        rw [hih, ← hb, hx]
+      simp only [encodeRawAbstractByteVals, overlayRawAbstractByteVals,
+        encodeRawAbstractByteVal, decodeRawAbstractByteVal?, hih, hx]
 
 private theorem mergeMaskedAbstractBytes_prefix_true :
     ∀ (bs tail : List AbstractByte) (bmList : List Bool),
@@ -1671,6 +1716,8 @@ theorem evalOperand_unionFieldRead_spec
   have hcons := unionNeedsConsistencyCheck_unionSlotFields_scalar hf sc
   obtain ⟨rPt, hpt_eq, hpt_kind⟩ :=
     placeTyResolved_field_kind (layouts := body.layouts) hdecl_u j fty
+  have hptr8 : layoutPointerBytes body.layouts = 8 := by
+    unfold layoutPointerBytes; rw [hptr]
   have hread_unfold : ∀ res,
       readProjectedValueUnionAware locals body.localDecls body.layouts
           (.aggregate 0 (unionSlotFields n f (.scalar sc))) uDecl.ty [.field j fty] = res →
@@ -1678,7 +1725,10 @@ theorem evalOperand_unionFieldRead_spec
           body.localDecls =
         match res with
         | .ok fv =>
-          if validateValueForTy? body.layouts (some rPt) fv then .ok fv locals else .ub
+          match materializeReadPtrValue body.layouts (some rPt) fv with
+          | none => .ub
+          | some matVal =>
+            if validateValueForTy? body.layouts (some rPt) matVal then .ok matVal locals else .ub
         | .ub => .ub
         | .unsupported => .unsupported := by
     intro res hres
@@ -1692,7 +1742,13 @@ theorem evalOperand_unionFieldRead_spec
        rw [hdecl_u]; dsimp only;
        rw [hres, hpt_eq];
        cases res with
-       | ok fv => dsimp only; cases validateValueForTy? body.layouts (some rPt) fv <;> rfl
+       | ok fv =>
+         dsimp only
+         cases materializeReadPtrValue body.layouts (some rPt) fv with
+         | none => rfl
+         | some matVal =>
+           dsimp only
+           cases validateValueForTy? body.layouts (some rPt) matVal <;> rfl
        | ub => rfl
        | unsupported => rfl)
   refine ⟨fun hjf hfty => ?_, fun hjne hw_le hbool hchar => ?_, fun hjne hk_lt hw_le => ?_⟩
@@ -1728,7 +1784,7 @@ theorem evalOperand_unionFieldRead_spec
         tyByteSize body.localDecls body.layouts rTy = some (wPred + 1) := by
       intro rTy hrk
       rw [← hw_succ]
-      exact tyByteSize_primScalar hprim hw hsz hrk
+      exact tyByteSize_primScalar hprim hw hsz hrk hptr8
     have henc := encodeByLayoutIdxAux_unionSlotFields hwt hfields hf hprim0 himm0 hfl
     have hub_len : length (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
         replicateUninitBytes (S - sc.sizeBytes)) = S := by
@@ -1745,9 +1801,7 @@ theorem evalOperand_unionFieldRead_spec
       dsimp only [dropAbstractBytes]
       rw [takeAbstractBytes_eq_take,
         List.take_append_of_le_length (by rw [encodeLittleEndianBytes_length]; exact hw_le),
-        ← takeAbstractBytes_eq_take, takeAbstractBytes_encodeLittleEndianBytes w sc.sizeBytes _ _ hw_le]
-    have hptr8 : layoutPointerBytes body.layouts = 8 := by
-      unfold layoutPointerBytes; rw [hptr]
+        ← takeAbstractBytes_eq_take, takeAbstractBytes_encodeLittleEndianBytes w sc.sizeBytes _ hw_le]
     have hdec : ∀ {rTy : Ty}, rTy.kind = fty.kind →
         decodeTypedValueFromBytes defaultCodecFuel body.layouts rTy
           (encodeLittleEndianBytes sc.bits w none) =
@@ -1799,7 +1853,7 @@ theorem evalOperand_unionFieldRead_spec
         tyByteSize body.localDecls body.layouts rTy = some (wPred + 1) := by
       intro rTy hrk
       rw [← hw_succ]
-      exact tyByteSize_primScalar hprim hw hsz hrk
+      exact tyByteSize_primScalar hprim hw hsz hrk hptr8
     have henc := encodeByLayoutIdxAux_unionSlotFields hwt hfields hf hprim0 himm0 hfl
     have hub_len : length (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
         replicateUninitBytes (S - sc.sizeBytes)) = S := by
@@ -2176,8 +2230,9 @@ theorem writeProjectedForLocal_union_field_uninit {body : CapturedMir} {locals :
     writeProjectedForLocal locals body.localDecls body.layouts u (.aggregate 0 .nil)
         [.field j fty] (.scalar sc') =
       .ok (.aggregate 0 (unionSlotFields n j (.scalar sc'))) := by
-  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, _, _, _, _⟩ :=
+  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, _, hptr, _, _⟩ :=
     hwt.adt_spec
+  have hptr8 : layoutPointerBytes body.layouts = 8 := by unfold layoutPointerBytes; rw [hptr]
   have hn_eq : n' = n := by
     unfold translateTy at hfields
     dsimp only at hfields
@@ -2256,7 +2311,7 @@ theorem writeProjectedForLocal_union_field_uninit {body : CapturedMir} {locals :
     · rfl
     · cases get? tl.fieldLayouts j
       · exact resolveTyWithLocalDecls_kind_eq body.localDecls body.layouts fty
-      · rfl)]
+      · rfl) hptr8]
   dsimp only
   simp only [unionSlotLacksLayoutFreeImage]
   rw [hwrite_at, hrebuild]
@@ -2284,8 +2339,9 @@ theorem writeProjectedForLocal_union_field_ge {body : CapturedMir} {locals : Lis
         (.aggregate 0 (unionSlotFields n f (.scalar sc)))
         [.field j fty] (.scalar sc') =
       .ok (.aggregate 0 (unionSlotFields n j (.scalar sc'))) := by
-  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, _, _, _, _⟩ :=
+  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, _, hptr, _, _⟩ :=
     hwt.adt_spec
+  have hptr8 : layoutPointerBytes body.layouts = 8 := by unfold layoutPointerBytes; rw [hptr]
   have hn_eq : n' = n := by
     unfold translateTy at hfields
     dsimp only at hfields
@@ -2355,7 +2411,7 @@ theorem writeProjectedForLocal_union_field_ge {body : CapturedMir} {locals : Lis
     · rfl
     · cases get? tl.fieldLayouts j
       · exact resolveTyWithLocalDecls_kind_eq body.localDecls body.layouts fty
-      · rfl)]
+      · rfl) hptr8]
   dsimp only
   simp only [unionSlotLacksLayoutFreeImage]
   rw [hwrite_at, hrebuild]
@@ -2371,12 +2427,12 @@ private theorem abstractByteListEq_append_same_prefix :
       abstractByteListEq_append_same_prefix pfx xs ys]
 
 private theorem drop_encodeLittleEndianBytes_nonempty :
-    ∀ (w k x : Nat) (p : Option (Nat × Nat)), w < k →
-      ∃ b p' tail, (encodeLittleEndianBytes x k p).drop w = .init b p' :: tail
-  | 0, _ + 1, x, p, _ => ⟨UInt8.ofNat x, p, _, rfl⟩
-  | _ + 1, 0, _, _, h => absurd h (by omega)
-  | w + 1, k + 1, x, p, h =>
-    drop_encodeLittleEndianBytes_nonempty w k (Nat.div x 256) p (Nat.lt_of_succ_lt_succ h)
+    ∀ (w k x : Nat), w < k →
+      ∃ b p' tail, (encodeLittleEndianBytes x k none).drop w = .init b p' :: tail
+  | 0, _ + 1, x, _ => ⟨UInt8.ofNat x, none, _, rfl⟩
+  | _ + 1, 0, _, h => absurd h (by omega)
+  | w + 1, k + 1, x, h =>
+    drop_encodeLittleEndianBytes_nonempty w k (Nat.div x 256) (Nat.lt_of_succ_lt_succ h)
 
 /-- Projected write of a *narrower* scalar field `_u.j = sc'` (`sc'.sizeBytes < sc.sizeBytes ≤ S`)
 on an initialized `n`-field union `_u` holding `unionSlotFields n f (.scalar sc)`:
@@ -2413,8 +2469,9 @@ theorem writeProjectedForLocal_union_field_lt {body : CapturedMir} {locals : Lis
         (unionSlotFields n j (.scalar sc') ++
           [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)])) := by
   intro mergedBytes
-  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, _, _, _, _⟩ :=
+  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, _, hptr, _, _⟩ :=
     hwt.adt_spec
+  have hptr8 : layoutPointerBytes body.layouts = 8 := by unfold layoutPointerBytes; rw [hptr]
   have hn_eq : n' = n := by
     unfold translateTy at hfields
     dsimp only at hfields
@@ -2458,7 +2515,7 @@ theorem writeProjectedForLocal_union_field_lt {body : CapturedMir} {locals : Lis
     dsimp only [mergedBytes]
     rw [abstractByteListEq_append_same_prefix]
     obtain ⟨b, p', tail, hdrop⟩ :=
-      drop_encodeLittleEndianBytes_nonempty sc'.sizeBytes sc.sizeBytes sc.bits none hk_lt
+      drop_encodeLittleEndianBytes_nonempty sc'.sizeBytes sc.sizeBytes sc.bits hk_lt
     have hpos : S - sc'.sizeBytes = (S - sc'.sizeBytes - 1) + 1 := by omega
     rw [hpos, replicateUninitBytes_eq_replicate, List.replicate_succ, hdrop]
     rfl
@@ -2491,7 +2548,7 @@ theorem writeProjectedForLocal_union_field_lt {body : CapturedMir} {locals : Lis
     · rfl
     · cases get? tl.fieldLayouts j
       · exact resolveTyWithLocalDecls_kind_eq body.localDecls body.layouts fty
-      · rfl)]
+      · rfl) hptr8]
   dsimp only
   simp only [unionSlotLacksLayoutFreeImage]
   rw [hwrite_at, hrebuild]
@@ -2564,8 +2621,9 @@ theorem writeProjectedForLocal_union_field_lt_of_initSlot {body : CapturedMir}
           (unionSlotFields n j (.scalar sc') ++
             [.aggregate 0 (encodeRawAbstractByteVals mergedBytes)])) := by
   intro mergedBytes
-  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, hfl_len, _, _, _⟩ :=
+  obtain ⟨defPath, args, tl, n', hk_u, _, _, hlookup, hfu, _, _, htl_sz, hfl_len, hptr, _, _⟩ :=
     hwt.adt_spec
+  have hptr8 : layoutPointerBytes body.layouts = 8 := by unfold layoutPointerBytes; rw [hptr]
   have hn_eq : n' = n := by
     unfold translateTy at hfields
     dsimp only at hfields
@@ -2641,7 +2699,7 @@ theorem writeProjectedForLocal_union_field_lt_of_initSlot {body : CapturedMir}
     dsimp only [mergedBytes]
     rw [abstractByteListEq_append_same_prefix]
     obtain ⟨b, p', tail, hdrop⟩ :=
-      drop_encodeLittleEndianBytes_nonempty sc'.sizeBytes sc_old.sizeBytes sc_old.bits none hk_lt
+      drop_encodeLittleEndianBytes_nonempty sc'.sizeBytes sc_old.sizeBytes sc_old.bits hk_lt
     have hpos : S - sc'.sizeBytes = (S - sc'.sizeBytes - 1) + 1 := by omega
     rw [hpos, replicateUninitBytes_eq_replicate, List.replicate_succ, hdrop]
     rfl
@@ -2671,7 +2729,7 @@ theorem writeProjectedForLocal_union_field_lt_of_initSlot {body : CapturedMir}
        · rfl
        · cases get? (a :: as) j
          · exact resolveTyWithLocalDecls_kind_eq body.localDecls body.layouts fty
-         · rfl)];
+         · rfl) hptr8];
      dsimp only;
      rw [hwrite_at]; dsimp only;
      rw [hfin])
@@ -2852,16 +2910,16 @@ theorem evalRvalue_unionAggregate_activeField_eq
       ImmediateRel fTy body.layouts (.scalar sc) (.scalar (.fromScalarInt msc)) →
       evalRvalue locals (.aggregate (.adt d 0 (some f)) [op]) mem body.localDecls body.layouts =
         .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) locals mem) := by
-  have hop_ld := hop.evalOperand_localDecls_eq locals mem.globals mem.callStack
   refine ⟨fun hub => ?_, fun sc msc hok himm => ?_⟩
   · unfold evalRvalue
     dsimp only
     unfold evalAggregateAdt evalOperands
-    rw [hbor, hcaller, hop_ld, hub]
+    rw [hbor, hcaller, hop.evalOperand_ub_of_nil_ub hub mem.callStack]
   · obtain ⟨args_u, hk_d⟩ := hadt
     obtain ⟨tl', flIdx, fTl, hlookup', hgf, hlf, rfl⟩ := unionFieldLayoutOf_lookup_eq hwt hfl
-    obtain ⟨_, _, tl, n', hk_u, _, _, hlookup, hfu, hvar, huninh, _, hfl_len, _, _, hadt_fields⟩ :=
+    obtain ⟨_, _, tl, n', hk_u, _, _, hlookup, hfu, hvar, huninh, _, hfl_len, hptr, _, hadt_fields⟩ :=
       hwt.adt_spec
+    have hptr8 : layoutPointerBytes body.layouts = 8 := by unfold layoutPointerBytes; rw [hptr]
     rw [hlookup] at hlookup'; injection hlookup' with htl_eq; subst htl_eq
     have hn_eq : n' = n := by
       unfold translateTy at hfields
@@ -2902,9 +2960,9 @@ theorem evalRvalue_unionAggregate_activeField_eq
       exact validateValueForTy?_primScalar body.layouts hprim hvb_sc hsz_fTy
         (fun r hr => Option.some.inj hr ▸ hrOp_kind)
         (fun hb => (hbool hb).2) (fun hc => (hchar hc).2)
-    have henc_rOp := encodeTypedValueToBytes_primScalar hprim himm hrOp_kind
+    have henc_rOp := encodeTypedValueToBytes_primScalar hprim himm hrOp_kind hptr8
     have htySz_rOp := tyByteSize_primScalar (localDecls := body.localDecls) hprim hvb_sc hsz_fTy
-      hrOp_kind
+      hrOp_kind hptr8
     have hblt_f : Nat.blt f n = true := Nat.ble_eq.mpr hf
     have haccept : unionLayoutAcceptsActiveField body.localDecls body.layouts tl f
         (some (.scalar sc)) (some oTy) = some (n, tl) := by
@@ -3013,7 +3071,7 @@ theorem evalRvalue_unionAggregate_activeField_eq
     unfold evalRvalue
     dsimp only
     unfold evalAggregateAdt evalOperands
-    rw [hbor, hcaller, hop_ld, hok]
+    rw [hbor, hcaller, hop.evalOperand_scalar_ok_of_nil_ok hok himm mem.callStack]
     dsimp only [evalOperands]
     unfold evalAggregateAdtUnionValue?
     simp only [hoTy_eq, hval_ty, hinfo, unionActiveSlotIsZstPlaceholder,
@@ -3254,7 +3312,7 @@ theorem evalScalarOperand_union_dst
       .scalar sc msc hrel hlaysz hbool hchar⟩
     rw [EStateM.bind_eq_ok heval_m]
     rfl
-  | copyLocal idx decl hdecl hsz_nz himm =>
+  | copyLocal idx decl hdecl hsz_nz himm _ =>
     have hne' : idx ≠ dstIdx := hne idx rfl
     obtain ⟨slot, mls, _, hlt_idx, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
     have hlt_ind : idx < tf_ind.locals.size := by
@@ -3712,7 +3770,7 @@ theorem step_union_aggregate_simulation
     intro idx hidx
     subst hidx
     cases hop_tf with
-    | copyLocal _ decl hdecl _ _ => exact primScalar_ne_union_local hdecl_u hwt hdecl hprim0
+    | copyLocal _ decl hdecl _ _ _ => exact primScalar_ne_union_local hdecl_u hwt hdecl hprim0
   have hunion := isUnionLocal_of_wellTyped hdecl_u hwt
   have hunionLay : isUnionLayout destPlace.layout = true := by
     simp only [destPlace, isUnionLayout, lay, hfields]
@@ -4024,27 +4082,32 @@ private theorem uint8_ofNat_mod_256 (y : Nat) : UInt8.ofNat (y % 256) = UInt8.of
   simp
 
 private theorem encodeLittleEndianBytes_range' (n : Nat) :
-    ∀ (x k : Nat) (prov : Option (Nat × Nat)),
-      encodeLittleEndianBytes (x / 2 ^ (8 * k)) n prov =
-        (List.range' k n).map (fun i => .init (UInt8.ofNat ((x / 2 ^ (8 * i)) % 256)) prov) := by
+    ∀ (x k : Nat),
+      encodeLittleEndianBytes (x / 2 ^ (8 * k)) n none =
+        (List.range' k n).map (fun i => .init (UInt8.ofNat ((x / 2 ^ (8 * i)) % 256)) none) := by
   induction n with
-  | zero => intro x k prov; rfl
+  | zero => intro x k; rfl
   | succ n ih =>
-    intro x k prov
+    intro x k
     have hdiv : Nat.div (x / 2 ^ (8 * k)) 256 = x / 2 ^ (8 * (k + 1)) := by
       change (x / 2 ^ (8 * k)) / 256 = x / 2 ^ (8 * (k + 1))
       rw [Nat.div_div_eq_div_mul, show 2 ^ (8 * (k + 1)) = 2 ^ (8 * k) * 256 by
         rw [show 8 * (k + 1) = 8 * k + 8 by omega, Nat.pow_add]]
-    simp only [encodeLittleEndianBytes, List.range'_succ, List.map_cons, uint8_ofNat_mod_256,
-      hdiv, ih x (k + 1) prov]
+    simp only [encodeLittleEndianBytes, encodePlainLittleEndianBytes, List.range'_succ,
+      List.map_cons, uint8_ofNat_mod_256, hdiv, ih x (k + 1)]
 
-theorem encodeLittleEndianBytes_eq_allocLeBytes (x n : Nat) (prov : Option (Nat × Nat)) :
-    encodeLittleEndianBytes x n prov =
-      (allocLeBytes x n).toList.map (fun b => .init b prov) := by
-  have h := encodeLittleEndianBytes_range' n x 0 prov
+theorem encodeLittleEndianBytes_eq_allocLeBytes (x n : Nat) :
+    encodeLittleEndianBytes x n none =
+      (allocLeBytes x n).toList.map (fun b => .init b none) := by
+  have h := encodeLittleEndianBytes_range' n x 0
   simp only [Nat.mul_zero, Nat.pow_zero, Nat.div_one] at h
   rw [h]
   simp [allocLeBytes, List.map_map, Function.comp]
+
+private theorem encodePlainLittleEndianBytes_eq_allocLeBytes (x n : Nat) :
+    encodePlainLittleEndianBytes x n =
+      (allocLeBytes x n).toList.map (fun b => .init b none) :=
+  encodeLittleEndianBytes_eq_allocLeBytes x n
 
 theorem writeAbstractBytesAt_replicateUninitBytes_zero :
     ∀ (bs : List AbstractByte) (S : Nat),
@@ -4098,7 +4161,7 @@ theorem encodeUnionFieldsWith_matches_unionMemRel
     have hfbs_len' : length fbs = sc.sizeBytes := hfbs_len
     have henc_sc : encodeUntypedValueToBytes 1 (.scalar sc) = some fbs := by
       simp [encodeUntypedValueToBytes, encodeScalarBytes, hbeq0,
-        encodeLittleEndianBytes_eq_allocLeBytes, fbs]
+        encodeLittleEndianBytes_eq_allocLeBytes, encodePlainLittleEndianBytes_eq_allocLeBytes, fbs]
     have hwrite : writeAbstractBytesAt (replicateUninitBytes S) 0 fbs = some bs := by
       simpa [bs, fbs, hfbs_len] using
         writeAbstractBytesAt_replicateUninitBytes_zero fbs S (by omega)
@@ -4264,6 +4327,82 @@ vendored `Miri.Memory.Allocation.copy` (`InitMask.prepareCopy` /
 so the initialized chunk `[0, k)` is preserved, and the uninitialized padding
 `[k, S)` was neither required to be initialized nor initialized by the copy
 (`UnionMemRel.initMask_spec`). -/
+private theorem evalOperand_unionWhole_scalar_eq
+    {locals : List LocalSlot} {u : Local} {uDecl : LocalDecl}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {globals : List CapturedAllocation} {callStack : List SavedCallerFrame}
+    {S n f : Nat} {sc : MirAst.ScalarInt}
+    (hdecl_u : get? localDecls u = some uDecl)
+    (hwt : WellTypedUnionTy layouts uDecl.ty S)
+    (isMove : Bool)
+    (hu_slot : get? locals u = some (.init (.aggregate 0 (unionSlotFields n f (.scalar sc)))))
+    (hlt_u : isMove = true → u < locals.length) :
+    evalOperand locals (if isMove then .move ⟨u, .nil⟩ else .copy ⟨u, .nil⟩)
+      .nil globals layouts .nil localDecls callStack =
+    .ok (.aggregate 0 (unionSlotFields n f (.scalar sc)))
+      (if isMove then locals.set u .uninit else locals) := by
+  obtain ⟨defPath, args, tl, _, hk_u, _, _, hlookup, hfu, hvar, huninh, _, _, _, _, _⟩ :=
+    hwt.adt_spec
+  have hpty : placeTyResolved localDecls layouts ⟨u, .nil⟩ = some uDecl.ty := by
+    unfold placeTyResolved resolveProjectedTyResolved
+    rw [hdecl_u]
+  have hmat : materializeReadPtrValue layouts (placeTyResolved localDecls layouts ⟨u, .nil⟩)
+      (.aggregate 0 (unionSlotFields n f (.scalar sc))) =
+      some (.aggregate 0 (unionSlotFields n f (.scalar sc))) := by
+    rw [hpty]; rcases uDecl with ⟨_, ⟨uk, ul⟩, _⟩; dsimp only at hk_u ⊢; subst hk_u
+    simp only [materializeReadPtrValue]
+    cases Nat.blt 2 (Trusted.Sequence.length (unionSlotFields n f (.scalar sc))) <;> rfl
+  have hvty : validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨u, .nil⟩)
+      (.aggregate 0 (unionSlotFields n f (.scalar sc))) = true := by
+    rw [hpty]; rcases uDecl with ⟨_, ⟨uk, ul⟩, _⟩; dsimp only at hk_u hlookup ⊢; subst hk_u
+    unfold validateValueForTy? validateValueForTyAux
+    dsimp only; rw [hlookup]; dsimp only; rw [huninh]; dsimp only
+    rw [hvar]; dsimp only; rw [hfu]
+  cases hld : localDecls with
+  | nil => rw [hld] at hdecl_u; nomatch hdecl_u
+  | cons ld0 lds =>
+    rw [hld] at hmat hvty
+    cases isMove
+    · simp only [Bool.false_eq_true, ↓reduceIte]
+      unfold evalOperand readProjectedValue; dsimp only
+      rw [hu_slot]; dsimp only
+      rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only
+      rw [hmat]; dsimp only; rw [hvty]
+    · simp only [↓reduceIte]
+      unfold evalOperand readProjectedValue; dsimp only
+      rw [hu_slot]; dsimp only
+      rw [valueContainsUninit_unionSlotFields_scalar n f sc, set?_eq_some_set (hlt_u rfl)]
+      dsimp only; rw [hmat]; dsimp only; rw [hvty]
+
+private theorem evalOperand_unionWhole_copy_eq
+    {locals : List LocalSlot} {u : Local} {uDecl : LocalDecl}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {globals : List CapturedAllocation} {callStack : List SavedCallerFrame}
+    {S n f : Nat} {sc : MirAst.ScalarInt}
+    (hdecl_u : get? localDecls u = some uDecl)
+    (hwt : WellTypedUnionTy layouts uDecl.ty S)
+    (hu_slot : get? locals u = some (.init (.aggregate 0 (unionSlotFields n f (.scalar sc))))) :
+    evalOperand locals (.copy ⟨u, .nil⟩)
+      .nil globals layouts .nil localDecls callStack =
+    .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) locals := by
+  simpa using evalOperand_unionWhole_scalar_eq
+    (globals := globals) (callStack := callStack) hdecl_u hwt false hu_slot (fun h => nomatch h)
+
+private theorem evalOperand_unionWhole_move_eq
+    {locals : List LocalSlot} {u : Local} {uDecl : LocalDecl}
+    {localDecls : List LocalDecl} {layouts : LayoutTable}
+    {globals : List CapturedAllocation} {callStack : List SavedCallerFrame}
+    {S n f : Nat} {sc : MirAst.ScalarInt}
+    (hdecl_u : get? localDecls u = some uDecl)
+    (hwt : WellTypedUnionTy layouts uDecl.ty S)
+    (hu_slot : get? locals u = some (.init (.aggregate 0 (unionSlotFields n f (.scalar sc)))))
+    (hlt_u : u < locals.length) :
+    evalOperand locals (.move ⟨u, .nil⟩)
+      .nil globals layouts .nil localDecls callStack =
+    .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) (locals.set u .uninit) := by
+  simpa using evalOperand_unionWhole_scalar_eq
+    (globals := globals) (callStack := callStack) hdecl_u hwt true hu_slot (fun _ => hlt_u)
+
 theorem union_whole_copy_initMask_preservation_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRelLM2_4 body s m)
@@ -4466,8 +4605,8 @@ theorem union_whole_copy_initMask_preservation_simulation
       body.layouts =
       .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) s.frame.locals s.memory := by
     unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-    simp only [evalOperand, hu_slot, readProjectedValue]
-    rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
+    rw [evalOperand_unionWhole_copy_eq hdecl_u hwt hu_slot]
+    dsimp only; rw [hvld]
   let locals₂ := s.frame.locals.set w (.init (.aggregate 0 (unionSlotFields n f (.scalar sc))))
   have ha_ok : evalStmt s ⟨.assign ⟨w, .nil⟩ (.use (.copy ⟨u, .nil⟩)), span⟩
       body.localDecls body.layouts = MirStepNode.step (advanceStmt s locals₂ s.memory) := by
@@ -4798,8 +4937,8 @@ theorem union_whole_move_initMask_preservation_simulation
       body.layouts =
       .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) locals₁ s.memory := by
     unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-    simp only [evalOperand, readProjectedValue, hu_slot, set?_eq_some_set hlt_af_u, locals₁]
-    rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
+    rw [evalOperand_unionWhole_move_eq hdecl_u hwt hu_slot hlt_af_u]
+    dsimp only [locals₁]; rw [hvld]
   have hw_uninit₁ : get? locals₁ w = some .uninit := by
     dsimp only [locals₁]
     rw [get?_eq_getElem?, List.getElem?_set_ne (Ne.symm hwu), ← get?_eq_getElem?]
@@ -5976,7 +6115,7 @@ theorem evalScalarOperand_LM2_4
           Bool.false_eq_true, ↓reduceIte, htry, hprim_c.layoutOfEncoded]
     exact Or.inr ⟨sc, msc, tf, heval_a, heval_m, hframe, id, (fun _ h => h), rfl,
       (fun _ _ _ _ => rfl), hrel, .scalar sc msc hrel hlaysz hbool hchar⟩
-  | copyLocal idx decl hdecl hsz_nz himm =>
+  | copyLocal idx decl hdecl hsz_nz himm _ =>
     obtain ⟨slot, mls, _, hlt_idx, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
     have himm' := himm mls hmls
     have hloc' : LocalRel mach decl body.layouts slot mls := by
@@ -6233,7 +6372,6 @@ theorem step_union_field_write_simulation
   rcases hstate with ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
     hcal, hstack, hbor, hprot, hcaller, hdisj⟩
   have hop_tf := hop topFrame hframes
-  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals s.memory.callStack
   have hmem_same : { s.memory with borrows := .nil, activeProtectors := .nil } = s.memory := by
     revert hbor hprot
     generalize s.memory = mem
@@ -6314,7 +6452,7 @@ theorem step_union_field_write_simulation
   · -- `op` reads a dead local.
     have ha : evalStmt s ⟨.assign ⟨u, [.field f f0Ty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_ub_of_nil_ub ha_ub s.memory.callStack]
     have hm_err' : annealEvalOperandLM2_4 body.localDecls body.layouts (translateOperand op)
         (some (translateTy f0Ty body.layouts)) m₀ = .error (.undefinedBehavior msg) m_err := by
       rw [hlm_eq]; exact hm_err
@@ -6331,7 +6469,7 @@ theorem step_union_field_write_simulation
   · -- `op` reads an uninitialized local.
     have ha : evalStmt s ⟨.assign ⟨u, [.field f f0Ty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_ub_of_nil_ub ha_ub s.memory.callStack]
     have hm_uninit' : annealEvalOperandLM2_4 body.localDecls body.layouts (translateOperand op)
         (some (translateTy f0Ty body.layouts)) m₀ = .ok ⟨.immediate .uninit, lay⟩ st' := by
       rw [hlm_eq]; exact hm_uninit
@@ -6384,7 +6522,7 @@ theorem step_union_field_write_simulation
     have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool' hchar'
     have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
         .ok (.scalar sc') s.frame.locals s.memory := by
-      unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ok]; dsimp only; rw [hvld]
+      unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_scalar_ok_of_nil_ok ha_ok himm' s.memory.callStack]; dsimp only; rw [hvld]
       simp only []
     have hwp := writeProjectedForLocal_union_field_ge (locals := s.frame.locals) hdecl_u hwt
       hfields hf hf hprim0 himm0 hfl hprim0 himm' (Nat.le_of_eq hk'.symm) (hk' ▸ hk_le0) hfl
@@ -6585,7 +6723,6 @@ theorem step_union_field_write_uninit_simulation
     hcal, hstack, hbor, hprot, hcaller, hdisj⟩
   obtain ⟨mem', id, hres⟩ := hcanRes
   have hop_tf := hop topFrame hframes
-  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals s.memory.callStack
   have hmem_same : { s.memory with borrows := .nil, activeProtectors := .nil } = s.memory := by
     revert hbor hprot
     generalize s.memory = mem
@@ -6662,7 +6799,7 @@ theorem step_union_field_write_uninit_simulation
   have hne : ∀ idx, op = .copy ⟨idx, .nil⟩ → idx ≠ u := by
     intro idx hidx; subst hidx
     cases hop_tf with
-    | copyLocal _ decl hdecl _ _ => exact primScalar_ne_union_local hdecl_u hwt hdecl hprim
+    | copyLocal _ decl hdecl _ _ _ => exact primScalar_ne_union_local hdecl_u hwt hdecl hprim
   have hagg_op_eq : ∀ st,
       (annealAggregateHooksLM2_4 body.localDecls body.layouts).evalOperandAt ()
         (.rvalue "operand") (translateOperand op) (some (translateTy fty body.layouts)) st =
@@ -6678,7 +6815,7 @@ theorem step_union_field_write_uninit_simulation
   · -- `op` reads a dead or uninitialized local: UB in both machines.
     have ha : evalStmt s ⟨.assign ⟨u, [.field j fty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_ub_of_nil_ub ha_ub s.memory.callStack]
     have hm_err_bind : (annealEvalOperandLM2_4 body.localDecls body.layouts (translateOperand op)
         (some (translateTy fty body.layouts)) >>= fun o =>
         (annealRvalueHooksLM2_4 body.localDecls body.layouts).copyOp () o dest) st₁ =
@@ -6712,7 +6849,7 @@ theorem step_union_field_write_uninit_simulation
                   stack_currentFrame?_singleton st₁.stack tf₁ rfl, Option.isNone_some,
                   Bool.false_eq_true, ↓reduceIte, htry_c, hp_c.layoutOfEncoded]
             rw [hev_c] at hop_st; cases hop_st; exact ⟨_, _, rfl⟩
-          | copyLocal idx decl hdecl _ himm_idx =>
+          | copyLocal idx decl hdecl _ himm_idx _ =>
             have hne_iu : idx ≠ u := hne idx rfl
             obtain ⟨_, mls_i, _, hlt_i, _, hmls_i, _, hloc_i⟩ := hframe₀.lookup_local hdecl
             have hlt_i1 : idx < tf₁.locals.size := by
@@ -6819,7 +6956,7 @@ theorem step_union_field_write_uninit_simulation
                   stack_currentFrame?_singleton st₁.stack tf₁ rfl, Option.isNone_some,
                   Bool.false_eq_true, ↓reduceIte, htry_c, hp_c.layoutOfEncoded]
             rw [hev_c] at hop_st; cases hop_st; exact ⟨_, _, rfl⟩
-          | copyLocal idx decl hdecl _ himm_idx =>
+          | copyLocal idx decl hdecl _ himm_idx _ =>
             have hne_iu : idx ≠ u := hne idx rfl
             obtain ⟨_, mls_i, _, hlt_i, _, hmls_i, _, hloc_i⟩ := hframe₀.lookup_local hdecl
             have hlt_i1 : idx < tf₁.locals.size := by
@@ -6873,7 +7010,7 @@ theorem step_union_field_write_uninit_simulation
     have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool_sc hchar_sc
     have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
         .ok (.scalar sc) s.frame.locals s.memory := by
-      unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ok]; dsimp only; rw [hvld]
+      unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_scalar_ok_of_nil_ok ha_ok himmRel s.memory.callStack]; dsimp only; rw [hvld]
       simp only []
     obtain ⟨hshell, hwp⟩ := writeProjectedForLocal_union_field_uninit (locals := s.frame.locals)
       hdecl_u hwt hfields hj hprim himmRel hk_le hfl
@@ -7265,8 +7402,112 @@ theorem evalSubsliceOperand_simulation
       · intro hb
         obtain ⟨hr_ok, hpl_ok, hrel⟩ := hin hb
         refine ⟨?_, ?_, hrel⟩
-        · cases isMove <;>
-            simp [subsliceReadOperand, evalOperand, placeTouchesUnion_subslice_single, hinit, hr_ok]
+        · cases hld : body.localDecls with
+          | nil => rw [hld] at hdecl_arr; nomatch hdecl_arr
+          | cons ld0 lds =>
+            have hdecl_arr' : get? (ld0 :: lds) arrIdx = some arrDecl := hld ▸ hdecl_arr
+            obtain ⟨_, _, _, _, _, _, _, _, _, hslice⟩ := hrel
+            have htyOpt :
+                placeTyResolved (ld0 :: lds) body.layouts ⟨arrIdx, [.subslice fromIdx toIdx fromEnd]⟩ = none ∨
+                ∃ rTy subLen,
+                  placeTyResolved (ld0 :: lds) body.layouts ⟨arrIdx, [.subslice fromIdx toIdx fromEnd]⟩ =
+                    some rTy ∧
+                  rTy.kind = .array elemKind subLen := by
+              unfold placeTyResolved
+              dsimp only
+              rw [hdecl_arr']
+              dsimp only [resolveProjectedTyResolved]
+              rcases arrDecl with ⟨_, ⟨ak, al⟩, _⟩
+              dsimp only at hwf ⊢
+              have hak : ak = .array elemKind count := hwf.arr_kind
+              subst hak
+              dsimp only
+              cases Nat.ble toIdx count
+              · exact Or.inl rfl
+              · cases fromEnd <;> dsimp only
+                · cases Nat.ble fromIdx toIdx
+                  · exact Or.inl rfl
+                  · dsimp only
+                    cases Nat.beq (Nat.sub toIdx fromIdx) count
+                    · exact Or.inr ⟨_, _, rfl, resolveTyWithLocalDecls_kind_eq (ld0 :: lds) body.layouts _⟩
+                    · exact Or.inr ⟨_, count, rfl, rfl⟩
+                · cases Nat.ble fromIdx (Nat.sub count toIdx)
+                  · exact Or.inl rfl
+                  · dsimp only
+                    cases Nat.beq (Nat.sub (Nat.sub count toIdx) fromIdx) count
+                    · exact Or.inr ⟨_, _, rfl, resolveTyWithLocalDecls_kind_eq (ld0 :: lds) body.layouts _⟩
+                    · exact Or.inr ⟨_, count, rfl, rfl⟩
+            have hlist_valid :
+                ∀ (fuel flIdx : Nat) (xs : List Value),
+                  (∀ k v, get? xs k = some v →
+                    ∃ sc, v = .scalar sc ∧
+                      (elemKind = .bool → sc.sizeBytes = 1 ∧ (sc.bits = 0 ∨ sc.bits = 1)) ∧
+                      (elemKind = .char → sc.sizeBytes = 4 ∧ isValidCharCode sc.bits = true)) →
+                  validateTyValueListWith
+                    (validateValueForTyAux body.layouts (fuel + 1)
+                      { kind := elemKind, layoutIdx := flIdx }) xs = true := by
+              intro fuel flIdx xs
+              induction xs with
+              | nil => intros; rfl
+              | cons x xs ih =>
+                intro hall
+                obtain ⟨sc, rfl, hbool, hchar⟩ := hall 0 x rfl
+                have hx : validateValueForTyAux body.layouts (fuel + 1)
+                    { kind := elemKind, layoutIdx := flIdx } (.scalar sc) = true := by
+                  rcases hwf.elem_prim with rfl | rfl | ⟨_, rfl⟩ | ⟨_, rfl⟩
+                  · obtain ⟨hsz1, hb⟩ := hbool rfl
+                    rcases hb with h0 | h1
+                    · unfold validateValueForTyAux; dsimp only; rw [hsz1, h0]; rfl
+                    · unfold validateValueForTyAux; dsimp only; rw [hsz1, h1]; rfl
+                  · obtain ⟨hsz4, hc⟩ := hchar rfl
+                    unfold validateValueForTyAux; dsimp only; rw [hsz4, hc]; rfl
+                  · rfl
+                  · rfl
+                dsimp only [validateTyValueListWith]
+                rw [hx]
+                exact ih (fun k v hk => hall (k + 1) v hk)
+            let cnt := subsliceEnd count toIdx fromEnd - fromIdx
+            have hmat :
+                materializeReadPtrValue body.layouts
+                  (placeTyResolved (ld0 :: lds) body.layouts ⟨arrIdx, [.subslice fromIdx toIdx fromEnd]⟩)
+                  (.aggregate 0 ((elems.drop fromIdx).take cnt)) =
+                some (.aggregate 0 ((elems.drop fromIdx).take cnt)) := by
+              rcases htyOpt with hnone | ⟨rTy, subLen, hsome, hrk⟩
+              · rw [hnone]
+              · rw [hsome]
+                rcases rTy with ⟨rk, rl⟩
+                dsimp only at hrk; subst hrk
+                rcases hwf.elem_prim with rfl | rfl | ⟨_, rfl⟩ | ⟨_, rfl⟩ <;> (
+                  simp only [materializeReadPtrValue]
+                  cases Nat.blt 2 (Trusted.Sequence.length ((elems.drop fromIdx).take cnt)) <;> rfl)
+            have hvty :
+                validateValueForTy? body.layouts
+                  (placeTyResolved (ld0 :: lds) body.layouts ⟨arrIdx, [.subslice fromIdx toIdx fromEnd]⟩)
+                  (.aggregate 0 ((elems.drop fromIdx).take cnt)) = true := by
+              rcases htyOpt with hnone | ⟨rTy, subLen, hsome, hrk⟩
+              · rw [hnone]
+              · rw [hsome]
+                rcases rTy with ⟨rk, rl⟩
+                dsimp only at hrk; subst hrk
+                unfold validateValueForTy? validateValueForTyAux
+                dsimp only
+                exact hlist_valid 14 _ _ (fun k v hk => by
+                  obtain ⟨sc, _, rfl, _, hbool, hchar, _, _⟩ := hslice.elem_rel k v hk
+                  exact ⟨sc, rfl, hbool, hchar⟩)
+            have hnu := placeTouchesUnion_subslice_single (ld0 :: lds) body.layouts
+              arrIdx fromIdx toIdx fromEnd
+            cases isMove <;> {
+              simp only [subsliceReadOperand, Bool.false_eq_true, ↓reduceIte]
+              unfold evalOperand readProjectedForLocal
+              dsimp only
+              rw [hinit]
+              dsimp only
+              rw [hnu]
+              dsimp only
+              rw [hr_ok]
+              dsimp only
+              rw [hmat]; dsimp only; rw [hvty]
+            }
         · rw [annealEvalOperandLM2_4_subslice]
           unfold annealEvalSubsliceOperand
           simp [m', get, getThe, MonadStateOf.get, EStateM.get, bind, EStateM.bind, hnot_empty,
@@ -7274,7 +7515,7 @@ theorem evalSubsliceOperand_simulation
       · intro he hlt h64
         obtain ⟨hr_ub, msg, hpl_err⟩ := hoob he hlt h64
         refine ⟨?_, msg, ?_⟩
-        · cases isMove <;>
+        · cases body.localDecls <;> cases isMove <;>
             simp [subsliceReadOperand, evalOperand, placeTouchesUnion_subslice_single, hinit, hr_ub]
         · cases hpl : annealProjectList
               (annealSubsliceProjectionCx topFrame' body.layouts m.machine)
@@ -7690,7 +7931,6 @@ theorem step_union_nonzero_field_write_simulation
     ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
       hcal, hstack, hbor, hprot, hcaller, hdisj⟩
   have hop_tf := hop topFrame hframes
-  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals s.memory.callStack
   have hmem_same : { s.memory with borrows := .nil, activeProtectors := .nil } = s.memory := by
     revert hbor hprot; generalize s.memory = mem; intro hbor hprot
     cases mem; dsimp only at hbor hprot; subst hbor hprot; rfl
@@ -7765,7 +8005,7 @@ theorem step_union_nonzero_field_write_simulation
     ⟨sc', msc', tf₁, ha_ok, hm_ok, hframe₁, hdisj₁, hmono₁, htf₁, hind₁, hrel', himm'⟩
   · have ha : evalStmt s ⟨.assign ⟨u, [.field j fty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_ub_of_nil_ub ha_ub s.memory.callStack]
     have hm_err' : annealEvalOperandLM2_4 body.localDecls body.layouts (translateOperand op)
         (some (translateTy fty body.layouts)) m₀ = .error (.undefinedBehavior msg) m_err := by
       rw [hlm_eq]; exact hm_err
@@ -7779,7 +8019,7 @@ theorem step_union_nonzero_field_write_simulation
     exact ⟨.ub _ _, fun _ h => absurd h MirStepNode_fail_ne_step⟩
   · have ha : evalStmt s ⟨.assign ⟨u, [.field j fty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_ub_of_nil_ub ha_ub s.memory.callStack]
     have hm_uninit' : annealEvalOperandLM2_4 body.localDecls body.layouts (translateOperand op)
         (some (translateTy fty body.layouts)) m₀ = .ok ⟨.immediate .uninit, lay⟩ st' := by
       rw [hlm_eq]; exact hm_uninit
@@ -7829,7 +8069,7 @@ theorem step_union_nonzero_field_write_simulation
     have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool' hchar'
     have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
         .ok (.scalar sc') s.frame.locals s.memory := by
-      unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ok]; dsimp only; rw [hvld]
+      unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_scalar_ok_of_nil_ok ha_ok himm' s.memory.callStack]; dsimp only; rw [hvld]
       simp only []
     have hwp := writeProjectedForLocal_union_field_ge (locals := s.frame.locals) hdecl_u hwt
       hfields hf hj hprim0 himm0 hfl0 hprim himm' hk_ge hk'_le hfl'
@@ -8195,7 +8435,6 @@ theorem step_union_narrower_field_write_simulation
     ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
       hcal, hstack, hbor, hprot, hcaller, hdisj⟩
   have hop_tf := hop topFrame hframes
-  have hop_ld := hop_tf.evalOperand_localDecls_eq s.frame.locals s.memory.globals s.memory.callStack
   have hmem_same : { s.memory with borrows := .nil, activeProtectors := .nil } = s.memory := by
     revert hbor hprot; generalize s.memory = mem; intro hbor hprot
     cases mem; dsimp only at hbor hprot; subst hbor hprot; rfl
@@ -8267,7 +8506,7 @@ theorem step_union_narrower_field_write_simulation
     ⟨sc', msc', tf₁, ha_ok, hm_ok, hframe₁, hdisj₁, hmono₁, htf₁, hind₁, hrel', himm'⟩
   · have ha : evalStmt s ⟨.assign ⟨u, [.field j fty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_ub_of_nil_ub ha_ub s.memory.callStack]
     have hm_err' : annealEvalOperandLM2_4 body.localDecls body.layouts (translateOperand op)
         (some (translateTy fty body.layouts)) m₀ = .error (.undefinedBehavior msg) m_err := by
       rw [hlm_eq]; exact hm_err
@@ -8281,7 +8520,7 @@ theorem step_union_narrower_field_write_simulation
     exact ⟨.ub _ _, fun _ hok => by rw [ha_ub] at hok; cases hok⟩
   · have ha : evalStmt s ⟨.assign ⟨u, [.field j fty]⟩ (.use op), span⟩
         body.localDecls body.layouts = MirStepNode.fail .ub := by
-      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ub]
+      unfold evalStmt evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_ub_of_nil_ub ha_ub s.memory.callStack]
     have hm_uninit' : annealEvalOperandLM2_4 body.localDecls body.layouts (translateOperand op)
         (some (translateTy fty body.layouts)) m₀ = .ok ⟨.immediate .uninit, lay⟩ st' := by
       rw [hlm_eq]; exact hm_uninit
@@ -8353,7 +8592,7 @@ theorem step_union_narrower_field_write_simulation
     have hvld := (WellTypedLM2_1ScalarOperand.ofScalar hop_tf).validateLoadedValue_true hbool' hchar'
     have hrv : evalRvalue s.frame.locals (.use op) s.memory body.localDecls body.layouts =
         .ok (.scalar sc') s.frame.locals s.memory := by
-      unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_ld, ha_ok]; dsimp only; rw [hvld]
+      unfold evalRvalue; dsimp only; rw [hbor, hcaller, hop_tf.evalOperand_scalar_ok_of_nil_ok ha_ok himm' s.memory.callStack]; dsimp only; rw [hvld]
       simp only []
     let mergedBytes :=
       encodeLittleEndianBytes sc'.bits sc'.sizeBytes none ++
@@ -8536,13 +8775,15 @@ theorem evalOperand_unionOverlayFieldRead_ne_spec
       List.getElem?_append_left (by rw [unionSlotFields_length hov.j_lt]; exact hj),
       ← get?_eq_getElem?]
     exact unionSlotFields_get_ne hov.j_lt hj hjne (.scalar sc_low)
+  have hptr8 : layoutPointerBytes body.layouts = 8 := by
+    unfold layoutPointerBytes; rw [hptr]
   have hw_pos : 0 < w := by rcases hw with rfl | rfl | rfl | rfl | rfl <;> decide
   obtain ⟨wPred, hw_succ⟩ : ∃ wPred, w = wPred + 1 := ⟨w - 1, by omega⟩
   have htySz : ∀ {rTy : Ty}, rTy.kind = fty.kind →
       tyByteSize body.localDecls body.layouts rTy = some (wPred + 1) := by
     intro rTy hrk
     rw [← hw_succ]
-    exact tyByteSize_primScalar hprim hw hsz hrk
+    exact tyByteSize_primScalar hprim hw hsz hrk hptr8
   have henc := encodeByLayoutIdxAux_unionOverlay hwt hfields hk_le hov
   have hub_len : length (encodeLittleEndianBytes sc.bits sc.sizeBytes none ++
       replicateUninitBytes (S - sc.sizeBytes)) = S := by
@@ -8560,9 +8801,7 @@ theorem evalOperand_unionOverlayFieldRead_ne_spec
     rw [takeAbstractBytes_eq_take,
       List.take_append_of_le_length (by rw [encodeLittleEndianBytes_length]; exact hw_le),
       ← takeAbstractBytes_eq_take,
-      takeAbstractBytes_encodeLittleEndianBytes w sc.sizeBytes _ _ hw_le]
-  have hptr8 : layoutPointerBytes body.layouts = 8 := by
-    unfold layoutPointerBytes; rw [hptr]
+      takeAbstractBytes_encodeLittleEndianBytes w sc.sizeBytes _ hw_le]
   have hdec : ∀ {rTy : Ty}, rTy.kind = fty.kind →
       decodeTypedValueFromBytes defaultCodecFuel body.layouts rTy
         (encodeLittleEndianBytes sc.bits w none) =
@@ -10377,23 +10616,24 @@ theorem step_union_whole_copy_or_move_overwrite_simulation
         (.aggregate 0 (unionSlotFields n f (.scalar sc)))
       cases isMove
       · simp only [↓reduceIte, Bool.false_eq_true] at hvld
+        obtain ⟨_, _, hlt_af_u, _, _, _, _, _⟩ := hframe.lookup_local hdecl_u
         have hrv : evalRvalue s.frame.locals (.use (unionWholeOperand false u)) s.memory
             body.localDecls body.layouts =
             .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) s.frame.locals s.memory := by
-          unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-          simp only [unionWholeOperand, ↓reduceIte, Bool.false_eq_true, evalOperand,
-            hu_slot, readProjectedValue]
-          rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
+          unfold evalRvalue; simp only [unionWholeOperand, Bool.false_eq_true, ↓reduceIte]
+          rw [hbor, hcaller]
+          rw [evalOperand_unionWhole_copy_eq hdecl_u hwt hu_slot]
+          dsimp only; rw [hvld]
         unfold evalStmt; dsimp only; rw [hrv]; simp [hw_dead]
       · simp only [↓reduceIte] at hvld
         have hrv : evalRvalue s.frame.locals (.use (unionWholeOperand true u)) s.memory
             body.localDecls body.layouts =
             .ok (.aggregate 0 (unionSlotFields n f (.scalar sc)))
               (s.frame.locals.set u .uninit) s.memory := by
-          unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-          simp only [unionWholeOperand, ↓reduceIte, evalOperand, readProjectedValue, hu_slot,
-            set?_eq_some_set hlt_af_u]
-          rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
+          unfold evalRvalue; simp only [unionWholeOperand, ↓reduceIte]
+          rw [hbor, hcaller]
+          rw [evalOperand_unionWhole_move_eq hdecl_u hwt hu_slot hlt_af_u]
+          dsimp only; rw [hvld]
         have hw1 : get? (s.frame.locals.set u .uninit) w = some .dead := by
           rw [get?_eq_getElem?, List.getElem?_set_ne (Ne.symm hwu), ← get?_eq_getElem?]
           exact hw_dead
@@ -10517,14 +10757,17 @@ theorem step_union_whole_copy_or_move_overwrite_simulation
       have hrv : evalRvalue s.frame.locals (.use (unionWholeOperand isMove u)) s.memory
           body.localDecls body.layouts =
           .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) locals₁ s.memory := by
-        unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-        cases isMove <;>
-          (simp only [↓reduceIte, Bool.false_eq_true] at hvld;
-           simp only [unionWholeOperand, ↓reduceIte, Bool.false_eq_true, evalOperand,
-             readProjectedValue, hu_slot, set?_eq_some_set hlt_af_u, locals₁];
-           rw [valueContainsUninit_unionSlotFields_scalar n f sc];
-           dsimp only;
-           rw [hvld])
+        cases isMove
+        · simp only [↓reduceIte, Bool.false_eq_true] at hvld
+          unfold evalRvalue; simp only [unionWholeOperand, Bool.false_eq_true, ↓reduceIte]
+          dsimp only [locals₁]; simp only [Bool.false_eq_true, ↓reduceIte]
+          rw [hbor, hcaller, evalOperand_unionWhole_copy_eq hdecl_u hwt hu_slot]
+          dsimp only; rw [hvld]
+        · simp only [↓reduceIte] at hvld
+          unfold evalRvalue; simp only [unionWholeOperand, ↓reduceIte]
+          dsimp only [locals₁]; simp only [↓reduceIte]
+          rw [hbor, hcaller, evalOperand_unionWhole_move_eq hdecl_u hwt hu_slot hlt_af_u]
+          dsimp only; rw [hvld]
       unfold evalStmt; dsimp only; rw [hrv]; simp only []
       rw [hprot, hbor]; dsimp only [invalidateConflictingBorrows]; rw [hmem_same]
       simp [hw_slot₁, set?_eq_some_set hlt_af_w₁, locals₂]
@@ -10669,8 +10912,8 @@ theorem step_union_self_copy_overlap_divergence
         body.localDecls body.layouts =
         .ok (.aggregate 0 (unionSlotFields n f (.scalar sc))) s.frame.locals s.memory := by
       unfold evalRvalue; dsimp only; rw [hbor, hcaller]
-      simp only [evalOperand, readProjectedValue, hu_slot]
-      rw [valueContainsUninit_unionSlotFields_scalar n f sc]; dsimp only; rw [hvld]
+      rw [evalOperand_unionWhole_copy_eq hdecl_u hwt hu_slot]
+      dsimp only; rw [hvld]
     unfold evalStmt; dsimp only; rw [hrv]; simp only []
     rw [hprot, hbor]; dsimp only [invalidateConflictingBorrows]; rw [hmem_same]
     simp [hu_slot, set?_eq_some_set hlt_af_u]

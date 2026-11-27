@@ -1619,7 +1619,9 @@ example :
 theorem boolNewtype_fallbackSound :
     MirValueCodec.AdtDecodeFallbackSound boolNewtypeLayouts boolNewtypeLayout 0 boolNewtypePlaced 1 :=
   MirValueCodec.AdtDecodeFallbackSound.of_scalar rfl rfl rfl
-    (fun slice _ h => MirValueCodec.boolByte_decode_isSome_of_decodeScalarLayoutBytes slice h)
+    (fun slice _ h =>
+      MirValueCodec.boolByte_decode_isSome_of_decodeScalarLayoutBytes
+        slice (layoutPointerBytes boolNewtypeLayouts) h)
 
 /-- `MirValueCodec` for the niche newtype `struct B(bool)`. -/
 def boolNewtypeAdtCodec :
@@ -1763,7 +1765,7 @@ theorem nonZeroU8Newtype_fallbackSound (layouts : LayoutTable) :
   MirValueCodec.AdtDecodeFallbackSound.of_scalar rfl rfl rfl
     (fun slice _ h =>
       MirValueCodec.scalarValidRange_decode_isSome_of_decodeScalarLayoutBytes
-        (.int 8 false) ⟨1, 255⟩ 1 (by decide) rfl rfl slice h)
+        (.int 8 false) ⟨1, 255⟩ 1 (by decide) rfl rfl slice (layoutPointerBytes layouts) h)
 
 /-! ### `[adv ep1-B4]` Integer Niches (`NonZero*`) Have No `TupleFieldCodec`
 

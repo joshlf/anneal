@@ -65,6 +65,14 @@ def advanceStmt
   }
 
 /--
+Test whether `bytes` contains any `AbstractByte.uninit` byte.
+-/
+def hasUninitByte : List AbstractByte → Bool
+  | .nil => false
+  | .uninit :: _ => true
+  | .init _ _ :: rest => hasUninitByte rest
+
+/--
 Concatenate two `List Value` sequences.
 -/
 @[reducible]
@@ -541,9 +549,34 @@ def padUnionAbstractBytes
     appendAbstractBytes bs (replicateUninitBytes (Nat.sub targetBytes len))
 
 /--
+Extract raw overlay bytes from the trailing element of a union aggregate's
+`fieldVals` when it is a `unionBytes`-element lossless raw-byte carrier
+`.aggregate 0 rawVals`.
+
+Reference (The Rust Reference 1.98.0, "Unions"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html>
+
+> "The key property of unions is that all fields of a union share common
+> storage. As a result, writes to one field of a union can overwrite its other
+> fields, and size of a union is determined by the size of its largest field."
+
+Modeling choice (`agent_docs/trusted-rust.md`): Reads the trailing lossless
+raw-byte overlay slot appended by `overlayRawAbstractByteVals`.
+-/
+def trailingUnionOverlayBytes? (unionBytes : Nat) : List Value → Option (List AbstractByte)
+  | .nil => .none
+  | .aggregate 0 rawVals :: .nil =>
+    match Nat.beq (length rawVals) unionBytes with
+    | true => decodeRawAbstractByteVals? rawVals
+    | false => .none
+  | _ :: .nil => .none
+  | _ :: rest => trailingUnionOverlayBytes? unionBytes rest
+
+/--
 Encode the `unionBytes`-byte storage image of a union local from its populated
-`fieldVals`, padding any uninitialized byte positions up to `unionBytes` with
-`AbstractByte.uninit`.
+`fieldVals`, preserving any lossless raw-byte overlay (including full
+`PtrByteFrag` metadata and invalid scalar bit patterns) and padding any
+uninitialized byte positions up to `unionBytes` with `AbstractByte.uninit`.
 
 Reference (The Rust Reference, "Unions"):
 <https://doc.rust-lang.org/1.98.0/reference/items/unions.html>
@@ -557,46 +590,60 @@ def encodeUnionStorageBytes
     (layouts : LayoutTable)
     (unionBytes : Nat)
     (fieldTarget : Option (Nat × Ty × Nat))
-    (fieldVals : List Value) :
+    (fieldVals : List Value)
+    (unionLayoutIdxOpt : Option Nat := .none) :
     List AbstractByte :=
-  let baseBytes : List AbstractByte :=
-    match fieldVals with
-    | .nil => replicateUninitBytes unionBytes
-    | _ :: _ =>
-      match
-        encodeUnionFieldsWith
-          (encodeUntypedValueToBytes defaultCodecFuel)
-          unionBytes
-          fieldVals
-      with
-      | .some bs => padUnionAbstractBytes unionBytes bs
-      | .none => replicateUninitBytes unionBytes
-  match fieldTarget with
-  | .none => baseBytes
-  | .some (fIdx, fTy, fBytes) =>
-    match Nat.beq fBytes 0 with
-    | true => baseBytes
-    | false =>
-      match get? fieldVals fIdx with
+  let layoutEncodedOpt : Option (List AbstractByte) :=
+    match unionLayoutIdxOpt with
+    | .some uIdx =>
+      match encodeByLayoutIdxAux 8 layouts uIdx (.aggregate 0 fieldVals) with
+      | .some bs => .some (padUnionAbstractBytes unionBytes bs)
+      | .none => .none
+    | .none => .none
+  match layoutEncodedOpt with
+  | .some bs => bs
+  | .none =>
+    match trailingUnionOverlayBytes? unionBytes fieldVals with
+    | .some rawBs => rawBs
+    | .none =>
+      let baseBytes : List AbstractByte :=
+        match fieldVals with
+        | .nil => replicateUninitBytes unionBytes
+        | _ :: _ =>
+          match
+            encodeUnionFieldsWith
+              (encodeUntypedValueToBytes defaultCodecFuel)
+              unionBytes
+              fieldVals
+          with
+          | .some bs => padUnionAbstractBytes unionBytes bs
+          | .none => replicateUninitBytes unionBytes
+      match fieldTarget with
       | .none => baseBytes
-      | .some .unit => baseBytes
-      | .some fv =>
-        let typedOpt : Option (List AbstractByte) :=
-          match encodeValueToBytes defaultCodecFuel layouts fTy fv with
-          | .some bs => .some bs
-          | .none =>
-            match encodeUntypedValueToBytes defaultCodecFuel fv with
-            | .some bs =>
-              match Nat.beq (length bs) fBytes with
-              | true => .some bs
-              | false => .none
-            | .none => .none
-        match typedOpt with
-        | .some fieldBs =>
-          match writeAbstractBytesAt baseBytes 0 fieldBs with
-          | .some merged => merged
+      | .some (fIdx, fTy, fBytes) =>
+        match Nat.beq fBytes 0 with
+        | true => baseBytes
+        | false =>
+          match get? fieldVals fIdx with
           | .none => baseBytes
-        | .none => baseBytes
+          | .some .unit => baseBytes
+          | .some fv =>
+            let typedOpt : Option (List AbstractByte) :=
+              match encodeValueToBytes defaultCodecFuel layouts fTy fv with
+              | .some bs => .some bs
+              | .none =>
+                match encodeUntypedValueToBytes defaultCodecFuel fv with
+                | .some bs =>
+                  match Nat.beq (length bs) fBytes with
+                  | true => .some bs
+                  | false => .none
+                | .none => .none
+            match typedOpt with
+            | .some fieldBs =>
+              match writeAbstractBytesAt baseBytes 0 fieldBs with
+              | .some merged => merged
+              | .none => baseBytes
+            | .none => baseBytes
 
 /--
 Reset a union aggregate's `fields` list when its storage contains uninitialized
@@ -610,6 +657,94 @@ def resetUnionFields (fields : List Value) : List Value :=
   | .unit :: _ => .unit :: .nil
   | .aggregate .zero .nil :: _ => .aggregate .zero .nil :: .nil
   | _ => .nil
+
+/--
+Whether `k` is a non-pointer primitive scalar (`bool`, `char`, integer, or float)
+that must not receive a provenance-bearing `Value.ptr` directly without passing
+through `Ptr2IntTransmutePolicy` byte conversion.
+-/
+@[reducible]
+def isNonPtrPrimitiveKind : RigidTy → Bool
+  | .bool | .char | .int _ | .uint _ | .float _ => true
+  | _ => false
+
+/--
+Convert a copied single-element value `copiedVal` from `srcPt` to `dstEffTy`
+without forging pointer provenance, without letting pointer provenance leak
+into a non-pointer integer destination (even under matching pointee shapes),
+and without triggering premature write-time UB on invalid scalar bit patterns
+(`Kani#5205` / `#5196`).
+
+Reference (`core::ptr::copy_nonoverlapping` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "The copy is \"untyped\" in the sense that data may be uninitialized or
+> otherwise violate the requirements of `T`. The initialization state is
+> preserved exactly."
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer."
+-/
+def convertCopySingleValue?
+    (layouts : LayoutTable)
+    (srcPtOpt dstPtOpt dstPlaceTyOpt : Option Ty)
+    (copiedVal : Value) :
+    Option Value :=
+  let effDstTyOpt : Option Ty :=
+    match dstPlaceTyOpt with
+    | .some t => .some t
+    | .none => dstPtOpt
+  let encodeCopied (sTyOpt : Option Ty) : Option (List AbstractByte) :=
+    match sTyOpt with
+    | .some sTy =>
+      match encodeTypedValueToBytes layouts sTy copiedVal with
+      | .some bs => .some bs
+      | .none => encodeUntypedValueToBytes defaultCodecFuel copiedVal
+    | .none => encodeUntypedValueToBytes defaultCodecFuel copiedVal
+  match srcPtOpt, effDstTyOpt with
+  | .some srcPt, .some dstTy =>
+    let directProvLeak : Bool :=
+      Bool.and (valueHasProv copiedVal) (isNonPtrPrimitiveKind dstTy.kind)
+    let needsByteConvert : Bool :=
+      Bool.or directProvLeak (Bool.not (sameRigidTyShape srcPt.kind dstTy.kind))
+    match needsByteConvert with
+    | false =>
+      match dstTy.kind, copiedVal with
+      | .adt _ _, .scalar _ | .adt _ _, .ptr _ _ =>
+        match encodeCopied (.some srcPt) with
+        | .some bs => decodeUntypedStorageBytes defaultCodecFuel layouts dstTy bs .strictUcg630Ub
+        | .none => .none
+      | _, _ => .some copiedVal
+    | true =>
+      match encodeCopied (.some srcPt) with
+      | .some bs =>
+        match rigidTyByteSize layouts dstTy with
+        | .some dSz =>
+          match Nat.beq (length bs) dSz with
+          | true => decodeUntypedStorageBytes defaultCodecFuel layouts dstTy bs .strictUcg630Ub
+          | false => .none
+        | .none =>
+          match directProvLeak with
+          | true => .none
+          | false => .some copiedVal
+      | .none =>
+        match directProvLeak with
+        | true => .none
+        | false =>
+          match rigidTyByteSize layouts srcPt, rigidTyByteSize layouts dstTy with
+          | .some sSz, .some dSz =>
+            match Nat.beq sSz dSz with
+            | false => .none
+            | true => .none
+          | _, _ => .some copiedVal
+  | .none, .some dstTy =>
+    match Bool.and (valueHasProv copiedVal) (isNonPtrPrimitiveKind dstTy.kind) with
+    | true => .none
+    | false => .some copiedVal
+  | _, .none => .some copiedVal
 
 /--
 Evaluate the single-element direct value copy branch (`count == 1` and
@@ -664,44 +799,19 @@ def evalCopySingleDirect
           local_ := dstEntry.targetLocal
           projection := dstEntry.targetProjection
         }
+        let dstPlaceTyOpt : Option Ty :=
+          match get? locals₃ dstPlace.local_ with
+          | .some _ => placeTyResolved localDecls layouts dstPlace
+          | .none => .none
+        let srcPtOpt := operandPointeeTy localDecls layouts src
+        let dstPtOpt := operandPointeeTy localDecls layouts dst
         let convertedOpt : Option Value :=
-          match
-            operandPointeeTy localDecls layouts src,
-            operandPointeeTy localDecls layouts dst
-          with
-          | .some srcPt, .some dstPt =>
-            match sameRigidTyShape srcPt.kind dstPt.kind with
-            | true => .some copiedVal
-            | false =>
-              match
-                rigidTyByteSize layouts srcPt,
-                rigidTyByteSize layouts dstPt
-              with
-              | .some sSz, .some dSz =>
-                match Nat.beq sSz dSz with
-                | false => .none
-                | true =>
-                  match
-                    encodeValueToBytes
-                      defaultCodecFuel
-                      layouts
-                      srcPt
-                      copiedVal
-                  with
-                  | .some bs =>
-                    decodeValueFromBytes
-                      defaultCodecFuel
-                      layouts
-                      dstPt
-                      bs
-                  | .none => .none
-              | _, _ => .some copiedVal
-          | _, _ => .some copiedVal
+          convertCopySingleValue? layouts srcPtOpt dstPtOpt dstPlaceTyOpt copiedVal
         match convertedOpt with
         | .none => MirStepNode.fail .ub
         | .some finalVal =>
           match
-            writePlaceValue
+            writePlaceValueUntyped
               locals₃
               s.memory.borrows
               dstPlace
@@ -745,21 +855,7 @@ def evalCopySingleDirect
                     with
                     | .none => finalVal
                     | .some bs =>
-                      match
-                        decodeArrayChunksWith
-                          (fun chunk =>
-                            decodeValueFromBytes
-                              defaultCodecFuel
-                              layouts
-                              { kind := .uint .u8, layoutIdx := 0 }
-                              chunk)
-                          1
-                          (length bs)
-                          bs
-                      with
-                      | .some copiedBytes =>
-                        .aggregate 0 (spliceValues copiedBytes 0 dstElems)
-                      | .none => finalVal
+                      .aggregate 0 (spliceValues (encodeRawAbstractByteVals bs) 0 dstElems)
                 | _, _ => finalVal
               let callerWriteRes : PlaceWriteResult :=
                 match dstPlace.projection with
@@ -827,9 +923,9 @@ def evalCopySingleDirect
 
 /--
 Write `newVal` to `dstPlace` in `locals₃` (or `s.memory.callerLocals` when
-`dstPlace.local_` indexes a caller local), invalidate conflicting Tree Borrows
-tags on `dstTargetLocal` relative to `dstTag`, and advance `s` to the next
-statement.
+`dstPlace.local_` indexes a caller local) via `writePlaceValueUntyped`,
+invalidate conflicting Tree Borrows tags on `dstTargetLocal` relative to
+`dstTag`, and advance `s` to the next statement.
 -/
 def commitCopyDstPlaceWrite
     (s : MachineState)
@@ -842,7 +938,7 @@ def commitCopyDstPlaceWrite
     (layouts : LayoutTable := emptyLayoutTable) :
     MirStepNode :=
   match
-    writePlaceValue
+    writePlaceValueUntyped
       locals₃
       s.memory.borrows
       dstPlace
@@ -938,15 +1034,17 @@ Evaluate `copy_nonoverlapping` (`countBits > 0`) when `src`, `dst`, or both
 address a `FieldsShape.union` local (`srcUnionOpt` / `dstUnionOpt`).
 
 Enforces pointer alignment (`isAlignedOffset`), place and union byte bounds,
-non-overlap (`rangesDisjoint`), and Rust typed-memory bit-validity:
-- Uninitialized union bytes (`AbstractByte.uninit`) may be copied into a union
-  destination (`dstUnionOpt = .some _`), updating `dst` to its decoded typed
-  field/union value when all required bytes are valid or resetting `dst` to its
-  uninitialized union representation via `resetUnionFields` when `.uninit` bytes
-  remain.
-- Copying uninitialized union bytes into a non-union destination
-  (`dstUnionOpt = .none`) fails closed with `MirStepNode.fail .ub` unless every
-  uninitialized byte falls strictly within aggregate padding of `dst`'s layout.
+non-overlap (`rangesDisjoint`), UCG #558 pointer-byte fragment coherence
+without provenance forging, and read-time validity (`Kani#5205` / `#5196`):
+- Uninitialized union bytes (`AbstractByte.uninit`), invalid scalar bit
+  patterns, and intact or fragmented pointer bytes copied into a union
+  destination (`dstUnionOpt = .some _`) are preserved losslessly via
+  `decodeUnionBytesWithCountOpt`.
+- Copying into a non-union destination (`dstUnionOpt = .none`) uses
+  `decodeUntypedStorageBytes` (preserving `PtrByteFrag` in `[u8; N]`, never
+  forging pointer provenance, rejecting provenance into non-pointer scalars
+  under `.strictUcg630Ub`, and deferring `bool`/`char`/`Unaligned<bool>`
+  bit-validity checks to typed reads).
 
 Reference (`core::intrinsics::copy_nonoverlapping`, Rust 1.98.0):
 <https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.copy_nonoverlapping.html>
@@ -994,6 +1092,10 @@ def evalCopyUnionBytes
             | .init (.aggregate _ fs) => fs
             | .init otherVal => otherVal :: .nil
             | _ => .nil
+          let srcUnionLayoutIdxOpt : Option Nat :=
+            match get? localDecls srcEntry.targetLocal with
+            | .some decl => .some (resolveTyWithLocalDecls localDecls layouts decl.ty).layoutIdx
+            | .none => .none
           let srcEffStart :=
             Nat.add srcInfo.subBaseOffset srcPtr.offsetBytes
           let srcBoundsOk :=
@@ -1015,6 +1117,7 @@ def evalCopyUnionBytes
                 srcInfo.unionBytes
                 srcInfo.fieldTarget
                 srcFields
+                srcUnionLayoutIdxOpt
             match
               sliceAbstractBytes srcStorageBytes srcEffStart copyByteLen
             with
@@ -1055,14 +1158,12 @@ def evalCopyUnionBytes
               }
               let srcPlaceTyOpt : Option Ty :=
                 match srcInFrame with
-                | true => placeTy localDecls layouts srcPlace
+                | true => placeTyResolved localDecls layouts srcPlace
                 | false => .none
               let fullSrcBytesOpt : Option (List AbstractByte) :=
                 match srcPlaceTyOpt with
                 | .some sTy =>
-                  match
-                    encodeValueToBytes defaultCodecFuel layouts sTy srcSubVal
-                  with
+                  match encodeTypedValueToBytes layouts sTy srcSubVal with
                   | .some bs => .some bs
                   | .none =>
                     encodeUntypedValueToBytes defaultCodecFuel srcSubVal
@@ -1095,6 +1196,10 @@ def evalCopyUnionBytes
             | .init (.aggregate vIdx fs) => (vIdx, fs)
             | .init otherVal => (0, otherVal :: .nil)
             | _ => (0, .nil)
+          let dstUnionLayoutIdxOpt : Option Nat :=
+            match get? localDecls dstEntry.targetLocal with
+            | .some decl => .some (resolveTyWithLocalDecls localDecls layouts decl.ty).layoutIdx
+            | .none => .none
           let dstEffStart :=
             Nat.add dstInfo.subBaseOffset dstPtr.offsetBytes
           let dstBoundsOk :=
@@ -1129,50 +1234,64 @@ def evalCopyUnionBytes
                 dstInfo.unionBytes
                 dstInfo.fieldTarget
                 dstFields
+                dstUnionLayoutIdxOpt
             match
               writeAbstractBytesAt dstStorageBytes dstEffStart copiedBytes
             with
             | .none => MirStepNode.fail .ub
             | .some updatedUnionBytes =>
+              let losslessUnionOpt : Option Value :=
+                match dstUnionLayoutIdxOpt with
+                | .some uIdx =>
+                  match LayoutTable.lookup layouts uIdx with
+                  | .some { isUninhabited := false, variants := .single 0, fields := .union count, .. } =>
+                    decodeUnionBytesWithCountOpt layouts uIdx count updatedUnionBytes
+                  | _ => .none
+                | .none => .none
               let newUnionVal : Value :=
-                match dstInfo.fieldTarget with
-                | .some (dstFieldIdx, dstFieldTy, dstFieldBytes) =>
-                  match
-                    sliceAbstractBytes updatedUnionBytes 0 dstFieldBytes
-                  with
-                  | .some updatedFieldBytes =>
+                match losslessUnionOpt with
+                | .some unionVal => unionVal
+                | .none =>
+                  match dstInfo.fieldTarget with
+                  | .some (dstFieldIdx, dstFieldTy, dstFieldBytes) =>
                     match
-                      decodeValueFromBytes
-                        defaultCodecFuel
-                        layouts
-                        dstFieldTy
-                        updatedFieldBytes
+                      sliceAbstractBytes updatedUnionBytes 0 dstFieldBytes
                     with
-                    | .some decodedFieldVal =>
-                      Value.aggregate
-                        dstVar
-                        (setOrExtendFields
-                          (resetUnionFields dstFields)
-                          dstFieldIdx
-                          decodedFieldVal)
+                    | .some updatedFieldBytes =>
+                      match
+                        decodeUntypedStorageBytes
+                          defaultCodecFuel
+                          layouts
+                          dstFieldTy
+                          updatedFieldBytes
+                          .strictUcg630Ub
+                      with
+                      | .some decodedFieldVal =>
+                        Value.aggregate
+                          dstVar
+                          (setOrExtendFields
+                            (resetUnionFields dstFields)
+                            dstFieldIdx
+                            decodedFieldVal)
+                      | .none =>
+                        Value.aggregate dstVar (resetUnionFields dstFields)
                     | .none =>
                       Value.aggregate dstVar (resetUnionFields dstFields)
                   | .none =>
-                    Value.aggregate dstVar (resetUnionFields dstFields)
-                | .none =>
-                  let decodedRootOpt : Option Value :=
-                    match get? localDecls dstEntry.targetLocal with
-                    | .some decl =>
-                      decodeValueFromBytes
-                        defaultCodecFuel
-                        layouts
-                        decl.ty
-                        updatedUnionBytes
-                    | .none => .none
-                  match decodedRootOpt with
-                  | .some decodedUnionVal => decodedUnionVal
-                  | .none =>
-                    Value.aggregate dstVar (resetUnionFields dstFields)
+                    let decodedRootOpt : Option Value :=
+                      match get? localDecls dstEntry.targetLocal with
+                      | .some decl =>
+                        decodeUntypedStorageBytes
+                          defaultCodecFuel
+                          layouts
+                          (resolveTyWithLocalDecls localDecls layouts decl.ty)
+                          updatedUnionBytes
+                          .strictUcg630Ub
+                      | .none => .none
+                    match decodedRootOpt with
+                    | .some decodedUnionVal => decodedUnionVal
+                    | .none =>
+                      Value.aggregate dstVar (resetUnionFields dstFields)
               match
                 set? locals₃ dstEntry.targetLocal (.init newUnionVal)
               with
@@ -1223,7 +1342,7 @@ def evalCopyUnionBytes
             | .none => false
           let dstLocalPlaceTy : Option Ty :=
             match dstInFrame with
-            | true => placeTy localDecls layouts dstPlace
+            | true => placeTyResolved localDecls layouts dstPlace
             | false => .none
           let dstIsAdt : Bool :=
             match dstLocalPlaceTy with
@@ -1255,11 +1374,12 @@ def evalCopyUnionBytes
                 | false => MirStepNode.fail .ub
                 | true =>
                   match
-                    decodeValueFromBytes
+                    decodeUntypedStorageBytes
                       defaultCodecFuel
                       layouts
                       dstPt
                       copiedBytes
+                      .strictUcg630Ub
                   with
                   | .some decodedVal =>
                     commitCopyDstPlaceWrite
@@ -1291,11 +1411,12 @@ def evalCopyUnionBytes
                   | false => MirStepNode.fail .ub
                   | true =>
                     match
-                      decodeValueFromBytes
+                      decodeUntypedStorageBytes
                         defaultCodecFuel
                         layouts
                         dstPt
                         copiedBytes
+                        .strictUcg630Ub
                     with
                     | .some decodedVal =>
                       commitCopyDstPlaceWrite
@@ -1321,41 +1442,35 @@ def evalCopyUnionBytes
                   with
                   | false => .none
                   | true =>
-                    match
-                      decodeArrayChunksWith
-                        (fun chunk =>
-                          decodeValueFromBytes
-                            defaultCodecFuel
-                            layouts
-                            { kind := .uint .u8, layoutIdx := 0 }
-                            chunk)
-                        1
-                        copyByteLen
-                        copiedBytes
-                    with
-                    | .some decodedByteVals =>
+                    match hasUninitByte copiedBytes with
+                    | true => .none
+                    | false =>
                       .some
                         (.aggregate 0
-                          (spliceValues decodedByteVals dstStart dstElems))
-                    | .none => .none
+                          (spliceValues (encodeRawAbstractByteVals copiedBytes) dstStart dstElems))
                 | _, _ => .none
               match dstTargetTyOpt with
               | .some dstPt =>
-                match
-                  encodeValueToBytes defaultCodecFuel layouts dstPt dstSubVal
-                with
+                let dstOldBytesOpt : Option (List AbstractByte) :=
+                  match encodeTypedValueToBytes layouts dstPt dstSubVal with
+                  | .some bs => .some bs
+                  | .none => encodeUntypedValueToBytes defaultCodecFuel dstSubVal
+                match dstOldBytesOpt with
                 | .some dstOldBytes =>
                   match
                     writeAbstractBytesAt dstOldBytes dstStart copiedBytes
                   with
                   | .none => MirStepNode.fail .ub
                   | .some updatedDstBytes =>
+                    let isPartialWrite : Bool := Nat.blt copyByteLen (length updatedDstBytes)
                     match
-                      decodeValueFromBytes
+                      decodeUntypedStorageBytes
                         defaultCodecFuel
                         layouts
                         dstPt
                         updatedDstBytes
+                        .strictUcg630Ub
+                        isPartialWrite
                     with
                     | .some decodedVal =>
                       commitCopyDstPlaceWrite
@@ -1614,7 +1729,10 @@ def elemsAreByteScalars : List Value → Bool
     match Nat.beq sc.sizeBytes 1 with
     | true => elemsAreByteScalars rest
     | false => false
-  | _ :: _ => false
+  | v :: rest =>
+    match isRawFragByteVal v with
+    | true => elemsAreByteScalars rest
+    | false => false
 
 /--
 One endpoint (`src` or `dst`) of a multi-element or sub-place
@@ -2446,6 +2564,19 @@ def fieldLayoutsAllPrimitive (layouts : LayoutTable) : List Nat → Bool
     | _ => false
 
 /--
+Whether `k` is a thin pointer type (`.rawPtr`, `.ref`, or `.fnPtr` with sized
+pointee, i.e., not `.slice`, `.str`, or `.dynamic`).
+-/
+@[reducible]
+def isThinPtrCopyKind : RigidTy → Bool
+  | .fnPtr _ _ _ _ => true
+  | .rawPtr _ pointee | .ref _ pointee =>
+    match pointee with
+    | .slice _ | .str | .dynamic _ => false
+    | _ => true
+  | _ => false
+
+/--
 Whether `encodeValueToBytes defaultCodecFuel layouts ty v` produces the exact
 in-memory byte representation of `v : ty` without falling back to untyped
 declaration-order field concatenation (which ignores `repr(Rust)` field
@@ -2486,37 +2617,40 @@ def srcValHasExactByteEncoding
   match isLayoutIndepByteKind ty.kind with
   | true => true
   | false =>
-    match ty.kind with
-    | .tuple (kHead :: kTail) =>
-      match LayoutTable.lookup layouts ty.layoutIdx with
-      | .some l =>
-        match l.isUninhabited, l.fields with
-        | false, .arbitrary offsets _ =>
-          Bool.and
-            (Nat.beq (length offsets) (length (kHead :: kTail)))
-            (listAllLayoutIndepScalar (kHead :: kTail))
-        | _, _ => false
-      | .none => false
-    | .adt _ .nil =>
-      match LayoutTable.lookup layouts ty.layoutIdx with
-      | .some l =>
-        match l.isUninhabited, l.variants, l.fields with
-        | false, .single _, .primitive =>
-          match l.backendRepr, v with
-          | .scalar sl, .scalar _ =>
-            Bool.and (Nat.ble 1 l.size.bytes) (scalarLayoutIsNonPtr sl)
-          | _, _ => false
-        | false, .single _, .arbitrary .nil _ => Nat.beq l.size.bytes 0
-        | false, .single _, .arbitrary offsets _ =>
-          match v with
-          | .aggregate _ fieldVals =>
+    match isThinPtrCopyKind ty.kind with
+    | true => true
+    | false =>
+      match ty.kind with
+      | .tuple (kHead :: kTail) =>
+        match LayoutTable.lookup layouts ty.layoutIdx with
+        | .some l =>
+          match l.isUninhabited, l.fields with
+          | false, .arbitrary offsets _ =>
             Bool.and
-              (Nat.beq (length offsets) (length fieldVals))
-              (allNonPtrScalarOrUnitValues fieldVals)
-          | _ => false
-        | _, _, _ => false
-      | .none => false
-    | _ => false
+              (Nat.beq (length offsets) (length (kHead :: kTail)))
+              (listAllLayoutIndepScalar (kHead :: kTail))
+          | _, _ => false
+        | .none => false
+      | .adt _ _ =>
+        match LayoutTable.lookup layouts ty.layoutIdx with
+        | .some l =>
+          match l.isUninhabited, l.variants, l.fields with
+          | false, .single _, .primitive =>
+            match l.backendRepr, v with
+            | .scalar sl, .scalar _ =>
+              Bool.and (Nat.ble 1 l.size.bytes) (scalarLayoutIsNonPtr sl)
+            | _, _ => false
+          | false, .single _, .arbitrary .nil _ => Nat.beq l.size.bytes 0
+          | false, .single _, .arbitrary offsets _ =>
+            match v with
+            | .aggregate _ fieldVals =>
+              Bool.and
+                (Nat.beq (length offsets) (length fieldVals))
+                (allNonPtrScalarOrUnitValues fieldVals)
+            | _ => false
+          | _, _, _ => false
+        | .none => false
+      | _ => false
 
 /--
 Whether `decodeValueFromBytes defaultCodecFuel layouts ty bs` decodes `bs` into
@@ -2555,43 +2689,46 @@ def dstTyHasExactByteDecode
   match isLayoutIndepByteKind ty.kind with
   | true => true
   | false =>
-    match ty.kind with
-    | .tuple (kHead :: kTail) =>
-      match LayoutTable.lookup layouts ty.layoutIdx with
-      | .some l =>
-        match l.isUninhabited, l.fields with
-        | false, .arbitrary offsets _ =>
-          Bool.and
-            (Nat.beq (length offsets) (length (kHead :: kTail)))
-            (listAllLayoutIndepScalar (kHead :: kTail))
-        | _, _ => false
-      | .none => false
-    | .adt _ .nil =>
-      match LayoutTable.lookup layouts ty.layoutIdx with
-      | .some l =>
-        match l.isUninhabited, l.variants, l.fields with
-        | false, .single _, .primitive =>
-          match l.backendRepr with
-          | .scalar sl =>
-            Bool.and (Nat.ble 1 l.size.bytes) (scalarLayoutIsNonPtr sl)
-          | _ => false
-        | false, .single _, .arbitrary .nil _ => Nat.beq l.size.bytes 0
-        | false, .single _, .arbitrary offsets _ =>
-          match
+    match isThinPtrCopyKind ty.kind with
+    | true => true
+    | false =>
+      match ty.kind with
+      | .tuple (kHead :: kTail) =>
+        match LayoutTable.lookup layouts ty.layoutIdx with
+        | .some l =>
+          match l.isUninhabited, l.fields with
+          | false, .arbitrary offsets _ =>
             Bool.and
-              (Nat.beq (length l.fieldLayouts) (length offsets))
-              (fieldLayoutsAllPrimitive layouts l.fieldLayouts)
-          with
-          | true => true
-          | false =>
-            match offsets, l.backendRepr with
-            | _ :: .nil, .scalar s0 => scalarLayoutIsNonPtr s0
-            | _ :: _ :: .nil, .scalarPair s0 s1 =>
-              Bool.and (scalarLayoutIsNonPtr s0) (scalarLayoutIsNonPtr s1)
-            | _, _ => false
-        | _, _, _ => false
-      | .none => false
-    | _ => false
+              (Nat.beq (length offsets) (length (kHead :: kTail)))
+              (listAllLayoutIndepScalar (kHead :: kTail))
+          | _, _ => false
+        | .none => false
+      | .adt _ _ =>
+        match LayoutTable.lookup layouts ty.layoutIdx with
+        | .some l =>
+          match l.isUninhabited, l.variants, l.fields with
+          | false, .single _, .primitive =>
+            match l.backendRepr with
+            | .scalar sl =>
+              Bool.and (Nat.ble 1 l.size.bytes) (scalarLayoutIsNonPtr sl)
+            | _ => false
+          | false, .single _, .arbitrary .nil _ => Nat.beq l.size.bytes 0
+          | false, .single _, .arbitrary offsets _ =>
+            match
+              Bool.and
+                (Nat.beq (length l.fieldLayouts) (length offsets))
+                (fieldLayoutsAllPrimitive layouts l.fieldLayouts)
+            with
+            | true => true
+            | false =>
+              match offsets, l.backendRepr with
+              | _ :: .nil, .scalar s0 => scalarLayoutIsNonPtr s0
+              | _ :: _ :: .nil, .scalarPair s0 s1 =>
+                Bool.and (scalarLayoutIsNonPtr s0) (scalarLayoutIsNonPtr s1)
+              | _, _ => false
+          | _, _, _ => false
+        | .none => false
+      | _ => false
 
 /--
 Byte-level path of a multi-element or sub-place `copy_nonoverlapping` when at
@@ -2706,8 +2843,27 @@ def copyBytesSubplace
       match resolveBorrowProjectionElems locals dstEp.entry.targetProjection with
       | .some rp => normalizeSubsliceProjections rp
       | .none => dstEp.entry.targetProjection
+    let srcSubPlaceTyOpt : Option Ty :=
+      match get? locals srcEp.entry.targetLocal with
+      | .some _ =>
+        placeTyResolved
+          localDecls
+          layouts
+          { local_ := srcEp.entry.targetLocal
+            projection := srcEp.entry.targetProjection }
+      | .none => .none
+    let srcSubSliceOk : Bool :=
+      match expBytesOpt, srcSubPlaceTyOpt with
+      | .some expB, .some srcTy =>
+        match isThinPtrCopyKind srcTy.kind, tyByteSize localDecls layouts srcTy with
+        | true, .some sB =>
+          Bool.and
+            (Nat.ble (Nat.add srcEp.ptr.offsetBytes expB) sB)
+            (Bool.or (Nat.blt 0 srcEp.ptr.offsetBytes) (Nat.blt expB sB))
+        | _, _ => false
+      | _, _ => false
     let wholeSrc : Option (Value × List ProjectionElem × Option (List ProjectionElem × List Value)) :=
-      match Nat.beq srcEp.ptr.offsetBytes 0, srcEp.rootValOpt with
+      match Bool.or (Nat.beq srcEp.ptr.offsetBytes 0) srcSubSliceOk, srcEp.rootValOpt with
       | true, .some srcRootVal =>
         match readProjectedValue locals srcRootVal srcEp.entry.targetProjection with
         | .ok srcSubVal => .some (srcSubVal, srcResolvedProj, .none)
@@ -2759,36 +2915,57 @@ def copyBytesSubplace
                 | _ => false
             match ekExact with
             | true =>
-              encodeValueToBytes
-                defaultCodecFuel
-                layouts
-                { kind := .array ek (length slicedElems), layoutIdx := unresolvedLayoutIdx layouts }
-                sVal
+              match
+                encodeValueToBytes
+                  defaultCodecFuel
+                  layouts
+                  { kind := .array ek (length slicedElems), layoutIdx := unresolvedLayoutIdx layouts }
+                  sVal
+              with
+              | .some bs => .some bs
+              | .none =>
+                match ek with
+                | .uint .u8 | .int .i8 => decodeRawAbstractByteVals? slicedElems
+                | _ => .none
             | false => .none
           | .none =>
             match allNonPtrScalarOrUnitValues slicedElems with
             | true => encodeUntypedValueToBytes defaultCodecFuel sVal
             | false => .none
         | .none =>
-          let srcPlaceTyOpt : Option Ty :=
-            match get? locals srcEp.entry.targetLocal with
-            | .some _ =>
-              placeTyResolved
-                localDecls
-                layouts
-                { local_ := srcEp.entry.targetLocal
-                  projection := srcEp.entry.targetProjection }
-            | .none => .none
-          match srcPlaceTyOpt with
-          | .some srcTy =>
-            match srcValHasExactByteEncoding layouts srcTy sVal with
-            | true => encodeValueToBytes defaultCodecFuel layouts srcTy sVal
-            | false => .none
-          | .none =>
-            match sVal with
-            | .scalar _ => encodeUntypedValueToBytes defaultCodecFuel sVal
-            | .unit => encodeUntypedValueToBytes defaultCodecFuel sVal
-            | _ => .none
+          let rawFullBsOpt : Option (List AbstractByte) :=
+            match srcSubPlaceTyOpt with
+            | .some srcTy =>
+              match srcValHasExactByteEncoding layouts srcTy sVal with
+              | true =>
+                match encodeTypedValueToBytes layouts srcTy sVal with
+                | .some bs => .some bs
+                | .none =>
+                  match isThinPtrCopyKind srcTy.kind, sVal with
+                  | true, .aggregate 0 rawVals => decodeRawAbstractByteVals? rawVals
+                  | _, _ =>
+                    match srcTy.kind, sVal with
+                    | .array (.uint .u8) n, .aggregate 0 rawVals =>
+                      match Nat.beq (length rawVals) n with
+                      | true => decodeRawAbstractByteVals? rawVals
+                      | false => .none
+                    | .array (.int .i8) n, .aggregate 0 rawVals =>
+                      match Nat.beq (length rawVals) n with
+                      | true => decodeRawAbstractByteVals? rawVals
+                      | false => .none
+                    | _, _ => .none
+              | false => .none
+            | .none =>
+              match sVal with
+              | .scalar _ => encodeUntypedValueToBytes defaultCodecFuel sVal
+              | .unit => encodeUntypedValueToBytes defaultCodecFuel sVal
+              | _ => .none
+          match rawFullBsOpt with
+          | .none => .none
+          | .some fullBs =>
+            match srcSubSliceOk, expBytesOpt with
+            | true, .some expB => sliceAbstractBytes fullBs srcEp.ptr.offsetBytes expB
+            | _, _ => .some fullBs
       match bsOpt with
       | .none => .unsupported
       | .some bs =>
@@ -2842,125 +3019,178 @@ def copyBytesSubplace
               match Nat.ble (Nat.add effDstStart (length bs)) (length dstElems) with
               | false => .unsupported
               | true =>
-                match
-                  decodeArrayChunksWith
-                    (fun chunk =>
-                      decodeValueFromBytes
-                        defaultCodecFuel
-                        layouts
-                        { kind := .uint .u8, layoutIdx := 0 }
-                        chunk)
-                    1
-                    (length bs)
-                    bs
-                with
-                | .some copiedBytes =>
+                match hasUninitByte bs with
+                | true => .unsupported
+                | false =>
                   commit
                     { local_ := dstLocal, projection := dstParentProj }
-                    (.aggregate 0 (spliceValues copiedBytes effDstStart dstElems))
+                    (.aggregate 0 (spliceValues (encodeRawAbstractByteVals bs) effDstStart dstElems))
                     (copySliceWindowProj dstParentProj effDstStart (length bs) (length dstElems))
-                | .none => .unsupported
             | .none =>
-              match Nat.beq dstEp.ptr.offsetBytes 0 with
-              | false => .unsupported
-              | true =>
-                let dstPlaceTyOpt : Option Ty :=
-                  match get? locals dstLocal with
-                  | .some _ =>
-                    placeTyResolved
-                      localDecls
-                      layouts
-                      { local_ := dstLocal, projection := dstEp.entry.targetProjection }
-                  | .none => .none
-                let dstTargetTyOpt : Option Ty :=
-                  match dstPlaceTyOpt with
-                  | .some t => .some t
-                  | .none =>
-                    match dstEp.pointeeOpt, dstEp.rootValOpt with
-                    | .some pt, .some dstRootVal =>
-                      match
-                        readProjectedValue locals dstRootVal dstEp.entry.targetProjection,
-                        rigidTyByteSize layouts pt
-                      with
-                      | .ok dstSubVal, .some ptBytes =>
-                        let repExact : Bool :=
-                          match dstSubVal with
-                          | .scalar sc =>
-                            Bool.and
-                              (isLayoutIndepScalarKind pt.kind)
-                              (Nat.beq ptBytes sc.sizeBytes)
-                          | _ => false
-                        match repExact with
-                        | true => .some pt
-                        | false => .none
-                      | _, _ => .none
-                    | _, _ => .none
-                let decodeAt
-                    (tyOpt : Option Ty)
-                    (dstProj dstEffProj : List ProjectionElem) :
-                    Option CopySliceOutcome :=
-                  let canWriteToSlot : Bool :=
-                    match dstEp.rootValOpt, stripLeadingOpaqueCast dstProj with
-                    | .none, _ :: _ => false
-                    | _, _ => true
-                  match canWriteToSlot, tyOpt with
-                  | true, .some dstTy =>
-                    match dstTyHasExactByteDecode layouts dstTy with
+              let dstPlaceTyOpt : Option Ty :=
+                match get? locals dstLocal with
+                | .some _ =>
+                  placeTyResolved
+                    localDecls
+                    layouts
+                    { local_ := dstLocal, projection := dstEp.entry.targetProjection }
+                | .none => .none
+              let partialPtrDstOutcomeOpt : Option CopySliceOutcome :=
+                match dstPlaceTyOpt with
+                | .some dstTy =>
+                  match isThinPtrCopyKind dstTy.kind, rigidTyByteSize layouts dstTy with
+                  | true, .some dstBytes =>
+                    match
+                      Bool.and
+                        (Nat.ble (Nat.add dstEp.ptr.offsetBytes (length bs)) dstBytes)
+                        (Bool.or (Nat.blt 0 dstEp.ptr.offsetBytes) (Nat.blt (length bs) dstBytes))
+                    with
                     | false => .none
                     | true =>
-                      match rigidTyByteSize layouts dstTy with
+                      let oldDstBytesOpt : Option (List AbstractByte) :=
+                        match dstEp.rootValOpt with
+                        | .none =>
+                          match stripLeadingOpaqueCast dstEp.entry.targetProjection with
+                          | .nil => .some (replicateUninitBytes dstBytes)
+                          | _ :: _ => .none
+                        | .some dstRootVal =>
+                          match readProjectedValue locals dstRootVal dstEp.entry.targetProjection with
+                          | .ok (.aggregate 0 rawVals) => decodeRawAbstractByteVals? rawVals
+                          | .ok dstSubVal => encodeTypedValueToBytes layouts dstTy dstSubVal
+                          | _ => .none
+                      match oldDstBytesOpt with
                       | .none => .none
-                      | .some dstBytes =>
-                        match Nat.beq (length bs) dstBytes with
-                        | false => .none
-                        | true =>
-                          match decodeValueFromBytes defaultCodecFuel layouts dstTy bs with
+                      | .some oldDstBytes =>
+                        match writeAbstractBytesAt oldDstBytes dstEp.ptr.offsetBytes bs with
+                        | .none => .none
+                        | .some mergedBytes =>
+                          match
+                            decodeUntypedStorageBytes
+                              defaultCodecFuel
+                              layouts
+                              dstTy
+                              mergedBytes
+                              .strictUcg630Ub
+                              true
+                          with
                           | .some decodedVal =>
                             .some
                               (commit
-                                { local_ := dstLocal, projection := dstProj }
+                                { local_ := dstLocal, projection := dstEp.entry.targetProjection }
                                 decodedVal
-                                dstEffProj)
+                                dstResolvedProj)
                           | .none => .none
                   | _, _ => .none
-                match decodeAt dstTargetTyOpt dstEp.entry.targetProjection dstResolvedProj with
-                | .some outcome => outcome
-                | .none =>
-                  match dstWinOpt with
-                  | .some (dstParentProj, .zero, _) =>
-                    let parentTyOpt : Option Ty :=
-                      match get? locals dstLocal with
-                      | .some _ =>
-                        placeTyResolved
-                          localDecls
-                          layouts
-                          { local_ := dstLocal, projection := dstParentProj }
-                      | .none => .none
-                    match decodeAt parentTyOpt dstParentProj dstParentProj with
-                    | .some outcome => outcome
-                    | .none => .unsupported
+                | .none => .none
+              match partialPtrDstOutcomeOpt with
+              | .some outcome => outcome
+              | .none =>
+                match Nat.beq dstEp.ptr.offsetBytes 0 with
+                | false => .unsupported
+                | true =>
+                  let dstTargetTyOpt : Option Ty :=
+                    match dstPlaceTyOpt with
+                    | .some t => .some t
+                    | .none =>
+                      match dstEp.pointeeOpt, dstEp.rootValOpt with
+                      | .some pt, .some dstRootVal =>
+                        match
+                          readProjectedValue locals dstRootVal dstEp.entry.targetProjection,
+                          rigidTyByteSize layouts pt
+                        with
+                        | .ok dstSubVal, .some ptBytes =>
+                          let repExact : Bool :=
+                            match dstSubVal with
+                            | .scalar sc =>
+                              Bool.and
+                                (isLayoutIndepScalarKind pt.kind)
+                                (Nat.beq ptBytes sc.sizeBytes)
+                            | _ => false
+                          match repExact with
+                          | true => .some pt
+                          | false => .none
+                        | _, _ => .none
+                      | _, _ => .none
+                  let decodeAt
+                      (tyOpt : Option Ty)
+                      (dstProj dstEffProj : List ProjectionElem) :
+                      Option CopySliceOutcome :=
+                    let canWriteToSlot : Bool :=
+                      match dstEp.rootValOpt, stripLeadingOpaqueCast dstProj with
+                      | .none, _ :: _ => false
+                      | _, _ => true
+                    match canWriteToSlot, tyOpt with
+                    | true, .some dstTy =>
+                      match dstTyHasExactByteDecode layouts dstTy with
+                      | false => .none
+                      | true =>
+                        match rigidTyByteSize layouts dstTy with
+                        | .none => .none
+                        | .some dstBytes =>
+                          match Nat.beq (length bs) dstBytes with
+                          | false => .none
+                          | true =>
+                            match
+                              decodeUntypedStorageBytes
+                                defaultCodecFuel
+                                layouts
+                                dstTy
+                                bs
+                                .strictUcg630Ub
+                            with
+                            | .some decodedVal =>
+                              .some
+                                (commit
+                                  { local_ := dstLocal, projection := dstProj }
+                                  decodedVal
+                                  dstEffProj)
+                            | .none =>
+                              match
+                                Bool.and
+                                  (isNonPtrPrimitiveKind dstTy.kind)
+                                  (policyRejectsProv .strictUcg630Ub bs)
+                              with
+                              | true => .some .ub
+                              | false => .none
+                    | _, _ => .none
+                  match decodeAt dstTargetTyOpt dstEp.entry.targetProjection dstResolvedProj with
+                  | .some outcome => outcome
                   | .none =>
-                    match dstEp.rootValOpt, splitLastConstantIndex? dstResolvedProj with
-                    | .none, .some (initProj, .zero, _) =>
-                      match
-                        stripLeadingOpaqueCast initProj,
-                        copyPlaceIsNonArrayAggregate localDecls layouts locals dstLocal initProj
-                      with
-                      | .nil, false =>
-                        let parentTyOpt : Option Ty :=
-                          match get? locals dstLocal with
-                          | .some _ =>
-                            placeTyResolved
-                              localDecls
-                              layouts
-                              { local_ := dstLocal, projection := initProj }
-                          | .none => .none
-                        match decodeAt parentTyOpt initProj initProj with
-                        | .some outcome => outcome
-                        | .none => .unsupported
+                    match dstWinOpt with
+                    | .some (dstParentProj, .zero, _) =>
+                      let parentTyOpt : Option Ty :=
+                        match get? locals dstLocal with
+                        | .some _ =>
+                          placeTyResolved
+                            localDecls
+                            layouts
+                            { local_ := dstLocal, projection := dstParentProj }
+                        | .none => .none
+                      match decodeAt parentTyOpt dstParentProj dstParentProj with
+                      | .some outcome => outcome
+                      | .none => .unsupported
+                    | .none =>
+                      match dstEp.rootValOpt, splitLastConstantIndex? dstResolvedProj with
+                      | .none, .some (initProj, .zero, _) =>
+                        match
+                          stripLeadingOpaqueCast initProj,
+                          copyPlaceIsNonArrayAggregate localDecls layouts locals dstLocal initProj
+                        with
+                        | .nil, false =>
+                          let parentTyOpt : Option Ty :=
+                            match get? locals dstLocal with
+                            | .some _ =>
+                              placeTyResolved
+                                localDecls
+                                layouts
+                                { local_ := dstLocal, projection := initProj }
+                            | .none => .none
+                          match decodeAt parentTyOpt initProj initProj with
+                          | .some outcome => outcome
+                          | .none => .unsupported
+                        | _, _ => .unsupported
                       | _, _ => .unsupported
-                    | _, _ => .unsupported
-                  | _ => .unsupported
+                    | _ => .unsupported
 
 /--
 Resolve a `copy_nonoverlapping` of `n ≥ 1` elements that is neither a union
@@ -3137,7 +3367,7 @@ def commitCopyDstPlaceWriteWithBorrows
     (layouts : LayoutTable := emptyLayoutTable) :
     MirStepNode :=
   match
-    writePlaceValue
+    writePlaceValueUntyped
       locals₃
       s.memory.borrows
       dstPlace
@@ -3334,10 +3564,48 @@ def evalCopyNonOverlappingPermOk
       n
       locals₃
   | false =>
+    let elemSzOpt : Option Nat :=
+      copyPointeeByteSize?
+        localDecls
+        layouts
+        (operandPointeeTy localDecls layouts src)
+        (operandPointeeTy localDecls layouts dst)
+    let srcPlaceSizeMismatch : Bool :=
+      match elemSzOpt, get? locals₃ srcEntry.targetLocal with
+      | .some eSz, .some _ =>
+        match
+          placeTyResolved
+            localDecls
+            layouts
+            { local_ := srcEntry.targetLocal, projection := srcEntry.targetProjection }
+        with
+        | .some sPlaceTy =>
+          match tyByteSize localDecls layouts sPlaceTy with
+          | .some pSz => Bool.not (Nat.beq pSz eSz)
+          | .none => false
+        | .none => false
+      | _, _ => false
+    let dstPlaceSizeMismatch : Bool :=
+      match elemSzOpt, get? locals₃ dstEntry.targetLocal with
+      | .some eSz, .some _ =>
+        match
+          placeTyResolved
+            localDecls
+            layouts
+            { local_ := dstEntry.targetLocal, projection := dstEntry.targetProjection }
+        with
+        | .some dPlaceTy =>
+          match tyByteSize localDecls layouts dPlaceTy with
+          | .some pSz => Bool.not (Nat.beq pSz eSz)
+          | .none => false
+        | .none => false
+      | _, _ => false
     let isSingleDirect :=
       Bool.and
         (Nat.beq n 1)
-        (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+        (Bool.and
+          (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+          (Bool.and (Bool.not srcPlaceSizeMismatch) (Bool.not dstPlaceSizeMismatch)))
     match isSingleDirect with
     | true =>
       evalCopySingleDirect
@@ -3432,38 +3700,12 @@ def evalForeignFrameCopySingleDirect
         | .unsupported => MirStepNode.unsupported
         | .ok copiedVal =>
           let convertedOpt : Option Value :=
-            match
-              operandPointeeTy localDecls layouts src,
-              operandPointeeTy localDecls layouts dst
-            with
-            | .some srcPt, .some dstPt =>
-              match sameRigidTyShape srcPt.kind dstPt.kind with
-              | true => .some copiedVal
-              | false =>
-                match
-                  rigidTyByteSize layouts srcPt,
-                  rigidTyByteSize layouts dstPt
-                with
-                | .some sSz, .some dSz =>
-                  match Nat.beq sSz dSz with
-                  | false => .none
-                  | true =>
-                    match
-                      encodeValueToBytes
-                        defaultCodecFuel
-                        layouts
-                        srcPt
-                        copiedVal
-                    with
-                    | .some bs =>
-                      decodeValueFromBytes
-                        defaultCodecFuel
-                        layouts
-                        dstPt
-                        bs
-                    | .none => .none
-                | _, _ => .some copiedVal
-            | _, _ => .some copiedVal
+            convertCopySingleValue?
+              layouts
+              (operandPointeeTy localDecls layouts src)
+              (operandPointeeTy localDecls layouts dst)
+              .none
+              copiedVal
           match convertedOpt with
           | .none => MirStepNode.fail .ub
           | .some finalVal =>
@@ -5550,15 +5792,24 @@ def evalStmt
           | true => MirStepNode.step (advanceStmt s locals')
           | false => MirStepNode.fail .ub
         | .none =>
+          let ptrBytes := layoutPointerBytes layouts
           let isNonNullEmptySlice :=
             match ptrOrFatVal with
-            | .aggregate 0 (.ptr p 8 :: .scalar ⟨0, 8⟩ :: .nil) =>
+            | .aggregate 0 (.ptr p pSz :: .scalar ⟨0, lSz⟩ :: .nil) =>
               Bool.and
-                (Bool.not isMutRefPlace)
-                (Bool.not
-                  (Bool.and
-                    (Nat.beq p.allocId 0)
-                    (Nat.beq p.offsetBytes 0)))
+                (Bool.and (Nat.beq pSz ptrBytes) (Nat.beq lSz ptrBytes))
+                (Bool.and
+                  (Bool.not isMutRefPlace)
+                  (Bool.not
+                    (Bool.and
+                      (Nat.beq p.allocId 0)
+                      (Nat.beq p.offsetBytes 0))))
+            | .aggregate 0 (.scalar s :: .scalar ⟨0, lSz⟩ :: .nil) =>
+              Bool.and
+                (Bool.and (Nat.beq s.sizeBytes ptrBytes) (Nat.beq lSz ptrBytes))
+                (Bool.and
+                  (Bool.not isMutRefPlace)
+                  (Bool.not (Nat.beq s.bits 0)))
             | _ => false
           match isNonNullEmptySlice with
           | true => MirStepNode.step (advanceStmt s locals')
@@ -6445,23 +6696,37 @@ theorem evalStmt_storageRevive_old_ptr_deref_ub
     dsimp only
     rw [hPtrSlot]
     dsimp only
-    cases hPlaceTy : placeTy localDecls layouts ⟨ptrLoc, .nil⟩ with
-    | none =>
-      dsimp only
-      rw [hDis]
-    | some ty =>
-      rcases ty with ⟨kind, layIdx⟩
-      cases kind with
-      | rawPtr m p =>
-        cases retagKind <;> rfl
-      | ref m p =>
-        dsimp only
-        cases rigidTyIsUninhabited 16 p
-        · dsimp only; rw [hDis]
-        · rfl
-      | _ =>
-        dsimp only
+    cases localDecls with
+    | nil =>
+      dsimp only [placeTy, get?]
+      rw [List.getElem?_nil, hDis]
+    | cons decl0 declRest =>
+      dsimp only [placeTy, placeTyResolved]
+      cases hDecl : get? (decl0 :: declRest) ptrLoc with
+      | none =>
+        dsimp only [materializeReadPtrValue, validateValueForTy?]
         rw [hDis]
+      | some decl =>
+        rcases decl with ⟨_, ⟨kind, layIdx⟩, _⟩
+        dsimp only [resolveProjectedTy, resolveProjectedTyResolved, materializeReadPtrValue]
+        cases hVal : validateValueForTy? layouts (.some ⟨kind, layIdx⟩) (.ptr ptrVal sz) with
+        | false =>
+          cases kind with
+          | rawPtr _ _ => cases hVal
+          | _ => rfl
+        | true =>
+          dsimp only
+          cases kind with
+          | rawPtr m p =>
+            cases retagKind <;> rfl
+          | ref m p =>
+            dsimp only
+            cases rigidTyIsUninhabited 16 p
+            · dsimp only; rw [hDis]
+            · rfl
+          | _ =>
+            dsimp only
+            rw [hDis]
   · cases localDecls <;> cases restProj <;> simp [evalStmt, evalOperand, hPtrSlot, hDis]
   · unfold evalCopyNonOverlappingWithCount
     simp only [Nat.beq]
@@ -10028,12 +10293,12 @@ def checkPtrArgAligned
 /-! ### Exact Abstract-Byte Storage Codec, Layout Data Mask, Padding Reset & Round-Trip Commit -/
 
 /--
-Structural equality on optional `(AllocId × tag)` byte provenance.
+Structural equality on optional `PtrByteFrag` byte provenance.
 -/
 @[reducible]
-def optProvEq : Option (Nat × Nat) → Option (Nat × Nat) → Bool
+def optProvEq : Option PtrByteFrag → Option PtrByteFrag → Bool
   | .none, .none => true
-  | .some (a1, t1), .some (a2, t2) => Bool.and (Nat.beq a1 a2) (Nat.beq t1 t2)
+  | .some f1, .some f2 => PtrByteFrag.beq f1 f2
   | _, _ => false
 
 /--
@@ -10071,14 +10336,6 @@ def abstractBytesRefine : List AbstractByte → List AbstractByte → Bool
   | _, _ => false
 
 /--
-Test whether `bytes` contains any `AbstractByte.uninit` byte.
--/
-def hasUninitByte : List AbstractByte → Bool
-  | .nil => false
-  | .uninit :: _ => true
-  | .init _ _ :: rest => hasUninitByte rest
-
-/--
 Test whether every byte in `bytes` is `AbstractByte.uninit`.
 -/
 def allBytesUninit : List AbstractByte → Bool
@@ -10089,7 +10346,7 @@ def allBytesUninit : List AbstractByte → Bool
 /--
 Helper verifying all remaining bytes are `.init _ expectedProv`.
 -/
-def allBytesMatchProv (expectedProv : Option (Nat × Nat)) : List AbstractByte → Bool
+def allBytesMatchProv (expectedProv : Option PtrByteFrag) : List AbstractByte → Bool
   | .nil => true
   | .uninit :: _ => false
   | .init _ p :: rest =>
@@ -10098,17 +10355,29 @@ def allBytesMatchProv (expectedProv : Option (Nat × Nat)) : List AbstractByte �
     | false => false
 
 /--
-Check that every byte in non-empty `bytes` is initialized AND carries the exact
-same provenance `Option (Nat × Nat)`, returning `.none` on any `.uninit` byte or
-fragmented/mixed provenance.
+Helper verifying every byte in `bytes` is initialized with `.none` provenance.
+-/
+def allBytesMatchNone : List AbstractByte → Bool
+  | .nil => true
+  | .init _ .none :: rest => allBytesMatchNone rest
+  | _ :: _ => false
+
+/--
+Check that every byte in non-empty `bytes` is either initialized with `.none`
+provenance (`allBytesMatchNone`) or forms a strictly coherent UCG #558 pointer
+byte image (`abstractBytesCoherentPtrProv?`), returning `.none` on any `.uninit`
+byte or fragmented/reversed/spliced provenance.
 -/
 def allBytesSameProv : List AbstractByte → Option (Option (Nat × Nat))
   | .nil => .none
-  | .uninit :: _ => .none
-  | .init _ p :: rest =>
-    match allBytesMatchProv p rest with
-    | true => .some p
-    | false => .none
+  | b :: rest =>
+    let bytes := b :: rest
+    match allBytesMatchNone bytes with
+    | true => .some .none
+    | false =>
+      match abstractBytesCoherentPtrProv? bytes with
+      | .some frag => .some (.some (frag.allocId, frag.tag))
+      | .none => .none
 
 /--
 Test whether any byte in `bytes` carries real allocation provenance (excluding
@@ -10118,8 +10387,8 @@ def bytesHaveRealProvenance (mem : Memory) : List AbstractByte → Bool
   | .nil => false
   | .uninit :: rest => bytesHaveRealProvenance mem rest
   | .init _ .none :: rest => bytesHaveRealProvenance mem rest
-  | .init _ (.some (a, _)) :: rest =>
-    match Bool.and (Nat.beq a 0) (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := 0 })) with
+  | .init _ (.some frag) :: rest =>
+    match Bool.and (Nat.beq frag.allocId 0) (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := 0 })) with
     | true => bytesHaveRealProvenance mem rest
     | false => true
 
@@ -11026,7 +11295,8 @@ def readRootAbstractBytes
     (ep : ResolvedMemEndpoint) :
     Option (List AbstractByte) :=
   match ep.globalAlloc? with
-  | .some gAlloc => globalAllocSliceToAbstractBytes gAlloc 0 ep.allocSize
+  | .some gAlloc =>
+    globalAllocSliceToAbstractBytes gAlloc 0 ep.allocSize (layoutPointerBytes ep.targetLayouts)
   | .none =>
     match ep.rootSlot? with
     | .some .uninit => .some (replicateUninitBytes ep.allocSize)
@@ -12192,13 +12462,13 @@ def buildGlobalRelocsAux (ptrBytes : Nat) : Nat → Nat → List AbstractByte �
   | off, .succ skip, _ :: rest => buildGlobalRelocsAux ptrBytes (Nat.add off 1) skip rest
   | off, .zero, b :: rest =>
     match b with
-    | .init _ (.some (a, _)) =>
+    | .init _ (.some frag) =>
       let window := takeAbstractBytes ptrBytes (b :: rest)
-      match Nat.beq (length window) ptrBytes, allBytesSameProv window with
-      | true, .some (.some (a', _)) =>
-        match Nat.beq a a', ptrBytes with
+      match Nat.beq (length window) ptrBytes, abstractBytesCoherentPtrProv? window with
+      | true, .some wFrag =>
+        match Bool.and (Nat.beq frag.allocId wFrag.allocId) (Nat.beq wFrag.ptrBytes ptrBytes), ptrBytes with
         | true, .succ ptrBytes' =>
-          (off, { allocId := a, offsetBytes := 0 }) ::
+          (off, { allocId := wFrag.allocId, offsetBytes := wFrag.origOffset }) ::
             buildGlobalRelocsAux ptrBytes (Nat.add off 1) ptrBytes' rest
         | _, _ => buildGlobalRelocsAux ptrBytes (Nat.add off 1) 0 rest
       | _, _ => buildGlobalRelocsAux ptrBytes (Nat.add off 1) 0 rest
@@ -12253,7 +12523,7 @@ def commitRootAbstractBytes
           bytes := abstractBytesToGlobalOptBytes newRootBytes
           relocations := buildGlobalRelocsAux ptrBytes 0 0 newRootBytes
         }
-        match globalAllocSliceToAbstractBytes updatedAlloc 0 ep.allocSize with
+        match globalAllocSliceToAbstractBytes updatedAlloc 0 ep.allocSize ptrBytes with
         | .none => .unsupported
         | .some rereadBytes =>
           match abstractBytesEq rereadBytes newRootBytes with

@@ -42,21 +42,21 @@ open Trusted.Sequence
 /-! ## MiniRust: the representation of thin pointers -/
 
 theorem encodePtrBytes_data (prov : Option Prov) (i : Nat) (data : List UInt8) :
-    (encodePtrBytes prov i data).mapM AbstractByte.data = some data := by
+    (Interp.encodePtrBytes prov i data).mapM AbstractByte.data = some data := by
   induction data generalizing i with
   | nil => rfl
-  | cons b rest ih => simp [encodePtrBytes, AbstractByte.data, ih]
+  | cons b rest ih => simp [Interp.encodePtrBytes, AbstractByte.data, ih]
 
 /-- The provenance fold of `decode_ptr` keeps a provenance whose fragments sit
 at their own positions. -/
 theorem decodePtrProvenance_encode (prov : Option Prov) (i : Nat) (data : List UInt8) :
-    decodePtrProvenance i prov (encodePtrBytes prov i data) = prov := by
+    decodePtrProvenance i prov (Interp.encodePtrBytes prov i data) = prov := by
   induction data generalizing i with
   | nil => rfl
   | cons b rest ih =>
     cases prov with
-    | none => simp [encodePtrBytes, decodePtrProvenance, AbstractByte.provenance_frag, ih]
-    | some p => simp [encodePtrBytes, decodePtrProvenance, AbstractByte.provenance_frag, ih]
+    | none => simp [Interp.encodePtrBytes, decodePtrProvenance, AbstractByte.provenance_frag, ih]
+    | some p => simp [Interp.encodePtrBytes, decodePtrProvenance, AbstractByte.provenance_frag, ih]
 
 /-- Once the provenance fold of `decode_ptr` has lost the provenance, it stays
 lost ("Crucially, if `acc` is ever `None`, it remains `None`"). -/
@@ -107,8 +107,8 @@ theorem encodePtr_eq (addr : Nat) (h : addr < 2 ^ 64) (prov : Option Prov) :
   encodePtr_of_encode { addr := addr, provenance := prov } (leBytes addr 8) (encode_usize addr h)
 
 theorem firstProvenance_encodePtrBytes (prov : Option Prov) (b : UInt8) (rest : List UInt8) :
-    firstProvenance (encodePtrBytes prov 0 (b :: rest)) = prov := by
-  cases prov <;> simp [encodePtrBytes, firstProvenance, AbstractByte.provenance_frag]
+    firstProvenance (Interp.encodePtrBytes prov 0 (b :: rest)) = prov := by
+  cases prov <;> simp [Interp.encodePtrBytes, firstProvenance, AbstractByte.provenance_frag]
 
 theorem decodePtr_ptrBytes (addr : Nat) (h : addr < 2 ^ 64) (prov : Option Prov) :
     decodePtr (ptrBytes addr prov) = .ok (some { addr := addr, provenance := prov }) := by
@@ -951,38 +951,47 @@ theorem rigidTyByteSize_of_ptrPointeeOf (layouts : Layout.LayoutTable) {t : MirA
 
 theorem encodeValueToBytes_of_ptrPointeeOf (layouts : Layout.LayoutTable) {t : MirAst.Ty}
     {mutbl : MirAst.Mutability} {it : Gen.IntType}
-    (hp : ptrPointeeOf t = some (mutbl, it)) (pv : ProvenancePtr) (hoff : pv.offsetBytes = 0) :
+    (hp : ptrPointeeOf t = some (mutbl, it)) (pv : ProvenancePtr) (hoff : pv.offsetBytes = 0)
+    (hptr8 : MirSemantics.layoutPointerBytes layouts = 8 := by rfl) :
     MirSemantics.encodeValueToBytes MirSemantics.defaultCodecFuel layouts t (.ptr pv 8) =
       MirSemantics.encodeScalarBytes ⟨0, 8⟩ (.some (pv.allocId, pv.tag)) := by
   unfold ptrPointeeOf at hp
-  cases hk : t.kind with
+  rcases t with ⟨kind, lidx⟩
+  cases kind with
   | rawPtr m inner | ref m inner =>
-    rw [hk] at hp
-    cases inner <;>
-      simp_all [intTyBytes, MirSemantics.encodeValueToBytes]
-  | _ => rw [hk] at hp; cases hp
+    cases inner <;> simp [intTyBytes] at hp <;>
+      (change MirSemantics.encodeValueToBytes (15 + 1) layouts _ _ = _;
+       unfold MirSemantics.encodeValueToBytes; dsimp only; rw [hptr8];
+       simp only [Nat.blt, Nat.ble, hoff])
+  | _ => simp at hp
 
 theorem decodeValueFromBytes_of_ptrPointeeOf (layouts : Layout.LayoutTable) {t : MirAst.Ty}
     {mutbl : MirAst.Mutability} {it : Gen.IntType}
     (hp : ptrPointeeOf t = some (mutbl, it)) (pv : ProvenancePtr) (hoff : pv.offsetBytes = 0)
     {bs : List MirSemantics.AbstractByte}
-    (hbs : MirSemantics.encodeScalarBytes ⟨0, 8⟩ (.some (pv.allocId, pv.tag)) = some bs) :
+    (hbs : MirSemantics.encodeScalarBytes ⟨0, 8⟩ (.some (pv.allocId, pv.tag)) = some bs)
+    (hptr8 : MirSemantics.layoutPointerBytes layouts = 8 := by rfl) :
     MirSemantics.decodeValueFromBytes MirSemantics.defaultCodecFuel layouts t bs =
       some (.ptr pv 8) ∧ bs.length = 8 := by
   have hpv : ({ allocId := pv.allocId, offsetBytes := 0 } : ProvenancePtr) = pv := by
     cases pv; simp_all
   simp only [MirSemantics.encodeScalarBytes, MirSemantics.encodeLittleEndianBytes,
+    MirSemantics.encodePtrBytes, MirSemantics.encodePtrBytesAux,
     Option.some.injEq] at hbs
   subst hbs
   refine ⟨?_, rfl⟩
   unfold ptrPointeeOf at hp
-  cases hk : t.kind with
+  rcases t with ⟨kind, lidx⟩
+  cases kind with
   | rawPtr m inner | ref m inner =>
-    rw [hk] at hp
     cases inner <;> simp [intTyBytes] at hp <;>
-      (simp only [MirSemantics.decodeValueFromBytes, hk];
+      (change MirSemantics.decodeValueFromBytes (15 + 1) layouts _ _ = _;
+       unfold MirSemantics.decodeValueFromBytes;
+       rw [hptr8];
+       simp only [MirSemantics.abstractBytesCoherentPtrProv?,
+         MirSemantics.abstractBytesCoherentPtrProvAux, Nat.beq_refl, Bool.and_self];
        exact congrArg (some ∘ (Value.ptr · 8)) hpv)
-  | _ => rw [hk] at hp; cases hp
+  | _ => simp at hp
 
 theorem decodeTypedValueFromBytes_of_ptrPointeeOf (layouts : Layout.LayoutTable) {t : MirAst.Ty}
     {mutbl : MirAst.Mutability} {it : Gen.IntType}
@@ -995,6 +1004,7 @@ theorem decodeTypedValueFromBytes_of_ptrPointeeOf (layouts : Layout.LayoutTable)
   have hpv : ({ allocId := pv.allocId, offsetBytes := 0 } : ProvenancePtr) = pv := by
     cases pv; simp_all
   simp only [MirSemantics.encodeScalarBytes, MirSemantics.encodeLittleEndianBytes,
+    MirSemantics.encodePtrBytes, MirSemantics.encodePtrBytesAux,
     Option.some.injEq] at hbs
   subst hbs
   refine ⟨?_, rfl⟩
@@ -1003,11 +1013,13 @@ theorem decodeTypedValueFromBytes_of_ptrPointeeOf (layouts : Layout.LayoutTable)
   cases kind with
   | rawPtr m inner | ref m inner =>
     cases inner <;> simp [intTyBytes] at hp <;>
-      (dsimp only [MirSemantics.decodeTypedValueFromBytes, MirSemantics.defaultCodecFuel,
-         MirSemantics.normalizeCodecTy];
+      (change MirSemantics.decodeTypedValueFromBytes (15 + 1) layouts _ _ = _;
+       unfold MirSemantics.decodeTypedValueFromBytes;
+       dsimp only [MirSemantics.normalizeCodecTy];
        rw [hptr8];
-       simp only [MirSemantics.decodePtrBytesNoForge, MirSemantics.abstractBytesUniformProv,
-         MirSemantics.abstractBytesAllProvAux, Nat.beq_refl, Bool.and_self];
+       simp only [MirSemantics.decodePtrBytesNoForge, MirSemantics.abstractBytesCoherentPtrProv?,
+         MirSemantics.abstractBytesCoherentPtrProvAux,
+         MirSemantics.decodeLittleEndianBits, Nat.beq_refl, Bool.and_self];
        exact congrArg (some ∘ (Value.ptr · 8)) hpv)
   | _ => simp at hp
 
@@ -1018,7 +1030,8 @@ theorem ptrPointeeOf_resolveTyWithLocalDecls (decls : List LocalDecl)
 
 theorem tyByteSize_of_ptrPointeeOf (decls : List LocalDecl)
     (layouts : Layout.LayoutTable) {t : MirAst.Ty} {mutbl : MirAst.Mutability} {it : Gen.IntType}
-    (hp : ptrPointeeOf t = some (mutbl, it)) :
+    (hp : ptrPointeeOf t = some (mutbl, it))
+    (hptr8 : MirSemantics.layoutPointerBytes layouts = 8 := by rfl) :
     MirSemantics.tyByteSize decls layouts t = some 8 := by
   have hr : ptrPointeeOf (MirSemantics.resolveTyWithLocalDecls decls layouts t) = some (mutbl, it) := by
     rw [ptrPointeeOf_resolveTyWithLocalDecls]; exact hp
@@ -1027,6 +1040,7 @@ theorem tyByteSize_of_ptrPointeeOf (decls : List LocalDecl)
   unfold ptrPointeeOf at hr
   rcases hrt : MirSemantics.resolveTyWithLocalDecls decls layouts t with ⟨kind, lidx⟩
   rw [hrt] at hr hsz
+  rw [hptr8]
   cases kind with
   | rawPtr m inner | ref m inner =>
     dsimp only
@@ -1035,10 +1049,11 @@ theorem tyByteSize_of_ptrPointeeOf (decls : List LocalDecl)
 
 theorem encodeByteCastSourceBytes_of_ptrPointeeOf (layouts : Layout.LayoutTable) {t : MirAst.Ty}
     {mutbl : MirAst.Mutability} {it : Gen.IntType}
-    (hp : ptrPointeeOf t = some (mutbl, it)) (pv : ProvenancePtr) (hoff : pv.offsetBytes = 0) :
+    (hp : ptrPointeeOf t = some (mutbl, it)) (pv : ProvenancePtr) (hoff : pv.offsetBytes = 0)
+    (hptr8 : MirSemantics.layoutPointerBytes layouts = 8 := by rfl) :
     MirSemantics.encodeByteCastSourceBytes layouts t (.ptr pv 8) =
       MirSemantics.encodeScalarBytes ⟨0, 8⟩ (.some (pv.allocId, pv.tag)) := by
-  have henc := encodeValueToBytes_of_ptrPointeeOf layouts hp pv hoff
+  have henc := encodeValueToBytes_of_ptrPointeeOf layouts hp pv hoff hptr8
   unfold MirSemantics.encodeByteCastSourceBytes MirSemantics.encodeTypedValueToBytes
   unfold ptrPointeeOf at hp
   rcases t with ⟨kind, lidx⟩
@@ -1072,11 +1087,11 @@ theorem evalRvalue_transmute_ptr (locals : List LocalSlot) (p : Nat) (castTy : M
     have hrDst : ptrPointeeOf (MirSemantics.resolveTyWithLocalDecls decls layouts castTy) =
         some (dstMutbl, dstIt) := by
       rw [ptrPointeeOf_resolveTyWithLocalDecls]; exact hdst
-    have hszSrc := tyByteSize_of_ptrPointeeOf decls layouts hrSrc
-    have hszDst := tyByteSize_of_ptrPointeeOf decls layouts hrDst
+    have hszSrc := tyByteSize_of_ptrPointeeOf decls layouts hrSrc hptr8
+    have hszDst := tyByteSize_of_ptrPointeeOf decls layouts hrDst hptr8
     have hopTy : MirSemantics.operandTy decls layouts (.copy ⟨p, []⟩) = some dp.ty := by
       simp [MirSemantics.operandTy, MirSemantics.placeTy, MirSemantics.resolveProjectedTy, get?, hdp]
-    have henc := encodeByteCastSourceBytes_of_ptrPointeeOf layouts hrSrc pv hoff
+    have henc := encodeByteCastSourceBytes_of_ptrPointeeOf layouts hrSrc pv hoff hptr8
     obtain ⟨bs, hbs⟩ : ∃ bs, MirSemantics.encodeScalarBytes ⟨0, 8⟩ (.some (pv.allocId, pv.tag)) = some bs :=
       ⟨_, rfl⟩
     rw [hbs] at henc
@@ -1084,9 +1099,26 @@ theorem evalRvalue_transmute_ptr (locals : List LocalSlot) (p : Nat) (castTy : M
     have hlenEq : Nat.beq (Trusted.Sequence.length bs) 8 = true := by
       have : Trusted.Sequence.length bs = bs.length := rfl
       simp [this, hlen]
+    have hPt : MirSemantics.placeTyResolved decls layouts ⟨p, []⟩ = some dp.ty := by
+      simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdp]
+    have hValOk : MirSemantics.validateValueForTy? layouts
+        (MirSemantics.placeTyResolved decls layouts ⟨p, []⟩) (.ptr pv 8) = true := by
+      rw [hPt]
+      rcases dp with ⟨_, ⟨kind, lidx⟩, _⟩
+      dsimp only at hsrc
+      cases kind with
+      | rawPtr _ _ | ref _ _ => rfl
+      | _ => simp [ptrPointeeOf] at hsrc
+    have hEvalOp : MirSemantics.evalOperand locals (.copy ⟨p, []⟩) mem.borrows mem.globals layouts
+        mem.callerLocals decls mem.callStack = .ok (.ptr pv 8) locals := by
+      cases decls with
+      | nil => simp [evalOperand, get?, hpv, readProjectedValue]
+      | cons d ds =>
+        simp only [evalOperand, get?, hpv, readProjectedValue, hPt,
+          MirSemantics.materializeReadPtrValue]
+        rw [← hPt, hValOk]
     simp [evalRvalue, evalByteCast, MirSemantics.resolveByteCastSrcTyAndSize,
-      evalOperand, get?, hpv, readProjectedValue,
-      hszDst, hopTy, hszSrc, henc, hlenEq, hdec]
+      hEvalOp, hszDst, hopTy, hszSrc, henc, hlenEq, hdec]
   · rcases hu with hu | hu <;>
       simp [evalRvalue, evalByteCast, evalOperand, get?, hu]
 

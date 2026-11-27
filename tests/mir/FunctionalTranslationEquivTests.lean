@@ -137,6 +137,94 @@ private theorem valueListContainsUninit_map_u32 (elems : List Nat) :
   | nil => rfl
   | cons _ tl ih => exact ih
 
+private theorem readProjectedValue_field0
+    (locals : List LocalSlot) (v0 v1 : Value) (ty : Ty) :
+    readProjectedValue locals (.aggregate 0 [v0, v1]) [.field 0 ty] =
+      match valueContainsUninit v0 with
+      | false => .ok v0
+      | true => .ub := rfl
+
+private theorem readProjectedValue_field1
+    (locals : List LocalSlot) (v0 v1 : Value) (ty : Ty) :
+    readProjectedValue locals (.aggregate 0 [v0, v1]) [.field 1 ty] =
+      match valueContainsUninit v1 with
+      | false => .ok v1
+      | true => .ub := rfl
+
+private theorem placeTouchesUnion_index_emptyLayouts
+    (d : LocalDecl) (ds : List LocalDecl) (l : Local) (idx : Local) :
+    placeTouchesUnion (d :: ds) emptyLayoutTable { local_ := l, projection := [.index idx] } =
+      false := rfl
+
+private theorem placeTouchesUnion_field_emptyLayouts
+    (d : LocalDecl) (ds : List LocalDecl) (l : Local) (fIdx : Nat) (fTy : Ty) :
+    placeTouchesUnion (d :: ds) emptyLayoutTable { local_ := l, projection := [.field fIdx fTy] } =
+      false := rfl
+
+private theorem placeTyResolved_eq
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place) :
+    placeTyResolved localDecls layouts p =
+      match get? localDecls p.local_ with
+      | .some decl => resolveProjectedTyResolved localDecls layouts decl.ty p.projection
+      | .none => .none := rfl
+
+private theorem resolveProjectedTyResolved_nil
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (baseTy : Ty) :
+    resolveProjectedTyResolved localDecls layouts baseTy .nil = .some baseTy := rfl
+
+private theorem resolveProjectedTyResolved_index_u32_head
+    (m : Mutability) (ds : List LocalDecl) (idxLocal : Local) :
+    resolveProjectedTyResolved
+        ({ mutability := m, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := none } :: ds)
+        emptyLayoutTable { kind := .array (.uint .u32) 0, layoutIdx := 0 }
+        [.index idxLocal] =
+      .some { kind := .uint .u32, layoutIdx := 0 } := rfl
+
+private theorem resolveProjectedTyResolved_field_u32_head
+    (m : Mutability) (ds : List LocalDecl) (baseTy : Ty) (fIdx : Nat) :
+    resolveProjectedTyResolved
+        ({ mutability := m, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := none } :: ds)
+        emptyLayoutTable baseTy
+        [.field fIdx { kind := .uint .u32, layoutIdx := 0 }] =
+      .some { kind := .uint .u32, layoutIdx := 0 } := rfl
+
+private theorem resolveProjectedTyResolved_field_bool_safe
+    (ds : List LocalDecl) (baseTy : Ty) (fIdx : Nat) :
+    resolveProjectedTyResolved
+        ({ mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := none } ::
+          { mutability := .not, ty := { kind := .array (.uint .u32) 0, layoutIdx := 0 }, debugName := none } ::
+          { mutability := .not, ty := { kind := .uint .usize, layoutIdx := 0 }, debugName := none } ::
+          { mutability := .mut, ty := { kind := .uint .usize, layoutIdx := 0 }, debugName := none } ::
+          { mutability := .mut, ty := { kind := .uint .u32, layoutIdx := 0 }, debugName := none } ::
+          { mutability := .mut, ty := { kind := .bool, layoutIdx := 0 }, debugName := none } :: ds)
+        emptyLayoutTable baseTy [.field fIdx { kind := .bool, layoutIdx := 0 }] =
+      .some { kind := .bool, layoutIdx := 0 } := rfl
+
+private theorem materializeReadPtrValue_scalar_some
+    (layouts : LayoutTable) (ty : Ty) (sc : ScalarInt) :
+    materializeReadPtrValue layouts (some ty) (.scalar sc) = some (.scalar sc) := rfl
+
+private theorem materializeReadPtrValue_u32Array_agg (fs : List Value) :
+    materializeReadPtrValue emptyLayoutTable
+        (some { kind := .array (.uint .u32) 0, layoutIdx := 0 }) (.aggregate 0 fs) =
+      some (.aggregate 0 fs) := by
+  change (match Nat.blt 2 (length fs) with
+    | false => some (Value.aggregate 0 fs)
+    | true => some (Value.aggregate 0 fs)) = some (Value.aggregate 0 fs)
+  cases Nat.blt 2 (length fs) <;> rfl
+
+private theorem validateValueForTy_u32 (sc : ScalarInt) :
+    validateValueForTy? emptyLayoutTable (some { kind := .uint .u32, layoutIdx := 0 }) (.scalar sc) =
+      true := rfl
+
+private theorem validateValueForTy_usize (sc : ScalarInt) :
+    validateValueForTy? emptyLayoutTable (some { kind := .uint .usize, layoutIdx := 0 }) (.scalar sc) =
+      true := rfl
+
+private theorem validateValueForTy_bool (sc : ScalarInt) :
+    validateValueForTy? emptyLayoutTable (some { kind := .bool, layoutIdx := 0 }) (.scalar sc) =
+      Bool.and (Nat.beq sc.sizeBytes 1) (Nat.ble sc.bits 1) := rfl
+
 /--
 `runMirTauToBlock` unfolding that keeps the continuation folded until the step
 node is a concrete `.tau (.running s')` (see `tauThen_tau`).
@@ -338,6 +426,15 @@ def fastSliceSumBody : CapturedMir :=
 def encodeU32Slice (elems : List Nat) : Value :=
   .aggregate 0 (elems.map (fun x => Value.scalar ⟨x, 4⟩))
 
+private theorem validateValueForTy_encodeU32Slice (elems : List Nat) :
+    validateValueForTy? emptyLayoutTable (some u32ArrayMirTy) (encodeU32Slice elems) = true := by
+  change validateTyValueListWith
+      (validateValueForTyAux emptyLayoutTable 15 { kind := .uint .u32, layoutIdx := 0 })
+      (elems.map (fun x => Value.scalar ⟨x, 4⟩)) = true
+  induction elems with
+  | nil => rfl
+  | cons _ tl ih => exact ih
+
 /-- Pure sum of the first `k` elements of `elems`. -/
 def prefixSum (elems : List Nat) : Nat → Nat
   | 0 => 0
@@ -406,10 +503,16 @@ private theorem fastSliceSum_h_body
   cases o6 <;>
     repeat' first
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, fastSliceSumMkState, fastSliceSumBody,
+          mkMirBody, mkDecl, u32MirTy, usizeMirTy, boolMirTy, u32ArrayMirTy,
           encodeU32Slice, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
           readProjectedValue_index, valueContainsUninit_scalar, valueContainsUninit_aggregate,
           valueListContainsUninit_nil, valueListContainsUninit_cons,
+          placeTouchesUnion_index_emptyLayouts, placeTouchesUnion_field_emptyLayouts,
+          placeTyResolved_eq,
+          resolveProjectedTyResolved_nil, resolveProjectedTyResolved_index_u32_head,
+          materializeReadPtrValue_scalar_some,
+          validateValueForTy_u32, validateValueForTy_usize, validateValueForTy_bool,
           evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
           List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
@@ -417,6 +520,10 @@ private theorem fastSliceSum_h_body
           List.length, List.set, BEq.beq, get?, set?, length, emptyMemory,
           invalidateConflictingBorrows, validateLoadedValue, resolveProjectedTy, elemTyOf,
           prefixSum_succ]
+      | rw [resolveProjectedTyResolved_index_u32_head]
+      | rw [validateValueForTy_u32]
+      | rw [validateValueForTy_usize]
+      | rw [validateValueForTy_bool]
       | rw [get?_map_u32 h_i_lt_len]
       | rw [evalScalarBinOp_addUnchecked_u32 h_add_u32]
       | rw [evalScalarBinOp_addUnchecked_usize h_add_usize]
@@ -484,11 +591,17 @@ private theorem evalPlaceLen_encodeU32Slice
     (h1 : get? locals 1 = .some (.init (encodeU32Slice elems))) :
     evalPlaceLen locals (locPlace 1) emptyMemory safeSliceSumBody.localDecls emptyLayoutTable =
       .ok (.scalar ⟨(elems.map (fun x => Value.scalar ⟨x, 4⟩)).length, 8⟩) locals emptyMemory := by
-  unfold evalPlaceLen evalPlaceRead locPlace safeSliceSumBody mkMirBody u32ArrayMirTy
+  unfold evalPlaceLen evalPlaceRead locPlace safeSliceSumBody mkMirBody
   rw [h1]
-  dsimp only [placeTy, resolveProjectedTy, splitLastDeref?, get?, GetElem?.getElem?,
-    List.get?Internal, encodeU32Slice, readProjectedValue]
+  dsimp only [encodeU32Slice, readProjectedValue]
   rw [valueContainsUninit_aggregate, valueListContainsUninit_map_u32]
+  dsimp only [placeTyResolved_eq, resolveProjectedTyResolved_nil, get?, GetElem?.getElem?,
+    List.get?Internal, mkDecl, u32ArrayMirTy]
+  rw [materializeReadPtrValue_u32Array_agg]
+  dsimp only
+  rw [show Value.aggregate 0 (elems.map (fun x => Value.scalar ⟨x, 4⟩)) = encodeU32Slice elems from rfl,
+      show ({ kind := .array (.uint .u32) 0, layoutIdx := 0 } : Ty) = u32ArrayMirTy from rfl,
+      validateValueForTy_encodeU32Slice elems]
   rfl
 
 /--
@@ -531,6 +644,7 @@ private theorem safeSliceSum_header_switch_raw
             safeSliceSumMkState elems n 5 i (some (.scalar sc)) rest) := by
   cases o5 <;> rfl
 
+set_option maxHeartbeats 600000 in
 private theorem safeSliceSum_h_body
     (elems : List Nat) (n i : Nat)
     (rest : Option (Value × Value × Value × Value × Value))
@@ -550,10 +664,18 @@ private theorem safeSliceSum_h_body
     rw [runMirTauToBlock_succ, safeSliceSum_bb2_len_step, List.length_map] <;>
     repeat' first
       | dsimp only [runMirTauToBlock_succ, tauThen_tau, safeSliceSumMkState, safeSliceSumBody,
+          mkMirBody, mkDecl, u32MirTy, usizeMirTy, boolMirTy, u32ArrayMirTy, checkedU32MirTy,
           locPlace, encodeU32Slice, Option.map, optSlot, stepMirFn, MirStepNode.step, evalStmt,
           advanceStmt, evalRvalue, evalOperand, evalConstValue, readProjectedValue,
-          readProjectedValue_index, valueContainsUninit_scalar, valueContainsUninit_aggregate,
+          readProjectedValue_index, readProjectedValue_field0, readProjectedValue_field1,
+          valueContainsUninit_scalar, valueContainsUninit_aggregate,
           valueListContainsUninit_nil, valueListContainsUninit_cons,
+          placeTouchesUnion_index_emptyLayouts, placeTouchesUnion_field_emptyLayouts,
+          placeTyResolved_eq,
+          resolveProjectedTyResolved_nil, resolveProjectedTyResolved_index_u32_head,
+          resolveProjectedTyResolved_field_u32_head, resolveProjectedTyResolved_field_bool_safe,
+          materializeReadPtrValue_scalar_some,
+          validateValueForTy_u32, validateValueForTy_usize, validateValueForTy_bool,
           evalPlaceWrite, operandIsSigned, operandTy, placeTy,
           tyIsSigned, evalTerminator, applyUnwindAction, Option.getD, GetElem?.getElem?,
           List.get?Internal, ite, dite, decide, Nat.decLt, Nat.decLe, Nat.decEq,
@@ -561,10 +683,20 @@ private theorem safeSliceSum_h_body
           List.length, List.set, BEq.beq, get?, set?, length, emptyMemory,
           invalidateConflictingBorrows, validateLoadedValue, resolveProjectedTy, elemTyOf,
           prefixSum_succ]
+      | rw [resolveProjectedTyResolved_index_u32_head]
+      | rw [resolveProjectedTyResolved_field_u32_head]
+      | rw [resolveProjectedTyResolved_field_bool_safe]
+      | rw [validateValueForTy_u32]
+      | rw [validateValueForTy_usize]
+      | rw [validateValueForTy_bool]
       | rw [evalOperandWithBodyCast_copy]
       | rw [evalOperandWithBodyCast_move_nil]
       | rw [evalOperandWithBodyCast_constant]
       | rw [evalScalarBinOp_lt_usize_of_lt h_i_lt_len]
+      | rw [resolveProjectedTyResolved_index_u32_head]
+      | rw [validateValueForTy_u32]
+      | rw [validateValueForTy_usize]
+      | rw [validateValueForTy_bool]
       | rw [get?_map_u32 h_i_lt_len]
       | rw [evalScalarBinOp_addWithOverflow_u32 h_add_u32]
       | rw [evalScalarBinOp_add_usize h_add_usize]

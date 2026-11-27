@@ -2172,10 +2172,11 @@ example {body : CapturedMir} {topFrame : Miri.Interpreter.Frame AnnealProv
     (hty : dstDecl.ty = srcDecl.ty)
     (hsz : (translateTy srcDecl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
     (himm_src : IsImmediateFrameLocal topFrame srcIdx)
-    (himm_dst : IsImmediateFrameLocal topFrame dstIdx) :
+    (himm_dst : IsImmediateFrameLocal topFrame dstIdx)
+    (hkind : IsScalarOrPtrTyKind srcDecl.ty.kind = true) :
     WellTypedLM1_4Stmt body topFrame
       ⟨.assign ⟨dstIdx, .nil⟩ (.use (.move ⟨srcIdx, .nil⟩)), span⟩ :=
-  .assignMove dstIdx srcIdx dstDecl srcDecl span hdst hsrc hty hsz himm_src himm_dst
+  .assignMove dstIdx srcIdx dstDecl srcDecl span hdst hsrc hty hsz himm_src himm_dst hkind
 
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m) (hphase : ∀ p, body.phase ≠ .other p)
@@ -3889,7 +3890,10 @@ example
     (hsrc_not_arr :
       arrayPtrOrRefElemLen? (operandTy localDecls layouts (.copy ⟨srcLoc, .nil⟩)) dstPointee =
         none)
-    (hptr8 : layoutPointerBytes layouts = 8)  :
+    (hptr8 : layoutPointerBytes layouts = 8)
+    (hsrc_valid :
+      validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨srcLoc, .nil⟩)
+        (.ptr ptrVal 8) = true) :
     evalRvalue locals (.cast .ptrToPtr (.copy ⟨srcLoc, .nil⟩) dstTy) mem localDecls layouts =
       .ok (.ptr ptrVal 8) locals mem ∧
     Miri.Interpreter.Cast.ptrToPtr
@@ -3904,7 +3908,7 @@ example
     ImmediateRelLM3_1 allocMap dstTy layouts
       (.ptr ptrVal 8)
       (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)) :=
-  evalCast_ptrToPtr_simulation locals mem localDecls layouts m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy hsrc_slot hptr_rel hdst_thin hsrc_not_arr hptr8
+  evalCast_ptrToPtr_simulation locals mem localDecls layouts m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy hsrc_slot hptr_rel hdst_thin hsrc_not_arr hptr8 hsrc_valid
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4648,12 +4652,13 @@ example
     (hfind_la : m.machine.memory.live.find? (fun x => x.1 == e.allocId) =
       some (e.allocId, localAlloc))
     (hoob : localAlloc.allocation.byteSize.bytes.toNat <
-      ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat) :
+      ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub :=
-  step_deref_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hoob
+  step_deref_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hoob hptr8
 
 example (pointee : RigidTy) (hthin : isThinRawPtrPointee pointee = true) :
     ∃ inner, castTypeInfoOfEncodedTyId (encodeRawPtrTyId pointee) = .ok (.rawPointer inner) :=
@@ -5231,7 +5236,10 @@ example
     (hsrc_not_arr :
       arrayPtrOrRefElemLen? (operandTy localDecls layouts (.copy ⟨srcLoc, .nil⟩)) dstPointee =
         none)
-    (hptr8 : layoutPointerBytes layouts = 8)  :
+    (hptr8 : layoutPointerBytes layouts = 8)
+    (hsrc_valid :
+      validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨srcLoc, .nil⟩)
+        (.ptr ptrVal 8) = true) :
     evalRvalue locals (.cast .ptrToPtr (.copy ⟨srcLoc, .nil⟩) dstTy) mem localDecls layouts =
       .ok (.ptr ptrVal 8) locals mem ∧
     Miri.Interpreter.Cast.ptrToPtr
@@ -5246,7 +5254,7 @@ example
     ImmediateRelLM3_1 allocMap dstTy layouts
       (.ptr ptrVal 8)
       (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)) :=
-  evalCast_ptrToPtr_annealCastHooks_simulation locals mem localDecls layouts m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy hsrc_thin hdst_thin hsrc_slot hptr_rel hsrc_not_arr hptr8
+  evalCast_ptrToPtr_annealCastHooks_simulation locals mem localDecls layouts m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy hsrc_thin hdst_thin hsrc_slot hptr_rel hsrc_not_arr hptr8 hsrc_valid
 
 example
     {localDecls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable}
@@ -6853,12 +6861,13 @@ example
     (hfind_la : m.machine.memory.live.find? (fun x => x.1 == e.allocId) =
       some (e.allocId, localAlloc))
     (hoob : localAlloc.allocation.byteSize.bytes.toNat <
-      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat) :
+      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub :=
-  step_deref_write_oob_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hfind_la hoob
+  step_deref_write_oob_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hfind_la hoob hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -8196,13 +8205,14 @@ example
     (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
     (htgt_live : get? s.frame.locals e.localIdx ≠ some .dead)
     (hoob : (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat <
-      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat) :
+      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub :=
   step_deref_write_narrower_partial_oob_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty
-    hval_prim hval_kind hop himm_ptr hslot_p he htag hdecl_tgt htgt_live hoob
+    hval_prim hval_kind hop himm_ptr hslot_p he htag hdecl_tgt htgt_live hoob hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -10869,7 +10879,8 @@ example
     (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
     (hoob : (translateTy allocDecl.ty body.layouts).layout.size.bytes.toNat <
       ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat)
-    (h_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)  :
+    (h_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_2 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
@@ -10877,7 +10888,7 @@ example
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing a dangling reference")) :=
-  step_safeRef_deref_read_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag h_hperm hdecl_a htarget hoob h_hdst_live
+  step_safeRef_deref_read_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag h_hperm hdecl_a htarget hoob h_hdst_live hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -13265,14 +13276,16 @@ example
           (Miri.Memory.allocRange Miri.ABI.Size.ZERO
             (translateTy decl.ty body.layouts).layout.size)
           Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) true true
-          localAlloc.allocation = .error .copyRangesOverlap alloc') :
+          localAlloc.allocation = .error .copyRangesOverlap alloc')
+    (hread_valid :
+      validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, .nil⟩) rootVal = true) :
     stepMirFn body s =
       MirStepNode.step (advanceStmt s (s.frame.locals.set idx (.init rootVal)) s.memory) ∧
     ∃ m_err,
       Miri.Interpreter.Step.step (annealStepHooksLM2_2 body.localDecls body.layouts) () m =
         (m_err, .error (.undefinedBehavior "whole-value copy between overlapping ranges")) :=
   step_assign_self_copy_memory_struct_divergence hstate hphase hbb hstmt hdecl henv
-    hmem_repr harb hnz_sz hslot hcopy_err
+    hmem_repr harb hnz_sz hslot hcopy_err hread_valid
 
 example
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -23303,8 +23316,7 @@ example :
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
       StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
-      (∃ s₄', stepMirFn b s₃ = .step s₄' ∧
-        get? s₄'.frame.locals 2 = some (.init (.scalar ⟨42, 8⟩))) ∧
+      stepMirFn b s₃ = MirStepNode.unsupported ∧
       get? b.localDecls 2 = some (declOf u32K) ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       (∃ s₄, StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
@@ -23435,10 +23447,9 @@ example :
     (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
         (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
       get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
-    (∃ s', evalCopyNonOverlapping (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
+    evalCopyNonOverlapping (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
         (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
-        .step s' ∧
-      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+        MirStepNode.unsupported ∧
     (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
         (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
         .step s' ∧
@@ -23704,13 +23715,14 @@ example :
 example (p : ProvenancePtr) (hoff : p.offsetBytes < scalarModulus 8)
     (mutability : Mutability) (pk : RigidTy) (idx : Nat) (layouts : Layout.LayoutTable)
     (hthin : (match pk with | .slice _ => true | .str => true | .dynamic _ => true | _ => false) =
-      false) :
+      false)
+    (hptr : layoutPointerBytes layouts = 8) :
     ∃ bs,
       encodeUntypedValueToBytes defaultCodecFuel (.ptr p 8) = some bs ∧
       decodeValueFromBytes defaultCodecFuel layouts
         { kind := .rawPtr mutability pk, layoutIdx := idx } bs = some (.ptr p 8) :=
   encodeUntypedValueToBytes_ptr_decode_roundtrip p hoff mutability pk idx layouts
-    (by cases pk <;> exact hthin)
+    (by cases pk <;> exact hthin) hptr
 
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -23768,7 +23780,7 @@ example :
      let hooks := annealStepHooks b.localDecls b.layouts
      let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
      let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
-     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+     ∃ (s₁ s₂ s₃ s₄ s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
        stepMirFn b (partialCopyLockstepAnnealPre b 0xFFFFFFFFFFFFFFFF) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarMax) =
          (m₁, .ok true) ∧
@@ -23782,8 +23794,7 @@ example :
        stepMirFn b s₃ = .step s₄ ∧
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
        StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
-       stepMirFn b s₄ = .step s₅_stage1 ∧
-       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       stepMirFn b s₄ = MirStepNode.unsupported ∧
        Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
        StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
        get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
@@ -23925,7 +23936,8 @@ example
     (hw_eq : integerKindByteWidth dstKind = integerKindByteWidth srcKind)
     (hfull : countSc.bits * elemBytes = integerKindByteWidth srcKind)
     (hsc_sz : srcSc.sizeBytes = integerKindByteWidth srcKind)
-    (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind)) :
+    (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind))
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
     StepRelLM3_1 body m
       (copyStage1FullBytesNextAllocMap s.frame.locals allocMap srcIdx dstIdx countOp elemBytes)
       (stepMirFn body s)
@@ -23934,7 +23946,7 @@ example
     hstate hphase hbb hstmt hprim hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
     hcountInt hcountOp hpt hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos
     he_s het_s he_d het_d hperm_s hperm_d hne_loc hunion_s hunion_d
-    hslot_s hslot_d hdecl_s hsrcInt hdecl_d hdstInt hw_eq hfull hsc_sz hsc_lt
+    hslot_s hslot_d hdecl_s hsrcInt hdecl_d hdstInt hw_eq hfull hsc_sz hsc_lt hptr8
 
 open LeanMiriSpec.Correspondence in
 #assert_standard_axioms
@@ -23996,7 +24008,7 @@ open LeanMiriSpec.Correspondence in
   step_intrinsic_copyNonOverlapping_perm_range_divergence
   evalCopySingleDirect_rawPtr_distinct_ok
   stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance
-  mergeByteProvenance_some_left
+  mergeByteProvenance_some_agree
   decodeLittleEndianBytes_encodeLittleEndianBytes_some
   encodeUntypedValueToBytes_ptr_decode_roundtrip
   step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported

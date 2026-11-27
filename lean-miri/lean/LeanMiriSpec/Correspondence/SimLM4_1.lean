@@ -113,19 +113,19 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 private theorem evalOperand_copy_nil_any
     (locals : List LocalSlot) (idx : Local) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) :
     evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals
-        localDecls callStack =
+        [] callStack =
       evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
 
 private theorem evalOperand_move_nil_any
     (locals : List LocalSlot) (idx : Local) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) :
     evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals
-        localDecls callStack =
+        [] callStack =
       evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
 
 private theorem evalOperandWithBodyCast_copy_nil_any
@@ -4619,15 +4619,15 @@ theorem WellTypedCallArgs.evalOperands_any
     (h : WellTypedCallArgs callerBody calleeBody tf ops decls)
     (locals : List LocalSlot) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) :
-    evalOperands locals ops borrows globals layouts callerLocals localDecls callStack =
+    evalOperands locals ops borrows globals layouts callerLocals [] callStack =
       evalOperands locals ops borrows globals layouts callerLocals := by
   induction h generalizing locals with
   | nil _ => rfl
   | cons op restOps argDecl restDecls hop _ ih =>
     have hop_eq :
-        evalOperand locals op borrows globals layouts callerLocals localDecls callStack =
+        evalOperand locals op borrows globals layouts callerLocals [] callStack =
           evalOperand locals op borrows globals layouts callerLocals := by
       cases hop with
       | scalarOp _ _ _ hsc _ _ =>
@@ -4665,7 +4665,7 @@ theorem WellTypedCallArgs.evalOperandsWithBodyCast_any
       rw [hop_nc]
       exact ih
   rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
-  exact h.evalOperands_any locals borrows globals layouts callerLocals [] callStack
+  exact h.evalOperands_any locals borrows globals layouts callerLocals callStack
 
 /-- Pointwise relation between evaluated Anneal argument values `argVals`,
 `lean-miri` argument immediates `argImms`, and the callee's post-`_0`
@@ -4775,7 +4775,7 @@ theorem evalCallArgOperand_simulation
         hframe
         hlay_eq
         (himm_tr _ _ (.scalar sc msc hrel hlaysz hbool hchar))
-    | copyLocal idx decl hdecl hsz_nz himm =>
+    | copyLocal idx decl hdecl hsz_nz himm _ =>
       obtain ⟨slot, mls, _, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
       have hcache := hloc.layout_eq
       have himm' := himm mls hmls

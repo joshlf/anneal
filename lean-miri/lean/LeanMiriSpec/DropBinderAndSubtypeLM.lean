@@ -1949,14 +1949,6 @@ theorem trusted_shallowInitBox_eq_transmute_on_rawPtr
         unfold encodeByteCastSourceBytes encodeTypedValueToBytes normalizeCodecTy encodeValueToBytes
         simp only [lookup_emptyLayoutTable_lm]; rfl
     have hLen : length (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = 8 := rfl
-    have hDecAux : ∀ bs, length bs = 8 →
-        decodeLittleEndianBytes bs = some (0, some (p.allocId, p.tag)) →
-        abstractBytesUniformProv bs = true →
-        decodePtrBytesNoForge false (.uint boxInt) 8 bs = some (.ptr p 8) := by
-      intro bs hl hd hu
-      unfold decodePtrBytesNoForge decodeScalarBytes
-      dsimp only
-      rw [hl, hd, hu]
     have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable
         (resolveTyWithLocalDecls decls emptyLayoutTable boxTy)
         (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = some (.ptr p 8) := by
@@ -1965,21 +1957,10 @@ theorem trusted_shallowInitBox_eq_transmute_on_rawPtr
         rw [hr] at hrBoxK; dsimp only at hrBoxK; subst hrBoxK
         unfold decodeTypedValueFromBytes
         dsimp only [normalizeCodecTy, defaultCodecFuel]
-        change decodePtrBytesNoForge false (.uint boxInt) 8
-          (encodeLittleEndianBytes 0 8 (some (p.allocId, p.tag))) = some (.ptr p 8)
-        refine hDecAux _ hLen rfl ?_
-        unfold abstractBytesUniformProv
-        change abstractBytesAllProvAux aid p.tag (encodeLittleEndianBytes 0 7 (some (aid, p.tag))) = true
-        have hProv : ∀ n, abstractBytesAllProvAux aid p.tag
-            (encodeLittleEndianBytes 0 n (some (aid, p.tag))) = true := by
-          intro n
-          induction n with
-          | zero => rfl
-          | succ k ih =>
-            unfold encodeLittleEndianBytes abstractBytesAllProvAux
-            simp only [Nat.beq_refl, Bool.and_self]
-            exact ih
-        exact hProv 7
+        unfold decodePtrBytesNoForge encodeLittleEndianBytes encodePtrBytes encodePtrBytesAux
+          decodeLittleEndianBits abstractBytesCoherentPtrProv? abstractBytesCoherentPtrProvAux
+        simp only [Nat.beq_refl, Bool.true_and, Bool.and_self]
+        rfl
     show evalByteCast locals op boxTy mem decls emptyLayoutTable = _
     unfold evalByteCast
     dsimp only

@@ -277,10 +277,10 @@ theorem char_surrogate_rejected :
 theorem ordering3_stage1_rejects_tag_provenance :
     decodeTypedValueFromBytes defaultCodecFuel stage1Layouts
         { kind := .adt "Ordering3" [], layoutIdx := 5 }
-        [.init (UInt8.ofNat 1) (some (7, 0))] = none ∧
+        [.init (UInt8.ofNat 1) (some { allocId := 7, tag := 0, byteIdx := 0, origOffset := 1, ptrBytes := 1 })] = none ∧
     decodeTypedValueFromBytes defaultCodecFuel stage1Layouts
         { kind := .adt "Ordering3" [], layoutIdx := 5 }
-        [.init (UInt8.ofNat 1) (some (7, 0))] .stripProvenance =
+        [.init (UInt8.ofNat 1) (some { allocId := 7, tag := 0, byteIdx := 0, origOffset := 1, ptrBytes := 1 })] .stripProvenance =
       some (.aggregate 1 []) := by
   exact ⟨rfl, rfl⟩
 

@@ -1074,7 +1074,7 @@ theorem annealEvalOperand_scalar_lm3_1
     refine ⟨sc, msc, tf, heval_a, ?_, by rw [hsame]; exact hstate,
       .scalar sc msc hrel hlaysz hbool hchar, fun _ => rfl⟩
     rw [hsame]; exact heval_m
-  | copyLocal idx decl hdecl hsz_nz himm =>
+  | copyLocal idx decl hdecl hsz_nz himm _ =>
     obtain ⟨slot, mls, _, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hfr.lookup_local hdecl
     have hcache := hloc.cachedLayout_eq
     have himm' := himm mls hmls
@@ -1298,7 +1298,7 @@ theorem WellTypedScalarOperand.translate_ne_move {body : CapturedMir}
   cases h with
   | constScalar c _ _ _ _ _ _ _ _ =>
     simp only [translateOperand, reduceCtorEq] at hp
-  | copyLocal idx _ _ _ _ =>
+  | copyLocal idx _ _ _ _ _ =>
     simp only [translateOperand, reduceCtorEq] at hp
 
 /-- The translation of a call of intrinsic `k` at any recognized `calleePath`

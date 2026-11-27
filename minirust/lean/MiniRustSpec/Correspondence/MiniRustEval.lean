@@ -3347,7 +3347,9 @@ locals, constants, and single-level field projections `.field 0` and `.field 1`
 on `(Int, bool)` 2-tuple locals. -/
 def OperandOkT (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List LocalDecl) (T : Gen.Type) : Operand → Prop
-  | .copy ⟨j, []⟩ => j < decls.length ∧ operandType layouts decls (.copy ⟨j, []⟩) = some T
+  | .copy ⟨j, []⟩ =>
+    j < decls.length ∧ operandType layouts decls (.copy ⟨j, []⟩) = some T ∧
+      (T = orderingTy → ∀ d, decls[j]? = some d → orderingDiscrLayoutOk layouts d.ty = true)
   | .copy ⟨j, [.field 0 fTy]⟩ =>
     j < decls.length ∧ (∃ d, decls[j]? = some d ∧ (intBoolTupleOf d.ty).isSome = true) ∧
       operandType layouts decls (.copy ⟨j, [.field 0 fTy]⟩) = some T
@@ -3411,7 +3413,7 @@ theorem operandOkB_T {layouts : Layout.LayoutTable} {decls : List LocalDecl} {op
   match op, h with
   | .copy ⟨j, []⟩, h =>
     simp only [operandOkB, Bool.and_eq_true, decide_eq_true_eq, operandIsBool_iff] at h
-    exact h
+    exact ⟨h.1, h.2, fun hc => by simp [orderingTy] at hc⟩
   | .copy ⟨j, [.field 1 fTy]⟩, h =>
     simp only [operandOkB, Bool.and_eq_true, decide_eq_true_eq] at h
     obtain ⟨hj, hty⟩ := h
@@ -3444,7 +3446,7 @@ theorem operandType_of_operandOkB {layouts : Layout.LayoutTable}
     (h : operandOkB layouts decls op = true) : operandType layouts decls op = some .Bool := by
   have hT := operandOkB_T h
   match op, hT with
-  | .copy ⟨_, []⟩, ⟨_, hty⟩ | .copy ⟨_, [.field 1 _]⟩, ⟨_, _, hty⟩ | .constant _, ⟨hty, _⟩ =>
+  | .copy ⟨_, []⟩, ⟨_, hty, _⟩ | .copy ⟨_, [.field 1 _]⟩, ⟨_, _, hty⟩ | .constant _, ⟨hty, _⟩ =>
     exact hty
 
 theorem operandType_of_operandIsOrdering {layouts : Layout.LayoutTable}
@@ -3460,11 +3462,19 @@ theorem operandType_of_operandIsOrdering {layouts : Layout.LayoutTable}
   | .constant c, h => simp only [operandIsOrdering] at h; exact scalarTypeOf_ordering h
 
 theorem operandOkO_T {layouts : Layout.LayoutTable} {decls : List LocalDecl} {op : Operand}
-    (h : operandOkO decls op = true) : OperandOkT layouts decls orderingTy op := by
+    (h : operandOkO decls op layouts = true) : OperandOkT layouts decls orderingTy op := by
   match op, h with
   | .copy ⟨j, []⟩, h =>
     simp only [operandOkO, Bool.and_eq_true, decide_eq_true_eq] at h
-    exact ⟨h.1, operandType_of_operandIsOrdering h.2⟩
+    obtain ⟨hj, hjd⟩ := h
+    cases hd : decls[j]? with
+    | none => simp [hd] at hjd
+    | some d =>
+      simp only [hd, Bool.and_eq_true] at hjd
+      refine ⟨hj, operandType_of_operandIsOrdering (by simp [operandIsOrdering, hd, hjd.1]), ?_⟩
+      intro _ d' hd'
+      rw [hd] at hd'; cases hd'
+      exact hjd.2
   | .constant c, h =>
     simp only [operandOkO, Bool.and_eq_true] at h
     exact ⟨operandType_of_operandIsOrdering h.1, h.2⟩
@@ -3486,7 +3496,7 @@ theorem evalValue_operandT {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
   have hlo := h.locs
   match op, hok, he with
   | .copy ⟨j, []⟩, hok, he =>
-    obtain ⟨hj, hty⟩ := hok
+    obtain ⟨hj, hty, _⟩ := hok
     simp only [translateOperand, translatePlace, Option.map_some, Option.some.injEq] at he
     subst he
     obtain ⟨d, slot, hd, hs⟩ := h.slot_exists j hj
@@ -3819,7 +3829,8 @@ theorem evalPlace_proj {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
         simp only [hitIdx, decide_eq_true_eq] at hproj
         have hgoodIdx := intTypeOf_good hitIdx
         have hokIdxT : OperandOkT body.layouts body.localDecls (.Int idxIt) (.copy ⟨idxLocal, []⟩) :=
-          ⟨hidxLt, by simp [operandType, hdIdx, scalarTypeOf_int hitIdx]⟩
+          ⟨hidxLt, by simp [operandType, hdIdx, scalarTypeOf_int hitIdx],
+            fun hc => by simp [orderingTy] at hc⟩
         obtain ⟨haok, hanone⟩ := evalValue_operandT h (.int idxIt hgoodIdx) (.copy ⟨idxLocal, []⟩)
           hokIdxT (.Load (.Local (localName idxLocal))) (by simp [translateOperand, translatePlace])
         cases hbIdx : opBits locals (.copy ⟨idxLocal, []⟩) with
@@ -4125,7 +4136,7 @@ theorem evalValue_operand {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     have hit := operandIntType_of_operandOk hok
     simp only [operandOk, placeOk, Bool.and_eq_true, decide_eq_true_eq] at hok
     exact evalValue_operandT h (.int it hgood) (.copy ⟨j, []⟩)
-      ⟨hok.1.1, operandType_of_operandIntType hit⟩ e he
+      ⟨hok.1.1, operandType_of_operandIntType hit, fun hc => by simp [orderingTy] at hc⟩ e he
   | .constant c, hok, he =>
     have hit := operandIntType_of_operandOk hok
     simp only [operandOk, Bool.and_eq_true] at hok
@@ -4506,11 +4517,11 @@ theorem evalValue_rvalue {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
     | none => simp [hd] at hjd
     | some d =>
       simp only [hd, Bool.and_eq_true] at hjd
-      obtain ⟨hord, _⟩ := hjd
+      obtain ⟨hord, hlay⟩ := hjd
       obtain rfl := translateRvalue_discriminant hd hord he
       have hokT : OperandOkT body.layouts body.localDecls orderingTy (.copy ⟨j, []⟩) :=
         operandOkO_T (by
-          simp only [operandOkO, operandIsOrdering, hd, hord, Bool.and_true, decide_eq_true_eq]
+          simp only [operandOkO, hd, hord, hlay, Bool.and_true, decide_eq_true_eq]
           exact hj)
       obtain ⟨hsome, hnone⟩ := evalValue_operandT h .ordering (.copy ⟨j, []⟩) hokT
         (.Load (.Local (localName j))) rfl
@@ -4947,9 +4958,21 @@ theorem tuplePlaceSpec_resolve {layouts : Layout.LayoutTable} {decls : List Loca
             cases leafSpec with
             | scalar _ => simp at h
             | tuple subFields subSize subAlign =>
-              simp only [Option.some.injEq, Prod.mk.injEq] at h
-              rcases h with ⟨rfl, rfl, rfl⟩
-              exact ⟨d, rootFields, rootSize, rootAlign, relOff, hj, rfl, ht, hres, rfl⟩
+              dsimp only at h
+              cases hPR : MirSemantics.placeTyResolved decls layouts ⟨j, .field idx fieldTy :: rest⟩ with
+              | none =>
+                simp only [hPR, ite_true, Option.some.injEq, Prod.mk.injEq] at h
+                rcases h with ⟨rfl, rfl, rfl⟩
+                exact ⟨d, rootFields, rootSize, rootAlign, relOff, hj, rfl, ht, hres, rfl⟩
+              | some leafTy =>
+                simp only [hPR] at h
+                cases hAcc : tyLayoutAcceptsSpec layouts MirSemantics.defaultCodecFuel leafTy
+                    (.tuple subFields subSize subAlign) with
+                | false => simp [hAcc] at h
+                | true =>
+                  simp only [hAcc, ite_true, Option.some.injEq, Prod.mk.injEq] at h
+                  rcases h with ⟨rfl, rfl, rfl⟩
+                  exact ⟨d, rootFields, rootSize, rootAlign, relOff, hj, rfl, ht, hres, rfl⟩
     · simp at h
 
 theorem evalPlace_tuplePlace {body : CapturedMir} {f : Gen.Function} {ctx : Ctx}
@@ -6453,7 +6476,7 @@ theorem translateRvalue_cmp {layouts : Layout.LayoutTable} {decls : List LocalDe
 operand or a three-way comparison `Cmp`. -/
 theorem rvalueOkO_spec {layouts : Layout.LayoutTable} {decls : List LocalDecl} {rv : Rvalue}
     (h : rvalueOkO layouts decls rv = true) :
-    (∃ op, rv = .use op ∧ operandOkO decls op = true) ∨
+    (∃ op, rv = .use op ∧ operandOkO decls op layouts = true) ∨
     (∃ a b, rv = .binaryOp .cmp a b ∧ relOperandsOk layouts decls a b = true) := by
   unfold rvalueOkO at h
   split at h
@@ -11194,22 +11217,22 @@ theorem callArgOk_cases {decls : List LocalDecl} {pd : LocalDecl} {op : Operand}
     · simp only [hpo, ↓reduceIte] at hty
       match op, hshape, hty, htr with
       | .copy ⟨j, []⟩, _, hty, htr =>
-        simp only [copyOp, operandOkO, Bool.and_eq_true, decide_eq_true_eq,
-          operandIsOrdering] at hty
+        simp only [copyOp, operandOkO, Bool.and_eq_true, decide_eq_true_eq] at hty
         simp only [translateCallArg, translateOperand, translatePlace, Option.map_some,
           Option.some.injEq] at htr
         subst htr
         refine .copyRoot j hty.1 (fun d hd => ?_)
         rw [hd] at hty
-        exact sameFragmentTy_of_ordering hty.2 hpo
+        simp only [Bool.and_eq_true] at hty
+        exact sameFragmentTy_of_ordering hty.2.1 hpo
       | .move ⟨j, []⟩, _, hty, htr =>
-        simp only [copyOp, operandOkO, Bool.and_eq_true, decide_eq_true_eq,
-          operandIsOrdering] at hty
+        simp only [copyOp, operandOkO, Bool.and_eq_true, decide_eq_true_eq] at hty
         simp only [translateCallArg, translatePlace, Option.map_some, Option.some.injEq] at htr
         subst htr
         refine .moveRoot j hty.1 (fun d hd => ?_)
         rw [hd] at hty
-        exact sameFragmentTy_of_ordering hty.2 hpo
+        simp only [Bool.and_eq_true] at hty
+        exact sameFragmentTy_of_ordering hty.2.1 hpo
       | .move ⟨_, _ :: _⟩, hshape, _, _ => simp at hshape
       | .copy ⟨_, _ :: _⟩, _, hty, _ => simp [copyOp, operandOkO] at hty
       | .constant c, _, hty, _ =>

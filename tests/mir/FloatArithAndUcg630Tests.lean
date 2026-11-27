@@ -349,9 +349,9 @@ theorem dialect_v2026_06_01_v2026_08_01_lockstep :
           .binary32 [(.binary32, 0x7FA00001)] .nondeterministic =
         nanChoices .binary32 [(.binary32, 0x7FA00001)] .nondeterministic ∧
       Trusted.Rustc.V2026_08_01.MirSemantics.policyRejectsProv
-          .strictUcg630Ub [.init 0 (.some (1, 0))] = true ∧
+          .strictUcg630Ub [.init 0 (.some ⟨1, 0, 0, 0, 8⟩)] = true ∧
       Trusted.Rustc.V2026_08_01.MirSemantics.policyRejectsProv
-          .stripProvenance [.init 0 (.some (1, 0))] = false) :=
+          .stripProvenance [.init 0 (.some ⟨1, 0, 0, 0, 8⟩)] = false) :=
   ⟨evalFloatNeg_parity, evalFloatCmp_parity, evalFloatBinOp_parity, EvalFloatBinOpRel_parity,
     nanChoices_parity, policyRejectsProv_parity,
     ⟨by decide +kernel,
@@ -540,16 +540,21 @@ theorem w9_ptr2int_pointer_width_scope_and_ptr_to_ptr_preservation :
     evalByteCast [.init arr] (.copy ⟨0, .nil⟩) tUsizeArr2Ty emptyMemory
         [⟨.not, tPtrArr2Ty, .none⟩] tPtrArrayLayouts .stripProvenance =
       .ok (.aggregate 0 [.scalar ⟨0x1000, 8⟩, .scalar ⟨0x2000, 8⟩]) [.init arr] emptyMemory ∧
-    tyByteSize [] tPtr32Layouts tUsize32Ty = some 8 ∧
-    tyByteSize [] tPtr32Layouts tPtr32Ty = some 8 ∧
-    (∀ policy,
-      evalByteCast [.init (.ptr p 4)] (.copy ⟨0, .nil⟩) tUsize32Ty emptyMemory
-          [⟨.not, tPtr32Ty, .none⟩] tPtr32Layouts policy = .ub ∧
-      evalByteCast [.init (.ptr p 4)] (.copy ⟨0, .nil⟩) tU32At1Ty emptyMemory
-          [⟨.not, tPtr32Ty, .none⟩] tPtr32Layouts policy = .unsupported) := by
+    tyByteSize [] tPtr32Layouts tUsize32Ty = some 4 ∧
+    tyByteSize [] tPtr32Layouts tPtr32Ty = some 4 ∧
+    evalByteCast [.init (.ptr p 4)] (.copy ⟨0, .nil⟩) tUsize32Ty emptyMemory
+        [⟨.not, tPtr32Ty, .none⟩] tPtr32Layouts .strictUcg630Ub = .ub ∧
+    evalByteCast [.init (.ptr p 4)] (.copy ⟨0, .nil⟩) tUsize32Ty emptyMemory
+        [⟨.not, tPtr32Ty, .none⟩] tPtr32Layouts .stripProvenance =
+      .ok (.scalar ⟨0x1000, 4⟩) [.init (.ptr p 4)] emptyMemory ∧
+    evalByteCast [.init (.ptr p 4)] (.copy ⟨0, .nil⟩) tU32At1Ty emptyMemory
+        [⟨.not, tPtr32Ty, .none⟩] tPtr32Layouts .strictUcg630Ub = .ub ∧
+    evalByteCast [.init (.ptr p 4)] (.copy ⟨0, .nil⟩) tU32At1Ty emptyMemory
+        [⟨.not, tPtr32Ty, .none⟩] tPtr32Layouts .stripProvenance =
+      .ok (.scalar ⟨0x1000, 4⟩) [.init (.ptr p 4)] emptyMemory := by
   dsimp only
   exact ⟨fun policy => by cases policy <;> exact ⟨rfl, rfl, rfl⟩, rfl, rfl, rfl, rfl, rfl, rfl,
-    fun policy => by cases policy <;> exact ⟨rfl, rfl⟩⟩
+    rfl, rfl, rfl, rfl⟩
 
 /-! ### §1.2 Round-1 Hardening: MiniRust Projected-Float-Operand Gates & `binary64` `MachTB` Carriers -/
 
@@ -1080,12 +1085,12 @@ theorem w13_ptr2int_niche_option_and_array_policy :
           tPtrArrayLayouts policy = .ub ∧
       evalByteCast [.init mixedA] (.copy ⟨0, .nil⟩) tRefArr2Ty emptyMemory ptrArrDecls
           tPtrArrayLayouts policy = .ub) ∧
-    -- (c.1) reverse `usize -> Option<&u8>`, layout-only decoder: FAIL-CLOSED `.ub` for `0`, for a
-    -- nonzero integer, and even for the identity `Option<&u8> -> Option<&u8>` (a pointer-tagged
-    -- `.multiple` layout is never decoded): no forgery, but `0 -> None` is a false-positive UB
+    -- (c.1) reverse `usize -> Option<&u8>`, layout-only decoder: `0 -> None` succeeds cleanly
+    -- (no false-positive UB once `decodeScalarLayoutBytes` no longer forges `.ptr` from `0usize`),
+    -- while nonzero integers (`0x1000`) and `optSome` still fail closed `.ub` (no forgery)
     (∀ policy,
       evalByteCast [.init (.scalar ⟨0, 8⟩)] (.copy ⟨0, .nil⟩) tOptRefU8Ty emptyMemory usizeDecls
-          tNicheEnumLayouts policy = .ub ∧
+          tNicheEnumLayouts policy = .ok optNone [.init (.scalar ⟨0, 8⟩)] emptyMemory ∧
       evalByteCast [.init (.scalar ⟨0x1000, 8⟩)] (.copy ⟨0, .nil⟩) tOptRefU8Ty emptyMemory
           usizeDecls tNicheEnumLayouts policy = .ub ∧
       evalByteCast [.init optSome] (.copy ⟨0, .nil⟩) tOptRefU8Ty emptyMemory optDecls
@@ -1723,8 +1728,10 @@ run_cmd do
     let mkNeg (f : Expr) (a : Nat) : Expr := mkApp2 (mkConst (tSem ++ `evalFloatNeg)) f (mkNatLit a)
     let mkChoices (f : Expr) (xs : List (Expr × Nat)) : Expr :=
       mkApp3 (mkConst (tSem ++ `nanChoices)) f (mkNanInputs xs) nondet
-    let provVal := mkApp2 (mkConst ``Option.some [0]) natPairTy
-      (mkApp4 (mkConst ``Prod.mk [0, 0]) natTy natTy (mkNatLit 1) (mkNatLit 0))
+    let ptrFragTy := mkConst (tSem ++ `PtrByteFrag)
+    let provVal := mkApp2 (mkConst ``Option.some [0]) ptrFragTy
+      (mkApp5 (mkConst (tSem ++ `PtrByteFrag.mk))
+        (mkNatLit 1) (mkNatLit 0) (mkNatLit 0) (mkNatLit 0) (mkNatLit 8))
     let provByte := mkApp2 (mkConst (tSem ++ `AbstractByte.init))
       (mkApp (mkConst ``UInt8.ofNat) (mkNatLit 0)) provVal
     let provBytes := mkApp3 (mkConst ``List.cons [0]) abTy provByte

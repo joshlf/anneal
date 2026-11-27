@@ -3617,6 +3617,21 @@ theorem lm22MemMove_outer_agg_wt (stEnv : LM2_2StaticEnv) (k dst tag : Nat)
             rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl rfl (by decide))
           (.nil _ 2))))
 
+private theorem lm22Nested_mem_read_valid
+    (localDecls : List LocalDecl) (srcIdx : Local)
+    (hdecl : get? localDecls srcIdx = some lm22NestedDecl) :
+    ∀ mach rootVal mp,
+      StructMemPlaceRel mach lm22NestedDecl.ty lm22NestedLayoutTable
+        lm22NestedFields lm22NestedPaths rootVal mp →
+      validateValueForTy? lm22NestedLayoutTable
+        (placeTyResolved localDecls lm22NestedLayoutTable ⟨srcIdx, .nil⟩) rootVal = true := by
+  intro mach rootVal mp hsmpr
+  obtain ⟨sc₀, sc₁, sc₂, rfl, hble₀, hble₁, hble₂⟩ := hsmpr.inv_nested_1_2
+  have hp : placeTyResolved localDecls lm22NestedLayoutTable ⟨srcIdx, .nil⟩ = some lm22NestedDecl.ty := by
+    unfold placeTyResolved resolveProjectedTyResolved; rw [hdecl]
+  rw [hp]
+  lm22_prove_validate_tac
+
 theorem lm22MemMove_move2to3_wt (stEnv : LM2_2StaticEnv) (k : Nat)
     (h2_init : 2 ∈ stEnv.initLocals) :
     WellTypedLM2_2Stmt lm22MemMoveBody lm22NestedEnv stEnv (k + 1)
@@ -3624,7 +3639,8 @@ theorem lm22MemMove_move2to3_wt (stEnv : LM2_2StaticEnv) (k : Nat)
       (useStructPostStaticEnv stEnv 3 (.move ⟨2, []⟩)) k :=
   .assignUseMemStruct stEnv k 3 true 2 _
     (.mk lm22NestedDecl lm22NestedDecl lm22NestedFields lm22NestedPaths _ _
-      (by decide) rfl rfl rfl rfl (Or.inl h2_init) rfl rfl (by decide) (by decide) rfl (by decide))
+      (by decide) rfl rfl rfl rfl (Or.inl h2_init) rfl rfl (by decide) (by decide) rfl (by decide)
+      (lm22Nested_mem_read_valid _ 2 rfl))
 
 theorem lm22MemMove_copy3to4_wt (stEnv : LM2_2StaticEnv) (k : Nat)
     (h3_init : 3 ∈ stEnv.initLocals) :
@@ -3633,7 +3649,8 @@ theorem lm22MemMove_copy3to4_wt (stEnv : LM2_2StaticEnv) (k : Nat)
       (useStructPostStaticEnv stEnv 4 (.copy ⟨3, []⟩)) k :=
   .assignUseMemStruct stEnv k 4 false 3 _
     (.mk lm22NestedDecl lm22NestedDecl lm22NestedFields lm22NestedPaths _ _
-      (by decide) rfl rfl rfl rfl (Or.inl h3_init) rfl rfl (by decide) (by decide) rfl (by decide))
+      (by decide) rfl rfl rfl rfl (Or.inl h3_init) rfl rfl (by decide) (by decide) rfl (by decide)
+      (lm22Nested_mem_read_valid _ 3 rfl))
 
 theorem lm22MemMove_full_trace_and_returns_agree :
     (get? (lm22StepAnnealN lm22MemMoveBody 7 (initMachineState lm22MemMoveBody [])).frame.locals 2 =
@@ -5106,7 +5123,8 @@ theorem lm22MemMoveUb_faults_with_ub_on_both :
     .assignUseMemStruct _ 2 3 true 2 _
       (.mk lm22NestedDecl lm22NestedDecl lm22NestedFields lm22NestedPaths _ _
         (by decide) rfl rfl rfl rfl (Or.inl (by decide)) rfl rfl
-        (by decide) (by decide) rfl (by decide))
+        (by decide) (by decide) rfl (by decide)
+        (lm22Nested_mem_read_valid _ 2 rfl))
   have ⟨hs7, ha6, hm6⟩ := lm22_trace_step ⟨[3], [2, 1, 4, 0]⟩ (fuel := 1) hs6
     lm22MemMoveUb_phase rfl rfl hwt6 rfl rfl
   have hwt7 : WellTypedLM2_2Stmt lm22MemMoveUbBody lm22NestedEnv ⟨[3], [2, 1, 4, 0]⟩ 2
@@ -5115,7 +5133,8 @@ theorem lm22MemMoveUb_faults_with_ub_on_both :
     .assignUseMemStruct _ 1 4 false 2 _
       (.mk lm22NestedDecl lm22NestedDecl lm22NestedFields lm22NestedPaths _ _
         (by decide) rfl rfl rfl rfl (Or.inr (by decide)) rfl rfl
-        (by decide) (by decide) rfl (by decide))
+        (by decide) (by decide) rfl (by decide)
+        (lm22Nested_mem_read_valid _ 2 rfl))
   have hsim7 := step_stmt_lm2_2_simulation hs7 lm22MemMoveUb_phase rfl rfl hwt7
   have ha7 :
       stepMirFn lm22MemMoveUbBody
@@ -6196,7 +6215,10 @@ theorem lm22SuperOuter_full_trace_and_returns_agree :
     .assignUseMemStruct _ 0 3 true 1 _
       (.mk lm22SuperOuterDecl lm22SuperOuterDecl lm22SuperOuterFields lm22SuperOuterPaths _ _
         (by decide) rfl rfl rfl rfl (Or.inl (by decide)) rfl rfl
-        (by decide) (by decide) rfl (by decide))
+        (by decide) (by decide) rfl (by decide)
+        (fun _ _ _ hsmpr => by
+          obtain ⟨sc₀, sc₁, sc₂, sc₃, rfl, _, _, _, _⟩ := hsmpr.inv_super_1_3
+          lm22_prove_validate_tac))
   have ⟨hs4, ha3, hm3⟩ := lm22_trace_step ⟨[3], [1, 2, 0]⟩ (fuel := 5) hs3
     lm22SuperOuter_phase rfl rfl hwt3 rfl rfl
   have hwt4 : WellTypedLM2_2Stmt lm22SuperOuterBody lm22SuperEnv ⟨[3], [1, 2, 0]⟩ 0
@@ -6628,7 +6650,10 @@ theorem lm22SelfMove_full_trace_and_returns_agree :
       (useStructPostStaticEnv ⟨[1], [2, 0]⟩ 1 (.move ⟨1, []⟩)) 0 :=
     .assignSelfMoveMemStruct _ 0 1 _
       (.mk lm22PaddedDecl lm22PaddedFields lm22PaddedPaths _ _ rfl rfl
-        (Or.inl (by decide)) rfl rfl (by decide) (by decide) rfl (by decide))
+        (Or.inl (by decide)) rfl rfl (by decide) (by decide) rfl (by decide)
+        (fun _ _ _ hsmpr => by
+          obtain ⟨sc₀, sc₁, rfl, _, _⟩ := hsmpr.inv_padded_1_1
+          lm22_prove_validate_tac))
   have ⟨hs5, ha4, hm4⟩ := lm22_trace_step ⟨[1], [2, 0]⟩ (fuel := 4) hs4
     lm22SelfMove_phase rfl rfl hwt4 rfl rfl
   have hwt5 : WellTypedLM2_2Stmt lm22SelfMoveBody lm22PaddedEnv ⟨[1], [2, 0]⟩ 0

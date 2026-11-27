@@ -1237,9 +1237,57 @@ def operandTouchesUnion (localDecls : List LocalDecl) (layouts : LayoutTable) :
   | .move p => placeTouchesUnion localDecls layouts p
   | .constant _ => false
 
+/-- A value `v` read from place `p` passes Trusted's read-time pointer materialization
+(`materializeReadPtrValue`) and recursive bit-validity check (`validateValueForTy?`)
+at `placeTyResolved localDecls layouts p` (`Kani#5205` / `#5196`). Holds trivially
+whenever `localDecls = []` (`placeReadValid_nil_decls`). -/
+def PlaceReadValid
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place) (v : Value) : Prop :=
+  materializeReadPtrValue layouts (placeTyResolved localDecls layouts p) v = .some v ∧
+    validateValueForTy? layouts (placeTyResolved localDecls layouts p) v = true
+
+/-- Lifting of `PlaceReadValid` to operands (constants carry no place read check). -/
+def OperandReadValid
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (op : Operand) (v : Value) : Prop :=
+  match localDecls with
+  | .nil => True
+  | _ :: _ =>
+    match op with
+    | .copy p => PlaceReadValid localDecls layouts p v
+    | .move p => PlaceReadValid localDecls layouts p v
+    | .constant _ => True
+
+/-- With no local declarations, every place read is trivially read-valid. -/
+@[simp]
+theorem placeReadValid_nil_decls (layouts : LayoutTable) (p : Place) (v : Value) :
+    PlaceReadValid .nil layouts p v :=
+  ⟨rfl, rfl⟩
+
+/-- With no local declarations, every operand is trivially read-valid. -/
+@[simp]
+theorem operandReadValid_nil_decls (layouts : LayoutTable) (op : Operand) (v : Value) :
+    OperandReadValid .nil layouts op v :=
+  trivial
+
+/-- A layout index that accepts arbitrary enum/union values under `validateValueForTy?`
+(either unmapped, or inhabited multi-variant enum / union). -/
+def EnumLayoutValid (layouts : LayoutTable) (lIdx : LayoutIdx) : Prop :=
+  match LayoutTable.lookup layouts lIdx with
+  | .none => True
+  | .some l =>
+    l.isUninhabited = false ∧
+      match l.variants with
+      | .multiple _ _ _ => True
+      | .single _ =>
+        match l.fields with
+        | .union _ => True
+        | _ => False
+      | .empty => False
+
 /-- **`localDecls`-irrelevance of non-`Deref`, non-union operands**: evaluating a
 constant, a root place, or a non-`Deref` projected place that does not touch a
-union gives the same result for every `localDecls` as for `localDecls = []`. -/
+union and whose read values satisfy `OperandReadValid` gives the same result for
+every `localDecls` as for `localDecls = []`. -/
 theorem evalOperand_eq_nil_localDecls_of_noUnion
     (locals : List LocalSlot)
     (op : Operand)
@@ -1251,32 +1299,209 @@ theorem evalOperand_eq_nil_localDecls_of_noUnion
     (hNoDeref : OperandNonDeref op)
     (hNoUnion : operandTouchesUnion localDecls layouts op = false)
     (hNotCastMove : ∀ loc ty r, op ≠ .move ⟨loc, .opaqueCast ty :: r⟩ := by
-      intro _ _ _ h; nomatch h) :
+      intro _ _ _ h; nomatch h)
+    (hReadValid : ∀ v, OperandReadValid localDecls layouts op v) :
     evalOperand locals op borrows globals layouts callerLocals localDecls =
       evalOperand locals op borrows globals layouts callerLocals := by
-  cases op with
-  | constant c => rfl
-  | copy p =>
-    rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
-    · rfl
-    · cases hd with
-      | deref => exact False.elim (hNoDeref tl rfl)
-      | _ =>
-        dsimp only [operandTouchesUnion] at hNoUnion
-        unfold evalOperand
-        dsimp only
-        rw [hNoUnion]
-  | move p =>
-    rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
-    · rfl
-    · cases hd with
-      | deref => exact False.elim (hNoDeref tl rfl)
-      | opaqueCast ty => exact False.elim (hNotCastMove loc ty tl rfl)
-      | _ =>
-        dsimp only [operandTouchesUnion] at hNoUnion
-        unfold evalOperand
-        dsimp only
-        rw [hNoUnion]
+  cases localDecls with
+  | nil => rfl
+  | cons d ds =>
+    cases op with
+    | constant c => rfl
+    | copy p =>
+      rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+      · cases hGet : get? locals loc with
+        | none => simp only [evalOperand, hGet]
+        | some slot =>
+          cases slot with
+          | uninit | dead => simp only [evalOperand, hGet]
+          | init rootVal =>
+            cases hR : readProjectedValue locals rootVal .nil with
+            | ub | unsupported => simp only [evalOperand, hGet, hR]
+            | ok fieldVal =>
+              obtain ⟨hMat, hVal⟩ := hReadValid fieldVal
+              simp only [evalOperand, hGet, hR]
+              rw [hMat]
+              dsimp only
+              rw [hVal]
+      · cases hHd : hd with
+        | deref => subst hHd; exact False.elim (hNoDeref tl rfl)
+        | _ =>
+          dsimp only [operandTouchesUnion] at hNoUnion
+          rw [hHd] at hNoUnion hReadValid
+          cases hGet : get? locals loc with
+          | none => simp only [evalOperand, hGet]
+          | some slot =>
+            cases slot with
+            | uninit | dead => simp only [evalOperand, hGet]
+            | init rootVal =>
+              cases hR : readProjectedValue locals rootVal (hd :: tl) with
+              | ub | unsupported =>
+                rw [hHd] at hR
+                simp only [evalOperand, hGet, hNoUnion, hR]
+              | ok fieldVal =>
+                rw [hHd] at hR
+                obtain ⟨hMat, hVal⟩ := hReadValid fieldVal
+                simp only [evalOperand, hGet, hNoUnion, hR]
+                rw [hMat]
+                dsimp only
+                rw [hVal]
+    | move p =>
+      rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+      · cases hGet : get? locals loc with
+        | none => simp only [evalOperand, hGet]
+        | some slot =>
+          cases slot with
+          | uninit | dead => simp only [evalOperand, hGet]
+          | init rootVal =>
+            cases hR : readProjectedValue locals rootVal .nil with
+            | ub | unsupported => simp only [evalOperand, hGet, hR]
+            | ok validVal =>
+              obtain ⟨hMat, hVal⟩ := hReadValid validVal
+              simp only [evalOperand, hGet, hR]
+              rw [hMat]
+              dsimp only
+              rw [hVal]
+      · cases hHd : hd with
+        | deref => subst hHd; exact False.elim (hNoDeref tl rfl)
+        | opaqueCast ty => subst hHd; exact False.elim (hNotCastMove loc ty tl rfl)
+        | _ =>
+          dsimp only [operandTouchesUnion] at hNoUnion
+          rw [hHd] at hNoUnion hReadValid
+          cases hGet : get? locals loc with
+          | none => simp only [evalOperand, hGet]
+          | some slot =>
+            cases slot with
+            | uninit | dead => simp only [evalOperand, hGet]
+            | init rootVal =>
+              cases hR : readProjectedValue locals rootVal (hd :: tl) with
+              | ub | unsupported =>
+                rw [hHd] at hR
+                simp only [evalOperand, hGet, hNoUnion, hR]
+              | ok fieldVal =>
+                rw [hHd] at hR
+                obtain ⟨hMat, hVal⟩ := hReadValid fieldVal
+                simp only [evalOperand, hGet, hNoUnion, hR]
+                rw [hMat]
+                dsimp only
+                rw [hVal]
+
+/-- Value-specific lifting of a successful `localDecls = []` `evalOperand` result to
+arbitrary `localDecls`, requiring `OperandReadValid localDecls layouts op val` only for
+the actual read value `val` (so it applies to `bool` / `char` / niche places too). -/
+theorem evalOperand_ok_of_nil_localDecls_of_noUnion
+    (locals locals' : List LocalSlot)
+    (op : Operand)
+    (val : Value)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl)
+    (hNoDeref : OperandNonDeref op)
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false)
+    (hNotCastMove : ∀ loc ty r, op ≠ .move ⟨loc, .opaqueCast ty :: r⟩ := by
+      intro _ _ _ h; nomatch h)
+    (hValid : OperandReadValid localDecls layouts op val)
+    (hNil : evalOperand locals op borrows globals layouts callerLocals = .ok val locals') :
+    evalOperand locals op borrows globals layouts callerLocals localDecls = .ok val locals' := by
+  cases localDecls with
+  | nil => exact hNil
+  | cons d ds =>
+    cases op with
+    | constant c => exact hNil
+    | copy p =>
+      rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+      · cases hGet : get? locals loc with
+        | none => simp only [evalOperand, hGet] at hNil; nomatch hNil
+        | some slot =>
+          cases slot with
+          | uninit | dead => simp only [evalOperand, hGet] at hNil; nomatch hNil
+          | init rootVal =>
+            cases hRead : readProjectedValue locals rootVal .nil with
+            | ub | unsupported => simp only [evalOperand, hGet, hRead] at hNil; nomatch hNil
+            | ok fieldVal =>
+              simp only [evalOperand, hGet, hRead] at hNil
+              injection hNil with hV hL
+              subst hV hL
+              simp only [evalOperand, hGet, hRead]
+              rw [hValid.1]
+              dsimp only
+              rw [hValid.2]
+      · cases hHd : hd with
+        | deref => subst hHd; exact False.elim (hNoDeref tl rfl)
+        | _ =>
+          dsimp only [operandTouchesUnion] at hNoUnion
+          rw [hHd] at hNoUnion hValid hNil
+          cases hGet : get? locals loc with
+          | none => simp only [evalOperand, hGet] at hNil; nomatch hNil
+          | some slot =>
+            cases slot with
+            | uninit | dead => simp only [evalOperand, hGet] at hNil; nomatch hNil
+            | init rootVal =>
+              cases hRead : readProjectedValue locals rootVal (hd :: tl) with
+              | ub | unsupported =>
+                rw [hHd] at hRead
+                simp only [evalOperand, hGet, hRead] at hNil
+                nomatch hNil
+              | ok fieldVal =>
+                rw [hHd] at hRead
+                simp only [evalOperand, hGet, hRead] at hNil
+                injection hNil with hV hL
+                subst hV hL
+                simp only [evalOperand, hGet, hNoUnion, hRead]
+                rw [hValid.1]
+                dsimp only
+                rw [hValid.2]
+    | move p =>
+      rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+      · cases hGet : get? locals loc with
+        | none => simp only [evalOperand, hGet] at hNil; nomatch hNil
+        | some slot =>
+          cases slot with
+          | uninit | dead => simp only [evalOperand, hGet] at hNil; nomatch hNil
+          | init rootVal =>
+            cases hRead : readProjectedValue locals rootVal .nil with
+            | ub | unsupported => simp only [evalOperand, hGet, hRead] at hNil; nomatch hNil
+            | ok validVal =>
+              cases hSet : set? locals loc .uninit with
+              | none => simp only [evalOperand, hGet, hRead, hSet] at hNil; nomatch hNil
+              | some locs' =>
+                simp only [evalOperand, hGet, hRead, hSet] at hNil
+                injection hNil with hV hL
+                subst hV hL
+                simp only [evalOperand, hGet, hRead]
+                rw [hValid.1]
+                dsimp only
+                rw [hValid.2]
+                dsimp only
+                rw [hSet]
+      · cases hHd : hd with
+        | deref => subst hHd; exact False.elim (hNoDeref tl rfl)
+        | opaqueCast ty => subst hHd; exact False.elim (hNotCastMove loc ty tl rfl)
+        | _ =>
+          dsimp only [operandTouchesUnion] at hNoUnion
+          rw [hHd] at hNoUnion hValid hNil
+          cases hGet : get? locals loc with
+          | none => simp only [evalOperand, hGet] at hNil; nomatch hNil
+          | some slot =>
+            cases slot with
+            | uninit | dead => simp only [evalOperand, hGet] at hNil; nomatch hNil
+            | init rootVal =>
+              cases hRead : readProjectedValue locals rootVal (hd :: tl) with
+              | ub | unsupported =>
+                rw [hHd] at hRead
+                simp only [evalOperand, hGet, hRead] at hNil
+                nomatch hNil
+              | ok fieldVal =>
+                rw [hHd] at hRead
+                simp only [evalOperand, hGet, hRead] at hNil
+                injection hNil with hV hL
+                subst hV hL
+                simp only [evalOperand, hGet, hNoUnion, hRead]
+                rw [hValid.1]
+                dsimp only
+                rw [hValid.2]
 
 /-- **`callStack`-irrelevance of non-`Deref` operands**: Trusted's `evalOperand` consults
 the inline call stack `callStack` only to resolve the frame of a dereferenced stack
@@ -1410,7 +1635,7 @@ theorem operandTouchesUnion_false_of_noFieldBeforeDeref
    placeTouchesUnion_false_of_noFieldBeforeDeref localDecls layouts loc proj hNoField⟩
 
 /-- Trusted's `evalPlaceRead` on a root local `⟨loc, .nil⟩` whose initialized value
-`rootVal` passes `validateValueForTy?` returns `.ok rootVal locals` for every
+`rootVal` satisfies `PlaceReadValid` returns `.ok rootVal locals` for every
 `localDecls` / `layouts`. -/
 theorem evalPlaceRead_root_of_valid
     (locals : List LocalSlot)
@@ -1423,8 +1648,7 @@ theorem evalPlaceRead_root_of_valid
     (rootVal outVal : Value)
     (hGet : get? locals loc = .some (.init rootVal))
     (hRead : readProjectedValue locals rootVal .nil = .ok outVal)
-    (hValid :
-      validateValueForTy? layouts (placeTy localDecls layouts ⟨loc, .nil⟩) outVal = true) :
+    (hValid : PlaceReadValid localDecls layouts ⟨loc, .nil⟩ outVal) :
     evalPlaceRead locals ⟨loc, .nil⟩ borrows globals layouts callerLocals localDecls =
       .ok outVal locals := by
   unfold evalPlaceRead
@@ -1433,11 +1657,13 @@ theorem evalPlaceRead_root_of_valid
   dsimp only
   rw [hRead]
   dsimp only
-  rw [hValid]
+  rw [hValid.1]
+  dsimp only
+  rw [hValid.2]
 
 /-- Trusted's `evalPlaceRead` on a non-`Deref`, non-union projected place
-`⟨loc, proj :: rest⟩` whose projected sub-value `outVal` passes
-`validateValueForTy?` reads `outVal` with the plain `readProjectedValue`, for
+`⟨loc, proj :: rest⟩` whose projected sub-value `outVal` satisfies
+`PlaceReadValid` reads `outVal` with the plain `readProjectedValue`, for
 every `localDecls` / `layouts`. -/
 theorem evalPlaceRead_proj_of_noUnion
     (locals : List LocalSlot)
@@ -1452,9 +1678,7 @@ theorem evalPlaceRead_proj_of_noUnion
     (rootVal outVal : Value)
     (hNotDeref : proj ≠ .deref)
     (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false)
-    (hValid :
-      validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨loc, proj :: rest⟩)
-        outVal = true)
+    (hValid : PlaceReadValid localDecls layouts ⟨loc, proj :: rest⟩ outVal)
     (hGet : get? locals loc = .some (.init rootVal))
     (hRead : readProjectedValue locals rootVal (proj :: rest) = .ok outVal) :
     evalPlaceRead locals ⟨loc, proj :: rest⟩ borrows globals layouts callerLocals localDecls =
@@ -1471,7 +1695,9 @@ theorem evalPlaceRead_proj_of_noUnion
     dsimp only
     rw [hReadL]
     dsimp only
-    rw [hValid]
+    rw [hValid.1]
+    dsimp only
+    rw [hValid.2]
 
 /-- Trusted's `writePlaceValue` on a bare live local `⟨loc, .nil⟩` whose static
 type accepts `val` (`validateValueForTy?`) stores `.init val`, for every
@@ -1510,8 +1736,8 @@ theorem writePlaceValue_root_of_valid
       rw [hSet]
 
 /-- Trusted's `evalOperand` on a non-`Deref`, non-union projected `.copy` place
-reads the projected sub-value with the plain `readProjectedValue`, for every
-`localDecls`, and leaves `locals` unchanged. -/
+reads the projected sub-value with the plain `readProjectedValue` whenever the read
+value satisfies `PlaceReadValid`, for every `localDecls`, and leaves `locals` unchanged. -/
 theorem evalOperand_copy_proj_of_noUnion
     (locals : List LocalSlot)
     (loc : Local)
@@ -1526,24 +1752,32 @@ theorem evalOperand_copy_proj_of_noUnion
     (hNotDeref : proj ≠ .deref)
     (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false)
     (hGet : get? locals loc = .some (.init rootVal))
-    (hRead : readProjectedValue locals rootVal (proj :: rest) = .ok outVal) :
+    (hRead : readProjectedValue locals rootVal (proj :: rest) = .ok outVal)
+    (hValid : PlaceReadValid localDecls layouts ⟨loc, proj :: rest⟩ outVal := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalOperand locals (.copy ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals
         localDecls =
       .ok outVal locals := by
-  cases proj with
-  | deref => exact False.elim (hNotDeref rfl)
-  | _ =>
-    unfold evalOperand
-    dsimp only
-    rw [hGet]
-    dsimp only
-    rw [hNoUnion]
-    dsimp only
-    rw [hRead]
+  cases localDecls with
+  | nil =>
+    cases proj with
+    | deref => exact False.elim (hNotDeref rfl)
+    | _ =>
+      simp only [evalOperand, hGet, hRead]
+  | cons d ds =>
+    cases proj with
+    | deref => exact False.elim (hNotDeref rfl)
+    | _ =>
+      simp only [evalOperand, hGet, hNoUnion, hRead]
+      rw [hValid.1]
+      dsimp only
+      rw [hValid.2]
 
 /-- Trusted's `evalOperand` on a non-`Deref`, non-union projected `.move` place
-reads the projected sub-value with the plain `readProjectedValue`, for every
-`localDecls`, and leaves the root local initialized (`locals` unchanged). -/
+reads the projected sub-value with the plain `readProjectedValue` whenever the read
+value satisfies `PlaceReadValid`, for every `localDecls`, and leaves the root local
+initialized (`locals` unchanged). -/
 theorem evalOperand_move_proj_of_noUnion
     (locals : List LocalSlot)
     (loc : Local)
@@ -1559,33 +1793,73 @@ theorem evalOperand_move_proj_of_noUnion
     (hNoUnion : placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false)
     (hGet : get? locals loc = .some (.init rootVal))
     (hRead : readProjectedValue locals rootVal (proj :: rest) = .ok outVal)
-    (hNotCast : ∀ ty, proj ≠ .opaqueCast ty := by intro _ h; nomatch h) :
+    (hNotCast : ∀ ty, proj ≠ .opaqueCast ty := by intro _ h; nomatch h)
+    (hValid : PlaceReadValid localDecls layouts ⟨loc, proj :: rest⟩ outVal := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalOperand locals (.move ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals
         localDecls =
       .ok outVal locals := by
-  cases proj with
-  | deref => exact False.elim (hNotDeref rfl)
-  | opaqueCast ty => exact False.elim (hNotCast ty rfl)
-  | _ =>
-    unfold evalOperand
-    dsimp only
-    rw [hGet]
-    dsimp only
-    rw [hNoUnion]
-    dsimp only
-    rw [hRead]
+  cases localDecls with
+  | nil =>
+    cases proj with
+    | deref => exact False.elim (hNotDeref rfl)
+    | opaqueCast ty => exact False.elim (hNotCast ty rfl)
+    | _ =>
+      simp only [evalOperand, hGet, hRead]
+  | cons d ds =>
+    cases proj with
+    | deref => exact False.elim (hNotDeref rfl)
+    | opaqueCast ty => exact False.elim (hNotCast ty rfl)
+    | _ =>
+      simp only [evalOperand, hGet, hNoUnion, hRead]
+      rw [hValid.1]
+      dsimp only
+      rw [hValid.2]
 
-/-- `validateValueForTy?` constrains only `bool` and `char` places. -/
-theorem validateValueForTy?_of_not_bool_char
-    (layouts : LayoutTable) (tyOpt : Option Ty) (v : Value)
-    (hNotBC : ∀ ty, tyOpt = .some ty → ty.kind ≠ .bool ∧ ty.kind ≠ .char) :
-    validateValueForTy? layouts tyOpt v = true := by
-  rcases tyOpt with _ | ⟨kind, idx⟩
-  · rfl
-  · cases kind <;> first
-      | rfl
-      | exact absurd rfl (hNotBC _ rfl).1
-      | exact absurd rfl (hNotBC _ rfl).2
+/-- `validateValueForTy?` accepts every value at an ADT place whose layout is
+unmapped or an inhabited multi-variant enum / union (`EnumLayoutValid`). -/
+theorem validateValueForTy?_of_enum_adt
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (lIdx : LayoutIdx)
+    (v : Value)
+    (hEnum : EnumLayoutValid layouts lIdx) :
+    validateValueForTy? layouts (.some { kind := .adt defPath args, layoutIdx := lIdx }) v =
+      true := by
+  unfold EnumLayoutValid at hEnum
+  unfold validateValueForTy? defaultCodecFuel validateValueForTyAux
+  dsimp only
+  cases hL : LayoutTable.lookup layouts lIdx with
+  | none => rfl
+  | some l =>
+    rw [hL] at hEnum
+    dsimp only at hEnum ⊢
+    rcases hEnum with ⟨hInhab, hVar⟩
+    rw [hInhab]
+    dsimp only
+    cases hV : l.variants with
+    | empty => rw [hV] at hVar; exact False.elim hVar
+    | multiple _ _ _ => rfl
+    | single _ =>
+      rw [hV] at hVar
+      dsimp only at hVar
+      cases hF : l.fields with
+      | union _ => rfl
+      | primitive | arbitrary _ _ | array _ _ => rw [hF] at hVar; exact False.elim hVar
+
+/-- `materializeReadPtrValue` leaves every value unchanged at an `.adt` type. -/
+theorem materializeReadPtrValue_adt
+    (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (lIdx : LayoutIdx)
+    (v : Value) :
+    materializeReadPtrValue layouts (.some { kind := .adt defPath args, layoutIdx := lIdx }) v =
+      .some v := by
+  cases v with
+  | aggregate varIdx rawVals =>
+    cases varIdx with
+    | succ _ => rfl
+    | zero =>
+      simp only [materializeReadPtrValue]
+      cases Nat.blt 2 (Trusted.Sequence.length rawVals) <;> rfl
+  | _ => rfl
 
 /-- Trusted's `writePlaceValue` on a non-`Deref`, non-union projected place whose
 static type accepts `val` (`validateValueForTy?`) writes `val` with the plain
@@ -1649,61 +1923,69 @@ trivially when `localDecls = []` (`setDiscriminantDestOk_nil_decls`). -/
 def SetDiscriminantDestOk
     (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place) : Prop :=
   placeTouchesUnion localDecls layouts p = false ∧
-    ∀ ty, placeTy localDecls layouts p = .some ty → ty.kind ≠ .bool ∧ ty.kind ≠ .char
+    (∀ v, PlaceReadValid localDecls layouts p v) ∧
+    (∀ v, validateValueForTy? layouts (placeTy localDecls layouts p) v = true)
 
 /-- With no local declarations, every `SetDiscriminant` destination is admissible. -/
 theorem setDiscriminantDestOk_nil_decls (layouts : LayoutTable) (p : Place) :
     SetDiscriminantDestOk .nil layouts p :=
-  ⟨placeTouchesUnion_nil_decls layouts p, fun ty hTy => by nomatch hTy⟩
+  ⟨placeTouchesUnion_nil_decls layouts p,
+    fun v => placeReadValid_nil_decls layouts p v,
+    fun _ => rfl⟩
 
-/-- Any non-union place whose resolved `placeTy` is an ADT (the canonical enum
-destination of `SetDiscriminant` in Rust MIR) satisfies `SetDiscriminantDestOk`
-for arbitrary `localDecls` / `layouts`. -/
+/-- Any non-union place whose resolved `placeTy` and `placeTyResolved` are enum ADTs
+(`EnumLayoutValid`) satisfies `SetDiscriminantDestOk` for arbitrary `localDecls` / `layouts`. -/
 theorem setDiscriminantDestOk_of_adt_ty
     (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place)
     (defPath : DefPath) (args : List RigidTy) (lIdx : LayoutIdx)
     (hNoUnion : placeTouchesUnion localDecls layouts p = false)
-    (hTy : placeTy localDecls layouts p = .some { kind := .adt defPath args, layoutIdx := lIdx }) :
-    SetDiscriminantDestOk localDecls layouts p := by
-  refine ⟨hNoUnion, fun ty hTy' => ?_⟩
-  rw [hTy] at hTy'
-  injection hTy' with hEq
-  subst hEq
-  constructor <;> (intro h; nomatch h)
+    (hTy : placeTy localDecls layouts p = .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hEnum : EnumLayoutValid layouts lIdx)
+    (hResValid : ∀ v, PlaceReadValid localDecls layouts p v) :
+    SetDiscriminantDestOk localDecls layouts p :=
+  ⟨hNoUnion, hResValid, fun v => by
+    rw [hTy]
+    exact validateValueForTy?_of_enum_adt layouts defPath args lIdx v hEnum⟩
 
-/-- In a layout table without union entries, every ADT-typed place satisfies
+/-- In a layout table without union entries, every enum-ADT-typed place satisfies
 `SetDiscriminantDestOk` for arbitrary `localDecls`. -/
 theorem setDiscriminantDestOk_of_layoutsHaveNoUnion_and_adt
     (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place)
     (defPath : DefPath) (args : List RigidTy) (lIdx : LayoutIdx)
     (hNo : layoutsHaveNoUnion layouts = true)
-    (hTy : placeTy localDecls layouts p = .some { kind := .adt defPath args, layoutIdx := lIdx }) :
+    (hTy : placeTy localDecls layouts p = .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hEnum : EnumLayoutValid layouts lIdx)
+    (hResValid : ∀ v, PlaceReadValid localDecls layouts p v) :
     SetDiscriminantDestOk localDecls layouts p :=
   setDiscriminantDestOk_of_adt_ty localDecls layouts p defPath args lIdx
-    (placeTouchesUnion_false_of_layoutsHaveNoUnion localDecls layouts p hNo) hTy
+    (placeTouchesUnion_false_of_layoutsHaveNoUnion localDecls layouts p hNo) hTy hEnum hResValid
 
-/-- A tuple field `_l.i` annotated with an ADT type (e.g. an enum field of a
-tuple local) satisfies `SetDiscriminantDestOk` for arbitrary `localDecls` /
-`layouts`. -/
+/-- A tuple field `_l.i` annotated with an enum ADT type satisfies `SetDiscriminantDestOk`
+for arbitrary `localDecls` / `layouts`. -/
 theorem setDiscriminantDestOk_tuple_field_adt
     (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
     (fieldTys : List RigidTy) (lIdx fLIdx : LayoutIdx) (i : FieldIdx)
     (defPath : DefPath) (args : List RigidTy)
     (hTy : placeTy localDecls layouts ⟨loc, .nil⟩ =
-      .some { kind := .tuple fieldTys, layoutIdx := lIdx }) :
+      .some { kind := .tuple fieldTys, layoutIdx := lIdx })
+    (hEnum : EnumLayoutValid layouts fLIdx)
+    (hResValid : ∀ v, PlaceReadValid localDecls layouts
+      ⟨loc, [.field i { kind := .adt defPath args, layoutIdx := fLIdx }]⟩ v) :
     SetDiscriminantDestOk localDecls layouts
       ⟨loc, [.field i { kind := .adt defPath args, layoutIdx := fLIdx }]⟩ := by
   apply setDiscriminantDestOk_of_adt_ty localDecls layouts _ defPath args fLIdx
     (placeTouchesUnion_tuple_field_false localDecls layouts loc fieldTys lIdx i _ hTy)
-  unfold placeTy at hTy ⊢
-  dsimp only at hTy ⊢
-  cases hG : get? localDecls loc with
-  | none => rw [hG] at hTy; nomatch hTy
-  | some decl => rfl
+  · unfold placeTy at hTy ⊢
+    dsimp only at hTy ⊢
+    cases hG : get? localDecls loc with
+    | none => rw [hG] at hTy; nomatch hTy
+    | some decl => rfl
+  · exact hEnum
+  · exact hResValid
 
 /-- Any projected place `⟨loc, proj⟩` whose root local has `placeTy = some declTy`
 with `projFieldBasesNonUnion layouts declTy proj = true` and whose leaf `placeTy`
-is an ADT satisfies `SetDiscriminantDestOk` for arbitrary `localDecls` / `layouts`. -/
+is an enum ADT satisfies `SetDiscriminantDestOk` for arbitrary `localDecls` / `layouts`. -/
 theorem setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt
     (localDecls : List LocalDecl) (layouts : LayoutTable) (loc : Local)
     (proj : List ProjectionElem) (declTy : Ty)
@@ -1711,12 +1993,14 @@ theorem setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt
     (hRootTy : placeTy localDecls layouts ⟨loc, .nil⟩ = .some declTy)
     (hCert : projFieldBasesNonUnion layouts declTy proj = true)
     (hLeafTy : placeTy localDecls layouts ⟨loc, proj⟩ =
-      .some { kind := .adt defPath args, layoutIdx := lIdx }) :
+      .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hEnum : EnumLayoutValid layouts lIdx)
+    (hResValid : ∀ v, PlaceReadValid localDecls layouts ⟨loc, proj⟩ v) :
     SetDiscriminantDestOk localDecls layouts ⟨loc, proj⟩ :=
   setDiscriminantDestOk_of_adt_ty localDecls layouts ⟨loc, proj⟩ defPath args lIdx
     (placeTouchesUnion_false_of_projFieldBasesNonUnion localDecls layouts loc proj declTy
       hRootTy hCert)
-    hLeafTy
+    hLeafTy hEnum hResValid
 
 
 
@@ -6736,6 +7020,7 @@ theorem evalOperand_move_bare_vs_projected_correspondence
     (localDecls : List LocalDecl) :
     (get? locals loc = .some (.init rootVal) →
       valueContainsUninit rootVal = false →
+      PlaceReadValid localDecls layouts ⟨loc, .nil⟩ rootVal →
       set? locals loc .uninit = .some locals' →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         locals (.move ⟨loc, .nil⟩) borrows globals layouts callerLocals localDecls =
@@ -6744,23 +7029,38 @@ theorem evalOperand_move_bare_vs_projected_correspondence
       placeTouchesUnion localDecls layouts ⟨loc, proj :: rest⟩ = false →
       get? locals loc = .some (.init rootVal) →
       evalValueProjRead locals rootVal (proj :: rest) = .ok outVal →
+      PlaceReadValid localDecls layouts ⟨loc, proj :: rest⟩ outVal →
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         locals (.move ⟨loc, proj :: rest⟩) borrows globals layouts callerLocals localDecls =
         .ok outVal locals) := by
   refine ⟨?_, ?_⟩
-  · intro hGet hInit hSet
-    dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand,
-      Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
-    rw [hGet]
-    dsimp only
-    rw [hInit]
-    dsimp only
-    rw [hSet]
-  · intro hNotDeref hNoUnion hGet hProjRead
+  · intro hGet hInit hValid hSet
+    cases localDecls with
+    | nil =>
+      dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand,
+        Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
+      rw [hGet]
+      dsimp only
+      rw [hInit]
+      dsimp only
+      rw [hSet]
+    | cons d ds =>
+      dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand,
+        Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValue]
+      rw [hGet]
+      dsimp only
+      rw [hInit]
+      dsimp only
+      rw [hValid.1]
+      dsimp only
+      rw [hValid.2]
+      dsimp only
+      rw [hSet]
+  · intro hNotDeref hNoUnion hGet hProjRead hValid
     exact evalOperand_move_proj_of_noUnion locals loc proj rest borrows globals layouts
       callerLocals localDecls rootVal outVal hNotDeref hNoUnion hGet
       (evalValueProjRead_refines_readProjectedValue (proj :: rest) locals rootVal outVal hProjRead)
-      (evalValueProjRead_not_opaqueCast hProjRead)
+      (evalValueProjRead_not_opaqueCast hProjRead) hValid
 
 /-- Pointwise lifting of a per-slot refinement relation `R` between Anneal
 `LocalSlotState`s and Trusted `LocalSlot`s to whole frames (equal lengths). -/
@@ -7206,7 +7506,8 @@ theorem evalStmt_setDiscriminant_correspondence
         s.memory.callStack hNoDerefP).trans
         (evalOperand_copy_proj_of_noUnion s.frame.locals loc proj rest s.memory.borrows
           s.memory.globals layouts s.memory.callerLocals localDecls rootVal
-          (.aggregate oldVar fields) hNotDeref hDestOk.1 hGet hTrustedRead)
+          (.aggregate oldVar fields) hNotDeref hDestOk.1 hGet hTrustedRead
+          (hDestOk.2.1 (.aggregate oldVar fields)))
     have hNotCast : ∀ ty, proj ≠ .opaqueCast ty := evalValueProjRead_not_opaqueCast hRead
     have hPW :=
       (writePlaceValue_eq_nil_callStack_of_nonDeref s.frame.locals s.memory.borrows
@@ -7214,7 +7515,7 @@ theorem evalStmt_setDiscriminant_correspondence
         s.memory.callStack hNoDerefP).trans
         (writePlaceValue_proj_of_noUnion s.frame.locals s.memory.borrows loc proj rest
           (.aggregate variantIdx fields) rootVal rootVal' locals' localDecls layouts hNotDeref
-          hDestOk.1 (validateValueForTy?_of_not_bool_char layouts _ _ hDestOk.2)
+          hDestOk.1 (hDestOk.2.2 (.aggregate variantIdx fields))
           hGet hTrustedWrite hSet hNotCast)
     cases proj with
     | deref => exact False.elim (hNotDeref rfl)
@@ -8060,13 +8361,22 @@ theorem evalOperandState_trusted_correspondence
     (hRel : SlotsRefine PromotedSlotRefines slots locals)
     (hNoDeref : OperandNonDeref op)
     (hNoUnion : operandTouchesUnion localDecls layouts op = false)
-    (hEval : evalOperandState slots op layouts globals = (.ok val, slots')) :
+    (hEval : evalOperandState slots op layouts globals = (.ok val, slots'))
+    (hValid : OperandReadValid localDecls layouts op val := by
+      simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ locals',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine PromotedSlotRefines slots' locals' := by
-  rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
-    localDecls hNoDeref hNoUnion (evalOperandState_ok_not_opaqueCastMove hEval)]
+  suffices hNil : ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
+        locals op borrows globals layouts callerLocals = .ok val locals' ∧
+      SlotsRefine PromotedSlotRefines slots' locals' by
+    obtain ⟨locals', hOkNil, hRel'⟩ := hNil
+    exact ⟨locals', evalOperand_ok_of_nil_localDecls_of_noUnion locals locals' op val borrows
+      globals layouts callerLocals localDecls hNoDeref hNoUnion
+      (evalOperandState_ok_not_opaqueCastMove hEval) hValid hOkNil, hRel'⟩
   have hLocEq : slotsToTrustedLocals slots = locals :=
     slotsToTrustedLocals_eq_of_promoted hRel
   cases op with
@@ -8265,7 +8575,10 @@ theorem evalAssumeState_trusted_correspondence
     (layouts : LayoutTable)
     (hRel : SlotsRefine PromotedSlotRefines slots s.frame.locals)
     (hNoDeref : OperandNonDeref op)
-    (hNoUnion : operandTouchesUnion localDecls layouts op = false) :
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false)
+    (hValid : ∀ b, b = 0 ∨ b = 1 → OperandReadValid localDecls layouts op (.scalar ⟨b, 1⟩) := by
+      intro _ _; simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy,
+        resolveTyWithLocalDecls, materializeReadPtrValue, validateValueForTy?]) :
     (evalAssumeState slots op layouts s.memory.globals = .ok slots' →
       ∃ locals',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -8297,11 +8610,16 @@ theorem evalAssumeState_trusted_correspondence
             rw [hTrue] at hAssume
             injection hAssume with hSlotsEq
             subst hSlotsEq
+            have hScEq : sc = ⟨1, 1⟩ := by
+              rcases sc with ⟨bits, sz⟩
+              dsimp only at hTrue
+              have hAnd := Bool.and_eq_true _ _ |>.mp hTrue
+              rw [Nat.eq_of_beq_eq_true hAnd.1, Nat.eq_of_beq_eq_true hAnd.2]
             obtain ⟨locals', hTOp, hRel'⟩ :=
               evalOperandState_trusted_correspondence
                 slots nextSlots s.frame.locals op (.scalar sc)
                 s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
-                hRel hNoDeref hNoUnion hOp
+                hRel hNoDeref hNoUnion hOp (hScEq ▸ hValid 1 (Or.inr rfl))
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
             rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
@@ -8315,7 +8633,7 @@ theorem evalAssumeState_trusted_correspondence
       evalOperandState_trusted_correspondence
         slots slots' s.frame.locals op (.scalar ⟨0, 1⟩)
         s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
-        hRel hNoDeref hNoUnion hFalseOp
+        hRel hNoDeref hNoUnion hFalseOp (hValid 0 (Or.inl rfl))
     refine ⟨?_, ?_⟩
     · unfold evalAssumeState
       rw [hFalseOp]
@@ -10641,13 +10959,22 @@ theorem evalOperandState_flat_refines
     (hRel : SlotsRefine FlatSlotStateRefines slots locals)
     (hNoDeref : OperandNonDeref op)
     (hNoUnion : operandTouchesUnion localDecls layouts op = false)
-    (hEval : evalOperandState slots op layouts globals = (.ok val, slots')) :
+    (hEval : evalOperandState slots op layouts globals = (.ok val, slots'))
+    (hValid : OperandReadValid localDecls layouts op val := by
+      simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ locals',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine FlatSlotStateRefines slots' locals' := by
-  rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
-    localDecls hNoDeref hNoUnion (evalOperandState_ok_not_opaqueCastMove hEval)]
+  suffices hNil : ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
+        locals op borrows globals layouts callerLocals = .ok val locals' ∧
+      SlotsRefine FlatSlotStateRefines slots' locals' by
+    obtain ⟨locals', hOkNil, hRel'⟩ := hNil
+    exact ⟨locals', evalOperand_ok_of_nil_localDecls_of_noUnion locals locals' op val borrows
+      globals layouts callerLocals localDecls hNoDeref hNoUnion
+      (evalOperandState_ok_not_opaqueCastMove hEval) hValid hOkNil, hRel'⟩
   cases op with
   | constant constOp =>
     unfold evalOperandState at hEval
@@ -10781,7 +11108,10 @@ theorem evalAssumeState_flat_refines
     (layouts : LayoutTable)
     (hRel : SlotsRefine FlatSlotStateRefines slots s.frame.locals)
     (hNoDeref : OperandNonDeref op)
-    (hNoUnion : operandTouchesUnion localDecls layouts op = false) :
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false)
+    (hValid : ∀ b, b = 0 ∨ b = 1 → OperandReadValid localDecls layouts op (.scalar ⟨b, 1⟩) := by
+      intro _ _; simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy,
+        resolveTyWithLocalDecls, materializeReadPtrValue, validateValueForTy?]) :
     (evalAssumeState slots op layouts s.memory.globals = .ok slots' →
       ∃ locals',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -10813,11 +11143,16 @@ theorem evalAssumeState_flat_refines
             rw [hTrue] at hAssume
             injection hAssume with hSlotsEq
             subst hSlotsEq
+            have hScEq : sc = ⟨1, 1⟩ := by
+              rcases sc with ⟨bits, sz⟩
+              dsimp only at hTrue
+              have hAnd := Bool.and_eq_true _ _ |>.mp hTrue
+              rw [Nat.eq_of_beq_eq_true hAnd.1, Nat.eq_of_beq_eq_true hAnd.2]
             obtain ⟨locals', hTOp, hRel'⟩ :=
               evalOperandState_flat_refines
                 slots nextSlots s.frame.locals op (.scalar sc)
                 s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
-                hRel hNoDeref hNoUnion hOp
+                hRel hNoDeref hNoUnion hOp (hScEq ▸ hValid 1 (Or.inr rfl))
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
             rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
@@ -10831,7 +11166,7 @@ theorem evalAssumeState_flat_refines
       evalOperandState_flat_refines
         slots slots' s.frame.locals op (.scalar ⟨0, 1⟩)
         s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
-        hRel hNoDeref hNoUnion hFalseOp
+        hRel hNoDeref hNoUnion hFalseOp (hValid 0 (Or.inl rfl))
     refine ⟨?_, ?_⟩
     · unfold evalAssumeState
       rw [hFalseOp]
@@ -12705,10 +13040,7 @@ theorem readPlaceStateCheckedIndex_evalPlaceRead_nested_refines
       get? locals place.local_ = .some (.init rootVal) ∧
       Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedForLocal
         locals localDecls layouts place.local_ rootVal place.projection = .ok val ∧
-      (validateValueForTy? layouts
-          (match place.projection with
-           | .nil => placeTy localDecls layouts place
-           | _ :: _ => placeTyResolved localDecls layouts place) val = true →
+      (PlaceReadValid localDecls layouts place val →
         Trusted.Rustc.V2026_06_01.MirSemantics.evalPlaceRead
           locals place borrows globals layouts callerLocals localDecls = .ok val locals) := by
   have ⟨hIdx, rootVal, hGetT, hProjR⟩ :=
@@ -12725,8 +13057,7 @@ theorem readPlaceStateCheckedIndex_evalPlaceRead_nested_refines
     exact hProjR
   · intro hValid
     rcases place with ⟨loc, _ | ⟨hd, tl⟩⟩
-    · dsimp only at hProjR hValid
-      exact evalPlaceRead_root_of_valid locals loc borrows globals layouts callerLocals
+    · exact evalPlaceRead_root_of_valid locals loc borrows globals layouts callerLocals
         localDecls rootVal val hGetT hProjR hValid
     · have hNotDeref : hd ≠ .deref := by
         intro h; subst h; nomatch hNoDeref
@@ -12750,13 +13081,22 @@ theorem evalOperandState_nested_refines
     (hRel : SlotsRefine NestedSlotStateRefines slots locals)
     (hNoDeref : OperandNonDeref op)
     (hNoUnion : operandTouchesUnion localDecls layouts op = false)
-    (hEval : evalOperandState slots op layouts globals = (.ok val, slots')) :
+    (hEval : evalOperandState slots op layouts globals = (.ok val, slots'))
+    (hValid : OperandReadValid localDecls layouts op val := by
+      simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ locals',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         locals op borrows globals layouts callerLocals localDecls = .ok val locals' ∧
       SlotsRefine NestedSlotStateRefines slots' locals' := by
-  rw [evalOperand_eq_nil_localDecls_of_noUnion locals op borrows globals layouts callerLocals
-    localDecls hNoDeref hNoUnion (evalOperandState_ok_not_opaqueCastMove hEval)]
+  suffices hNil : ∃ locals',
+      Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
+        locals op borrows globals layouts callerLocals = .ok val locals' ∧
+      SlotsRefine NestedSlotStateRefines slots' locals' by
+    obtain ⟨locals', hOkNil, hRel'⟩ := hNil
+    exact ⟨locals', evalOperand_ok_of_nil_localDecls_of_noUnion locals locals' op val borrows
+      globals layouts callerLocals localDecls hNoDeref hNoUnion
+      (evalOperandState_ok_not_opaqueCastMove hEval) hValid hOkNil, hRel'⟩
   cases op with
   | constant constOp =>
     unfold evalOperandState at hEval
@@ -14449,7 +14789,10 @@ theorem evalAssumeState_nested_refines
     (layouts : LayoutTable)
     (hRel : SlotsRefine NestedSlotStateRefines slots s.frame.locals)
     (hNoDeref : OperandNonDeref op)
-    (hNoUnion : operandTouchesUnion localDecls layouts op = false) :
+    (hNoUnion : operandTouchesUnion localDecls layouts op = false)
+    (hValid : ∀ b, b = 0 ∨ b = 1 → OperandReadValid localDecls layouts op (.scalar ⟨b, 1⟩) := by
+      intro _ _; simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy,
+        resolveTyWithLocalDecls, materializeReadPtrValue, validateValueForTy?]) :
     (evalAssumeState slots op layouts s.memory.globals = .ok slots' →
       ∃ locals',
         Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt
@@ -14481,11 +14824,16 @@ theorem evalAssumeState_nested_refines
             rw [hTrue] at hAssume
             injection hAssume with hSlotsEq
             subst hSlotsEq
+            have hScEq : sc = ⟨1, 1⟩ := by
+              rcases sc with ⟨bits, sz⟩
+              dsimp only at hTrue
+              have hAnd := Bool.and_eq_true _ _ |>.mp hTrue
+              rw [Nat.eq_of_beq_eq_true hAnd.1, Nat.eq_of_beq_eq_true hAnd.2]
             obtain ⟨locals', hTOp, hRel'⟩ :=
               evalOperandState_nested_refines
                 slots nextSlots s.frame.locals op (.scalar sc)
                 s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
-                hRel hNoDeref hNoUnion hOp
+                hRel hNoDeref hNoUnion hOp (hScEq ▸ hValid 1 (Or.inr rfl))
             refine ⟨locals', ?_, hRel'⟩
             dsimp only [Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt]
             rw [evalOperand_eq_nil_callStack_of_nonDeref s.frame.locals op s.memory.borrows
@@ -14499,7 +14847,7 @@ theorem evalAssumeState_nested_refines
       evalOperandState_nested_refines
         slots slots' s.frame.locals op (.scalar ⟨0, 1⟩)
         s.memory.borrows s.memory.globals layouts s.memory.callerLocals localDecls
-        hRel hNoDeref hNoUnion hFalseOp
+        hRel hNoDeref hNoUnion hFalseOp (hValid 0 (Or.inl rfl))
     refine ⟨?_, ?_⟩
     · unfold evalAssumeState
       rw [hFalseOp]
@@ -16343,6 +16691,8 @@ theorem evalSetDiscriminantState_general_certified_nested_refines
     (hCert : projFieldBasesNonUnion layouts declTy (p :: rest) = true)
     (hLeafTy : placeTy localDecls layouts ⟨loc, p :: rest⟩ =
       .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hEnum : EnumLayoutValid layouts lIdx)
+    (hResValid : ∀ v, PlaceReadValid localDecls layouts ⟨loc, p :: rest⟩ v)
     (hGetS : get? slots loc = .some (.init rootVal))
     (hNotUnit : evalValueProjRead s.frame.locals rootVal (p :: rest) ≠ .ok .unit)
     (hOk : evalSetDiscriminantState slots ⟨loc, p :: rest⟩ variantIdx = .ok slots')
@@ -16359,7 +16709,7 @@ theorem evalSetDiscriminantState_general_certified_nested_refines
   (evalSetDiscriminantState_general_nested_refines s slots slots' loc p rest variantIdx
     rootVal rootVal span localDecls layouts hRel hNoProt).2 hNotDeref
     (setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt localDecls layouts loc (p :: rest)
-      declTy defPath args lIdx hRootTy hCert hLeafTy)
+      declTy defPath args lIdx hRootTy hCert hLeafTy hEnum hResValid)
     hPad hGetS hNotUnit hOk
 
 /-- **Certified Projected Assignment Into an Initialized Sub-Slot of a Nested Partial Shell (`evalStmt_assign_partialShell_init_subslot_certified_nested_refines`)**:
@@ -16445,6 +16795,9 @@ theorem evalSetDiscriminantState_partialShell_any_depth_certified_nested_refines
     (hLeafTy :
       placeTy localDecls layouts ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ =
         .some { kind := .adt defPath args, layoutIdx := lIdx })
+    (hEnum : EnumLayoutValid layouts lIdx)
+    (hResValid : ∀ v, PlaceReadValid localDecls layouts
+      ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ v)
     (hOk :
       evalSetDiscriminantState slots
         ⟨loc, .field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)⟩ variantIdx = .ok slots')
@@ -16464,7 +16817,7 @@ theorem evalSetDiscriminantState_partialShell_any_depth_certified_nested_refines
     restSteps tail variantIdx w span localDecls layouts hRel hSlot hChain hNotUnit
     (setDiscriminantDestOk_of_projFieldBasesNonUnion_and_adt localDecls layouts loc
       (.field i₀ ty₀ :: (fieldStepsToProjs restSteps ++ tail)) declTy defPath args lIdx
-      hRootTy hCert hLeafTy)
+      hRootTy hCert hLeafTy hEnum hResValid)
     hOk hNoProt hPad
 
 /-- **Certified `readPlaceStateCheckedIndex` ↔ `readProjectedForLocal` / `evalPlaceRead` Refinement on Nested Frames (`readPlaceStateCheckedIndex_evalPlaceRead_certified_nested_refines`)**:
@@ -16492,10 +16845,7 @@ theorem readPlaceStateCheckedIndex_evalPlaceRead_certified_nested_refines
       get? locals place.local_ = .some (.init rootVal) ∧
       Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedForLocal
         locals localDecls layouts place.local_ rootVal place.projection = .ok val ∧
-      (validateValueForTy? layouts
-          (match place.projection with
-           | .nil => placeTy localDecls layouts place
-           | _ :: _ => placeTyResolved localDecls layouts place) val = true →
+      (PlaceReadValid localDecls layouts place val →
         Trusted.Rustc.V2026_06_01.MirSemantics.evalPlaceRead
           locals place borrows globals layouts callerLocals localDecls = .ok val locals) :=
   readPlaceStateCheckedIndex_evalPlaceRead_nested_refines slots locals borrows globals callerLocals
@@ -16523,7 +16873,10 @@ theorem evalOperandState_copy_certified_nested_refines
     (hNoDeref : OperandNonDeref (.copy place))
     (hRootTy : placeTy localDecls layouts ⟨place.local_, .nil⟩ = .some declTy)
     (hCert : projFieldBasesNonUnion layouts declTy place.projection = true)
-    (hEval : evalOperandState slots (.copy place) layouts globals = (.ok val, slots')) :
+    (hEval : evalOperandState slots (.copy place) layouts globals = (.ok val, slots'))
+    (hValid : OperandReadValid localDecls layouts (.copy place) val := by
+      simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ locals',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         locals (.copy place) borrows globals layouts callerLocals localDecls = .ok val locals' ∧
@@ -16532,7 +16885,7 @@ theorem evalOperandState_copy_certified_nested_refines
     callerLocals localDecls hRel hNoDeref
     (operandTouchesUnion_copy_of_projFieldBasesNonUnion localDecls layouts place.local_
       place.projection declTy hRootTy hCert)
-    hEval
+    hEval hValid
 
 /-- **Certified `.move` `evalOperandState` Refinement on Nested Frames (`evalOperandState_move_certified_nested_refines`)**:
 One-step wrapper around `evalOperandState_nested_refines` for `.move place` that discharges
@@ -16553,7 +16906,10 @@ theorem evalOperandState_move_certified_nested_refines
     (hNoDeref : OperandNonDeref (.move place))
     (hRootTy : placeTy localDecls layouts ⟨place.local_, .nil⟩ = .some declTy)
     (hCert : projFieldBasesNonUnion layouts declTy place.projection = true)
-    (hEval : evalOperandState slots (.move place) layouts globals = (.ok val, slots')) :
+    (hEval : evalOperandState slots (.move place) layouts globals = (.ok val, slots'))
+    (hValid : OperandReadValid localDecls layouts (.move place) val := by
+      simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ locals',
       Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand
         locals (.move place) borrows globals layouts callerLocals localDecls = .ok val locals' ∧
@@ -16562,7 +16918,7 @@ theorem evalOperandState_move_certified_nested_refines
     callerLocals localDecls hRel hNoDeref
     (operandTouchesUnion_move_of_projFieldBasesNonUnion localDecls layouts place.local_
       place.projection declTy hRootTy hCert)
-    hEval
+    hEval hValid
 
 /-! ## Section 3.B.1: `evalAggregateRawPtr` & `evalRvalue (.aggregate (.rawPtr pointee mut) ops)` -/
 

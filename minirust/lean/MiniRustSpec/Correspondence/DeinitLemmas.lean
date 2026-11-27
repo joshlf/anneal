@@ -804,7 +804,10 @@ theorem evalStmt_retag_field {layouts : Trusted.Rustc.V2026_06_01.Layout.LayoutT
         .ok (.scalar sc) s.frame.locals := by
       rw [evalOperand_copy_nonDeref s.frame.locals ⟨i, .field idx fieldTy :: rest⟩ hnd
         s.memory.borrows s.memory.globals layouts s.memory.callerLocals decls hnu]
-      simp [Trusted.Sequence.get?, hs, hprojRead s.frame.locals]
+      simp only [Trusted.Sequence.get?, hs, hprojRead s.frame.locals]
+      exact evalOperand_post_read_ok layouts decls ⟨i, .field idx fieldTy :: rest⟩
+        (.scalar sc) s.frame.locals (materializeReadPtrValue_scalar layouts _ sc)
+        (validateValueForTy?_scalar_of_resolveFieldPath hd (specOfRigidTy_of_tupleTypeOf ht) hres sc)
     have hplTy : placeTy decls layouts ⟨i, .field idx fieldTy :: rest⟩ = some leafTy := by
       simp [placeTy, Trusted.Sequence.get?, hd, hprojTy]
     rcases leafTy with ⟨lkind, llidx⟩

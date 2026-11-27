@@ -1905,7 +1905,7 @@ theorem abstractByteCodec_exact : abstractByteCodec.Exact := by
       show AbstractByte.init (UInt8.ofBitVec v.toBitVec) none = AbstractByte.init v none
       rfl
 
-theorem abstractByteCodec_dec_prov_none (u : UInt8) (p : Nat × Nat) :
+theorem abstractByteCodec_dec_prov_none (u : UInt8) (p : PtrByteFrag) :
     abstractByteCodec.dec (.init u (some p)) = none := rfl
 
 /-- Lift any `Anneal.SepLogicLenses.ByteLensCodec α n` into a `ParametricCore`

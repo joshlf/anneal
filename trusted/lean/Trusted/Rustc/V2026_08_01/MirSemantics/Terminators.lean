@@ -4198,6 +4198,14 @@ def writeBytesDstAddrAligned
   | false, .none => true
 
 /--
+Construct `n` copies of `b : AbstractByte` for untyped byte fills (`write_bytes`).
+-/
+@[reducible]
+def replicateAbstractByte : Nat → AbstractByte → List AbstractByte
+  | .zero, _ => .nil
+  | .succ k, b => b :: replicateAbstractByte k b
+
+/--
 Validate a direct call `write_bytes::<T>(dst, val, count)` whose arguments
 evaluated to `argVals`, against the Tree Borrows `borrows` and the active frame
 depth `frameDepth`. The element type `T` is the single type argument in
@@ -4225,20 +4233,16 @@ Checks, in order:
 7. A write whose destination is a whole local (an allocation of its own) and
    that extends past the end of that local is `.ub`: the pointer is not
    dereferenceable for `count * size_of::<T>()` bytes.
-8. One element (`count = 1`) at offset `0` of a place of type `T`, where `T` is
-   a primitive scalar type and the filled value `writeBytesFillBits val
-   (size_of::<T>())` satisfies `validateValueForTy?` for `T`, stores that scalar
-   (`.store`). When `T` is `bool` or `char` and the repeated byte pattern is not
-   a valid bit representation of `T` (e.g. `2` in a `bool` or `0xFF` repeated in
-   a `char`), `write_bytes` itself is not immediate UB in Rust unless the bytes
-   are subsequently read at type `T`, whereas Anneal's non-union local slots
-   store typed `Value`s without re-validating root locals on `Operand.copy`;
-   `writeBytesAction` therefore fails closed with `.fault .unsupported` rather
-   than either misreporting immediate `.ub` or storing an unvalidated typed
-   scalar.
-9. Every other shape (multi-element writes, aggregate `T`, interior offsets,
-   bit-invalid `bool`/`char` fills, and writes past the end of a sub-place) is
-   unsupported.
+8. One element (`count = 1`) at offset `0` of a place of primitive scalar type
+   `T` stores `writeBytesFillBits val (size_of::<T>())` WITHOUT premature
+   write-time bit-validity rejection (`Kani#5205` / `#5196`), deferring `bool` /
+   `char` validity enforcement to typed reads (`evalOperand` / `evalPlaceRead`).
+9. A whole-place fill (`dstPtr.offsetBytes = 0` and `byteCount = size_of(dstPlaceTy)`)
+   on an array (`[u8; N]`), union (`MaybeUninit<T>`), single-variant struct
+   (`Unaligned<T>`), or scalar target decodes the repeated raw bytes via
+   `decodeUntypedStorageBytes` without premature write-time validity UB.
+10. Every other shape (partial interior sub-place writes or unmodeled aggregates)
+    fails closed with `.fault .unsupported`.
 
 Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
 at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -4342,7 +4346,17 @@ def writeBytesAction
                   match placeTyResolved bodyLocalDecls bodyLayouts dstPlace with
                   | .none => .fault .unsupported
                   | .some dstPlaceTy =>
-                    match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts dstPlaceTy.kind with
+                    let placeAlignOpt : Option Nat :=
+                      match intrinsicRigidTyAlign bodyLocalDecls bodyLayouts dstPlaceTy.kind with
+                      | .some a => .some a
+                      | .none =>
+                        match LayoutTable.lookup bodyLayouts dstPlaceTy.layoutIdx with
+                        | .some l =>
+                          match Bool.and (Bool.not l.isUninhabited) (Nat.blt 0 l.align.bytes) with
+                          | true => .some l.align.bytes
+                          | false => .none
+                        | .none => .none
+                    match placeAlignOpt with
                     | .none => .fault .unsupported
                     | .some placeAlign =>
                       match
@@ -4363,13 +4377,17 @@ def writeBytesAction
                             match Nat.beq byteCount 0 with
                             | true => .noWrite
                             | false =>
+                              let wholePlaceSizeOpt : Option Nat :=
+                                match
+                                  intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts
+                                    dstPlaceTy.kind
+                                with
+                                | .some sz => .some sz
+                                | .none => tyByteSize bodyLocalDecls bodyLayouts dstPlaceTy
                               let rootOutOfBounds : Bool :=
                                 match dstEntry.targetProjection with
                                 | .nil =>
-                                  match
-                                    intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts
-                                      dstPlaceTy.kind
-                                  with
+                                  match wholePlaceSizeOpt with
                                   | .some placeSize =>
                                     Nat.blt placeSize (Nat.add dstPtr.offsetBytes byteCount)
                                   | .none => false
@@ -4386,13 +4404,29 @@ def writeBytesAction
                                 | true =>
                                   let fillVal : Value :=
                                     .scalar ⟨writeBytesFillBits valSc.bits elemSize, elemSize⟩
-                                  match
-                                    validateValueForTy? bodyLayouts (.some dstPlaceTy) fillVal
-                                  with
-                                  | true =>
-                                    .store dstPlace dstEntry.targetLocal dstPtr.tag fillVal
-                                  | false => .fault .unsupported
-                                | false => .fault .unsupported
+                                  .store dstPlace dstEntry.targetLocal dstPtr.tag fillVal
+                                | false =>
+                                  match Nat.beq dstPtr.offsetBytes 0, wholePlaceSizeOpt with
+                                  | true, .some placeSize =>
+                                    match Nat.beq byteCount placeSize with
+                                    | false => .fault .unsupported
+                                    | true =>
+                                      let fillBytes :=
+                                        replicateAbstractByte
+                                          byteCount
+                                          (.init (UInt8.ofNat valSc.bits) .none)
+                                      match
+                                        decodeUntypedStorageBytes
+                                          defaultCodecFuel
+                                          bodyLayouts
+                                          dstPlaceTy
+                                          fillBytes
+                                          .strictUcg630Ub
+                                      with
+                                      | .some fillVal =>
+                                        .store dstPlace dstEntry.targetLocal dstPtr.tag fillVal
+                                      | .none => .fault .unsupported
+                                  | _, _ => .fault .unsupported
         | _, _ =>
           match isUnsizedRigidTy 8 elemTy with
           | true => .fault .ub
@@ -4571,7 +4605,7 @@ def commitWriteBytesDstPlaceWrite
     | .none => MirStepNode.fail .ub
     | .some borrows' =>
       match
-        writePlaceValue
+        writePlaceValueUntyped
           locals₃
           s.memory.borrows
           dstPlace

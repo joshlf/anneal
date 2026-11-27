@@ -413,6 +413,46 @@ theorem finish_write_immediate_from_mid_hooks
     | immediate _ oldImm _ _ hvd =>
       exact hd_live_helper oldImm rfl (by rcases hvd with ⟨rfl, _⟩ | ⟨_, rfl, _⟩ <;> simp)
 
+theorem IsFloatCastScalarTy.evalOperand_copy_eq
+    {locals : List LocalSlot} {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {ld : List LocalDecl} {ly : LayoutTable} {callerLocals : List LocalSlot}
+    {cs : List SavedCallerFrame} {idx : Local} {decl : LocalDecl} {sc : MirAst.ScalarInt}
+    (hscalar : IsFloatCastScalarTy decl.ty)
+    (hdecl : get? ld idx = some decl)
+    (hslot : get? locals idx = some (.init (.scalar sc))) :
+    evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals ly callerLocals ld cs =
+      .ok (.scalar sc) locals := by
+  refine evalOperand_copy_root_of_readValid hslot rfl hdecl (fun _ _ => rfl) (fun rTy hrk => ?_)
+  rcases rTy with ⟨rk, rl⟩
+  dsimp only at hrk
+  rcases hscalar with ⟨f, hfmt⟩ | ⟨t, ht⟩
+  · rcases ieeeFormatOfTy?_kind hfmt with ⟨hk, _⟩ | ⟨hk, _⟩ <;>
+      (rw [hk] at hrk; subst hrk; rfl)
+  · unfold floatIntTargetOfTy? at ht
+    cases hk : decl.ty.kind <;> rw [hk] at ht hrk <;> try cases ht
+    all_goals (subst hrk; rfl)
+
+theorem IsFloatCastScalarTy.evalOperand_move_eq
+    {locals : List LocalSlot} {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {ld : List LocalDecl} {ly : LayoutTable} {callerLocals : List LocalSlot}
+    {cs : List SavedCallerFrame} {idx : Local} {decl : LocalDecl} {sc : MirAst.ScalarInt}
+    (hscalar : IsFloatCastScalarTy decl.ty)
+    (hdecl : get? ld idx = some decl)
+    (hslot : get? locals idx = some (.init (.scalar sc)))
+    (hlt : idx < locals.length) :
+    evalOperand locals (.move ⟨idx, .nil⟩) borrows globals ly callerLocals ld cs =
+      .ok (.scalar sc) (locals.set idx .uninit) := by
+  refine evalOperand_move_root_of_readValid hslot rfl (set?_eq_some_set hlt .uninit) hdecl
+    (fun _ _ => rfl) (fun rTy hrk => ?_)
+  rcases rTy with ⟨rk, rl⟩
+  dsimp only at hrk
+  rcases hscalar with ⟨f, hfmt⟩ | ⟨t, ht⟩
+  · rcases ieeeFormatOfTy?_kind hfmt with ⟨hk, _⟩ | ⟨hk, _⟩ <;>
+      (rw [hk] at hrk; subst hrk; rfl)
+  · unfold floatIntTargetOfTy? at ht
+    cases hk : decl.ty.kind <;> rw [hk] at ht hrk <;> try cases ht
+    all_goals (subst hrk; rfl)
+
 /-- **Copy-operand real-step simulation** for every modeled float cast
 (`_d = copy _s as T` with `CastKind.floatToFloat` / `floatToInt` / `intToFloat`) in either
 NaN mode (`FloatNaNModeOk`): from any `StateRelLM3_1`-related state with immediate `_s`,
@@ -540,8 +580,8 @@ theorem step_cast_float_copy_simulation_mode
       unfold evalFloatCastRvalue
       have hop : evalOperand s.frame.locals (.copy ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
-          .ok (.scalar sc) s.frame.locals := by
-        unfold evalOperand readProjectedValue; dsimp only []; rw [hslot_s]
+          .ok (.scalar sc) s.frame.locals :=
+        hsig.src_scalar.evalOperand_copy_eq hdecl_src hslot_s
       rw [hop]
       dsimp only []
       rw [operandTy_copy_local hdecl_src, hev]
@@ -697,8 +737,8 @@ theorem step_cast_float_move_simulation_mode
       unfold evalFloatCastRvalue
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
-          .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]; rfl
+          .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) :=
+        hsig.src_scalar.evalOperand_move_eq hdecl_src hslot_s hlt_af_s
       rw [hop]
       dsimp only []
       rw [operandTy_move_local hdecl_src, hev]

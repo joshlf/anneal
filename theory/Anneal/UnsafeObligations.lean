@@ -352,6 +352,7 @@ theorem evalCopyNonOverlapping_one_of_obligations
           (callStack := s.memory.callStack) =
         .ok (.scalar ⟨1, 8⟩) s.frame.locals)
     (hSrcPt : operandPointeeTy [] emptyLayoutTable srcOp = none)
+    (hDstPt : operandPointeeTy [] emptyLayoutTable dstOp = none := by rfl)
     (hSrcLookup :
       lookupBorrow s.memory.borrows src.toProvenancePtr.tag = some srcEntry)
     (hDstLookup :
@@ -383,10 +384,13 @@ theorem evalCopyNonOverlapping_one_of_obligations
   refine ⟨?_, hNonoverlap⟩
   have hSrcZero : src.toProvenancePtr.offsetBytes = 0 := hSrcOff
   have hDstZero : dst.toProvenancePtr.offsetBytes = 0 := hDstOff
+  have hDstPlace :
+      placeTyResolved [] emptyLayoutTable { local_ := dstEntry.targetLocal, projection := [] } = none := by
+    cases dstEntry.targetLocal <;> rfl
   unfold evalCopyNonOverlapping evalCopyNonOverlappingWithCount
-    evalCopyNonOverlappingPermOk evalCopySingleDirect writePlaceValue
+    evalCopyNonOverlappingPermOk evalCopySingleDirect convertCopySingleValue? writePlaceValueUntyped
   simp [hSrc, hDst, hCnt, hSrcLookup, hDstLookup, hSrcPerm, hDstPerm,
-        hSrcZero, hDstZero, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt,
+        hSrcZero, hDstZero, hTagNe, hLocNe, hSrcVal, hSrcProj, hSrcPt, hDstPt, hDstPlace,
         hDstProj, hDstVal, hWrite, hFrame, hCopiedInit]
 
 /-! ## 3. Slice-Split, Unaligned Raw-Pointer, and Array-to-Slice Obligations -/

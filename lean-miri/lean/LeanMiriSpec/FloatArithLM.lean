@@ -1224,15 +1224,45 @@ private theorem annealEvalOperand_constant_float_ok {body : CapturedMir} {m : An
       Option.isNone_some, Bool.false_eq_true, ↓reduceIte, htry,
       layoutOfEncodedTyId_floatCastScalar (Or.inl ⟨f, hf⟩) body.layouts]
 private theorem evalOperand_copy_scalar_ok {locals : List LocalSlot} {mem : Memory}
-    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {sc : MirAst.ScalarInt} (hslot : get? locals idx = some (.init (.scalar sc))) :
+    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {decl : LocalDecl}
+    {sc : MirAst.ScalarInt} (hdecl : get? ld idx = some decl)
+    (hfloat : ∃ fk, decl.ty.kind = .float fk)
+    (hslot : get? locals idx = some (.init (.scalar sc))) :
     evalOperand locals (.copy ⟨idx, .nil⟩) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack =
-      .ok (.scalar sc) locals := by unfold evalOperand readProjectedValue; dsimp only []; rw [hslot]
+      .ok (.scalar sc) locals := by
+  refine evalOperand_copy_root_of_readValid hslot rfl hdecl (fun _ _ => rfl) (fun rTy hrk => ?_)
+  obtain ⟨fk, hfk⟩ := hfloat
+  rcases rTy with ⟨rk, rl⟩; dsimp only at hrk; rw [hfk] at hrk; subst hrk; rfl
+private theorem evalOperand_copy_ieee_ok {locals : List LocalSlot} {mem : Memory}
+    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {decl : LocalDecl} {f : IeeeFormat}
+    {sc : MirAst.ScalarInt} (hdecl : get? ld idx = some decl)
+    (hf : ieeeFormatOfTy? decl.ty = some f)
+    (hslot : get? locals idx = some (.init (.scalar sc))) :
+    evalOperand locals (.copy ⟨idx, .nil⟩) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack =
+      .ok (.scalar sc) locals :=
+  evalOperand_copy_scalar_ok hdecl
+    (by rcases ieeeFormatOfTy?_kind hf with ⟨hk, _⟩ | ⟨hk, _⟩ <;> exact ⟨_, hk⟩) hslot
 private theorem evalOperand_move_scalar_ok {locals : List LocalSlot} {mem : Memory}
-    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {sc : MirAst.ScalarInt} (hslot : get? locals idx = some (.init (.scalar sc))) :
+    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {decl : LocalDecl}
+    {sc : MirAst.ScalarInt} (hdecl : get? ld idx = some decl)
+    (hfloat : ∃ fk, decl.ty.kind = .float fk)
+    (hslot : get? locals idx = some (.init (.scalar sc))) :
     evalOperand locals (.move ⟨idx, .nil⟩) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack =
       .ok (.scalar sc) (locals.set idx .uninit) := by
   obtain ⟨hlt, _⟩ := List.getElem?_eq_some_iff.mp (by rw [← get?_eq_getElem?]; exact hslot)
-  unfold evalOperand readProjectedValue; dsimp only []; rw [hslot, set?_eq_some_set hlt]
+  refine evalOperand_move_root_of_readValid hslot rfl (set?_eq_some_set hlt .uninit) hdecl
+    (fun _ _ => rfl) (fun rTy hrk => ?_)
+  obtain ⟨fk, hfk⟩ := hfloat
+  rcases rTy with ⟨rk, rl⟩; dsimp only at hrk; rw [hfk] at hrk; subst hrk; rfl
+private theorem evalOperand_move_ieee_ok {locals : List LocalSlot} {mem : Memory}
+    {ld : List LocalDecl} {ly : LayoutTable} {idx : Local} {decl : LocalDecl} {f : IeeeFormat}
+    {sc : MirAst.ScalarInt} (hdecl : get? ld idx = some decl)
+    (hf : ieeeFormatOfTy? decl.ty = some f)
+    (hslot : get? locals idx = some (.init (.scalar sc))) :
+    evalOperand locals (.move ⟨idx, .nil⟩) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack =
+      .ok (.scalar sc) (locals.set idx .uninit) :=
+  evalOperand_move_scalar_ok hdecl
+    (by rcases ieeeFormatOfTy?_kind hf with ⟨hk, _⟩ | ⟨hk, _⟩ <;> exact ⟨_, hk⟩) hslot
 private theorem evalOperand_const_scalar_ok {locals : List LocalSlot} {mem : Memory}
     {ld : List LocalDecl} {ly : LayoutTable} {c : ConstOperand} {sc : MirAst.ScalarInt} (hval : c.val = .scalar (.int sc)) :
     evalOperand locals (.constant c) mem.borrows mem.globals ly mem.callerLocals ld mem.callStack =
@@ -1337,7 +1367,7 @@ private theorem binary_copy_copy_float_setup
       have hr_err := annealEvalOperand_copy_dead (m := { m with stack := ⟨#[tfb]⟩ }) (known := if (translateBinOp bop).rightHomogeneous then some (translateTy lhsDecl.ty body.layouts) else none)
         rfl hlt_rb hdecl_rhs (by rw [hmls_r_eq]; rcases mls_r with ⟨v0, l0⟩; dsimp only at hmr; subst hmr; rfl) hloc_r.cachedLayout_eq
       have ha_ub : stepMirFn body s = .fail .ub := by
-        rw [stepMirFn_eq_of_not_other body s hcal hphase]; simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []; rw [evalOperand_copy_scalar_ok hslot_l]; dsimp only []; unfold evalOperand; dsimp only []; rw [hslot_r]
+        rw [stepMirFn_eq_of_not_other body s hcal hphase]; simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []; rw [evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l]; dsimp only []; unfold evalOperand; dsimp only []; rw [hslot_r]
       have hm_err : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩) m =
           ({ m with stack := ⟨#[tfc]⟩ }, .error (.undefinedBehavior "read of dead local")) := by
         rw [hm_stmt]; unfold Miri.Interpreter.runRvalue; rw [EStateM.bind_eq_ok hdst_eval, EStateM.bind_eq_ok hl_ok, annealReadImmediate_scalar, pure_bind, EStateM.bind_eq_error hr_err]
@@ -1346,7 +1376,7 @@ private theorem binary_copy_copy_float_setup
       have hr_ok := annealEvalOperand_copy_live (m := { m with stack := ⟨#[tfb]⟩ }) (known := if (translateBinOp bop).rightHomogeneous then some (translateTy lhsDecl.ty body.layouts) else none)
         rfl hlt_rb hdecl_rhs (by rw [hmls_r_eq]; rcases mls_r with ⟨v0, l0⟩; dsimp only at hmr; subst hmr; rfl) hloc_r.cachedLayout_eq
       have ha_ub : stepMirFn body s = .fail .ub := by
-        rw [stepMirFn_eq_of_not_other body s hcal hphase]; simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []; rw [evalOperand_copy_scalar_ok hslot_l]; dsimp only []; unfold evalOperand; dsimp only []; rw [hslot_r]
+        rw [stepMirFn_eq_of_not_other body s hcal hphase]; simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []; rw [evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l]; dsimp only []; unfold evalOperand; dsimp only []; rw [hslot_r]
       have hm_err : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) () (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)), span⟩) m =
           ({ m with stack := ⟨#[tfc]⟩ }, .error (.undefinedBehavior "read of uninitialized local")) := by
         rw [hm_stmt]; unfold Miri.Interpreter.runRvalue; rw [EStateM.bind_eq_ok hdst_eval, EStateM.bind_eq_ok hl_ok, annealReadImmediate_scalar, pure_bind, EStateM.bind_eq_ok hr_ok, annealReadImmediate_uninit_eq]; rfl
@@ -1446,7 +1476,7 @@ theorem step_float_unaryNeg_copy_simulation
       (by rw [hmls_s_eq]; rcases mls_s with ⟨v0, l0⟩; dsimp only at hms; subst hms; rfl) hloc_s.cachedLayout_eq
     have hrv_a : evalRvalue s.frame.locals (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)) s.memory body.localDecls body.layouts =
         .ok (.scalar ⟨evalFloatNeg f sc.bits, f.byteWidth⟩) s.frame.locals s.memory := by
-      rw [evalRvalue_unaryOp_neg_float _ _ _ sc _ _ _ (evalOperand_copy_scalar_ok hslot_s) (by rw [operandTy_copy_local hdecl_src]; exact isFloatOptTy_some_of_ieee hf_src)]
+      rw [evalRvalue_unaryOp_neg_float _ _ _ sc _ _ _ (evalOperand_copy_ieee_ok hdecl_src hf_src hslot_s) (by rw [operandTy_copy_local hdecl_src]; exact isFloatOptTy_some_of_ieee hf_src)]
       unfold evalFloatUnaryNeg; rw [operandTy_copy_local hdecl_src]; dsimp only; rw [hf_src, hbw]; dsimp only; rw [Nat.beq_refl]
     have hm_write : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) ()
         (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩) m =
@@ -1522,7 +1552,7 @@ theorem step_float_unaryNeg_move_simulation
       ((himm_s.cache_layout hlt_d _).cache_layout hlt_sa _) hlt_sb
     have hrv_a : evalRvalue s.frame.locals (.unaryOp .neg (.move ⟨srcIdx, .nil⟩)) s.memory body.localDecls body.layouts =
         .ok (.scalar ⟨evalFloatNeg f sc.bits, f.byteWidth⟩) (s.frame.locals.set srcIdx .uninit) s.memory := by
-      rw [evalRvalue_unaryOp_neg_float _ _ _ sc _ _ _ (evalOperand_move_scalar_ok hslot_s) (by rw [operandTy_move_local hdecl_src]; exact isFloatOptTy_some_of_ieee hf_src)]
+      rw [evalRvalue_unaryOp_neg_float _ _ _ sc _ _ _ (evalOperand_move_ieee_ok hdecl_src hf_src hslot_s) (by rw [operandTy_move_local hdecl_src]; exact isFloatOptTy_some_of_ieee hf_src)]
       unfold evalFloatUnaryNeg; rw [operandTy_move_local hdecl_src]; dsimp only; rw [hf_src, hbw]; dsimp only; rw [Nat.beq_refl]
     have hm_write : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) ()
         (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.move ⟨srcIdx, .nil⟩)), span⟩) m =
@@ -1654,7 +1684,7 @@ theorem step_float_unaryNeg_copy_indirect_simulation
     obtain ⟨msc', hrel', hsu⟩ := scalarOps_unary_floatNeg_eq body.localDecls body.layouts nondet chooseNaN hf_src hrel hbw
     have hrv_a : evalRvalue s.frame.locals (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)) s.memory body.localDecls body.layouts =
         .ok (.scalar ⟨evalFloatNeg f sc.bits, f.byteWidth⟩) s.frame.locals s.memory := by
-      rw [evalRvalue_unaryOp_neg_float _ _ _ sc _ _ _ (evalOperand_copy_scalar_ok (hss ▸ hslot_s)) (by rw [operandTy_copy_local hdecl_src]; exact isFloatOptTy_some_of_ieee hf_src)]
+      rw [evalRvalue_unaryOp_neg_float _ _ _ sc _ _ _ (evalOperand_copy_ieee_ok hdecl_src hf_src (hss ▸ hslot_s)) (by rw [operandTy_copy_local hdecl_src]; exact isFloatOptTy_some_of_ieee hf_src)]
       unfold evalFloatUnaryNeg; rw [operandTy_copy_local hdecl_src]; dsimp only; rw [hf_src, hbw]; dsimp only; rw [Nat.beq_refl]
     have hm_write : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts nondet chooseNaN) ()
         (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.unaryOp .neg (.copy ⟨srcIdx, .nil⟩)), span⟩) m =
@@ -1702,7 +1732,7 @@ theorem step_float_cmp_copy_copy_simulation
     obtain ⟨res, hres, _, hfb⟩ := floatOps_binary_cmp_eq body.layouts nondet chooseNaN hbop hf_lhs hf_rhs hlrel hrrel hlbw hrbw
     have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)) s.memory
         body.localDecls body.layouts = .ok (.scalar (boolToScalar res)) s.frame.locals s.memory := by
-      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_copy_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r)
+      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r)
         (by rw [operandTy_copy_local hdecl_lhs, isFloatOptTy_some_of_ieee hf_lhs]; rfl),
         operandTy_copy_local hdecl_lhs, operandTy_copy_local hdecl_rhs,
         evalFloatScalarBinOp_of_fmt bop lSc rSc lhsDecl.ty rhsDecl.ty f s.frame.locals s.memory hf_lhs hf_rhs hlbw hrbw]
@@ -1781,7 +1811,7 @@ theorem step_float_arith_copy_copy_deterministic_simulation
       floatOps_binary_arith_deterministic_eq body.layouts chooseNaN hbop hf_lhs hf_rhs hlrel hrrel hlbw hrbw
     have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)) s.memory
         body.localDecls body.layouts = .ok (.scalar ⟨baseBits, f.byteWidth⟩) s.frame.locals s.memory := by
-      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_copy_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r)
+      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r)
         (by rw [operandTy_copy_local hdecl_lhs, isFloatOptTy_some_of_ieee hf_lhs]; rfl),
         operandTy_copy_local hdecl_lhs, operandTy_copy_local hdecl_rhs,
         evalFloatScalarBinOp_of_fmt bop lSc rSc lhsDecl.ty rhsDecl.ty f s.frame.locals s.memory hf_lhs hf_rhs hlbw hrbw, hbin]
@@ -1889,7 +1919,7 @@ theorem step_float_arith_copy_const_deterministic_simulation
     have hdstT : translateTy lhsDecl.ty body.layouts = translateTy dstDecl.ty body.layouts := by rw [translateTy_of_ieeeFormatOfTy? hf_lhs, translateTy_of_ieeeFormatOfTy? hf_dst]
     obtain ⟨baseBits, msc', _, hbin, hrel', hfb⟩ := floatOps_binary_arith_deterministic_eq body.layouts chooseNaN hbop hf_lhs hf_c hlrel hrrel hlbw hsz_c
     have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.constant c)) s.memory body.localDecls body.layouts = .ok (.scalar ⟨baseBits, f.byteWidth⟩) s.frame.locals s.memory := by
-      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc sc _ _ _ hnot_off (evalOperand_copy_scalar_ok hslot_l) (evalOperand_const_scalar_ok hv_c)
+      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc sc _ _ _ hnot_off (evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_const_scalar_ok hv_c)
         (by rw [operandTy_copy_local hdecl_lhs, isFloatOptTy_some_of_ieee hf_lhs]; rfl), operandTy_copy_local hdecl_lhs, operandTy_const,
         evalFloatScalarBinOp_of_fmt bop lSc sc lhsDecl.ty c.ty f s.frame.locals s.memory hf_lhs hf_c hlbw hsz_c, hbin]
     have hm_write : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts false chooseNaN) ()
@@ -1958,7 +1988,7 @@ theorem step_float_arith_const_copy_deterministic_simulation
     have hdstT : translateTy c.ty body.layouts = translateTy dstDecl.ty body.layouts := by rw [translateTy_of_ieeeFormatOfTy? hf_c, translateTy_of_ieeeFormatOfTy? hf_dst]
     obtain ⟨baseBits, msc', _, hbin, hrel', hfb⟩ := floatOps_binary_arith_deterministic_eq body.layouts chooseNaN hbop hf_c hf_rhs hlrel hrrel hsz_c hrbw
     have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.constant c) (.copy ⟨rhsIdx, .nil⟩)) s.memory body.localDecls body.layouts = .ok (.scalar ⟨baseBits, f.byteWidth⟩) s.frame.locals s.memory := by
-      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ sc rSc _ _ _ hnot_off (evalOperand_const_scalar_ok hv_c) (evalOperand_copy_scalar_ok hslot_r)
+      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ sc rSc _ _ _ hnot_off (evalOperand_const_scalar_ok hv_c) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r)
         (by rw [operandTy_const, isFloatOptTy_some_of_ieee hf_c]; rfl), operandTy_const, operandTy_copy_local hdecl_rhs,
         evalFloatScalarBinOp_of_fmt bop sc rSc c.ty rhsDecl.ty f s.frame.locals s.memory hf_c hf_rhs hsz_c hrbw, hbin]
     have hm_write : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts false chooseNaN) ()
@@ -2018,7 +2048,7 @@ theorem step_float_arith_move_copy_deterministic_simulation
       have hr_ok := annealEvalOperand_copy_live (m := { m with stack := ⟨#[tfb']⟩ }) (known := if (translateBinOp bop).rightHomogeneous then some (translateTy lhsDecl.ty body.layouts) else none)
         rfl hlt_rb hdecl_rhs (by rw [hmls_r_eq]; rcases mls_r with ⟨v0, l0⟩; dsimp only at hmr; subst hmr; rfl) hloc_r.cachedLayout_eq
       have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.move ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)) s.memory body.localDecls body.layouts = .ok (.scalar ⟨baseBits, f.byteWidth⟩) (s.frame.locals.set lhsIdx .uninit) s.memory := by
-        rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_move_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r_set)
+        rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_move_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r_set)
           (by rw [operandTy_move_local hdecl_lhs, isFloatOptTy_some_of_ieee hf_lhs]; rfl), operandTy_move_local hdecl_lhs, operandTy_copy_local hdecl_rhs,
           evalFloatScalarBinOp_of_fmt bop lSc rSc lhsDecl.ty rhsDecl.ty f (s.frame.locals.set lhsIdx .uninit) s.memory hf_lhs hf_rhs hlbw hrbw, hbin]
       have hm_write : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts false chooseNaN) ()
@@ -2104,7 +2134,7 @@ theorem step_float_arith_copy_copy_nondet_soundness
     unfold evalFloatBinOp; rw [evalFloatCmp_of_arith bop f _ _ hbop, hbase]
   have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)) s.memory
       body.localDecls body.layouts = .ok (.scalar ⟨baseBits, f.byteWidth⟩) s.frame.locals s.memory := by
-    rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_copy_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r)
+    rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r)
       (by rw [operandTy_copy_local hdecl_lhs, isFloatOptTy_some_of_ieee hf_lhs]; rfl),
       operandTy_copy_local hdecl_lhs, operandTy_copy_local hdecl_rhs,
       evalFloatScalarBinOp_of_fmt bop lSc rSc lhsDecl.ty rhsDecl.ty f s.frame.locals s.memory hf_lhs hf_rhs hlbw hrbw, hbin]
@@ -2123,7 +2153,7 @@ theorem step_float_arith_copy_copy_nondet_soundness
     hdecl_dst himm_dc hlive_dst hrv_a hm_write (floatCast_dst_localRel (Or.inl ⟨f, hf_dst⟩) hrel' hdst_sz)
   refine ⟨outSc, fun policy => ?_, hfin.2⟩
   exact (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy s.frame.locals s.frame.locals s.frame.locals bop _ _ lSc rSc lhsDecl.ty rhsDecl.ty f s.memory body.localDecls body.layouts _ hnot_off
-    (evalOperand_copy_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r) (operandTy_copy_local hdecl_lhs) (operandTy_copy_local hdecl_rhs) hf_lhs hf_rhs hlbw hrbw).mpr (Or.inl ⟨outSc, hrel_t, rfl⟩)
+    (evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r) (operandTy_copy_local hdecl_lhs) (operandTy_copy_local hdecl_rhs) hf_lhs hf_rhs hlbw hrbw).mpr (Or.inl ⟨outSc, hrel_t, rfl⟩)
 /-- **Index-exact nondeterministic real-step correspondence** (sharpens completeness): under the constant selector `fun _ _ => pure idx`, real `Step.step` stores EXACTLY the `idx`-th element of `Trusted`'s ordered `nanChoices f [(f, lhs), (f, rhs)]` (ORIGINAL un-negated rhs, also for `.sub`) when the base result is NaN, and `baseBits` for EVERY `idx` otherwise. -/
 theorem step_float_arith_copy_copy_nondet_index_exact
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState} {allocMap : List AllocMapEntry} (hstate : StateRelLM3_1 body s m allocMap)
@@ -2149,7 +2179,7 @@ theorem step_float_arith_copy_copy_nondet_index_exact
     unfold evalFloatBinOp; rw [evalFloatCmp_of_arith bop f _ _ hbop, hbase]
   have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩)) s.memory
       body.localDecls body.layouts = .ok (.scalar ⟨baseBits, f.byteWidth⟩) s.frame.locals s.memory := by
-    rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_copy_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r)
+    rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc rSc _ _ _ hnot_off (evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r)
       (by rw [operandTy_copy_local hdecl_lhs, isFloatOptTy_some_of_ieee hf_lhs]; rfl),
       operandTy_copy_local hdecl_lhs, operandTy_copy_local hdecl_rhs,
       evalFloatScalarBinOp_of_fmt bop lSc rSc lhsDecl.ty rhsDecl.ty f s.frame.locals s.memory hf_lhs hf_rhs hlbw hrbw, hbin]
@@ -2180,7 +2210,7 @@ theorem step_float_arith_copy_copy_nondet_completeness
   obtain ⟨_, _, _, _, _, _, _, _, _, _, _, hlbw, hrbw, _⟩ := binary_copy_copy_float_init_eval hstate (bop := bop) (span := span) hdecl_dst hdecl_lhs hdecl_rhs hf_lhs hf_rhs hslot_l hslot_r himm
   have hrel_bin : EvalFloatBinOpRel .nondeterministic bop f lSc.bits rSc.bits outSc := by
     rcases (EvalRvalueFloatRel_binaryOp_float_iff .nondeterministic policy s.frame.locals s.frame.locals s.frame.locals bop _ _ lSc rSc lhsDecl.ty rhsDecl.ty f s.memory body.localDecls body.layouts _ hnot_off
-      (evalOperand_copy_scalar_ok hslot_l) (evalOperand_copy_scalar_ok hslot_r) (operandTy_copy_local hdecl_lhs) (operandTy_copy_local hdecl_rhs) hf_lhs hf_rhs hlbw hrbw).mp hrel_rv with ⟨outSc', hrel', hok⟩ | ⟨_, huns⟩
+      (evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r) (operandTy_copy_local hdecl_lhs) (operandTy_copy_local hdecl_rhs) hf_lhs hf_rhs hlbw hrbw).mp hrel_rv with ⟨outSc', hrel', hok⟩ | ⟨_, huns⟩
     · injection hok with hv _ _; injection hv with hsc; rw [hsc]; exact hrel'
     · cases huns
   obtain ⟨baseBits, hbase, hcase⟩ :=
@@ -2298,7 +2328,7 @@ theorem step_float_arith_const_copy_nondet_index_exact
     have hdstT : translateTy c.ty body.layouts = translateTy dstDecl.ty body.layouts := by rw [translateTy_of_ieeeFormatOfTy? hf_c, translateTy_of_ieeeFormatOfTy? hf_dst]
     have hbin : evalFloatBinOp bop f sc.bits rSc.bits = .some ⟨baseBits, f.byteWidth⟩ := by unfold evalFloatBinOp; rw [evalFloatCmp_of_arith bop f _ _ hbop, hbase]
     have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.constant c) (.copy ⟨rhsIdx, .nil⟩)) s.memory body.localDecls body.layouts = .ok (.scalar ⟨baseBits, f.byteWidth⟩) s.frame.locals s.memory := by
-      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ sc rSc _ _ _ hnot_off (evalOperand_const_scalar_ok hv_c) (evalOperand_copy_scalar_ok hslot_r)
+      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ sc rSc _ _ _ hnot_off (evalOperand_const_scalar_ok hv_c) (evalOperand_copy_ieee_ok hdecl_rhs hf_rhs hslot_r)
         (by rw [operandTy_const, isFloatOptTy_some_of_ieee hf_c]; rfl), operandTy_const, operandTy_copy_local hdecl_rhs,
         evalFloatScalarBinOp_of_fmt bop sc rSc c.ty rhsDecl.ty f s.frame.locals s.memory hf_c hf_rhs hsz_c hrbw, hbin]
     have hm_write : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts true (fun _ _ => pure idx)) ()
@@ -2347,7 +2377,7 @@ theorem step_float_arith_copy_const_nondet_index_exact
     have hdstT : translateTy lhsDecl.ty body.layouts = translateTy dstDecl.ty body.layouts := by rw [translateTy_of_ieeeFormatOfTy? hf_lhs, translateTy_of_ieeeFormatOfTy? hf_dst]
     have hbin : evalFloatBinOp bop f lSc.bits sc.bits = .some ⟨baseBits, f.byteWidth⟩ := by unfold evalFloatBinOp; rw [evalFloatCmp_of_arith bop f _ _ hbop, hbase]
     have hrv_a : evalRvalue s.frame.locals (.binaryOp bop (.copy ⟨lhsIdx, .nil⟩) (.constant c)) s.memory body.localDecls body.layouts = .ok (.scalar ⟨baseBits, f.byteWidth⟩) s.frame.locals s.memory := by
-      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc sc _ _ _ hnot_off (evalOperand_copy_scalar_ok hslot_l) (evalOperand_const_scalar_ok hv_c)
+      rw [evalRvalue_binaryOp_float _ _ _ bop _ _ lSc sc _ _ _ hnot_off (evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hslot_l) (evalOperand_const_scalar_ok hv_c)
         (by rw [operandTy_copy_local hdecl_lhs, isFloatOptTy_some_of_ieee hf_lhs]; rfl), operandTy_copy_local hdecl_lhs, operandTy_const,
         evalFloatScalarBinOp_of_fmt bop lSc sc lhsDecl.ty c.ty f s.frame.locals s.memory hf_lhs hf_c hlbw hsz_c, hbin]
     have hm_write : Miri.Interpreter.Step.evalStatement (annealStepHooksFloatArith body.localDecls body.layouts true (fun _ _ => pure idx)) ()
@@ -2434,7 +2464,7 @@ theorem step_float_uninit_binaryOp_ub_lockstep
   · have hslot_eq : slot_l = .init (.scalar lSc) := Option.some.inj (hslot_l.symm.trans hl_init); subst hslot_eq
     have ha : stepMirFn body s = .fail .ub := by
       rw [stepMirFn_eq_of_not_other body s hcal hphase]; simp only [hbb, hstmt]; unfold evalStmt evalRvalue; dsimp only []
-      rw [evalOperand_copy_scalar_ok hl_init]; dsimp only []; unfold evalOperand; dsimp only []; rw [hr_un]
+      rw [evalOperand_copy_ieee_ok hdecl_lhs hf_lhs hl_init]; dsimp only []; unfold evalOperand; dsimp only []; rw [hr_un]
     rcases hloc_l.floatCast_immediate_cases (Or.inl ⟨f, hf_lhs⟩) ((himm_l.cache_layout hlt_d _) mls_l hmls_l) with ⟨h, _⟩ | ⟨h, _⟩ | ⟨_, lMsc, _, _, _, hml⟩
     · cases h
     · cases h
@@ -2472,7 +2502,7 @@ theorem step_float_f16_f128_fail_closed
   have hfloat_opt : isFloatOptTy (some srcDecl.ty) = true := by rcases h16 with hk | hk <;> simp [isFloatOptTy, isFloatTy, hk]
   have ha : stepMirFn body s = .fail .unsupported := by
     rw [stepMirFn_eq_of_not_other body s hcal hphase]; simp only [hbb, hstmt]; unfold evalStmt; dsimp only []
-    rw [evalRvalue_unaryOp_neg_float _ _ _ sc _ _ _ (evalOperand_copy_scalar_ok hslot_s) (by rw [operandTy_copy_local hdecl_src]; exact hfloat_opt)]
+    rw [evalRvalue_unaryOp_neg_float _ _ _ sc _ _ _ (evalOperand_copy_scalar_ok hdecl_src (h16.elim (fun h => ⟨_, h⟩) (fun h => ⟨_, h⟩)) hslot_s) (by rw [operandTy_copy_local hdecl_src]; exact hfloat_opt)]
     unfold evalFloatUnaryNeg; rw [operandTy_copy_local hdecl_src]; dsimp only; rw [hfmt_none]; rfl
   refine ⟨ha, ?_⟩
   obtain ⟨_, mls_d, _, hlt_d, _, _, hmls_d_eq, hloc_d⟩ := hfr.lookup_local hdecl_dst
@@ -3016,7 +3046,7 @@ theorem w2_lm_cmp_and_snan_neg :
   have hneg_val : ∃ s', stepMirFn bodyNeg sNeg = .step s' ∧ get? s'.frame.locals 0 = some (.init (.scalar ⟨0xFFA00001, 4⟩)) := by
     rw [stepMirFn_eq_of_not_other bodyNeg sNeg rfl (fun _ h => nomatch h)]
     simp only [bodyNeg, sNeg, faMkBody, faMkState, get?, List.getElem?_cons_zero, mkStmt, local_]; unfold evalStmt; dsimp only []
-    rw [evalRvalue_unaryOp_neg_float _ _ _ ⟨0x7FA00001, 4⟩ _ [⟨.mut, faF32Ty, none⟩, ⟨.not, faF32Ty, none⟩] emptyLayoutTable (evalOperand_copy_scalar_ok (locals := [.uninit, .init (.scalar ⟨0x7FA00001, 4⟩)]) (idx := 1) rfl) rfl]
+    rw [evalRvalue_unaryOp_neg_float _ _ _ ⟨0x7FA00001, 4⟩ _ [⟨.mut, faF32Ty, none⟩, ⟨.not, faF32Ty, none⟩] emptyLayoutTable (evalOperand_copy_scalar_ok (decl := ⟨.not, faF32Ty, none⟩) rfl ⟨.f32, rfl⟩ (locals := [.uninit, .init (.scalar ⟨0x7FA00001, 4⟩)]) (idx := 1) rfl) rfl]
     unfold evalFloatUnaryNeg; rw [operandTy_copy_local (ld := [⟨.mut, faF32Ty, none⟩, ⟨.not, faF32Ty, none⟩]) (idx := 1) (decl := ⟨.not, faF32Ty, none⟩) rfl]
     dsimp only [faF32Ty, ieeeFormatOfTy?, IeeeFormat.byteWidth, Nat.beq]; rw [hneg_ev]; exact ⟨_, rfl, rfl⟩
   have hc1 := floatBits_comparison_eq .eq .binary32 0x7FC00000 0x7FC00000 (by decide) (by decide)

@@ -49,35 +49,58 @@ export MiniRust.Snapshots.S2026_05_Matched.Generated.Ops (
   decode_discriminant_tag
 )
 
-/-! ## 1. MiniRust `MrAbstractByte` Isomorphism (`Generated.Ops.MrAbstractByte`) -/
+/-! ## 1. MiniRust `MrAbstractByte` Refinement (`Generated.Ops.MrAbstractByte`) -/
 
-/-- Translate an Anneal `AbstractByte` to a MiniRust `Generated.Ops.MrAbstractByte`. -/
+/-- Translate an Anneal `AbstractByte` to a MiniRust `Generated.Ops.MrAbstractByte`
+by projecting `PtrByteFrag` onto its `(allocId, tag)` provenance pair. -/
 @[reducible]
 def translateByte : AbstractByte → MrAbstractByte
   | .uninit => .uninit
-  | .init b p => .init b p
+  | .init b p => .init b (p.map PtrByteFrag.provPair)
 
-/-- Translate a MiniRust `Generated.Ops.MrAbstractByte` to an Anneal `AbstractByte`. -/
+/-- Embed a MiniRust `Generated.Ops.MrAbstractByte` into an Anneal `AbstractByte`
+at canonical byte fragment position `0` (width `8`, offset `0`). -/
 @[reducible]
 def untranslateByte : MrAbstractByte → AbstractByte
   | .uninit => .uninit
-  | .init b p => .init b p
+  | .init b p =>
+    .init b (p.map fun (a, t) =>
+      { allocId := a, tag := t, byteIdx := 0, origOffset := 0, ptrBytes := 8 })
 
 /-! ## 2. Universal Correspondence & Round-Trip Theorems (`∀`) -/
 
 /--
-**Theorem L2.1 (`translateByte_bijective`)**:
-Anneal's `AbstractByte` and MiniRust's `MrAbstractByte` are in exact bijection
-preserving both initialized byte values and optional `(allocId, tag)` provenance.
+**Theorem L2.1 (`translateByte_retraction`)**:
+Anneal's `AbstractByte` strictly refines MiniRust's `MrAbstractByte` with
+`UCG#558` byte-fragment metadata (`byteIdx`, `origOffset`, `ptrBytes`):
+`translateByte` is a left inverse to `untranslateByte` preserving initialization
+status, concrete byte values, and `(allocId, tag)` provenance pairs.
 -/
-theorem translateByte_bijective :
-    (∀ b : AbstractByte, untranslateByte (translateByte b) = b) ∧
-    (∀ mb : MrAbstractByte, translateByte (untranslateByte mb) = mb) := by
-  constructor
-  · intro b
-    cases b <;> rfl
+theorem translateByte_retraction :
+    (∀ mb : MrAbstractByte, translateByte (untranslateByte mb) = mb) ∧
+    (∀ b : AbstractByte, translateByte b = .uninit ↔ b = .uninit) ∧
+    (∀ (b : UInt8) (f : PtrByteFrag),
+      translateByte (.init b (some f)) = .init b (some (f.allocId, f.tag))) := by
+  refine ⟨?_, ?_, fun _ _ => rfl⟩
   · intro mb
-    cases mb <;> rfl
+    cases mb with
+    | uninit => rfl
+    | init b p => cases p <;> rfl
+  · intro b
+    cases b <;> simp [translateByte]
+
+private theorem encodePlainLittleEndianBytes_length (bits numBytes : Nat) :
+    (encodePlainLittleEndianBytes bits numBytes).length = numBytes := by
+  induction numBytes generalizing bits with
+  | zero => rfl
+  | succ rem ih => simp only [encodePlainLittleEndianBytes, List.length_cons, ih]
+
+private theorem encodePtrBytesAux_length
+    (a t orig ptrBytes bits idx numBytes : Nat) :
+    (encodePtrBytesAux a t orig ptrBytes bits idx numBytes).length = numBytes := by
+  induction numBytes generalizing bits idx with
+  | zero => rfl
+  | succ rem ih => simp only [encodePtrBytesAux, List.length_cons, ih]
 
 /--
 **Theorem L2.2 (`encodeLittleEndianBytes_length`)**:
@@ -88,16 +111,41 @@ length exactly `numBytes`.
 theorem encodeLittleEndianBytes_length
     (bits numBytes : Nat) (prov : Option (Nat × Nat)) :
     (encodeLittleEndianBytes bits numBytes prov).length = numBytes := by
-  induction numBytes generalizing bits with
-  | zero =>
-    rfl
-  | succ rem ih =>
-    simp only [encodeLittleEndianBytes, List.length_cons, ih]
+  cases prov with
+  | none => exact encodePlainLittleEndianBytes_length bits numBytes
+  | some p =>
+    rcases p with ⟨a, t⟩
+    exact encodePtrBytesAux_length a t (normPtrByteOffset numBytes bits) numBytes bits 0 numBytes
 
 /-- Helper arithmetic lemma: `(UInt8.ofNat bits).toBitVec.toNat = bits % 256`. -/
 theorem uint8_ofNat_toNat_eq_mod (bits : Nat) :
     (UInt8.ofNat bits).toBitVec.toNat = bits % 256 := by
   simp [UInt8.ofNat, BitVec.ofNat]
+
+private theorem decodeLittleEndianBits_encodePlain
+    (numBytes bits : Nat) (h_bound : bits < scalarModulus numBytes) :
+    decodeLittleEndianBits (encodePlainLittleEndianBytes bits numBytes) = some bits := by
+  induction numBytes generalizing bits with
+  | zero =>
+    have h0 : bits = 0 := by
+      simp [scalarModulus] at h_bound
+      omega
+    subst h0
+    rfl
+  | succ rem ih =>
+    have h_div_bound : Nat.div bits 256 < scalarModulus rem := by
+      simp only [scalarModulus, Nat.mul_eq] at h_bound
+      change bits / 256 < scalarModulus rem
+      omega
+    have h_ih := ih (Nat.div bits 256) h_div_bound
+    simp only [decodeLittleEndianBits, h_ih]
+    congr 1
+    rw [uint8_ofNat_toNat_eq_mod]
+    exact Nat.mod_add_div bits 256
+
+private theorem abstractBytesCoherentPtrProv?_encodePlain (bits numBytes : Nat) :
+    abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes bits numBytes) = none := by
+  cases numBytes <;> rfl
 
 /--
 **Theorem L2.3 (`decode_encode_little_endian_roundtrip`)**:
@@ -109,25 +157,9 @@ recovers `some (bits, none)` with zero loss of precision.
 theorem decode_encode_little_endian_roundtrip
     (numBytes bits : Nat) (h_bound : bits < scalarModulus numBytes) :
     decodeLittleEndianBytes (encodeLittleEndianBytes bits numBytes none) = some (bits, none) := by
-  induction numBytes generalizing bits with
-  | zero =>
-    have h0 : bits = 0 := by
-      simp [scalarModulus] at h_bound
-      omega
-    subst h0
-    rfl
-  | succ rem ih =>
-    have h_div_bound : Nat.div bits 256 < scalarModulus rem := by
-      simp only [scalarModulus, Nat.mul_eq] at h_bound
-      have hdiv : bits / 256 < scalarModulus rem := by omega
-      exact hdiv
-    have h_ih := ih (Nat.div bits 256) h_div_bound
-    simp only [decodeLittleEndianBytes, h_ih, mergeByteProvenance]
-    congr 1
-    congr 1
-    rw [uint8_ofNat_toNat_eq_mod]
-    have h_reconstruct : bits % 256 + 256 * (bits / 256) = bits := Nat.mod_add_div bits 256
-    exact h_reconstruct
+  unfold decodeLittleEndianBytes encodeLittleEndianBytes
+  rw [decodeLittleEndianBits_encodePlain numBytes bits h_bound,
+      abstractBytesCoherentPtrProv?_encodePlain bits numBytes]
 
 /--
 **Theorem L2.4 (`decodeLittleEndianBytes_uninit_head_is_none`)**:
@@ -179,7 +211,59 @@ private theorem seq_length_eq {α : Type u} (xs : List α) :
 
 private theorem mergeByteProvenance_self (prov : Option (Nat × Nat)) :
     mergeByteProvenance prov prov = prov := by
-  cases prov <;> rfl
+  cases prov with
+  | none => rfl
+  | some p =>
+    rcases p with ⟨a, t⟩
+    simp [mergeByteProvenance]
+
+private theorem decodeLittleEndianBits_encodePtrBytesAux
+    (a t orig ptrBytes : Nat) :
+    ∀ (numBytes bits idx : Nat),
+      bits < scalarModulus numBytes →
+      decodeLittleEndianBits (encodePtrBytesAux a t orig ptrBytes bits idx numBytes) = some bits
+  | 0, bits, _, h_bound => by
+    have h0 : bits = 0 := by simp [scalarModulus] at h_bound; omega
+    subst h0; rfl
+  | rem + 1, bits, idx, h_bound => by
+    have h_div_bound : Nat.div bits 256 < scalarModulus rem := by
+      simp only [scalarModulus, Nat.mul_eq] at h_bound
+      change bits / 256 < scalarModulus rem
+      omega
+    have h_ih := decodeLittleEndianBits_encodePtrBytesAux a t orig ptrBytes rem (Nat.div bits 256) (Nat.add idx 1) h_div_bound
+    simp only [decodeLittleEndianBits, h_ih]
+    congr 1
+    rw [uint8_ofNat_toNat_eq_mod]
+    exact Nat.mod_add_div bits 256
+
+private theorem abstractBytesCoherentPtrProvAux_encodePtrBytesAux
+    (a t orig ptrBytes : Nat) :
+    ∀ (k bits idx : Nat), idx + k = ptrBytes →
+      abstractBytesCoherentPtrProvAux a t orig ptrBytes idx
+        (encodePtrBytesAux a t orig ptrBytes bits idx k) = true
+  | 0, _, idx, h => by
+    have heq : idx = ptrBytes := by omega
+    subst heq
+    simp [abstractBytesCoherentPtrProvAux]
+  | k + 1, bits, idx, h => by
+    have hnext : Nat.add idx 1 + k = ptrBytes := by change idx + 1 + k = ptrBytes; omega
+    simp only [abstractBytesCoherentPtrProvAux, Nat.beq_refl, Bool.and_self]
+    exact abstractBytesCoherentPtrProvAux_encodePtrBytesAux a t orig ptrBytes k (Nat.div bits 256) (Nat.add idx 1) hnext
+
+private theorem abstractBytesCoherentPtrProv?_encodePtrBytes
+    (a t bits rem : Nat) :
+    abstractBytesCoherentPtrProv? (encodePtrBytes bits (rem + 1) a t) =
+      some { allocId := a, tag := t, byteIdx := 0,
+             origOffset := normPtrByteOffset (rem + 1) bits, ptrBytes := rem + 1 } := by
+  have hPos : Nat.blt 0 (rem + 1) = true := Nat.blt_eq.mpr (Nat.succ_pos rem)
+  have hAux := abstractBytesCoherentPtrProvAux_encodePtrBytesAux a t
+    (normPtrByteOffset (rem + 1) bits) (rem + 1) rem (Nat.div bits 256) 1 (by omega)
+  unfold encodePtrBytes
+  dsimp only [encodePtrBytesAux]
+  unfold abstractBytesCoherentPtrProv?
+  dsimp only
+  rw [hPos, hAux]
+  rfl
 
 /--
 **Theorem L2.7 (`decode_encode_little_endian_with_prov_roundtrip`)**:
@@ -187,42 +271,21 @@ For EVERY non-zero byte width `rem + 1`, EVERY in-range unsigned integer
 `bits < scalarModulus (rem + 1)`, and EVERY optional pointer provenance
 `prov : Option (Nat × Nat)`, encoding `bits` with provenance `prov` and decoding
 via `decodeLittleEndianBytes` recovers `some (bits, prov)` with both bit pattern
-and `(allocId, tag)` provenance preserved.
+and coherent `(allocId, tag)` provenance preserved.
 -/
 theorem decode_encode_little_endian_with_prov_roundtrip
     (rem bits : Nat) (prov : Option (Nat × Nat))
     (h_bound : bits < scalarModulus (rem + 1)) :
     decodeLittleEndianBytes (encodeLittleEndianBytes bits (rem + 1) prov) =
       some (bits, prov) := by
-  induction rem generalizing bits with
-  | zero =>
-    have h_lt : bits < 256 := by
-      simp [scalarModulus] at h_bound
-      omega
-    simp only [decodeLittleEndianBytes, mergeByteProvenance,
-      Nat.add_eq, Nat.mul_eq]
-    congr 1
-    congr 1
-    rw [uint8_ofNat_toNat_eq_mod]
-    omega
-  | succ k ih =>
-    have h_div_bound : Nat.div bits 256 < scalarModulus (k + 1) := by
-      simp only [scalarModulus, Nat.mul_eq] at h_bound
-      have hdiv : bits / 256 < 256 * scalarModulus k := by omega
-      exact hdiv
-    have h_ih := ih (Nat.div bits 256) h_div_bound
-    change
-      (match decodeLittleEndianBytes (encodeLittleEndianBytes (Nat.div bits 256) (k + 1) prov) with
-       | some (highBits, restProv) =>
-         some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 highBits),
-           mergeByteProvenance prov restProv)
-       | none => none) = some (bits, prov)
-    rw [h_ih]
-    simp only [mergeByteProvenance_self, Nat.add_eq, Nat.mul_eq]
-    congr 1
-    congr 1
-    rw [uint8_ofNat_toNat_eq_mod]
-    exact Nat.mod_add_div bits 256
+  cases prov with
+  | none => exact decode_encode_little_endian_roundtrip (rem + 1) bits h_bound
+  | some p =>
+    rcases p with ⟨a, t⟩
+    unfold decodeLittleEndianBytes encodeLittleEndianBytes
+    rw [decodeLittleEndianBits_encodePtrBytesAux a t (normPtrByteOffset (rem + 1) bits) (rem + 1)
+          (rem + 1) bits 0 h_bound,
+        abstractBytesCoherentPtrProv?_encodePtrBytes a t bits rem]
 
 /--
 **Theorem L2.8 (`decodeScalarBytes_encodeScalarBytes_roundtrip`)**:
@@ -382,7 +445,7 @@ theorem decode_encode_uint_and_int_roundtrip
   have h_len :
       Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes bits (rem + 1) none)) (rem + 1) =
         true := by
-    simp [encodeLittleEndianBytes_length, Nat.beq_refl]
+    rw [seq_length_eq, encodeLittleEndianBytes_length]; exact Nat.beq_refl (rem + 1)
   have h_u := (decodeScalarBytes_encodeScalarBytes_roundtrip rem bits none false h_bound).2
   have h_s := (decodeScalarBytes_encodeScalarBytes_roundtrip rem bits none true h_bound).2
   constructor
@@ -402,16 +465,20 @@ theorem decode_encode_uint_and_int_roundtrip
 /--
 **Theorem L2.13 (`decode_encode_thin_ptr_and_ref_null_check`)**:
 Universal thin pointer provenance round-trip and null reference rejection in
-`MirSemantics.{encodeValueToBytes,decodeValueFromBytes}`:
+`MirSemantics.{encodeValueToBytes,decodeValueFromBytes}` on 64-bit layouts
+(`layoutPointerBytes layouts = 8`):
 1. Encoding a thin pointer `.ptr { allocId, offsetBytes } 8` at `.rawPtr` or `.ref`
-   attaches provenance `some (allocId, allocId)` to all 8 bytes and decodes back to the exact pointer;
-2. Decoding 8 zero bytes without provenance (`none`) at `.ref` returns `none` (null reference is UB),
-   whereas decoding at `.rawPtr` succeeds (`some (.ptr { allocId := 0, offsetBytes := 0 } 8)`).
+   attaches coherent `PtrByteFrag` provenance `(allocId, allocId)` to all 8 bytes
+   and decodes back to the exact pointer;
+2. Decoding 8 zero bytes without provenance (`none`) at `.ref` returns `none` (null
+   reference is UB), whereas decoding at `.rawPtr` returns provenance-less
+   `some (.scalar ⟨0, 8⟩)` (never forging provenance).
 -/
 theorem decode_encode_thin_ptr_and_ref_null_check
     (mutability : Mutability)
     (allocId offsetBytes fuel lIdx : Nat) (layouts : LayoutTable)
-    (h_off : offsetBytes < scalarModulus 8) :
+    (h_off : offsetBytes < scalarModulus 8)
+    (h_pw : layoutPointerBytes layouts = 8 := by rfl) :
     let p : ProvenancePtr :=
       { allocId := allocId, offsetBytes := offsetBytes }
     let rawTy : Ty :=
@@ -426,7 +493,7 @@ theorem decode_encode_thin_ptr_and_ref_null_check
     decodeValueFromBytes (fuel + 1) layouts refTy ptrBytes = some (.ptr p 8) ∧
     decodeValueFromBytes (fuel + 1) layouts refTy nullBytes = none ∧
     decodeValueFromBytes (fuel + 1) layouts rawTy nullBytes =
-      some (.ptr { allocId := 0, offsetBytes := 0 } 8) := by
+      some (.scalar ⟨0, 8⟩) := by
   have h_ptr :=
     (decodeScalarBytes_encodeScalarBytes_roundtrip 7 offsetBytes (some (allocId, allocId)) false h_off).2
   have h_zero_bound : 0 < scalarModulus 8 := by decide
@@ -435,19 +502,34 @@ theorem decode_encode_thin_ptr_and_ref_null_check
   have h_len_ptr :
       Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes offsetBytes 8 (some (allocId, allocId)))) 8 =
         true := by
-    simp
+    rw [seq_length_eq, encodeLittleEndianBytes_length]; rfl
   have h_len_null :
       Nat.beq (Trusted.Sequence.length (encodeLittleEndianBytes 0 8 none)) 8 = true := by
-    simp
-  refine ⟨rfl, ?_, rfl, ?_, ?_, ?_⟩
+    rw [seq_length_eq, encodeLittleEndianBytes_length]; rfl
+  have h_coh_ptr :
+      abstractBytesCoherentPtrProv? (encodeLittleEndianBytes offsetBytes 8 (some (allocId, allocId))) =
+        some { allocId := allocId, tag := allocId, byteIdx := 0,
+               origOffset := normPtrByteOffset 8 offsetBytes, ptrBytes := 8 } :=
+    abstractBytesCoherentPtrProv?_encodePtrBytes allocId allocId offsetBytes 7
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold encodeValueToBytes
+    simp only [h_pw, encodeScalarBytes]
+    rfl
   · unfold decodeValueFromBytes
-    simp only [h_len_ptr, h_ptr]
+    simp only [h_pw, h_len_ptr, h_ptr, h_coh_ptr]
+    rfl
+  · unfold encodeValueToBytes
+    simp only [h_pw, encodeScalarBytes]
+    rfl
   · unfold decodeValueFromBytes
-    simp only [h_len_ptr, h_ptr]
+    simp only [h_pw, h_len_ptr, h_ptr, h_coh_ptr]
+    rfl
   · unfold decodeValueFromBytes
-    simp only [h_len_null, h_zero]
+    simp only [h_pw, h_len_null, h_zero]
+    rfl
   · unfold decodeValueFromBytes
-    simp only [h_len_null, h_zero]
+    simp only [h_pw, h_len_null, h_zero]
+    rfl
 
 /--
 **Theorem L2.14 (`wrappingRangeContains_characterization`)**:

@@ -10530,8 +10530,48 @@ private def ccEvalCopyNonOverlappingPermOk
       s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
       srcUnionOpt dstUnionOpt n locals₃
   | false =>
+    let elemSzOpt : Option Nat :=
+      copyPointeeByteSize?
+        localDecls
+        layouts
+        (operandPointeeTy localDecls layouts src)
+        (operandPointeeTy localDecls layouts dst)
+    let srcPlaceSizeMismatch : Bool :=
+      match elemSzOpt, get? locals₃ srcEntry.targetLocal with
+      | .some eSz, .some _ =>
+        match
+          placeTyResolved
+            localDecls
+            layouts
+            { local_ := srcEntry.targetLocal, projection := srcEntry.targetProjection }
+        with
+        | .some sPlaceTy =>
+          match tyByteSize localDecls layouts sPlaceTy with
+          | .some pSz => Bool.not (Nat.beq pSz eSz)
+          | .none => false
+        | .none => false
+      | _, _ => false
+    let dstPlaceSizeMismatch : Bool :=
+      match elemSzOpt, get? locals₃ dstEntry.targetLocal with
+      | .some eSz, .some _ =>
+        match
+          placeTyResolved
+            localDecls
+            layouts
+            { local_ := dstEntry.targetLocal, projection := dstEntry.targetProjection }
+        with
+        | .some dPlaceTy =>
+          match tyByteSize localDecls layouts dPlaceTy with
+          | .some pSz => Bool.not (Nat.beq pSz eSz)
+          | .none => false
+        | .none => false
+      | _, _ => false
     let isSingleDirect :=
-      Bool.and (Nat.beq n 1) (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+      Bool.and
+        (Nat.beq n 1)
+        (Bool.and
+          (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+          (Bool.and (Bool.not srcPlaceSizeMismatch) (Bool.not dstPlaceSizeMismatch)))
     match isSingleDirect with
     | true =>
       evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃
@@ -11081,7 +11121,7 @@ private theorem evalStmt_retag_stepCtxCB
   | unsupported => exact stepCtxCB_unsupported
   | ok val locals' =>
     dsimp (config := { zeta := false }) only
-    extract_lets placeTyOpt isMutRefPlace _elemSz _pointeeBytes checkGlobalRetagL retagPtrValL _protId _srcM checkGlobalRetagR retagPtrValR
+    extract_lets placeTyOpt isMutRefPlace _elemSz _pointeeBytes _ptrBytes checkGlobalRetagL retagPtrValL _protId _srcM checkGlobalRetagR retagPtrValR
     have h_cg : ∀ ptrOrFatVal ptrVal,
         StepCtxCB c ac ti s.memory.callStack
           (checkGlobalRetagL ptrOrFatVal ptrVal) (checkGlobalRetagR ptrOrFatVal ptrVal) := by
@@ -16381,13 +16421,31 @@ theorem evalOperand_copy_widePtr_field0 (locals : List LocalSlot) (loc : Local)
     (hSlot : get? locals loc = some (.init (.aggregate 0 [dataVal, metaVal])))
     (hNoUnion : placeTouchesUnion localDecls layouts
       { local_ := loc, projection := [.field 0 fTy] } = false)
-    (hNoUninit : valueContainsUninit dataVal = false := by rfl) :
+    (hNoUninit : valueContainsUninit dataVal = false := by rfl)
+    (hValid :
+      localDecls = .nil ∨
+        (materializeReadPtrValue layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 0 fTy] })
+            dataVal = .some dataVal ∧
+          validateValueForTy? layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 0 fTy] })
+            dataVal = true) := by
+      exact Or.inl rfl) :
     evalOperand locals (.copy { local_ := loc, projection := [.field 0 fTy] })
       borrows globals layouts callerLocals localDecls callStack = .ok dataVal locals := by
-  unfold evalOperand
-  dsimp only
-  rw [hSlot, hNoUnion]
-  simp only [readProjectedValue, get?, List.getElem?_cons_zero, hNoUninit]
+  cases localDecls with
+  | nil =>
+    unfold evalOperand
+    dsimp only
+    rw [hSlot]
+    simp only [readProjectedValue, get?, List.getElem?_cons_zero, hNoUninit]
+  | cons d ds =>
+    rcases hValid with hNil | ⟨hMat, hVal⟩
+    · nomatch hNil
+    · unfold evalOperand
+      dsimp only
+      rw [hSlot, hNoUnion]
+      simp only [readProjectedValue, get?, List.getElem?_cons_zero, hNoUninit, hMat, hVal]
 
 /-- **`evalOperand_copy_widePtr_field1`**: projecting `.field 1` (metadata
 component of a decomposed 2-field `(data, meta)` aggregate in local `loc`)
@@ -16400,13 +16458,32 @@ theorem evalOperand_copy_widePtr_field1 (locals : List LocalSlot) (loc : Local)
     (hSlot : get? locals loc = some (.init (.aggregate 0 [dataVal, metaVal])))
     (hNoUnion : placeTouchesUnion localDecls layouts
       { local_ := loc, projection := [.field 1 fTy] } = false)
-    (hNoUninit : valueContainsUninit metaVal = false := by rfl) :
+    (hNoUninit : valueContainsUninit metaVal = false := by rfl)
+    (hValid :
+      localDecls = .nil ∨
+        (materializeReadPtrValue layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 1 fTy] })
+            metaVal = .some metaVal ∧
+          validateValueForTy? layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 1 fTy] })
+            metaVal = true) := by
+      exact Or.inl rfl) :
     evalOperand locals (.copy { local_ := loc, projection := [.field 1 fTy] })
       borrows globals layouts callerLocals localDecls callStack = .ok metaVal locals := by
-  unfold evalOperand
-  dsimp only
-  rw [hSlot, hNoUnion]
-  simp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero, hNoUninit]
+  cases localDecls with
+  | nil =>
+    unfold evalOperand
+    dsimp only
+    rw [hSlot]
+    simp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero, hNoUninit]
+  | cons d ds =>
+    rcases hValid with hNil | ⟨hMat, hVal⟩
+    · nomatch hNil
+    · unfold evalOperand
+      dsimp only
+      rw [hSlot, hNoUnion]
+      simp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero,
+        hNoUninit, hMat, hVal]
 
 /-- **`evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip`**: projecting
 `.field 0` and `.field 1` from a decomposed 2-field `(data, meta)` aggregate
@@ -16424,7 +16501,25 @@ theorem evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip (locals : List LocalS
     (hNoUnion0 : placeTouchesUnion localDecls layouts
       { local_ := loc, projection := [.field 0 dataTy] } = false)
     (hNoUnion1 : placeTouchesUnion localDecls layouts
-      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+      { local_ := loc, projection := [.field 1 metaTy] } = false)
+    (hValid0 :
+      localDecls = .nil ∨
+        (materializeReadPtrValue layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 0 dataTy] })
+            (.ptr p (layoutPointerBytes layouts)) = .some (.ptr p (layoutPointerBytes layouts)) ∧
+          validateValueForTy? layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 0 dataTy] })
+            (.ptr p (layoutPointerBytes layouts)) = true) := by
+      exact Or.inl rfl)
+    (hValid1 :
+      localDecls = .nil ∨
+        (materializeReadPtrValue layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 1 metaTy] })
+            (.scalar ⟨len, layoutPointerBytes layouts⟩) = .some (.scalar ⟨len, layoutPointerBytes layouts⟩) ∧
+          validateValueForTy? layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 1 metaTy] })
+            (.scalar ⟨len, layoutPointerBytes layouts⟩) = true) := by
+      exact Or.inl rfl) :
     evalRvalue locals
       (.aggregate (.rawPtr pointeeTy mutability)
         [.copy { local_ := loc, projection := [.field 0 dataTy] },
@@ -16437,9 +16532,9 @@ theorem evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip (locals : List LocalS
     (.copy { local_ := loc, projection := [.field 1 metaTy] })
     mem localDecls layouts p len hWide
     (evalOperand_copy_widePtr_field0 locals loc dataTy _ _ mem.borrows mem.globals layouts
-      mem.callerLocals localDecls mem.callStack hSlot hNoUnion0)
+      mem.callerLocals localDecls mem.callStack hSlot hNoUnion0 (by rfl) hValid0)
     (evalOperand_copy_widePtr_field1 locals loc metaTy _ _ mem.borrows mem.globals layouts
-      mem.callerLocals localDecls mem.callStack hSlot hNoUnion1)
+      mem.callerLocals localDecls mem.callStack hSlot hNoUnion1 (by rfl) hValid1)
 
 /-- **`evalRvalue_aggregate_tuple_pair`**: evaluating `Rvalue.aggregate .tuple [op0, op1]`
 (such as `Layout::for_value(_raw)` `(size, align)` pair assembly) produces
@@ -18281,7 +18376,25 @@ theorem evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip_scalarAddr (locals : 
     (hNoUnion0 : placeTouchesUnion localDecls layouts
       { local_ := loc, projection := [.field 0 dataTy] } = false)
     (hNoUnion1 : placeTouchesUnion localDecls layouts
-      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+      { local_ := loc, projection := [.field 1 metaTy] } = false)
+    (hValid0 :
+      localDecls = .nil ∨
+        (materializeReadPtrValue layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 0 dataTy] })
+            (.scalar ⟨addr, layoutPointerBytes layouts⟩) = .some (.scalar ⟨addr, layoutPointerBytes layouts⟩) ∧
+          validateValueForTy? layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 0 dataTy] })
+            (.scalar ⟨addr, layoutPointerBytes layouts⟩) = true) := by
+      exact Or.inl rfl)
+    (hValid1 :
+      localDecls = .nil ∨
+        (materializeReadPtrValue layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 1 metaTy] })
+            (.scalar ⟨len, layoutPointerBytes layouts⟩) = .some (.scalar ⟨len, layoutPointerBytes layouts⟩) ∧
+          validateValueForTy? layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 1 metaTy] })
+            (.scalar ⟨len, layoutPointerBytes layouts⟩) = true) := by
+      exact Or.inl rfl) :
     evalRvalue locals
       (.aggregate (.rawPtr pointeeTy mutability)
         [.copy { local_ := loc, projection := [.field 0 dataTy] },
@@ -18294,9 +18407,9 @@ theorem evalRvalue_aggregate_rawPtr_to_raw_parts_roundtrip_scalarAddr (locals : 
     (.copy { local_ := loc, projection := [.field 1 metaTy] })
     mem localDecls layouts addr len hWide hAddr hLen
     (evalOperand_copy_widePtr_field0 locals loc dataTy _ _ mem.borrows mem.globals layouts
-      mem.callerLocals localDecls mem.callStack hSlot hNoUnion0)
+      mem.callerLocals localDecls mem.callStack hSlot hNoUnion0 (by rfl) hValid0)
     (evalOperand_copy_widePtr_field1 locals loc metaTy _ _ mem.borrows mem.globals layouts
-      mem.callerLocals localDecls mem.callStack hSlot hNoUnion1)
+      mem.callerLocals localDecls mem.callStack hSlot hNoUnion1 (by rfl) hValid1)
 
 /-- Runtime representations of `()` metadata accepted by `evalAggregateRawPtr` for sized pointees:
 both `.unit` (`ConstantValue.zeroSized`) and `.aggregate 0 []` (`Rvalue.aggregate .tuple []`). -/

@@ -2342,29 +2342,59 @@ theorem fa_mrM_transmute_ptr_strip {M : Type} [Gen.Memory M] [MemoryOps M]
       (fa_encodeIntM_u64_cf (M := M) addr haddr)
       (fa_decodeM_rawPtrNone (M := M) addr haddr none)
       (fa_checkValueM_rawPtrNone (M := M) addr haddr none m)⟩
-private theorem fa_decodeArrayChunks_u8_encode (allocId tag : Nat) :
-    ∀ (n bits : Nat),
+private theorem fa_decodeLittleEndianBits_of_decodeScalarBytes
+    {bs : List AbstractByte} {sv : ScalarVal} {prov : Option (Nat × Nat)} {signed : Bool}
+    (h : decodeScalarBytes bs signed = some (sv, prov)) :
+    decodeLittleEndianBits bs = some sv.bits := by
+  unfold decodeScalarBytes decodeLittleEndianBytes at h
+  cases hLen : Nat.beq (Trusted.Sequence.length bs) 0 with
+  | true => simp [hLen] at h
+  | false =>
+    simp only [hLen] at h
+    cases hBits : decodeLittleEndianBits bs with
+    | none => simp [hBits] at h
+    | some bits => simp only [hBits] at h; cases h; rfl
+
+private theorem fa_seqLength_encodePtrAux (allocId tag origOff ptrBytes : Nat) :
+    ∀ (n idx bits : Nat),
+      Trusted.Sequence.length (encodePtrBytesAux allocId tag origOff ptrBytes bits idx n) = n
+  | 0, _, _ => rfl
+  | n + 1, idx, bits => by
+    show Nat.succ (Trusted.Sequence.length
+      (encodePtrBytesAux allocId tag origOff ptrBytes (Nat.div bits 256) (Nat.add idx 1) n)) = n + 1
+    rw [fa_seqLength_encodePtrAux allocId tag origOff ptrBytes n (Nat.add idx 1) (Nat.div bits 256)]
+
+private theorem fa_decodeArrayChunks_u8_encodePtrAux (allocId tag origOff ptrBytes : Nat) :
+    ∀ (n idx bits : Nat),
       decodeArrayChunksWith
         (fun chunk => decodeTypedValueFromBytes 15 faPolicyLayouts
           { kind := .uint .u8, layoutIdx := 0 } chunk .stripProvenance)
-        1 n (encodeLittleEndianBytes bits n (some (allocId, tag))) =
+        1 n (encodePtrBytesAux allocId tag origOff ptrBytes bits idx n) =
         some (fcLeByteVals bits n)
-  | 0, _ => rfl
-  | n + 1, bits => by
+  | 0, _, _ => rfl
+  | n + 1, idx, bits => by
     have hble : Nat.ble 1 (Trusted.Sequence.length
-        (encodeLittleEndianBytes bits (n + 1) (some (allocId, tag)))) = true := by
-      rw [fc_seqLength_encodeLittleEndianBytes]; rfl
+        (encodePtrBytesAux allocId tag origOff ptrBytes bits idx (n + 1))) = true := by
+      rw [fa_seqLength_encodePtrAux]; rfl
     have hbyte : decodeTypedValueFromBytes 15 faPolicyLayouts
         { kind := .uint .u8, layoutIdx := 0 }
-        [.init (UInt8.ofNat bits) (some (allocId, tag))] .stripProvenance =
+        [.init (UInt8.ofNat bits) (some { allocId := allocId, tag := tag, byteIdx := idx, origOffset := origOff, ptrBytes := ptrBytes })] .stripProvenance =
         some (Value.scalar ⟨bits % 256, 1⟩) := by
       change some (Value.scalar ⟨(UInt8.ofNat bits).toBitVec.toNat, 1⟩) = _
       rw [fc_uint8_ofNat_toNat]
     unfold decodeArrayChunksWith
     rw [hble]
-    dsimp only [encodeLittleEndianBytes, takeAbstractBytes, dropAbstractBytes]
-    rw [hbyte, fa_decodeArrayChunks_u8_encode allocId tag n (Nat.div bits 256)]
+    dsimp only [encodePtrBytesAux, takeAbstractBytes, dropAbstractBytes]
+    rw [hbyte, fa_decodeArrayChunks_u8_encodePtrAux allocId tag origOff ptrBytes n (Nat.add idx 1) (Nat.div bits 256)]
     rfl
+
+private theorem fa_decodeArrayChunks_u8_encode (allocId tag : Nat) (n bits : Nat) :
+    decodeArrayChunksWith
+      (fun chunk => decodeTypedValueFromBytes 15 faPolicyLayouts
+        { kind := .uint .u8, layoutIdx := 0 } chunk .stripProvenance)
+      1 n (encodeLittleEndianBytes bits n (some (allocId, tag))) =
+      some (fcLeByteVals bits n) :=
+  fa_decodeArrayChunks_u8_encodePtrAux allocId tag (normPtrByteOffset n bits) n n 0 bits
 /-- **Decoder-level `ucg#630` vs. `reference#1752` flip on pointer bytes**: on `faPolicyLayouts`, decoding 8 provenance-carrying bytes `encodeLittleEndianBytes addr 8 (some (allocId, tag))` at `usize`, `u64`, `i64`, `f64`, or `[u8; 8]` returns `.none` under `.strictUcg630Ub` and decodes the exact address bits (or byte array) under `.stripProvenance`. -/
 theorem fa_decodeTyped_ptr_bytes_policy_flip (addr allocId tag : Nat) (haddr : addr < 2 ^ 64) :
     let bs := encodeLittleEndianBytes addr 8 (some (allocId, tag))
@@ -2863,16 +2893,22 @@ theorem fa_composite_tuple_struct_policy_correspondence
       (resolveTyWithLocalDecls decls faPolicyLayouts faPolPtrUsizeTupTy) = some 16 := rfl
   have hSzMix : tyByteSize decls faPolicyLayouts
       (resolveTyWithLocalDecls decls faPolicyLayouts faPolMixedStructTy) = some 16 := rfl
-  have hUnifA : abstractBytesUniformProv bsA = true := by
-    simp [bsA, abstractBytesUniformProv, abstractBytesAllProvAux, Nat.beq_refl]
+  have hCohA : abstractBytesCoherentPtrProv? bsA =
+      some ({ allocId := pA.allocId, tag := pA.tag, byteIdx := 0, origOffset := normPtrByteOffset 8 pA.offsetBytes, ptrBytes := 8 } : PtrByteFrag) := by
+    simp [bsA, encodeLittleEndianBytes, MirSemantics.encodePtrBytes, encodePtrBytesAux,
+      abstractBytesCoherentPtrProv?, abstractBytesCoherentPtrProvAux, Nat.beq_refl]
+    rfl
   have hDecA := fc_decodeScalarBytes_encode (some (pA.allocId, pA.tag)) false 7 pA.offsetBytes
     (fc_lt_256_pow_8 hA)
   have hDecB := fc_decodeScalarBytes_encode (some (pB.allocId, pB.tag)) false 7 pB.offsetBytes
     (fc_lt_256_pow_8 hB)
+  have hBitsA : decodeLittleEndianBits bsA = some pA.offsetBytes :=
+    fa_decodeLittleEndianBits_of_decodeScalarBytes hDecA
   have hPtrA : decodePtrBytesNoForge false (.uint .u8) 8 bsA =
       some (.ptr { allocId := pA.allocId, offsetBytes := pA.offsetBytes } 8) := by
     dsimp only [decodePtrBytesNoForge]
-    rw [fc_seqLength_encodeLittleEndianBytes, Nat.beq_refl, hDecA, hUnifA]
+    rw [fc_seqLength_encodeLittleEndianBytes, hBitsA, hCohA]
+    rfl
   have hWrB : wrappingRangeContains { start := 0, end_ := 2 ^ (8 * 8) - 1 } pB.offsetBytes = true := by
     unfold wrappingRangeContains
     have h01 : Nat.ble 0 (2 ^ (8 * 8) - 1) = true := Nat.ble_eq.mpr (Nat.zero_le _)
@@ -2889,17 +2925,18 @@ theorem fa_composite_tuple_struct_policy_correspondence
       | some (sv, _) => some (Value.scalar sv) | none => none) = _
     rw [hDecB]
   have hMixA : ∀ pol, decodeScalarLayoutBytesNoForge
-      (.initialized (.pointer 0) { start := 0, end_ := 2 ^ (8 * 8) - 1 }) bsA pol =
+      (.initialized (.pointer 0) { start := 0, end_ := 2 ^ (8 * 8) - 1 }) bsA pol 8 =
       some (.ptr { allocId := pA.allocId, offsetBytes := pA.offsetBytes } 8) := fun _ => by
     dsimp only [decodeScalarLayoutBytesNoForge, scalarLayoutByteWidth]
-    rw [fc_seqLength_encodeLittleEndianBytes, Nat.beq_refl, hDecA, hUnifA]
+    rw [fc_seqLength_encodeLittleEndianBytes, hBitsA, hCohA]
+    rfl
   have hMixBS : decodeScalarLayoutBytesNoForge
-      (.initialized (.int 64 false) { start := 0, end_ := 2 ^ (8 * 8) - 1 }) bsB .strictUcg630Ub =
+      (.initialized (.int 64 false) { start := 0, end_ := 2 ^ (8 * 8) - 1 }) bsB .strictUcg630Ub 8 =
       none := by
     dsimp only [decodeScalarLayoutBytesNoForge, scalarLayoutByteWidth]
     rw [fc_seqLength_encodeLittleEndianBytes]
   have hMixBP : decodeScalarLayoutBytesNoForge
-      (.initialized (.int 64 false) { start := 0, end_ := 2 ^ (8 * 8) - 1 }) bsB .stripProvenance =
+      (.initialized (.int 64 false) { start := 0, end_ := 2 ^ (8 * 8) - 1 }) bsB .stripProvenance 8 =
       some (.scalar ⟨pB.offsetBytes, 8⟩) := by
     dsimp only [decodeScalarLayoutBytesNoForge, scalarLayoutByteWidth]
     rw [fc_seqLength_encodeLittleEndianBytes, Nat.beq_refl, hDecB]
@@ -2958,8 +2995,11 @@ theorem fa_provFree_policy_equivalence_correspondence
     change (match decodeScalarBytes (encodeLittleEndianBytes b64 8 none) false with | some (sv, _) => some (Value.scalar sv) | none => none) = _
     rw [fc_decodeScalarBytes_encode none false 7 b64 (fc_lt_256_pow_8 h64)]
   have hDecPtr : decodeTypedValueFromBytes defaultCodecFuel faPolicyLayouts faPolPtrTy (encodeLittleEndianBytes b64 8 none) .strictUcg630Ub = some (.scalar ⟨b64, 8⟩) := by
+    have hBits64 : decodeLittleEndianBits (encodeLittleEndianBytes b64 8 none) = some b64 :=
+      fa_decodeLittleEndianBits_of_decodeScalarBytes
+        (fc_decodeScalarBytes_encode none false 7 b64 (fc_lt_256_pow_8 h64))
     change decodePtrBytesNoForge false (.uint .u8) 8 (encodeLittleEndianBytes b64 8 none) = _
-    dsimp only [decodePtrBytesNoForge]; rw [fc_seqLength_encodeLittleEndianBytes, fc_decodeScalarBytes_encode none false 7 b64 (fc_lt_256_pow_8 h64)]
+    dsimp only [decodePtrBytesNoForge]; rw [fc_seqLength_encodeLittleEndianBytes, hBits64]; rfl
   have hDecI32 : decodeTypedValueFromBytes defaultCodecFuel faPolicyLayouts faPolI32Ty (encodeLittleEndianBytes b32 4 none) .strictUcg630Ub = some (.scalar ⟨b32, 4⟩) := by
     change (match decodeScalarBytes (encodeLittleEndianBytes b32 4 none) true with | some (sv, _) => some (Value.scalar sv) | none => none) = _
     rw [fc_decodeScalarBytes_encode none true 3 b32 (fc_lt_256_pow_4 h32)]
@@ -3064,9 +3104,13 @@ theorem fa_shared_ub_no_forge_both_policies
   have hDecRef : ∀ policy, decodeTypedValueFromBytes defaultCodecFuel faPolicyLayouts faPolRefU8Ty
       (encodeLittleEndianBytes addr 8 none) policy = none := by
     intro policy
+    have hBitsAddr : decodeLittleEndianBits (encodeLittleEndianBytes addr 8 none) = some addr :=
+      fa_decodeLittleEndianBits_of_decodeScalarBytes
+        (fc_decodeScalarBytes_encode none false 7 addr (fc_lt_256_pow_8 haddr))
     change decodePtrBytesNoForge true (.uint .u8) 8 (encodeLittleEndianBytes addr 8 none) = none
     dsimp only [decodePtrBytesNoForge]
-    rw [fc_seqLength_encodeLittleEndianBytes, fc_decodeScalarBytes_encode none false 7 addr (fc_lt_256_pow_8 haddr)]
+    rw [fc_seqLength_encodeLittleEndianBytes, hBitsAddr]
+    rfl
   have hResRef : resolveTyWithLocalDecls decls faPolicyLayouts faPolRefU8Ty = faPolRefU8Ty := rfl
   have hRefUb : ∀ policy,
       evalByteCast locals op64 faPolRefU8Ty mem decls faPolicyLayouts policy = .ub := by

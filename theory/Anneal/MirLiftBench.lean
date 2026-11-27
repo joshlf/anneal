@@ -6231,7 +6231,8 @@ theorem runMirToBlock_countToN_iter (n i : Nat) (hlt : i < n) (hn : n < 42949672
     simp [Anneal.MirLoops.countToNBody, Anneal.MirLoops.mkMirBody,
       Anneal.MirLoops.constU32, Trusted.Sequence.get?, evalStmt, evalOperand,
       readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?,
-      invalidateConflictingBorrows, hmod]
+      invalidateConflictingBorrows, placeTyResolved, placeTy, materializeReadPtrValue,
+      validateValueForTy?, hmod]
     rfl
   have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
       (Anneal.MirLoops.countStateMem 2 1 (i + 1) emptyMemory) =
@@ -6327,7 +6328,8 @@ theorem runMirToBlock_countToN_iter_initPureState (n i : Nat) (hlt : i < n) (hn 
     simp [Anneal.MirLoops.countToNBody, Anneal.MirLoops.mkMirBody,
       Anneal.MirLoops.constU32, Trusted.Sequence.get?, evalStmt, evalOperand,
       readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?,
-      invalidateConflictingBorrows, hmod]
+      invalidateConflictingBorrows, placeTyResolved, placeTy, materializeReadPtrValue,
+      validateValueForTy?, hmod]
     rfl
   have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
       ((countToNPureState 2 1 (i + 1)).toMachineState emptyMemory) =
@@ -6658,7 +6660,8 @@ theorem runMirToBlock_countToN_iter_sym (s₀ : LocalSlot) (n i : Nat) (hlt : i 
     simp [Anneal.MirLoops.countToNBody, Anneal.MirLoops.mkMirBody,
       Anneal.MirLoops.constU32, Trusted.Sequence.get?, evalStmt, evalOperand,
       readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?,
-      invalidateConflictingBorrows, hmod]
+      invalidateConflictingBorrows, placeTyResolved, placeTy, materializeReadPtrValue,
+      validateValueForTy?, hmod]
     rfl
   have hs3 : mirStep (Anneal.MirLoops.countToNBody n)
       ((countToNSymState s₀ 2 1 (i + 1)).toMachineState emptyMemory) =
@@ -6833,7 +6836,8 @@ theorem runMirToBlock_countToNWithTemp_iter (n i : Nat) (s₂ : LocalSlot)
         Anneal.MirLoops.constU32,
         Trusted.Sequence.get?, evalStmt, evalOperand,
         readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?,
-        invalidateConflictingBorrows, hmod]
+        invalidateConflictingBorrows, placeTyResolved, placeTy, materializeReadPtrValue,
+        validateValueForTy?, hmod]
       rfl
   have hs3 : mirStep (countToNWithTempBody n)
       ((countToNWithTempState 2 1 i (.init (.scalar ⟨i + 1, 4⟩))).toMachineState emptyMemory) =
@@ -7064,7 +7068,8 @@ theorem runMirToBlock_nestedCountToNM_inner_iter (n m acc i j : Nat)
     dsimp [nestedCountState, PureState.toMachineState, emptyMemory]
     simp [nestedCountToNMBody, Anneal.MirLoops.mkMirBody, Anneal.MirLoops.constU32,
       Trusted.Sequence.get?, evalStmt, evalOperand, readProjectedValue, evalRvalue,
-      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows, hmod]
+      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows,
+      placeTyResolved, placeTy, materializeReadPtrValue, validateValueForTy?, hmod]
     rfl
   have hs3 : mirStep (nestedCountToNMBody n m)
       ((nestedCountState 4 1 (acc + 1) i (.init (.scalar ⟨j, 4⟩))).toMachineState emptyMemory) =
@@ -7074,7 +7079,8 @@ theorem runMirToBlock_nestedCountToNM_inner_iter (n m acc i j : Nat)
     dsimp [nestedCountState, PureState.toMachineState, emptyMemory]
     simp [nestedCountToNMBody, Anneal.MirLoops.mkMirBody, Anneal.MirLoops.constU32,
       Trusted.Sequence.get?, evalStmt, evalOperand, readProjectedValue, evalRvalue,
-      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows, hmod]
+      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows,
+      placeTyResolved, placeTy, materializeReadPtrValue, validateValueForTy?, hmod]
     rfl
   have hs4 : mirStep (nestedCountToNMBody n m)
       ((nestedCountState 4 2 (acc + 1) i (.init (.scalar ⟨j + 1, 4⟩))).toMachineState emptyMemory) =
@@ -7115,7 +7121,8 @@ theorem runMirToBlock_nestedCountToNM_inner_to_outer (n m acc i : Nat)
     dsimp [nestedCountState, PureState.toMachineState, emptyMemory]
     simp [nestedCountToNMBody, Anneal.MirLoops.mkMirBody, Anneal.MirLoops.constU32,
       Trusted.Sequence.get?, evalStmt, evalOperand, readProjectedValue, evalRvalue,
-      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows, hmod]
+      evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows,
+      placeTyResolved, placeTy, materializeReadPtrValue, validateValueForTy?, hmod]
     rfl
   have hs3 : mirStep (nestedCountToNMBody n m)
       ((nestedCountState 5 1 acc (i + 1) (.init (.scalar ⟨m, 4⟩))).toMachineState emptyMemory) =
@@ -7262,7 +7269,8 @@ theorem selfLoopMir_incr_step (n i : Nat) (hi : i + 1 < 4294967296) :
   dsimp [countToNPureState, PureState.toMachineState, emptyMemory]
   simp [selfLoopMirBody, Anneal.MirLoops.mkMirBody, Anneal.MirLoops.constU32,
     Trusted.Sequence.get?, evalStmt, evalOperand, readProjectedValue, evalRvalue,
-    evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows, hmod]
+    evalConstValue, advanceStmt, Trusted.Sequence.set?, invalidateConflictingBorrows,
+    placeTyResolved, placeTy, materializeReadPtrValue, validateValueForTy?, hmod]
   rfl
 
 /-- **No overshoot on a live self-loop**: from the header `(bb1, 0)` the

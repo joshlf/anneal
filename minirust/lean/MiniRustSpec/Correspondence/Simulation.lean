@@ -727,9 +727,9 @@ private theorem opMoved_lt_of_operandOkB {layouts : Layout.LayoutTable} {decls :
   simp only [copyOp, operandOkB, Bool.and_eq_true, decide_eq_true_eq] at hok
   exact hok.1
 
-private theorem opMoved_lt_of_operandOkO {decls : List LocalDecl}
+private theorem opMoved_lt_of_operandOkO {layouts : Layout.LayoutTable} {decls : List LocalDecl}
     {op : Operand} {j : Nat} (hop : opMoved op = some j)
-    (hok : operandOkO decls (copyOp op) = true) : j < decls.length := by
+    (hok : operandOkO decls (copyOp op) layouts = true) : j < decls.length := by
   rw [opMoved_eq_move hop] at hok
   simp only [copyOp, operandOkO, Bool.and_eq_true, decide_eq_true_eq] at hok
   exact hok.1
@@ -4385,7 +4385,7 @@ private theorem findDeclOrContainerElemTyWithKind?_intKind
   | some dt => rw [hf] at h; simp only [Option.some.injEq] at h; subst h; exact hd decls hf
   | none => rw [hf] at h; exact hc decls h
 
-private theorem resolveProjectedTyResolved_allFields_kind
+private theorem resolveProjectedTyResolved_allFields_kind'
     (decls : List LocalDecl) (layouts : Layout.LayoutTable) :
     ∀ {projs : List ProjectionElem}, allFields projs = true →
       ∀ (bTy1 bTy2 : MirAst.Ty), bTy1.kind = bTy2.kind →
@@ -4406,6 +4406,42 @@ private theorem resolveProjectedTyResolved_allFields_kind
       apply ih hall _ ft
       repeat (first | rfl | exact resolveTyWithLocalDecls_kind decls layouts ft | split)
     | _ => simp [allFields] at hall
+
+private theorem validateValueForTy?_deref_scalar_of_ptrPointeeOf
+    (decls : List LocalDecl) (layouts : Layout.LayoutTable)
+    {p : Nat} {dp pTy : MirAst.Ty} {declP : LocalDecl} {m : MirAst.Mutability} {it : Gen.IntType}
+    (hdp : decls[p]? = some declP) (hdty : declP.ty = dp)
+    (hp_pt : ptrPointeeOf dp = some (m, it))
+    (hpty : MirSemantics.placeTyResolved decls layouts ⟨p, [.deref]⟩ = some pTy)
+    (sc : ScalarInt) :
+    MirSemantics.validateValueForTy? layouts
+      (some (MirSemantics.resolveTyWithLocalDecls decls layouts pTy)) (.scalar sc) = true := by
+  have hp_int : (intTyBytes pTy.kind).isSome = true := by
+    simp only [MirSemantics.placeTyResolved, get?, hdp, hdty,
+      MirSemantics.resolveProjectedTyResolved] at hpty
+    unfold ptrPointeeOf at hp_pt
+    cases hk : dp.kind with
+    | rawPtr _ inner | ref _ inner =>
+      rw [hk] at hp_pt
+      have hek : (intTyBytes inner).isSome = true := by
+        cases htb : intTyBytes inner <;> simp [htb] at hp_pt ⊢
+      simp only [MirSemantics.pointeeTyOf, hk] at hpty
+      cases hfd : MirSemantics.findDeclOrContainerElemTyWithKind? decls layouts inner with
+      | some resTy =>
+        simp only [hfd, MirSemantics.resolveProjectedTyResolved, Option.some.injEq] at hpty
+        subst hpty
+        exact findDeclOrContainerElemTyWithKind?_intKind decls layouts hek hfd
+      | none =>
+        simp only [hfd] at hpty
+        split at hpty
+        · split at hpty <;> (simp only [MirSemantics.resolveProjectedTyResolved, Option.some.injEq] at hpty; subst hpty; exact hek)
+        · simp only [MirSemantics.resolveProjectedTyResolved, Option.some.injEq] at hpty; subst hpty; exact hek
+    | _ => rw [hk] at hp_pt; simp at hp_pt
+  have hrk : (intTyBytes (MirSemantics.resolveTyWithLocalDecls decls layouts pTy).kind).isSome = true := by
+    rw [resolveTyWithLocalDecls_kind]; exact hp_int
+  cases hk : (MirSemantics.resolveTyWithLocalDecls decls layouts pTy).kind <;>
+    simp [intTyBytes, hk] at hrk <;>
+    simp [MirSemantics.validateValueForTy?, MirSemantics.validateValueForTyAux, hk]
 
 private theorem isElemPtrAtZero_false_of_scalar_read
     (decls : List LocalDecl) (layouts : Layout.LayoutTable) (locals : List LocalSlot)
@@ -4544,7 +4580,7 @@ private theorem isElemPtrAtZero_false_of_scalar_read
     · have hkind_map : (MirSemantics.placeTyResolved decls layouts
           ⟨entry.targetLocal, .field idx fTy :: rest⟩).map (·.kind) = some leafTy.kind := by
         simp only [MirSemantics.placeTyResolved, get?, hdk]
-        rw [resolveProjectedTyResolved_allFields_kind decls layouts hall dk.ty dk.ty rfl, hleaf]
+        rw [resolveProjectedTyResolved_allFields_kind' decls layouts hall dk.ty dk.ty rfl, hleaf]
         rfl
       cases hplr : MirSemantics.placeTyResolved decls layouts
           ⟨entry.targetLocal, .field idx fTy :: rest⟩ with
@@ -4747,14 +4783,19 @@ private theorem evalOperand_deref_eq_target_typed {body : CapturedMir}
   have hrhs : evalOperand locals (.copy ⟨entry.targetLocal, entry.targetProjection⟩)
       mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls =
       .ok (.scalar sc) locals := by
+    have hvalTarget := validateValueForTy?_scalar_of_ptrTargetSpec htspec sc
     cases hproj : entry.targetProjection with
     | nil =>
-      rw [hproj] at hrd
+      rw [hproj] at hrd hvalTarget
       have hrootEq : targetRootVal = .scalar sc := by
         cases hU : valueContainsUninit targetRootVal <;> simp [readProjectedValue, hU] at hrd
         exact hrd
       subst hrootEq
-      simp [evalOperand, get?, ht, readProjectedValue]
+      rw [evalOperand_copy_nonDeref locals ⟨entry.targetLocal, []⟩ (fun _ h => nomatch h)
+        mem.borrows mem.globals body.layouts mem.callerLocals body.localDecls (hproj ▸ hnu)]
+      simp only [get?, ht, readProjectedValue]
+      exact evalOperand_post_read_ok body.layouts body.localDecls ⟨entry.targetLocal, []⟩
+        (.scalar sc) locals (materializeReadPtrValue_scalar body.layouts _ sc) hvalTarget
     | cons ph pt =>
       have hnd : ∀ rest, (ph :: pt) ≠ .deref :: rest := by
         intro rest hr
@@ -4762,8 +4803,10 @@ private theorem evalOperand_deref_eq_target_typed {body : CapturedMir}
         simp [ptrTargetSpec] at htspec
       rw [evalOperand_copy_nonDeref locals ⟨entry.targetLocal, ph :: pt⟩ hnd mem.borrows
         mem.globals body.layouts mem.callerLocals body.localDecls (hproj ▸ hnu)]
-      rw [hproj] at hrd
-      simp [get?, ht, hrd]
+      rw [hproj] at hrd hvalTarget
+      simp only [get?, ht, hrd]
+      exact evalOperand_post_read_ok body.layouts body.localDecls ⟨entry.targetLocal, ph :: pt⟩
+        (.scalar sc) locals (materializeReadPtrValue_scalar body.layouts _ sc) hvalTarget
   rw [hrhs]
   have hextract : MirSemantics.extractScalarSlice? sc 0 pointeeIt.size.bytes = some sc := by
     unfold MirSemantics.extractScalarSlice?
@@ -4775,10 +4818,8 @@ private theorem evalOperand_deref_eq_target_typed {body : CapturedMir}
     rw [hb1, hb2]
   have hval_ok : MirSemantics.validateValueForTy? body.layouts
       (some (MirSemantics.resolveTyWithLocalDecls body.localDecls body.layouts pTy))
-      (.scalar sc) = true := by
-    rcases hr : MirSemantics.resolveTyWithLocalDecls body.localDecls body.layouts pTy with ⟨rk, rl⟩
-    simp only [hr] at hnot_bad
-    cases rk <;> simp_all [MirSemantics.validateValueForTy?]
+      (.scalar sc) = true :=
+    validateValueForTy?_deref_scalar_of_ptrPointeeOf body.localDecls body.layouts hdp rfl hp_pt hpty sc
   unfold evalOperand
   dsimp only [get?]
   rw [hp]
@@ -4854,7 +4895,7 @@ private theorem writePlaceValue_deref_of_ptrTargetSpec {body : CapturedMir}
         writeProjectedValue locals rootVal (ph :: pt) (.scalar wSc) = .ok w) :
     writePlaceValue locals borrows ⟨p, [.deref]⟩ (.scalar wSc) body.localDecls body.layouts =
       .ok (locals.set entry.targetLocal (.init w)) := by
-  obtain ⟨pTy, hpty, _, _, _, hnot_bad, halign_all⟩ :=
+  obtain ⟨pTy, hpty, hsc_bytes, _, _, hnot_bad, halign_all⟩ :=
     ptrDeclLayoutsOk_ptr_spec hdlo hdp hp_pt
   obtain ⟨dk, oldSc, hdk, hvsh, hold_sz, hpos, hrd⟩ :=
     readProjectedValue_scalar_of_ptrTargetSpec hdeclsOk hslots htspec ht
@@ -4873,10 +4914,8 @@ private theorem writePlaceValue_deref_of_ptrTargetSpec {body : CapturedMir}
     placeTouchesUnion_false_of_inFragment (.inr (.inr (.inr (by simp [htspec]))))
   have hval_ok : MirSemantics.validateValueForTy? body.layouts
       (some (MirSemantics.resolveTyWithLocalDecls body.localDecls body.layouts pTy))
-      (.scalar wSc) = true := by
-    rcases hr : MirSemantics.resolveTyWithLocalDecls body.localDecls body.layouts pTy with ⟨rk, rl⟩
-    simp only [hr] at hnot_bad
-    cases rk <;> simp_all [MirSemantics.validateValueForTy?]
+      (.scalar wSc) = true :=
+    validateValueForTy?_deref_scalar_of_ptrPointeeOf body.localDecls body.layouts hdp rfl hp_pt hpty wSc
   have hsplice : MirSemantics.spliceScalarSlice? oldSc 0 wSc = some wSc := by
     unfold MirSemantics.spliceScalarSlice?
     have hb1 : Bool.and (Nat.ble 1 wSc.sizeBytes)
@@ -6780,7 +6819,7 @@ theorem step_correspondence_NF (body : CapturedMir) (f : Gen.Function) (hfrag : 
       obtain ⟨hAok, hAnone⟩ := evalRelOperand_frag body.localDecls s.frame.locals hslotsA hnA
         (copyOp discr) hokT s.memory.borrows s.memory.globals s.memory.callerLocals
       have hdeq := evalOperand_decls_eq_nil_of_RelOperandOk (callStack := s.memory.callStack)
-        body.localDecls s.frame.locals
+        body.localDecls s.frame.locals hslotsA hnA
         (copyOp discr) hokT s.memory.borrows s.memory.globals s.memory.callerLocals
       have hmove := evalOperand_move s.frame.locals discr hsimple s.memory.borrows s.memory.globals
         body.layouts s.memory.callerLocals []
@@ -10536,7 +10575,7 @@ theorem multi_step_correspondence (entry : CapturedMir) (callees : List Captured
         obtain ⟨hAok, hAnone⟩ := evalRelOperand_frag curBody.localDecls s.frame.locals hslotsA hnA
           (copyOp discr) hokT s.memory.borrows s.memory.globals s.memory.callerLocals
         have hdeq := evalOperand_decls_eq_nil_of_RelOperandOk (callStack := s.memory.callStack)
-          curBody.localDecls s.frame.locals
+          curBody.localDecls s.frame.locals hslotsA hnA
           (copyOp discr) hokT s.memory.borrows s.memory.globals s.memory.callerLocals
         have hmove := evalOperand_move s.frame.locals discr hsimple s.memory.borrows
           s.memory.globals curBody.layouts s.memory.callerLocals [] s.memory.callStack
@@ -15977,18 +16016,19 @@ theorem BorrowsOk.entry_rangeLen_zero {body : CapturedMir} {ctx : Ctx}
 
 private theorem tyByteSize_of_intTypeOf (decls : List LocalDecl) (layouts : Layout.LayoutTable)
     {ty : MirAst.Ty} {it : Gen.IntType} (hit : intTypeOf ty = some it) :
-    MirSemantics.tyByteSize decls layouts ty = some it.size.bytes ∧
-      it.size.bytes ≤ 16 := by
+    ∃ sz, MirSemantics.tyByteSize decls layouts ty = some sz ∧ sz ≤ 16 := by
   have hk : (MirSemantics.resolveTyWithLocalDecls decls layouts ty).kind = ty.kind :=
     resolveTyWithLocalDecls_kind decls layouts ty
   unfold MirSemantics.tyByteSize MirSemantics.tyByteSizeAndAlignAux
   cases htk : ty.kind with
   | uint w =>
-    cases w <;> simp [intTypeOf, intTyBytes, htk] at hit <;> subst hit <;>
-      simp [hk, htk, MirSemantics.rigidTyByteSize, MirSemantics.intCastTargetBytes]
+    cases w <;> cases h4 : Nat.beq (MirSemantics.layoutPointerBytes layouts) 4 <;>
+      (simp only [hk, htk, h4, MirSemantics.rigidTyByteSize, MirSemantics.intCastTargetBytes];
+       exact ⟨_, rfl, by decide⟩)
   | int w =>
-    cases w <;> simp [intTypeOf, intTyBytes, htk] at hit <;> subst hit <;>
-      simp [hk, htk, MirSemantics.rigidTyByteSize, MirSemantics.intCastTargetBytes]
+    cases w <;> cases h4 : Nat.beq (MirSemantics.layoutPointerBytes layouts) 4 <;>
+      (simp only [hk, htk, h4, MirSemantics.rigidTyByteSize, MirSemantics.intCastTargetBytes];
+       exact ⟨_, rfl, by decide⟩)
   | _ => simp [intTypeOf, intTyBytes, htk] at hit
 
 /-- Exact intra-page span bound (`bOff + bound < 65536`) for any borrow entry `b`
@@ -16057,7 +16097,7 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
     have hpl_root : MirSemantics.placeTyResolved body.localDecls body.layouts ⟨b.targetLocal, []⟩ =
         some dk.ty := by
       simp [MirSemantics.placeTyResolved, get?, hdk, MirSemantics.resolveProjectedTyResolved]
-    obtain ⟨hsz, hle16⟩ := tyByteSize_of_intTypeOf body.localDecls body.layouts hit
+    obtain ⟨sz, hsz, hle16⟩ := tyByteSize_of_intTypeOf body.localDecls body.layouts hit
     cases had : b.allocDead with
     | true =>
       refine ⟨0, hboff, ?_, by omega⟩
@@ -16066,7 +16106,7 @@ theorem ptrTargetPlaceSpan_lt_page {body : CapturedMir}
       rw [had] at hlk_self
       rw [hlk_self]
     | false =>
-      refine ⟨bIt.size.bytes, hboff, ?_, by omega⟩
+      refine ⟨sz, hboff, ?_, by omega⟩
       unfold MirSemantics.ptrAllocByteBound?
       dsimp only [emptyMemory]
       rw [had] at hlk_self

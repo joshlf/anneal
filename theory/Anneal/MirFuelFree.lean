@@ -10780,7 +10780,7 @@ def copyWriteDstVal
     (dstLoc : Local) (dstTag : Nat) (newVal : Value)
     (localDecls : List LocalDecl := .nil) (layouts : LayoutTable := emptyLayoutTable) :
     MirStepNode :=
-  match writePlaceValue locals₃ s.memory.borrows dstPlace newVal localDecls layouts with
+  match writePlaceValueUntyped locals₃ s.memory.borrows dstPlace newVal localDecls layouts with
   | .ok locals₄ =>
     let borrows' := invalidateConflictingBorrows s.memory.borrows dstLoc (.some dstTag) (length s.memory.callStack)
     MirStepNode.step (advanceStmt s locals₄ { s.memory with borrows := borrows' })
@@ -10845,8 +10845,48 @@ def evalCopyNonOverlappingPermOk
       s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
       srcUnionOpt dstUnionOpt n locals₃
   | false =>
+    let elemSzOpt : Option Nat :=
+      copyPointeeByteSize?
+        localDecls
+        layouts
+        (operandPointeeTy localDecls layouts src)
+        (operandPointeeTy localDecls layouts dst)
+    let srcPlaceSizeMismatch : Bool :=
+      match elemSzOpt, get? locals₃ srcEntry.targetLocal with
+      | .some eSz, .some _ =>
+        match
+          placeTyResolved
+            localDecls
+            layouts
+            { local_ := srcEntry.targetLocal, projection := srcEntry.targetProjection }
+        with
+        | .some sPlaceTy =>
+          match tyByteSize localDecls layouts sPlaceTy with
+          | .some pSz => Bool.not (Nat.beq pSz eSz)
+          | .none => false
+        | .none => false
+      | _, _ => false
+    let dstPlaceSizeMismatch : Bool :=
+      match elemSzOpt, get? locals₃ dstEntry.targetLocal with
+      | .some eSz, .some _ =>
+        match
+          placeTyResolved
+            localDecls
+            layouts
+            { local_ := dstEntry.targetLocal, projection := dstEntry.targetProjection }
+        with
+        | .some dPlaceTy =>
+          match tyByteSize localDecls layouts dPlaceTy with
+          | .some pSz => Bool.not (Nat.beq pSz eSz)
+          | .none => false
+        | .none => false
+      | _, _ => false
     let isSingleDirect :=
-      Bool.and (Nat.beq n 1) (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+      Bool.and
+        (Nat.beq n 1)
+        (Bool.and
+          (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+          (Bool.and (Bool.not srcPlaceSizeMismatch) (Bool.not dstPlaceSizeMismatch)))
     match isSingleDirect with
     | true =>
       evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃

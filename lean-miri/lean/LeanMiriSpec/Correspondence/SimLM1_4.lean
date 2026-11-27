@@ -85,6 +85,7 @@ inductive WellTypedLM1_4Stmt (body : CapturedMir)
       (translateTy srcDecl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO →
       IsImmediateFrameLocal topFrame srcIdx →
       IsImmediateFrameLocal topFrame dstIdx →
+      (hImmValid : IsScalarOrPtrTyKind srcDecl.ty.kind = true := by decide) →
       WellTypedLM1_4Stmt body topFrame
         ⟨.assign ⟨dstIdx, .nil⟩ (.use (.move ⟨srcIdx, .nil⟩)), span⟩
 
@@ -653,7 +654,7 @@ theorem evalOperand_move_simulation
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   simp only [hbb, hstmt]
   cases hwt topFrame hframes with
-  | assignMove _ _ dstDecl srcDecl _ hdecl_dst hdecl_src hty hsz himm_src himm_dst =>
+  | assignMove _ _ dstDecl srcDecl _ hdecl_dst hdecl_src hty hsz himm_src himm_dst hkind =>
     -- `annealEvalPlace` memoizes the destination layout.
     obtain ⟨_, mls_dst0, _, hlt_dst0, _, hmls_opt, hmls_eq0, hloc_dst0⟩ :=
       hframe.lookup_local hdecl_dst
@@ -820,8 +821,11 @@ theorem evalOperand_move_simulation
             rw [hbor, hcaller, evalOperand_borrows_nil_callStack_eq]
             have hop_ok : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil
                 s.memory.globals body.layouts .nil body.localDecls =
-                .ok v (s.frame.locals.set srcIdx .uninit) := by
-              simp [evalOperand, readProjectedValue, himmRel.valueContainsUninit_eq_false, hslot_src, set?_eq_some_set hlt_af_src]
+                .ok v (s.frame.locals.set srcIdx .uninit) :=
+              evalOperand_move_root_of_readValid hslot_src himmRel.valueContainsUninit_eq_false
+                (set?_eq_some_set hlt_af_src .uninit) hdecl_src
+                (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz hkind hrk).1)
+                (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz hkind hrk).2)
             rw [hop_ok]
             dsimp only
             rw [hval_ok]

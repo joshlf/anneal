@@ -2603,7 +2603,7 @@ def provGlobalMem : Memory := { globals := [provGlobalAlloc] }
    relocation table that desynchronises the view from trusted semantics. -/
 theorem canary3a_provenance_failClosed :
     (∃ bs, globalAllocSliceToAbstractBytes provGlobalAlloc 0 4 = some bs ∧
-      bs.all (fun b => match b with | .init _ (some (7, _)) => true | _ => false) = true) ∧
+      bs.all (fun b => match b with | .init _ (some f) => f.allocId == 7 | _ => false) = true) ∧
     globalAllocSliceToAbstractBytes provGlobalAlloc 8 4 =
       some (List.replicate 4 (.init 0 none)) ∧
     (⟨9, 0, 4⟩ : ByteSubLens Nat).get provGlobalMem = none ∧
@@ -2715,7 +2715,7 @@ theorem canary3a_byteMem_provenance_and_sliceTypedAt
   have hOldLen : (mCodec.codec.encode oldVal).length = 4 := mCodec.codec.encode_len oldVal
   have hBmLen : bm.length = 12 := by simp [bm, hPtrLen, hOldLen]
   -- 1. `ptrLens4.getVal strictU32 bm = none` because byte 0 carries `some prov`
-  have hPtr4Get : ptrLens4.get bm = some (encodeLittleEndianBytes ptrLo.toNat 4 (some prov)) := by
+  have hPtr4Get : ptrLens4.get bm = some (ptrBytes.take 4) := by
     rw [ByteSubLens.get_of_pos bm (by decide)]
     dsimp only [ByteStoreOps.readBytes?, ptrLens4]
     rw [hBmLen]
@@ -4002,7 +4002,7 @@ private theorem writeU32Slice_entry_to_stmt14 (fatVal : Value) (v : UInt32) (m :
       (writeU32Stmt14State fatVal v m) := by
   rcases m with ⟨mNextAlloc, mGlobals, mBorrows, mNextTag, mCallees, mTraitImpls,
     mCallStack, mActiveCallee, mActiveProtectors, mNextProtector, mCallerLocals,
-    mFnPtrs, mExposed⟩
+    mFnPtrs, mExposed, mUnwind⟩
   dsimp only at hAc hCs hPr hCa hFlat ⊢
   subst hAc hCs hPr hCa
   let m : Memory :=
@@ -4010,7 +4010,7 @@ private theorem writeU32Slice_entry_to_stmt14 (fatVal : Value) (v : UInt32) (m :
       nextTag := mNextTag, callees := [], traitImpls := mTraitImpls,
       callStack := [], activeCallee := none, activeProtectors := [],
       nextProtector := mNextProtector, callerLocals := mCallerLocals,
-      fnPtrs := mFnPtrs, exposedAllocIds := mExposed }
+      fnPtrs := mFnPtrs, exposedAllocIds := mExposed, rootUnwindCeiling := mUnwind }
   let b0 := wrapScalarBits v.toNat (scalarModulus 1)
   let s1 := wrapScalarBits (shiftRightUnsignedBits v.toNat 8) (scalarModulus 4)
   let b1 := wrapScalarBits s1 (scalarModulus 1)
@@ -4250,7 +4250,7 @@ theorem writeU32Slice_mutSummaryOutcomeCut :
       rcases hM'Eq with ⟨cl', hSetCl, hM'⟩
       rcases m with ⟨mNextAlloc, mGlobals, mBorrows, mNextTag, mCallees, mTraitImpls,
         mCallStack, mActiveCallee, mActiveProtectors, mNextProtector, mCallerLocals,
-        mFnPtrs, mExposed⟩
+        mFnPtrs, mExposed, mUnwind⟩
       dsimp only at hAc hCs hPr hCa hDisj hFindE hMemE hGetSlot hBound hFlat hSetCl hM' ⊢
       subst hAc hCs hPr hCa
       let m : Memory :=
@@ -4258,7 +4258,7 @@ theorem writeU32Slice_mutSummaryOutcomeCut :
           nextTag := mNextTag, callees := [], traitImpls := mTraitImpls,
           callStack := [], activeCallee := none, activeProtectors := [],
           nextProtector := mNextProtector, callerLocals := mCallerLocals,
-          fnPtrs := mFnPtrs, exposedAllocIds := mExposed }
+          fnPtrs := mFnPtrs, exposedAllocIds := mExposed, rootUnwindCeiling := mUnwind }
       subst hM'
       let fatVal : Value := .aggregate 0 [.ptr ⟨e.tag, L.offset⟩ 8, .scalar ⟨4, 8⟩]
       let b0 := wrapScalarBits v.toNat (scalarModulus 1)
@@ -4462,7 +4462,7 @@ theorem writePaddedPairSlice_mutSummaryOutcomeCut :
       rcases hM'Eq with ⟨cl', hSetCl, hM'⟩
       rcases m with ⟨mNextAlloc, mGlobals, mBorrows, mNextTag, mCallees, mTraitImpls,
         mCallStack, mActiveCallee, mActiveProtectors, mNextProtector, mCallerLocals,
-        mFnPtrs, mExposed⟩
+        mFnPtrs, mExposed, mUnwind⟩
       dsimp only at hAc hCs hPr hCa hDisj hFindE hMemE hGetSlot hBound hFlat hSetCl hM' ⊢
       subst hAc hCs hPr hCa
       let m : Memory :=
@@ -4470,7 +4470,7 @@ theorem writePaddedPairSlice_mutSummaryOutcomeCut :
           nextTag := mNextTag, callees := [], traitImpls := mTraitImpls,
           callStack := [], activeCallee := none, activeProtectors := [],
           nextProtector := mNextProtector, callerLocals := mCallerLocals,
-          fnPtrs := mFnPtrs, exposedAllocIds := mExposed }
+          fnPtrs := mFnPtrs, exposedAllocIds := mExposed, rootUnwindCeiling := mUnwind }
       subst hM'
       let fatVal : Value := .aggregate 0 [.ptr ⟨e.tag, L.offset⟩ 8, .scalar ⟨8, 8⟩]
       let bf := wrapScalarBits (if flag then 1 else 0) (scalarModulus 1)
@@ -4509,10 +4509,13 @@ theorem writePaddedPairSlice_mutSummaryOutcomeCut :
           (mkSt12 1 m .uninit .uninit .dead .dead .dead .dead .dead .dead .dead) =
           .cont (mkSt12 2 m .uninit (.init (.scalar ⟨bf, 1⟩))
             .dead .dead .dead .dead .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt12 2
-          { m with borrows := invalidateConflictingBorrows mBorrows 4 none 0 }
-          .uninit (.init (.scalar ⟨bf, 1⟩)) .dead .dead .dead .dead .dead .dead .dead) = _
-        rw [hBorEq 4 (by decide)]
+        have hstep1 : Anneal.PureMirExec.mirStep writePaddedPairSliceBody
+            (mkSt12 1 m .uninit .uninit .dead .dead .dead .dead .dead .dead .dead) =
+            .cont (mkSt12 2 { m with borrows := invalidateConflictingBorrows mBorrows 4 none 0 }
+              .uninit (.init (.scalar ⟨bf, 1⟩)) .dead .dead .dead .dead .dead .dead .dead) := by
+          dsimp only [mkSt12, bf]
+          cases flag <;> rfl
+        rw [hstep1, hBorEq 4 (by decide)]
       have hs2 : Anneal.PureMirExec.mirStep writePaddedPairSliceBody
           (mkSt12 2 m .uninit (.init (.scalar ⟨bf, 1⟩))
             .dead .dead .dead .dead .dead .dead .dead) =

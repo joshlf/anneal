@@ -2424,28 +2424,43 @@ private theorem ptrAlloc_readTargetUInt_any (arr : Array UInt8) (hn : arr.size â
     have hlt_a : i < arr.size := by rw [hlen]; exact hi
     simp [Nat.zero_add, Array.getElem?_eq_getElem hlt_a, pure, Except.pure]
 
-private theorem encodeLittleEndianBytes_eq_leBytesList (x n : Nat) :
-    encodeLittleEndianBytes x n none =
+private theorem encodePlainLittleEndianBytes_eq_leBytesList (x n : Nat) :
+    encodePlainLittleEndianBytes x n =
       (leBytesList x n).map (fun b => AbstractByte.init b none) := by
   induction n generalizing x with
   | zero => rfl
   | succ n ih =>
     rw [leBytesList_succ, List.map_cons]
-    dsimp only [encodeLittleEndianBytes]
+    dsimp only [encodePlainLittleEndianBytes]
     have hdiv : Nat.div x 256 = x / 256 := rfl
     rw [hdiv, ih (x / 256)]
     congr 2
     apply UInt8.toNat_inj.mp
     simp [UInt8.toNat_ofNat']
 
-private theorem decodeLittleEndianBytes_map_init (bs : List UInt8) :
-    decodeLittleEndianBytes (bs.map (fun b => AbstractByte.init b none)) =
-      some (leListVal bs, none) := by
+private theorem encodeLittleEndianBytes_eq_leBytesList (x n : Nat) :
+    encodeLittleEndianBytes x n none =
+      (leBytesList x n).map (fun b => AbstractByte.init b none) :=
+  encodePlainLittleEndianBytes_eq_leBytesList x n
+
+private theorem decodeLittleEndianBits_map_init (bs : List UInt8) :
+    decodeLittleEndianBits (bs.map (fun b => AbstractByte.init b none)) =
+      some (leListVal bs) := by
   induction bs with
   | nil => rfl
   | cons b bs ih =>
-    dsimp only [List.map, decodeLittleEndianBytes]
+    dsimp only [List.map, decodeLittleEndianBits]
     rw [ih]
+    rfl
+
+private theorem decodeLittleEndianBytes_map_init (bs : List UInt8) :
+    decodeLittleEndianBytes (bs.map (fun b => AbstractByte.init b none)) =
+      some (leListVal bs, none) := by
+  cases bs with
+  | nil => rfl
+  | cons b bs =>
+    unfold decodeLittleEndianBytes
+    rw [decodeLittleEndianBits_map_init (b :: bs)]
     rfl
 
 private theorem writeAbstractBytesAt_map_init (bs ws : List UInt8) (off : Nat)

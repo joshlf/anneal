@@ -22,8 +22,8 @@ theorem readAssertCondition_simulation
   intro m_res a_res
   have hop_sim := evalOperand_scalar_simulation hframes hframe hop s.memory.globals none
   have hld_eq : evalOperand s.frame.locals cond .nil s.memory.globals body.layouts .nil body.localDecls =
-      evalOperand s.frame.locals cond .nil s.memory.globals body.layouts .nil := by
-    cases hop <;> rfl
+      evalOperand s.frame.locals cond .nil s.memory.globals body.layouts .nil :=
+    hop.evalOperand_localDecls_eq_of_frameRel hframe .nil s.memory.globals .nil .nil
   rw [hld_eq] at hop_sim
   dsimp only [m_res, a_res]
   generalize ha_eval : evalOperand s.frame.locals cond .nil s.memory.globals body.layouts .nil = aRes at hop_sim

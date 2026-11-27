@@ -289,7 +289,7 @@ theorem witness1b_byterun_repeat_u16x4_mir_wp_converges (x : Nat) (hLt : x < 655
     let ms0 : MachineState :=
       { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.scalar ⟨x, 2⟩)] }
         memory := {} }
-    let elemRuns : List (ByteRun (Nat × Nat)) :=
+    let elemRuns : List (ByteRun PtrByteFrag) :=
       [.initPlain [UInt8.ofNat x, UInt8.ofNat (x / 256)]]
     let expectedBytes := flattenByteRuns abstractByteRunCodec (repeatByteRuns 4 elemRuns)
     let m0 : V2026ByteMem :=
@@ -2790,7 +2790,7 @@ theorem neg4_spatialMem_uninit_prov_strip_forgery_and_pinned_write_blocked :
       reabsorbPaddedFromMem provPtrBodyCtx 0 { stPinned with mem := mStripped } = .fail) ∧
     valAndBytesMatchTargetSpec false u8U32BodyCtx.body.layouts u32TargetSpec
       (.scalar ⟨42, 4⟩)
-      [.init 42 (some (7, 7)), .init 0 none, .init 0 none, .init 0 none] = false ∧
+      [.init 42 (some ⟨7, 7, 0, 42, 8⟩), .init 0 none, .init 0 none, .init 0 none] = false ∧
     -- 3. Unauthenticated `BodySpatialCtx` & `.ref` target rejected, plus pinned pure-write blocking
     (bodySpatialCtxWf
       { body := { u8U32SampleBody with layouts := { pointerBits := 64, isLittleEndian := true, entries := [] } }

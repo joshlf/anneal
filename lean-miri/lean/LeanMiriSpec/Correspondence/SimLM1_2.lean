@@ -965,8 +965,8 @@ theorem step_terminator_switchInt_simulation
   have hop_sim := evalOperand_scalar_simulation hframes hframe (hdiscr topFrame hframes)
     s.memory.globals none
   have hld_eq : evalOperand s.frame.locals discr .nil s.memory.globals body.layouts .nil body.localDecls =
-      evalOperand s.frame.locals discr .nil s.memory.globals body.layouts .nil := by
-    cases (hdiscr topFrame hframes) <;> rfl
+      evalOperand s.frame.locals discr .nil s.memory.globals body.layouts .nil :=
+    (hdiscr topFrame hframes).evalOperand_localDecls_eq_of_frameRel hframe .nil s.memory.globals .nil .nil
   rw [hld_eq] at hop_sim
   have hm_term : translateTerminator bb.terminator =
       { sourceInfo := defaultSourceInfo,
@@ -1108,7 +1108,7 @@ theorem evalOperand_scalar_simulation_opTy
     conv => rhs; rw [← hsame]
     exact .ok (.scalar sc) af.locals topFrame (.scalar (.fromScalarInt msc))
       hframe (.scalar sc msc hrel hlaysz hbool hchar) (fun _ h => h) rfl (fun hdisj => hdisj)
-  | copyLocal idx decl hdecl hsz_nz himm =>
+  | copyLocal idx decl hdecl hsz_nz himm hkind =>
     obtain ⟨slot, mls, _, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
     have hcache := hloc.layout_eq
     have himm' := himm mls hmls
@@ -1129,8 +1129,10 @@ theorem evalOperand_scalar_simulation_opTy
         rw [ha, annealEvalOperand_copy_live hframes hlt_mf hdecl hmls_eq hcache]
         exact .uninit _
       · have ha : evalOperand af.locals (.copy ⟨idx, .nil⟩) .nil globals body.layouts .nil body.localDecls =
-            .ok v af.locals := by
-          simp [evalOperand, readProjectedValue, hslot, himmRel.valueContainsUninit_eq_false]
+            .ok v af.locals :=
+          evalOperand_copy_root_of_readValid hslot himmRel.valueContainsUninit_eq_false hdecl
+            (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz_nz hkind hrk).1)
+            (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz_nz hkind hrk).2)
         rw [ha, annealEvalOperand_copy_live hframes hlt_mf hdecl hmls_eq hcache]
         exact .ok v af.locals
           (cacheFrameLocalLayout topFrame idx hlt_mf (translateTy decl.ty body.layouts)) imm

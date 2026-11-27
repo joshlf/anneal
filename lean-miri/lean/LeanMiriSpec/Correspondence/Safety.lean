@@ -3050,7 +3050,7 @@ theorem switchInt_step_cases
   have hA := stepMirFn_at_terminator (body := body) hcal hphase hbb hstmt_none hstmt_len
   have hop_sim := evalOperand_scalar_simulation hframes hframe (hdiscr topFrame hframes)
     s.memory.globals none
-  rw [(hdiscr topFrame hframes).evalOperand_localDecls_eq] at hop_sim
+  rw [(hdiscr topFrame hframes).evalOperand_localDecls_eq_of_frameRel hframe .nil s.memory.globals .nil .nil] at hop_sim
   have hm_term : translateTerminator bb.terminator =
       { sourceInfo := defaultSourceInfo,
         kind := .SwitchInt (translateOperand discr) (translateSwitchTargets targets) } := by
@@ -3212,7 +3212,7 @@ theorem readAssertCondition_full
       ∃ m' msg, (annealTerminatorHooks body.localDecls body.layouts).readAssertCondition ()
           (translateOperand cond) m = (m', .error (.undefinedBehavior msg))) := by
   have hop_sim := evalOperand_scalar_simulation hframes hframe hop s.memory.globals none
-  rw [hop.evalOperand_localDecls_eq] at hop_sim
+  rw [hop.evalOperand_localDecls_eq_of_frameRel hframe .nil s.memory.globals .nil .nil] at hop_sim
   generalize ha_eval : evalOperand s.frame.locals cond .nil s.memory.globals body.layouts .nil =
     aRes at hop_sim
   generalize hm_eval : (annealEvalOperand body.localDecls body.layouts (translateOperand cond) none >>=
@@ -3951,7 +3951,8 @@ theorem step_assign_move_preserves_immediate
     {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
     (hframes : m.stack.frames = #[topFrame])
     (himm_src : IsImmediateFrameLocal topFrame srcIdx)
-    (himm_dst : IsImmediateFrameLocal topFrame dstIdx) :
+    (himm_dst : IsImmediateFrameLocal topFrame dstIdx)
+    (hkind : IsScalarOrPtrTyKind srcDecl.ty.kind = true := by decide) :
     ∀ j, IsImmediateFrameLocal topFrame j →
       ∀ tf',
         (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m).1.stack.frames =
@@ -4104,8 +4105,11 @@ theorem step_assign_move_preserves_immediate
           rw [hbor, hcaller, hstack]
           have hop_ok : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) .nil
               s.memory.globals body.layouts .nil body.localDecls =
-              .ok v (s.frame.locals.set srcIdx .uninit) := by
-            simp [evalOperand, readProjectedValue, himmRel.valueContainsUninit_eq_false, hslot_src, set?_eq_some_set hlt_af_src]
+              .ok v (s.frame.locals.set srcIdx .uninit) :=
+            evalOperand_move_root_of_readValid hslot_src himmRel.valueContainsUninit_eq_false
+              (set?_eq_some_set hlt_af_src .uninit) hdecl_src
+              (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz hkind hrk).1)
+              (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz hkind hrk).2)
           rw [hop_ok]
           dsimp only
           rw [hval_ok]
@@ -4164,7 +4168,8 @@ theorem step_assign_move_simulation_ext
     (hty : dstDecl.ty = srcDecl.ty)
     (hsz : (translateTy srcDecl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
     (himm_src : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame srcIdx)
-    (himm_dst : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx) :
+    (himm_dst : ∀ topFrame, m.stack.frames = #[topFrame] → IsImmediateFrameLocal topFrame dstIdx)
+    (hkind : IsScalarOrPtrTyKind srcDecl.ty.kind = true := by decide) :
     StepRel body m
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
@@ -4178,9 +4183,9 @@ theorem step_assign_move_simulation_ext
           IsImmediateFrameLocal tf' j) :=
   ⟨step_stmt_lm1_4_simulation hstate hphase hbb hstmt (fun tf hframes =>
       .assignMove dstIdx srcIdx dstDecl srcDecl span hdecl_dst hdecl_src hty hsz
-        (himm_src tf hframes) (himm_dst tf hframes)),
+        (himm_src tf hframes) (himm_dst tf hframes) hkind),
     fun tf hframes => step_assign_move_preserves_immediate hstate hbb hstmt hdecl_dst hdecl_src
-      hty hsz hframes (himm_src tf hframes) (himm_dst tf hframes)⟩
+      hty hsz hframes (himm_src tf hframes) (himm_dst tf hframes) hkind⟩
 
 /-! ### Extended statements: `LM-1.2` comparisons and casts, `LM-1.4` moves -/
 
@@ -4220,6 +4225,7 @@ inductive WellTypedScalarStmtExt (body : CapturedMir) (nonAddrTaken : Nat → Pr
       (translateTy srcDecl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO →
       nonAddrTaken srcIdx →
       nonAddrTaken dstIdx →
+      (hImmValid : IsScalarOrPtrTyKind srcDecl.ty.kind = true := by decide) →
       WellTypedScalarStmtExt body nonAddrTaken stmt
 
 /-- Every extended-fragment statement is a `Nop`, `StorageLive`, `StorageDead`, or
@@ -4275,13 +4281,13 @@ theorem step_stmtExt_simulation_ext
     exact step_assign_lm1_2_simulation_ext hstate hphase hbb hstmt (fun tf hframes =>
       .intToInt stmt dstIdx dstDecl op srcTy hkind hdecl
         (himm tf hframes dstIdx dstDecl hdecl hna) (hop.toFrame hframes himm) hsrc hdst)
-  | move dstIdx srcIdx dstDecl srcDecl hkind hdecl_dst hdecl_src hty hsz hna_src hna_dst =>
+  | move dstIdx srcIdx dstDecl srcDecl hkind hdecl_dst hdecl_src hty hsz hna_src hna_dst himmv =>
     rcases stmt with ⟨kind, span⟩
     dsimp only at hkind
     subst hkind
     exact step_assign_move_simulation_ext hstate hphase hbb hstmt hdecl_dst hdecl_src hty hsz
       (fun tf hframes => himm tf hframes srcIdx srcDecl hdecl_src hna_src)
-      (fun tf hframes => himm tf hframes dstIdx dstDecl hdecl_dst hna_dst)
+      (fun tf hframes => himm tf hframes dstIdx dstDecl hdecl_dst hna_dst) himmv
 
 /-! ### Extended unconditional fragment: `LM-1.1` plus `SwitchInt` and `Assert … unreachable` -/
 

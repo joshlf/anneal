@@ -5882,21 +5882,34 @@ theorem sliceAbstractBytes_stripAbstractBytesProv (bs : List AbstractByte) (off 
     simp only [Option.map, dropAbstractBytes_stripAbstractBytesProv,
       takeAbstractBytes_stripAbstractBytesProv]
 
-theorem decodeLittleEndianBytes_stripAbstractBytesProv (bs : List AbstractByte) :
-    decodeLittleEndianBytes (stripAbstractBytesProv bs) =
-      match decodeLittleEndianBytes bs with
-      | .some res => .some (res.1, .none)
-      | .none => .none := by
+private theorem decodeLittleEndianBits_stripAbstractBytesProv (bs : List AbstractByte) :
+    decodeLittleEndianBits (stripAbstractBytesProv bs) = decodeLittleEndianBits bs := by
   induction bs with
   | nil => rfl
   | cons b rest ih =>
     cases b with
     | uninit => rfl
-    | init byte prov =>
-      simp only [decodeLittleEndianBytes, ih]
-      cases decodeLittleEndianBytes rest with
-      | none => rfl
-      | some res => rfl
+    | init byte prov => simp only [decodeLittleEndianBits, ih]
+
+private theorem abstractBytesCoherentPtrProv?_stripAbstractBytesProv (bs : List AbstractByte) :
+    abstractBytesCoherentPtrProv? (stripAbstractBytesProv bs) = .none := by
+  cases bs with
+  | nil => rfl
+  | cons b rest =>
+    cases b with
+    | uninit => rfl
+    | init _ _ => rfl
+
+theorem decodeLittleEndianBytes_stripAbstractBytesProv (bs : List AbstractByte) :
+    decodeLittleEndianBytes (stripAbstractBytesProv bs) =
+      match decodeLittleEndianBytes bs with
+      | .some res => .some (res.1, .none)
+      | .none => .none := by
+  unfold decodeLittleEndianBytes
+  rw [decodeLittleEndianBits_stripAbstractBytesProv, abstractBytesCoherentPtrProv?_stripAbstractBytesProv]
+  cases decodeLittleEndianBits bs with
+  | none => rfl
+  | some bits => rfl
 
 theorem decodeScalarBytes_stripAbstractBytesProv (bs : List AbstractByte) (isSigned : Bool) :
     decodeScalarBytes (stripAbstractBytesProv bs) isSigned =
@@ -5963,12 +5976,12 @@ theorem abstractBytesHaveProv_sliceAbstractBytes_false (bs sl : List AbstractByt
 /-! ### Refinement (`strictUcg630Ub` refines `stripProvenance`) & exact cast split -/
 
 theorem decodeScalarLayoutBytesNoForge_strict_imp_strip
-    (sl : ScalarLayout) (bs : List AbstractByte) (v : Value)
-    (h : decodeScalarLayoutBytesNoForge sl bs .strictUcg630Ub = .some v) :
-    decodeScalarLayoutBytesNoForge sl bs .stripProvenance = .some v := by
+    (sl : ScalarLayout) (bs : List AbstractByte) (v : Value) (ptrBytes : Nat := 8)
+    (h : decodeScalarLayoutBytesNoForge sl bs .strictUcg630Ub ptrBytes = .some v) :
+    decodeScalarLayoutBytesNoForge sl bs .stripProvenance ptrBytes = .some v := by
   unfold decodeScalarLayoutBytesNoForge at h ⊢
   revert h
-  cases scalarLayoutByteWidth sl with
+  cases scalarLayoutByteWidth sl ptrBytes with
   | none => intro h; cases h
   | some sz =>
     dsimp only
@@ -6266,7 +6279,7 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
                 | true =>
                   match decodeArrayChunksWith
                       (fun bs => decodeTypedValueFromBytes fuel' layouts
-                        { kind := elemKind, layoutIdx := 0 } bs .strictUcg630Ub)
+                        { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } bs .strictUcg630Ub)
                       elemSz n bytes with
                   | some elems => some (.aggregate 0 elems)
                   | none => none) = some v) →
@@ -6278,7 +6291,7 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
                 | true =>
                   match decodeArrayChunksWith
                       (fun bs => decodeTypedValueFromBytes fuel' layouts
-                        { kind := elemKind, layoutIdx := 0 } bs .stripProvenance)
+                        { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } bs .stripProvenance)
                       elemSz n bytes with
                   | some elems => some (.aggregate 0 elems)
                   | none => none) = some v) := by
@@ -6294,7 +6307,7 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
               intro h
               cases hd : decodeArrayChunksWith
                   (fun bs => decodeTypedValueFromBytes fuel' layouts
-                    { kind := elemKind, layoutIdx := 0 } bs .strictUcg630Ub)
+                    { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } bs .strictUcg630Ub)
                   elemSz n bytes with
               | none => rw [hd] at h; cases h
               | some elems =>
@@ -6414,13 +6427,50 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
           | empty => exact id
           | multiple tag tagField varShapes =>
             dsimp only
-            cases Bool.or (scalarLayoutIsPointer tag) (backendReprHasPointer l.backendRepr) with
+            have hPostFalse :
+                (match backendReprHasPointer l.backendRepr with
+                 | true => decodeValueFromBytes (.succ fuel') layouts (normalizeCodecTy ty) bytes
+                 | false =>
+                   match abstractBytesHaveProv bytes with
+                   | true => none
+                   | false => decodeValueFromBytes (.succ fuel') layouts (normalizeCodecTy ty) bytes) = some v →
+                (match backendReprHasPointer l.backendRepr with
+                 | true => decodeValueFromBytes (.succ fuel') layouts (normalizeCodecTy ty) bytes
+                 | false => decodeValueFromBytes (.succ fuel') layouts (normalizeCodecTy ty) bytes) = some v := by
+              cases backendReprHasPointer l.backendRepr with
+              | true => exact id
+              | false =>
+                dsimp only
+                cases abstractBytesHaveProv bytes with
+                | true => intro h'; cases h'
+                | false => exact id
+            cases scalarLayoutIsPointer tag with
             | true => exact id
             | false =>
-              dsimp only
-              cases abstractBytesHaveProv bytes with
-              | true => intro h; cases h
-              | false => exact id
+              dsimp only [Bool.or]
+              cases l.fields with
+              | arbitrary offs _ =>
+                cases scalarLayoutByteWidth tag (layoutPointerBytes layouts) with
+                | none => exact hPostFalse
+                | some tagSz =>
+                  dsimp only
+                  cases get? offs tagField with
+                  | none => exact hPostFalse
+                  | some tagOff =>
+                    dsimp only
+                    cases sliceAbstractBytes bytes tagOff.bytes tagSz with
+                    | none => exact id
+                    | some tagSlice =>
+                      dsimp only
+                      cases abstractBytesHaveProv tagSlice with
+                      | true => intro h; cases h
+                      | false => exact hPostFalse
+              | primitive =>
+                dsimp only
+                cases abstractBytesHaveProv bytes with
+                | true => intro h; cases h
+                | false => exact id
+              | _ => exact hPostFalse
           | single variantIdx =>
             cases variantIdx <;>
             cases l.fields with
@@ -6434,7 +6484,7 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
                 cases l.backendRepr with
                 | scalar s0 =>
                   dsimp only
-                  exact decodeScalarLayoutBytesNoForge_strict_imp_strip s0 bytes v
+                  exact decodeScalarLayoutBytesNoForge_strict_imp_strip s0 bytes v (layoutPointerBytes layouts)
                 | _ =>
                   dsimp only
                   cases abstractBytesHaveProv bytes with
@@ -6490,7 +6540,7 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
                     cases l.backendRepr with
                     | scalar s0 =>
                       dsimp only
-                      cases scalarLayoutByteWidth s0 with
+                      cases scalarLayoutByteWidth s0 (layoutPointerBytes layouts) with
                       | none => intro h; cases h
                       | some sz0 =>
                         dsimp only
@@ -6499,11 +6549,11 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
                         | some slice0 =>
                           dsimp only
                           intro h
-                          cases hd0 : decodeScalarLayoutBytesNoForge s0 slice0 .strictUcg630Ub with
+                          cases hd0 : decodeScalarLayoutBytesNoForge s0 slice0 .strictUcg630Ub (layoutPointerBytes layouts) with
                           | none => rw [hd0] at h; cases h
                           | some v0 =>
                             rw [hd0] at h
-                            rw [decodeScalarLayoutBytesNoForge_strict_imp_strip s0 slice0 v0 hd0]
+                            rw [decodeScalarLayoutBytesNoForge_strict_imp_strip s0 slice0 v0 (layoutPointerBytes layouts) hd0]
                             exact h
                     | _ =>
                       dsimp only
@@ -6516,10 +6566,10 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
                       cases l.backendRepr with
                       | scalarPair s0 s1 =>
                         dsimp only
-                        cases scalarLayoutByteWidth s0 with
+                        cases scalarLayoutByteWidth s0 (layoutPointerBytes layouts) with
                         | none => intro h; cases h
                         | some sz0 =>
-                          cases scalarLayoutByteWidth s1 with
+                          cases scalarLayoutByteWidth s1 (layoutPointerBytes layouts) with
                           | none => intro h; cases h
                           | some sz1 =>
                             dsimp only
@@ -6531,15 +6581,15 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
                               | some slice1 =>
                                 dsimp only
                                 intro h
-                                cases hd0 : decodeScalarLayoutBytesNoForge s0 slice0 .strictUcg630Ub with
+                                cases hd0 : decodeScalarLayoutBytesNoForge s0 slice0 .strictUcg630Ub (layoutPointerBytes layouts) with
                                 | none => rw [hd0] at h; cases h
                                 | some v0 =>
-                                  cases hd1 : decodeScalarLayoutBytesNoForge s1 slice1 .strictUcg630Ub with
+                                  cases hd1 : decodeScalarLayoutBytesNoForge s1 slice1 .strictUcg630Ub (layoutPointerBytes layouts) with
                                   | none => rw [hd0, hd1] at h; cases h
                                   | some v1 =>
                                     rw [hd0, hd1] at h
-                                    rw [decodeScalarLayoutBytesNoForge_strict_imp_strip s0 slice0 v0 hd0,
-                                      decodeScalarLayoutBytesNoForge_strict_imp_strip s1 slice1 v1 hd1]
+                                    rw [decodeScalarLayoutBytesNoForge_strict_imp_strip s0 slice0 v0 (layoutPointerBytes layouts) hd0,
+                                      decodeScalarLayoutBytesNoForge_strict_imp_strip s1 slice1 v1 (layoutPointerBytes layouts) hd1]
                                     exact h
                       | _ =>
                         dsimp only
@@ -6569,6 +6619,11 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
       | true => intro h; cases h
       | false => exact id
     | char =>
+      dsimp only
+      cases abstractBytesHaveProv bytes with
+      | true => intro h; cases h
+      | false => exact id
+    | float _ =>
       dsimp only
       cases abstractBytesHaveProv bytes with
       | true => intro h; cases h
@@ -7239,12 +7294,12 @@ private theorem decodeRichFieldSpecs_congr_provFree
       rw [hcongr spec.2.2 fSlice (abstractBytesHaveProv_sliceAbstractBytes_false bytes fSlice spec.1 spec.2.1 hbs hsl), ih]
 
 theorem decodeScalarLayoutBytesNoForge_eq_of_provFree
-    (sl : ScalarLayout) (bs : List AbstractByte)
+    (sl : ScalarLayout) (bs : List AbstractByte) (ptrBytes : Nat := 8)
     (hbs : abstractBytesHaveProv bs = false) :
-    decodeScalarLayoutBytesNoForge sl bs .strictUcg630Ub =
-      decodeScalarLayoutBytesNoForge sl bs .stripProvenance := by
+    decodeScalarLayoutBytesNoForge sl bs .strictUcg630Ub ptrBytes =
+      decodeScalarLayoutBytesNoForge sl bs .stripProvenance ptrBytes := by
   unfold decodeScalarLayoutBytesNoForge
-  cases scalarLayoutByteWidth sl with
+  cases scalarLayoutByteWidth sl ptrBytes with
   | none => rfl
   | some sz =>
     dsimp only
@@ -7291,7 +7346,7 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
                | true =>
                  match decodeArrayChunksWith
                      (fun bs => decodeTypedValueFromBytes fuel' layouts
-                       { kind := elemKind, layoutIdx := 0 } bs .strictUcg630Ub)
+                       { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } bs .strictUcg630Ub)
                      elemSz n bytes with
                  | some elems => some (Value.aggregate 0 elems)
                  | none => none) =
@@ -7303,7 +7358,7 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
                | true =>
                  match decodeArrayChunksWith
                      (fun bs => decodeTypedValueFromBytes fuel' layouts
-                       { kind := elemKind, layoutIdx := 0 } bs .stripProvenance)
+                       { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } bs .stripProvenance)
                      elemSz n bytes with
                  | some elems => some (Value.aggregate 0 elems)
                  | none => none) := by
@@ -7385,11 +7440,47 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
           dsimp only
           cases l.variants with
           | empty => rfl
-          | multiple tag _ _ =>
+          | multiple tag tagField _ =>
             dsimp only
-            cases Bool.or (scalarLayoutIsPointer tag) (backendReprHasPointer l.backendRepr) with
+            cases scalarLayoutIsPointer tag with
             | true => rfl
-            | false => dsimp only; rw [hbs]
+            | false =>
+              dsimp only [Bool.or]
+              cases l.fields with
+              | arbitrary outerOffsets _ =>
+                cases scalarLayoutByteWidth tag (layoutPointerBytes layouts) with
+                | none =>
+                  dsimp only
+                  cases backendReprHasPointer l.backendRepr with
+                  | true => rfl
+                  | false => dsimp only; rw [hbs]
+                | some tagSz =>
+                  dsimp only
+                  cases get? outerOffsets tagField with
+                  | none =>
+                    dsimp only
+                    cases backendReprHasPointer l.backendRepr with
+                    | true => rfl
+                    | false => dsimp only; rw [hbs]
+                  | some tagOff =>
+                    dsimp only
+                    cases hsl : sliceAbstractBytes bytes tagOff.bytes tagSz with
+                    | none => rfl
+                    | some tagSlice =>
+                      dsimp only
+                      rw [abstractBytesHaveProv_sliceAbstractBytes_false bytes tagSlice tagOff.bytes tagSz hbs hsl]
+                      dsimp only
+                      cases backendReprHasPointer l.backendRepr with
+                      | true => rfl
+                      | false => dsimp only; rw [hbs]
+              | primitive =>
+                dsimp only
+                rw [hbs]
+              | _ =>
+                dsimp only
+                cases backendReprHasPointer l.backendRepr with
+                | true => rfl
+                | false => dsimp only; rw [hbs]
           | single varIdx =>
             cases varIdx <;>
             cases l.fields with
@@ -7401,7 +7492,7 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
               | false =>
                 dsimp only
                 cases l.backendRepr with
-                | scalar s0 => dsimp only; exact decodeScalarLayoutBytesNoForge_eq_of_provFree s0 bytes hbs
+                | scalar s0 => dsimp only; exact decodeScalarLayoutBytesNoForge_eq_of_provFree s0 bytes (layoutPointerBytes layouts) hbs
                 | _ => dsimp only; rw [hbs]
             | array stride count =>
               simp only
@@ -7431,7 +7522,7 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
                     cases l.backendRepr with
                     | scalar s0 =>
                       dsimp only
-                      cases scalarLayoutByteWidth s0 with
+                      cases scalarLayoutByteWidth s0 (layoutPointerBytes layouts) with
                       | none => rfl
                       | some sz0 =>
                         dsimp only
@@ -7439,7 +7530,7 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
                         | none => rfl
                         | some slice0 =>
                           dsimp only
-                          rw [decodeScalarLayoutBytesNoForge_eq_of_provFree s0 slice0
+                          rw [decodeScalarLayoutBytesNoForge_eq_of_provFree s0 slice0 (layoutPointerBytes layouts)
                             (abstractBytesHaveProv_sliceAbstractBytes_false bytes slice0 off0.bytes sz0 hbs hsl0)]
                     | _ => dsimp only; rw [hbs]
                   | cons off1 offTail2 =>
@@ -7448,10 +7539,10 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
                       cases l.backendRepr with
                       | scalarPair s0 s1 =>
                         dsimp only
-                        cases scalarLayoutByteWidth s0 with
+                        cases scalarLayoutByteWidth s0 (layoutPointerBytes layouts) with
                         | none => rfl
                         | some sz0 =>
-                          cases scalarLayoutByteWidth s1 with
+                          cases scalarLayoutByteWidth s1 (layoutPointerBytes layouts) with
                           | none => rfl
                           | some sz1 =>
                             dsimp only
@@ -7462,9 +7553,9 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
                               | none => rfl
                               | some slice1 =>
                                 dsimp only
-                                rw [decodeScalarLayoutBytesNoForge_eq_of_provFree s0 slice0
+                                rw [decodeScalarLayoutBytesNoForge_eq_of_provFree s0 slice0 (layoutPointerBytes layouts)
                                     (abstractBytesHaveProv_sliceAbstractBytes_false bytes slice0 off0.bytes sz0 hbs hsl0),
-                                  decodeScalarLayoutBytesNoForge_eq_of_provFree s1 slice1
+                                  decodeScalarLayoutBytesNoForge_eq_of_provFree s1 slice1 (layoutPointerBytes layouts)
                                     (abstractBytesHaveProv_sliceAbstractBytes_false bytes slice1 off1.bytes sz1 hbs hsl1)]
                       | _ => dsimp only; rw [hbs]
                     | cons _ _ => dsimp only; rw [hbs]
@@ -7472,6 +7563,7 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
     | int w => cases w <;> (dsimp only; rw [hbs])
     | bool => dsimp only; rw [hbs]
     | char => dsimp only; rw [hbs]
+    | float _ => dsimp only; rw [hbs]
     | _ => rfl
 
 /-- On provenance-free bytes, `decodeTypedValueRichWithPolicy` is policy-independent. -/
@@ -7867,6 +7959,83 @@ private theorem abstractBytesHaveProv_mergeMaskedAbstractBytes
         | nil => exact hstep true .nil hm
         | cons m mRest => exact hstep m mRest hm
 
+private theorem isRawFragByteVal_false_of_valueHasProv_false
+    (v : Value) (hv : valueHasProv v = false) :
+    isRawFragByteVal v = false := by
+  cases v with
+  | scalar _ => rfl
+  | ptr _ _ => cases hv
+  | unit => rfl
+  | uninit => rfl
+  | aggregate varIdx fields =>
+    cases varIdx with
+    | succ _ => rfl
+    | zero =>
+      cases fields with
+      | nil => rfl
+      | cons f0 rest0 =>
+        cases f0 with
+        | ptr _ _ =>
+          simp only [valueHasProv, valueListHasProv, Bool.true_or] at hv
+          cases hv
+        | _ => rfl
+
+private theorem decodeRawAbstractByteVal?_noProv_of_valueHasProv_false
+    (v : Value) (b : AbstractByte) (hv : valueHasProv v = false)
+    (hd : decodeRawAbstractByteVal? v = .some b) :
+    abstractBytesHaveProv [b] = false := by
+  unfold decodeRawAbstractByteVal? at hd
+  cases v with
+  | ptr _ _ => cases hv
+  | unit => cases hd
+  | uninit => cases hd
+  | scalar sc =>
+    cases sc with
+    | mk bits sz =>
+      cases bits with
+      | zero =>
+        cases sz with
+        | zero => injection hd with hd; subst hd; rfl
+        | succ sz' =>
+          cases sz' with
+          | zero => injection hd with hd; subst hd; rfl
+          | succ _ => cases hd
+      | succ _ =>
+        cases sz with
+        | zero => cases hd
+        | succ sz' =>
+          cases sz' with
+          | zero => injection hd with hd; subst hd; rfl
+          | succ _ => cases hd
+  | aggregate varIdx fields =>
+    cases varIdx with
+    | succ _ => cases hd
+    | zero =>
+      cases fields with
+      | nil => cases hd
+      | cons f0 _ =>
+        cases f0 with
+        | ptr _ _ =>
+          simp only [valueHasProv, valueListHasProv, Bool.true_or] at hv
+          cases hv
+        | _ => cases hd
+
+private theorem decodeRawAbstractByteVal?_aggregate_none_of_valueHasProv_false
+    (varIdx : Nat) (fields : List Value)
+    (hv : valueHasProv (.aggregate varIdx fields) = false) :
+    decodeRawAbstractByteVal? (.aggregate varIdx fields) = .none := by
+  cases varIdx with
+  | succ _ => rfl
+  | zero =>
+    cases fields with
+    | nil => rfl
+    | cons f0 _ =>
+      cases f0 with
+      | ptr _ _ =>
+        simp only [valueHasProv, valueListHasProv, Bool.true_or] at hv
+        cases hv
+      | _ => rfl
+
 private theorem abstractBytesHaveProv_overlayRawAbstractByteVals
     (vs : List Value) (buf out : List AbstractByte)
     (hvs : valueListHasProv vs = false)
@@ -7893,37 +8062,23 @@ private theorem abstractBytesHaveProv_overlayRawAbstractByteVals
         cases bHead with
         | uninit => exact hbuf
         | init _ prov => cases prov with | none => exact hbuf | some _ => cases hbuf
-      cases v with
-      | ptr _ _ => cases hv
-      | scalar sc =>
-        cases sc with
-        | mk bits sz =>
-          cases sz with
-          | zero =>
-            cases bits with
-            | zero =>
-              unfold overlayRawAbstractByteVals at ho
-              simp only at ho
-              cases hrec : overlayRawAbstractByteVals vRest bRest with
-              | none => rw [hrec] at ho; cases ho
-              | some tail =>
-                rw [hrec] at ho; dsimp only at ho; injection ho with ho; subst ho
-                exact ih bRest tail hvRest hbRest hrec
-            | succ _ => cases ho
-          | succ sz' =>
-            cases sz' with
-            | zero =>
-              unfold overlayRawAbstractByteVals at ho
-              simp only at ho
-              cases hrec : overlayRawAbstractByteVals vRest bRest with
-              | none => rw [hrec] at ho; cases ho
-              | some tail =>
-                rw [hrec] at ho; dsimp only at ho; injection ho with ho; subst ho
-                exact ih bRest tail hvRest hbRest hrec
-            | succ _ => cases bits <;> cases ho
-      | unit => cases ho
-      | uninit => cases ho
-      | aggregate _ _ => cases ho
+      unfold overlayRawAbstractByteVals at ho
+      cases hd : decodeRawAbstractByteVal? v with
+      | none => rw [hd] at ho; cases ho
+      | some b =>
+        rw [hd] at ho
+        cases hrec : overlayRawAbstractByteVals vRest bRest with
+        | none => rw [hrec] at ho; cases ho
+        | some tail =>
+          rw [hrec] at ho; dsimp only at ho; injection ho with ho; subst ho
+          have htail := ih bRest tail hvRest hbRest hrec
+          have hb := decodeRawAbstractByteVal?_noProv_of_valueHasProv_false v b hv hd
+          cases b with
+          | uninit => exact htail
+          | init _ prov =>
+            cases prov with
+            | none => exact htail
+            | some _ => cases hb
 
 private theorem valueListHasProv_splitUnionTypedAndOverlay
     (count : Nat) (fieldVals : List Value) (res : List Value × Option (List Value))
@@ -7997,10 +8152,13 @@ private theorem abstractBytesHaveProv_encodeUntypedValueToBytes
       unfold encodeUntypedValueToBytes at henc
       exact abstractBytesHaveProv_encodeScalarBytes_none sv bs henc
     | aggregate varIdx fields =>
+      unfold encodeUntypedValueToBytes at henc
+      rw [isRawFragByteVal_false_of_valueHasProv_false (.aggregate varIdx fields) hv] at henc
+      dsimp only at henc
       unfold valueHasProv at hv
       induction fields generalizing bs with
       | nil =>
-        change Option.some .nil = Option.some bs at henc
+        unfold encodeUntypedValueToBytes.encodeFields at henc
         injection henc with henc; subst henc; rfl
       | cons f fs ihf =>
         have hf : valueHasProv f = false := by
@@ -8010,14 +8168,11 @@ private theorem abstractBytesHaveProv_encodeUntypedValueToBytes
           | true => rw [h1] at hv; cases hv
         have hfs : valueListHasProv fs = false := by
           unfold valueListHasProv at hv; rw [hf] at hv; exact hv
-        change (match encodeUntypedValueToBytes fuel' f,
-            encodeUntypedValueToBytes (fuel' + 1) (.aggregate varIdx fs) with
-          | some b1, some b2 => some (appendAbstractBytes b1 b2)
-          | _, _ => none) = some bs at henc
+        unfold encodeUntypedValueToBytes.encodeFields at henc
         cases h1 : encodeUntypedValueToBytes fuel' f with
         | none => rw [h1] at henc; cases henc
         | some b1 =>
-          cases h2 : encodeUntypedValueToBytes (fuel' + 1) (.aggregate varIdx fs) with
+          cases h2 : encodeUntypedValueToBytes.encodeFields fuel' fs with
           | none => rw [h1, h2] at henc; cases henc
           | some b2 =>
             rw [h1, h2] at henc
@@ -8306,31 +8461,150 @@ private theorem abstractBytesHaveProv_encodeValueToBytes
   | zero => cases henc
   | succ fuel' ih =>
     unfold encodeValueToBytes at henc
-    have hwide_enc : ∀ (isWide : Bool),
-        (match isWide, v with
-         | false, .ptr p 8 => encodeScalarBytes ⟨p.offsetBytes, 8⟩ (.some (p.allocId, p.tag))
-         | false, .scalar sv =>
-           match Nat.beq sv.sizeBytes 8 with
+    have hptr_half : ∀ (v' : Value) (b' : List AbstractByte),
+        valueHasProv v' = false →
+        (match Nat.blt 0 (layoutPointerBytes layouts), v' with
+         | true, .ptr p sz =>
+           match Nat.beq sz (layoutPointerBytes layouts) with
+           | true => encodeScalarBytes ⟨p.offsetBytes, layoutPointerBytes layouts⟩ (.some (p.allocId, p.tag))
+           | false => .none
+         | true, .scalar sv =>
+           match Nat.beq sv.sizeBytes (layoutPointerBytes layouts) with
            | true => encodeScalarBytes sv .none
            | false => .none
-         | true, .aggregate 0 (.ptr p 8 :: .scalar metaSc :: .nil) =>
-           match encodeScalarBytes ⟨p.offsetBytes, 8⟩ (.some (p.allocId, p.tag)),
-                 encodeScalarBytes ⟨metaSc.bits, 8⟩ .none with
+         | true, .aggregate 0 rawVals =>
+           match Nat.beq (length rawVals) (layoutPointerBytes layouts) with
+           | true => decodeRawAbstractByteVals? rawVals
+           | false => .none
+         | _, _ => .none) = .some b' →
+        abstractBytesHaveProv b' = false := by
+      intro v' b' hv' h'
+      cases hpos : Nat.blt 0 (layoutPointerBytes layouts) with
+      | false => rw [hpos] at h'; cases h'
+      | true =>
+        rw [hpos] at h'
+        cases v' with
+        | ptr _ _ => cases hv'
+        | scalar sv =>
+          dsimp only at h'
+          cases hsz : Nat.beq sv.sizeBytes (layoutPointerBytes layouts) with
+          | false => rw [hsz] at h'; cases h'
+          | true => rw [hsz] at h'; dsimp only at h'; exact abstractBytesHaveProv_encodeScalarBytes_none sv b' h'
+        | aggregate varIdx rawVals =>
+          cases varIdx with
+          | succ _ => cases h'
+          | zero =>
+            change (match Nat.beq (length rawVals) (layoutPointerBytes layouts) with
+              | true => decodeRawAbstractByteVals? rawVals
+              | false => .none) = .some b' at h'
+            cases hlen : Nat.beq (length rawVals) (layoutPointerBytes layouts) with
+            | false => rw [hlen] at h'; cases h'
+            | true =>
+              rw [hlen] at h'; dsimp only at h'
+              have hraw : ∀ (rs : List Value) (bs' : List AbstractByte),
+                  valueListHasProv rs = false →
+                  decodeRawAbstractByteVals? rs = .some bs' →
+                  abstractBytesHaveProv bs' = false := by
+                intro rs
+                induction rs with
+                | nil =>
+                  intro bs' _ hd
+                  unfold decodeRawAbstractByteVals? at hd
+                  injection hd with hd; subst hd; rfl
+                | cons r rRest ihr =>
+                  intro bs' hrs hd
+                  have hr : valueHasProv r = false := by
+                    unfold valueListHasProv at hrs
+                    cases h1 : valueHasProv r with
+                    | false => rfl
+                    | true => rw [h1] at hrs; cases hrs
+                  have hrRest : valueListHasProv rRest = false := by
+                    unfold valueListHasProv at hrs; rw [hr] at hrs; exact hrs
+                  unfold decodeRawAbstractByteVals? at hd
+                  cases hd1 : decodeRawAbstractByteVal? r with
+                  | none => rw [hd1] at hd; cases hd
+                  | some rb =>
+                    rw [hd1] at hd
+                    cases hd2 : decodeRawAbstractByteVals? rRest with
+                    | none => rw [hd2] at hd; cases hd
+                    | some rtail =>
+                      rw [hd2] at hd; dsimp only at hd; injection hd with hd; subst hd
+                      have hrb := decodeRawAbstractByteVal?_noProv_of_valueHasProv_false r rb hr hd1
+                      have hrt := ihr rtail hrRest hd2
+                      cases rb with
+                      | uninit => exact hrt
+                      | init _ prov => cases prov with | none => exact hrt | some _ => cases hrb
+              exact hraw rawVals b' hv' h'
+        | _ => cases h'
+    have hmeta_half : ∀ (v' : Value) (b' : List AbstractByte),
+        valueHasProv v' = false →
+        (match Nat.blt 0 (layoutPointerBytes layouts), v' with
+         | true, .ptr vt vtSz =>
+           match Nat.beq vtSz (layoutPointerBytes layouts) with
+           | true => encodeScalarBytes ⟨vt.offsetBytes, layoutPointerBytes layouts⟩ (.some (vt.allocId, vt.tag))
+           | false => .none
+         | true, .scalar metaSc =>
+           encodeScalarBytes ⟨metaSc.bits, layoutPointerBytes layouts⟩ .none
+         | _, _ => .none) = .some b' →
+        abstractBytesHaveProv b' = false := by
+      intro v' b' hv' h'
+      cases hpos : Nat.blt 0 (layoutPointerBytes layouts) with
+      | false => rw [hpos] at h'; cases h'
+      | true =>
+        rw [hpos] at h'
+        cases v' with
+        | ptr _ _ => cases hv'
+        | scalar metaSc => exact abstractBytesHaveProv_encodeScalarBytes_none _ b' h'
+        | _ => cases h'
+    have hwide_enc : ∀ (isWide : Bool),
+        (match isWide, v with
+         | false, _ =>
+           match Nat.blt 0 (layoutPointerBytes layouts), v with
+           | true, .ptr p sz =>
+             match Nat.beq sz (layoutPointerBytes layouts) with
+             | true => encodeScalarBytes ⟨p.offsetBytes, layoutPointerBytes layouts⟩ (.some (p.allocId, p.tag))
+             | false => .none
+           | true, .scalar sv =>
+             match Nat.beq sv.sizeBytes (layoutPointerBytes layouts) with
+             | true => encodeScalarBytes sv .none
+             | false => .none
+           | true, .aggregate 0 rawVals =>
+             match Nat.beq (length rawVals) (layoutPointerBytes layouts) with
+             | true => decodeRawAbstractByteVals? rawVals
+             | false => .none
+           | _, _ => .none
+         | true, .aggregate 0 (dataVal :: metaVal :: .nil) =>
+           match
+             (match Nat.blt 0 (layoutPointerBytes layouts), dataVal with
+              | true, .ptr p sz =>
+                match Nat.beq sz (layoutPointerBytes layouts) with
+                | true => encodeScalarBytes ⟨p.offsetBytes, layoutPointerBytes layouts⟩ (.some (p.allocId, p.tag))
+                | false => .none
+              | true, .scalar sv =>
+                match Nat.beq sv.sizeBytes (layoutPointerBytes layouts) with
+                | true => encodeScalarBytes sv .none
+                | false => .none
+              | true, .aggregate 0 rawVals =>
+                match Nat.beq (length rawVals) (layoutPointerBytes layouts) with
+                | true => decodeRawAbstractByteVals? rawVals
+                | false => .none
+              | _, _ => .none),
+             (match Nat.blt 0 (layoutPointerBytes layouts), metaVal with
+              | true, .ptr vt vtSz =>
+                match Nat.beq vtSz (layoutPointerBytes layouts) with
+                | true => encodeScalarBytes ⟨vt.offsetBytes, layoutPointerBytes layouts⟩ (.some (vt.allocId, vt.tag))
+                | false => .none
+              | true, .scalar metaSc =>
+                encodeScalarBytes ⟨metaSc.bits, layoutPointerBytes layouts⟩ .none
+              | _, _ => .none)
+           with
            | .some b1, .some b2 => .some (appendAbstractBytes b1 b2)
            | _, _ => .none
          | _, _ => .none) = .some bs →
         abstractBytesHaveProv bs = false := by
       intro isWide
       cases isWide with
-      | false =>
-        cases v with
-        | ptr _ _ => intro _; cases hv
-        | scalar sv =>
-          intro h'; dsimp only at h'
-          cases hsz : Nat.beq sv.sizeBytes 8 with
-          | false => rw [hsz] at h'; cases h'
-          | true => rw [hsz] at h'; dsimp only at h'; exact abstractBytesHaveProv_encodeScalarBytes_none sv bs h'
-        | _ => intro h'; cases h'
+      | false => intro h'; exact hptr_half v bs hv h'
       | true =>
         cases v with
         | aggregate varIdx fs =>
@@ -8339,10 +8613,77 @@ private theorem abstractBytesHaveProv_encodeValueToBytes
           | zero =>
             cases fs with
             | nil => intro h'; cases h'
-            | cons f0 fRest =>
-              cases f0 with
-              | ptr _ _ => intro _; cases hv
-              | _ => intro h'; cases h'
+            | cons dataVal fRest =>
+              cases fRest with
+              | nil => intro h'; cases h'
+              | cons metaVal fRest2 =>
+                cases fRest2 with
+                | cons _ _ => intro h'; cases h'
+                | nil =>
+                  intro h'
+                  change (match
+                    (match Nat.blt 0 (layoutPointerBytes layouts), dataVal with
+                     | true, .ptr p sz =>
+                       match Nat.beq sz (layoutPointerBytes layouts) with
+                       | true => encodeScalarBytes ⟨p.offsetBytes, layoutPointerBytes layouts⟩ (.some (p.allocId, p.tag))
+                       | false => .none
+                     | true, .scalar sv =>
+                       match Nat.beq sv.sizeBytes (layoutPointerBytes layouts) with
+                       | true => encodeScalarBytes sv .none
+                       | false => .none
+                     | true, .aggregate 0 rawVals =>
+                       match Nat.beq (length rawVals) (layoutPointerBytes layouts) with
+                       | true => decodeRawAbstractByteVals? rawVals
+                       | false => .none
+                     | _, _ => .none),
+                    (match Nat.blt 0 (layoutPointerBytes layouts), metaVal with
+                     | true, .ptr vt vtSz =>
+                       match Nat.beq vtSz (layoutPointerBytes layouts) with
+                       | true => encodeScalarBytes ⟨vt.offsetBytes, layoutPointerBytes layouts⟩ (.some (vt.allocId, vt.tag))
+                       | false => .none
+                     | true, .scalar metaSc =>
+                       encodeScalarBytes ⟨metaSc.bits, layoutPointerBytes layouts⟩ .none
+                     | _, _ => .none)
+                  with
+                  | some b1, some b2 => some (appendAbstractBytes b1 b2)
+                  | _, _ => none) = some bs at h'
+                  have hd : valueHasProv dataVal = false := by
+                    simp only [valueHasProv, valueListHasProv] at hv
+                    cases h1 : valueHasProv dataVal with
+                    | false => rfl
+                    | true => rw [h1] at hv; cases hv
+                  have hm : valueHasProv metaVal = false := by
+                    simp only [valueHasProv, valueListHasProv, hd, Bool.false_or, Bool.or_false] at hv
+                    exact hv
+                  cases h1 : (match Nat.blt 0 (layoutPointerBytes layouts), dataVal with
+                    | true, .ptr p sz =>
+                      match Nat.beq sz (layoutPointerBytes layouts) with
+                      | true => encodeScalarBytes ⟨p.offsetBytes, layoutPointerBytes layouts⟩ (.some (p.allocId, p.tag))
+                      | false => .none
+                    | true, .scalar sv =>
+                      match Nat.beq sv.sizeBytes (layoutPointerBytes layouts) with
+                      | true => encodeScalarBytes sv .none
+                      | false => .none
+                    | true, .aggregate 0 rawVals =>
+                      match Nat.beq (length rawVals) (layoutPointerBytes layouts) with
+                      | true => decodeRawAbstractByteVals? rawVals
+                      | false => .none
+                    | _, _ => .none) with
+                  | none => rw [h1] at h'; cases h'
+                  | some b1 =>
+                    cases h2 : (match Nat.blt 0 (layoutPointerBytes layouts), metaVal with
+                      | true, .ptr vt vtSz =>
+                        match Nat.beq vtSz (layoutPointerBytes layouts) with
+                        | true => encodeScalarBytes ⟨vt.offsetBytes, layoutPointerBytes layouts⟩ (.some (vt.allocId, vt.tag))
+                        | false => .none
+                      | true, .scalar metaSc =>
+                        encodeScalarBytes ⟨metaSc.bits, layoutPointerBytes layouts⟩ .none
+                      | _, _ => .none) with
+                    | none => rw [h1, h2] at h'; cases h'
+                    | some b2 =>
+                      rw [h1, h2] at h'; dsimp only at h'; injection h' with h'; subst h'
+                      rw [abstractBytesHaveProv_appendAbstractBytes, hptr_half dataVal b1 hd h1,
+                        hmeta_half metaVal b2 hm h2, Bool.or_false]
         | _ => intro h'; cases h'
     cases hkind : ty.kind with
     | bool =>
@@ -8408,14 +8749,7 @@ private theorem abstractBytesHaveProv_encodeValueToBytes
       | _ => cases henc
     | fnPtr _ _ _ _ =>
       rw [hkind] at henc; dsimp only at henc
-      cases v with
-      | ptr _ _ => cases hv
-      | scalar sv =>
-        dsimp only at henc
-        cases hsz : Nat.beq sv.sizeBytes 8 with
-        | false => rw [hsz] at henc; cases henc
-        | true => rw [hsz] at henc; dsimp only at henc; exact abstractBytesHaveProv_encodeScalarBytes_none sv bs henc
-      | _ => cases henc
+      exact hptr_half v bs hv henc
     | rawPtr _ pointee =>
       rw [hkind] at henc; dsimp only at henc
       exact hwide_enc _ henc
@@ -8583,7 +8917,7 @@ private theorem abstractBytesHaveProv_encodeValueToBytes
               cases hlf : l.fields with
               | arbitrary outerOffsets _ =>
                 rw [hlf] at henc
-                cases htsz : scalarLayoutByteWidth tagLayout with
+                cases htsz : scalarLayoutByteWidth tagLayout (layoutPointerBytes layouts) with
                 | none => rw [htsz] at henc; cases henc
                 | some tagSz =>
                   rw [htsz] at henc
@@ -9046,64 +9380,134 @@ theorem abstractBytesHaveProv_encodeByteCastSourceBytes
     | none => rw [he1] at henc; cases henc
   | false =>
     rw [hun] at henc
-    cases he1 : encodeValueToBytes defaultCodecFuel layouts (normalizeCodecTy srcTy) v with
-    | some b1 =>
-      rw [he1] at henc; injection henc with henc; rw [← henc]
-      exact abstractBytesHaveProv_encodeValueToBytes defaultCodecFuel layouts _ v b1 hv he1
-    | none =>
-      rw [he1] at henc
-      cases hk : (normalizeCodecTy srcTy).kind with
-      | adt _ _ =>
-        rw [hk] at henc
-        cases hlu : LayoutTable.lookup layouts (normalizeCodecTy srcTy).layoutIdx with
-        | none =>
-          rw [hlu] at henc
-          exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv henc
-        | some _ =>
-          rw [hlu] at henc
-          cases he2 : encodeByLayoutIdxAux 8 layouts (normalizeCodecTy srcTy).layoutIdx v with
-          | some b2 =>
-            rw [he2] at henc; injection henc with henc; rw [← henc]
-            exact abstractBytesHaveProv_encodeByLayoutIdxAux 8 layouts _ v b2 hv he2
-          | none =>
-            rw [he2] at henc
-            exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv henc
-      | tuple ks =>
-        rw [hk] at henc
-        cases ks with
-        | nil => exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv henc
-        | cons _ _ =>
+    have hrest :
+        (match
+          (match encodeValueToBytes defaultCodecFuel layouts (normalizeCodecTy srcTy) v with
+           | Option.some b0 => Option.some b0
+           | Option.none =>
+             match (normalizeCodecTy srcTy).kind with
+             | .adt _ _ | .tuple (_ :: _) | .array _ _ =>
+               match LayoutTable.lookup layouts (normalizeCodecTy srcTy).layoutIdx with
+               | Option.some _ => encodeByLayoutIdxAux 8 layouts (normalizeCodecTy srcTy).layoutIdx v
+               | Option.none => Option.none
+             | _ => Option.none)
+        with
+        | Option.some b0 => Option.some b0
+        | Option.none => encodeUntypedValueToBytes defaultCodecFuel v) = Option.some bs →
+        abstractBytesHaveProv bs = false := by
+      intro h'
+      cases he1 : encodeValueToBytes defaultCodecFuel layouts (normalizeCodecTy srcTy) v with
+      | some b1 =>
+        rw [he1] at h'; dsimp only at h'; injection h' with h'; rw [← h']
+        exact abstractBytesHaveProv_encodeValueToBytes defaultCodecFuel layouts _ v b1 hv he1
+      | none =>
+        rw [he1] at h'
+        cases hk : (normalizeCodecTy srcTy).kind with
+        | adt _ _ =>
+          rw [hk] at h'
           cases hlu : LayoutTable.lookup layouts (normalizeCodecTy srcTy).layoutIdx with
           | none =>
-            rw [hlu] at henc
-            exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv henc
+            rw [hlu] at h'
+            exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv h'
           | some _ =>
-            rw [hlu] at henc
+            rw [hlu] at h'
             cases he2 : encodeByLayoutIdxAux 8 layouts (normalizeCodecTy srcTy).layoutIdx v with
             | some b2 =>
-              rw [he2] at henc; injection henc with henc; rw [← henc]
+              rw [he2] at h'; dsimp only at h'; injection h' with h'; rw [← h']
               exact abstractBytesHaveProv_encodeByLayoutIdxAux 8 layouts _ v b2 hv he2
             | none =>
-              rw [he2] at henc
-              exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv henc
-      | array _ _ =>
-        rw [hk] at henc
-        cases hlu : LayoutTable.lookup layouts (normalizeCodecTy srcTy).layoutIdx with
-        | none =>
-          rw [hlu] at henc
-          exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv henc
-        | some _ =>
-          rw [hlu] at henc
-          cases he2 : encodeByLayoutIdxAux 8 layouts (normalizeCodecTy srcTy).layoutIdx v with
-          | some b2 =>
-            rw [he2] at henc; injection henc with henc; rw [← henc]
-            exact abstractBytesHaveProv_encodeByLayoutIdxAux 8 layouts _ v b2 hv he2
+              rw [he2] at h'
+              exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv h'
+        | tuple ks =>
+          rw [hk] at h'
+          cases ks with
+          | nil => exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv h'
+          | cons _ _ =>
+            cases hlu : LayoutTable.lookup layouts (normalizeCodecTy srcTy).layoutIdx with
+            | none =>
+              rw [hlu] at h'
+              exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv h'
+            | some _ =>
+              rw [hlu] at h'
+              cases he2 : encodeByLayoutIdxAux 8 layouts (normalizeCodecTy srcTy).layoutIdx v with
+              | some b2 =>
+                rw [he2] at h'; dsimp only at h'; injection h' with h'; rw [← h']
+                exact abstractBytesHaveProv_encodeByLayoutIdxAux 8 layouts _ v b2 hv he2
+              | none =>
+                rw [he2] at h'
+                exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv h'
+        | array _ _ =>
+          rw [hk] at h'
+          cases hlu : LayoutTable.lookup layouts (normalizeCodecTy srcTy).layoutIdx with
           | none =>
-            rw [he2] at henc
-            exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv henc
-      | _ =>
-        rw [hk] at henc
-        exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv henc
+            rw [hlu] at h'
+            exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv h'
+          | some _ =>
+            rw [hlu] at h'
+            cases he2 : encodeByLayoutIdxAux 8 layouts (normalizeCodecTy srcTy).layoutIdx v with
+            | some b2 =>
+              rw [he2] at h'; dsimp only at h'; injection h' with h'; rw [← h']
+              exact abstractBytesHaveProv_encodeByLayoutIdxAux 8 layouts _ v b2 hv he2
+            | none =>
+              rw [he2] at h'
+              exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv h'
+        | _ =>
+          rw [hk] at h'
+          exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel v bs hv h'
+    cases hk0 : (normalizeCodecTy srcTy).kind with
+    | uint w =>
+      cases w with
+      | usize =>
+        rw [hk0] at henc
+        cases hpw : Nat.beq (layoutPointerBytes layouts) 4 with
+        | false => rw [hpw] at henc; exact hrest (by rw [hk0]; exact henc)
+        | true =>
+          rw [hpw] at henc
+          cases v with
+          | scalar sv =>
+            dsimp only at henc
+            cases hsz : Nat.beq sv.sizeBytes 4 with
+            | true =>
+              rw [hsz] at henc; dsimp only at henc
+              cases he0 : encodeScalarBytes sv .none with
+              | some b0 =>
+                rw [he0] at henc; injection henc with henc; rw [← henc]
+                exact abstractBytesHaveProv_encodeScalarBytes_none sv b0 he0
+              | none =>
+                rw [he0] at henc
+                exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel (.scalar sv) bs hv henc
+            | false =>
+              rw [hsz] at henc
+              exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel (.scalar sv) bs hv henc
+          | _ => exact hrest (by rw [hk0]; exact henc)
+      | _ => exact hrest (by rw [hk0] at henc ⊢; exact henc)
+    | int w =>
+      cases w with
+      | isize =>
+        rw [hk0] at henc
+        cases hpw : Nat.beq (layoutPointerBytes layouts) 4 with
+        | false => rw [hpw] at henc; exact hrest (by rw [hk0]; exact henc)
+        | true =>
+          rw [hpw] at henc
+          cases v with
+          | scalar sv =>
+            dsimp only at henc
+            cases hsz : Nat.beq sv.sizeBytes 4 with
+            | true =>
+              rw [hsz] at henc; dsimp only at henc
+              cases he0 : encodeScalarBytes sv .none with
+              | some b0 =>
+                rw [he0] at henc; injection henc with henc; rw [← henc]
+                exact abstractBytesHaveProv_encodeScalarBytes_none sv b0 he0
+              | none =>
+                rw [he0] at henc
+                exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel (.scalar sv) bs hv henc
+            | false =>
+              rw [hsz] at henc
+              exact abstractBytesHaveProv_encodeUntypedValueToBytes defaultCodecFuel (.scalar sv) bs hv henc
+          | _ => exact hrest (by rw [hk0]; exact henc)
+      | _ => exact hrest (by rw [hk0] at henc ⊢; exact henc)
+    | _ => exact hrest (by rw [hk0] at henc ⊢; exact henc)
 
 /-- **Provenance-free equivalence for `evalByteCast`**: when the source operand evaluates
 to a provenance-free `Value` (`valueHasProv v = false`), `.strictUcg630Ub` and
@@ -9215,13 +9619,13 @@ theorem evalByteCastRichWithPolicy_eq_of_provFree
 `.stripProvenance` equals decoding `stripAbstractBytesProv bs` under `.strictUcg630Ub`. -/
 theorem decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv
     (sl : ScalarLayout) (bs : List AbstractByte)
-    (hNonPtr : scalarLayoutIsPointer sl = false) :
-    decodeScalarLayoutBytesNoForge sl bs .stripProvenance =
-      decodeScalarLayoutBytesNoForge sl (stripAbstractBytesProv bs) .strictUcg630Ub := by
+    (hNonPtr : scalarLayoutIsPointer sl = false) (ptrBytes : Nat := 8) :
+    decodeScalarLayoutBytesNoForge sl bs .stripProvenance ptrBytes =
+      decodeScalarLayoutBytesNoForge sl (stripAbstractBytesProv bs) .strictUcg630Ub ptrBytes := by
   unfold decodeScalarLayoutBytesNoForge
   rw [length_stripAbstractBytesProv, abstractBytesHaveProv_stripAbstractBytesProv,
     decodeScalarBytes_stripAbstractBytesProv]
-  cases scalarLayoutByteWidth sl with
+  cases scalarLayoutByteWidth sl ptrBytes with
   | none => rfl
   | some sz =>
     dsimp only
@@ -9457,12 +9861,12 @@ theorem decodeTypedValueFromBytes_adt_multiple_strip_eq_strict_stripProv
               | some res => rcases res with ⟨sv, prov⟩; rfl
       exact hspan_step _
   have hdecTag : ∀ tagSlice,
-      decodeScalarLayoutBytes tag (stripAbstractBytesProv tagSlice) =
-        decodeScalarLayoutBytes tag tagSlice := by
+      decodeScalarLayoutBytes tag (stripAbstractBytesProv tagSlice) (layoutPointerBytes layouts) =
+        decodeScalarLayoutBytes tag tagSlice (layoutPointerBytes layouts) := by
     intro tagSlice
     unfold decodeScalarLayoutBytes
     rw [length_stripAbstractBytesProv, decodeScalarBytes_stripAbstractBytesProv]
-    cases scalarLayoutByteWidth tag with
+    cases scalarLayoutByteWidth tag (layoutPointerBytes layouts) with
     | none => rfl
     | some sz =>
       dsimp only
@@ -9518,7 +9922,7 @@ theorem decodeTypedValueFromBytes_adt_multiple_strip_eq_strict_stripProv
     dsimp only
     cases l.fields with
     | arbitrary outerOffsets _ =>
-      cases scalarLayoutByteWidth tag with
+      cases scalarLayoutByteWidth tag (layoutPointerBytes layouts) with
       | none => rfl
       | some tagSz =>
         dsimp only
@@ -9531,8 +9935,10 @@ theorem decodeTypedValueFromBytes_adt_multiple_strip_eq_strict_stripProv
           | none => rfl
           | some tagSlice =>
             dsimp only [Option.map]
+            rw [abstractBytesHaveProv_stripAbstractBytesProv]
+            dsimp only
             rw [hdecTag tagSlice]
-            cases decodeScalarLayoutBytes tag tagSlice with
+            cases decodeScalarLayoutBytes tag tagSlice (layoutPointerBytes layouts) with
             | none => rfl
             | some tagVal =>
               cases tagVal with
@@ -9838,7 +10244,7 @@ theorem decodeTypedValueFromBytes_array_strip_eq_strict_stripProv
            | false => .none
            | true =>
              match decodeArrayChunksWith
-                 (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := ek, layoutIdx := 0 } chunk .stripProvenance)
+                 (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := ek, layoutIdx := unresolvedLayoutIdx layouts } chunk .stripProvenance)
                  elemSz n bs with
              | .some elems => .some (.aggregate 0 elems)
              | .none => .none) =
@@ -9849,7 +10255,7 @@ theorem decodeTypedValueFromBytes_array_strip_eq_strict_stripProv
            | false => .none
            | true =>
              match decodeArrayChunksWith
-                 (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := ek, layoutIdx := 0 } chunk .strictUcg630Ub)
+                 (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := ek, layoutIdx := unresolvedLayoutIdx layouts } chunk .strictUcg630Ub)
                  elemSz n (stripAbstractBytesProv bs) with
              | .some elems => .some (.aggregate 0 elems)
              | .none => .none) := by
@@ -9864,9 +10270,9 @@ theorem decodeTypedValueFromBytes_array_strip_eq_strict_stripProv
         | true =>
           dsimp only
           rw [decodeArrayChunksWith_stripAbstractBytesProv
-            (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := ek, layoutIdx := 0 } chunk .stripProvenance)
-            (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := ek, layoutIdx := 0 } chunk .strictUcg630Ub)
-            (hElem' 0) elemSz n bs]
+            (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := ek, layoutIdx := unresolvedLayoutIdx layouts } chunk .stripProvenance)
+            (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := ek, layoutIdx := unresolvedLayoutIdx layouts } chunk .strictUcg630Ub)
+            (hElem' (unresolvedLayoutIdx layouts)) elemSz n bs]
     cases LayoutTable.lookup layouts li with
     | none => exact hfallback _
     | some l =>
@@ -9923,7 +10329,7 @@ theorem decodeTypedValueFromBytes_array_policy_independent_ptr
            | false => .none
            | true =>
              match decodeArrayChunksWith
-                 (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := elemKind, layoutIdx := 0 } chunk .strictUcg630Ub)
+                 (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } chunk .strictUcg630Ub)
                  elemSz n bs with
              | .some elems => .some (.aggregate 0 elems)
              | .none => .none) =
@@ -9934,7 +10340,7 @@ theorem decodeTypedValueFromBytes_array_policy_independent_ptr
            | false => .none
            | true =>
              match decodeArrayChunksWith
-                 (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := elemKind, layoutIdx := 0 } chunk .stripProvenance)
+                 (fun chunk => decodeTypedValueFromBytes fuel layouts { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } chunk .stripProvenance)
                  elemSz n bs with
              | .some elems => .some (.aggregate 0 elems)
              | .none => .none) := by
@@ -9947,7 +10353,7 @@ theorem decodeTypedValueFromBytes_array_policy_independent_ptr
         | false => rfl
         | true =>
           dsimp only
-          rw [decodeArrayChunksWith_congr _ _ (hElemEq 0) elemSz n bs]
+          rw [decodeArrayChunksWith_congr _ _ (hElemEq (unresolvedLayoutIdx layouts)) elemSz n bs]
     cases LayoutTable.lookup layouts li with
     | none => exact hfallback _
     | some l =>
@@ -10113,10 +10519,10 @@ theorem decodeTypedValueFromBytes_adt_single_scalarPair_strip_eq_strict_stripPro
       simp only
       rw [hlen2, hflNe, hbr]
       dsimp only
-      cases scalarLayoutByteWidth s0 with
+      cases scalarLayoutByteWidth s0 (layoutPointerBytes layouts) with
       | none => rfl
       | some sz0 =>
-        cases scalarLayoutByteWidth s1 with
+        cases scalarLayoutByteWidth s1 (layoutPointerBytes layouts) with
         | none => rfl
         | some sz1 =>
           dsimp only
@@ -10128,8 +10534,8 @@ theorem decodeTypedValueFromBytes_adt_single_scalarPair_strip_eq_strict_stripPro
             | none => rfl
             | some slice1 =>
               dsimp only [Option.map]
-              rw [decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv s0 slice0 hs0,
-                decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv s1 slice1 hs1])
+              rw [decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv s0 slice0 hs0 (layoutPointerBytes layouts),
+                decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv s1 slice1 hs1 (layoutPointerBytes layouts)])
 
 /-- **Closed-form provenance erasure for single-variant `.primitive` ADTs** (non-pointer
 scalar or non-`.scalar` backend representation). -/
@@ -10160,7 +10566,7 @@ theorem decodeTypedValueFromBytes_adt_single_primitive_strip_eq_strict_stripProv
         dsimp only
         cases hbr : l.backendRepr with
         | scalar s0 =>
-          exact decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv s0 bs (hNonPtr s0 hbr)
+          exact decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv s0 bs (hNonPtr s0 hbr) (layoutPointerBytes layouts)
         | scalarPair _ _ =>
           rw [abstractBytesHaveProv_stripAbstractBytesProv, decodeScalarBytes_stripAbstractBytesProv]
           dsimp only
@@ -10598,21 +11004,21 @@ theorem decodeTypedValueFromBytes_adt_scalarPair_mixed_strip
     (hfld : l.fields = .arbitrary [off0, off1] memOrder)
     (hflNe : Nat.beq (length l.fieldLayouts) 2 = false)
     (hbr : l.backendRepr = .scalarPair s0 s1)
-    (hw0 : scalarLayoutByteWidth s0 = .some sz0)
-    (hw1 : scalarLayoutByteWidth s1 = .some sz1)
+    (hw0 : scalarLayoutByteWidth s0 (layoutPointerBytes layouts) = .some sz0)
+    (hw1 : scalarLayoutByteWidth s1 (layoutPointerBytes layouts) = .some sz1)
     (hsl0 : sliceAbstractBytes bs off0.bytes sz0 = .some slice0)
     (hsl1 : sliceAbstractBytes bs off1.bytes sz1 = .some slice1)
     (hs0 : scalarLayoutIsPointer s0 = true)
     (hs1 : scalarLayoutIsPointer s1 = false) :
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := li } bs .stripProvenance =
       match
-        decodeScalarLayoutBytesNoForge s0 slice0 .strictUcg630Ub,
-        decodeScalarLayoutBytesNoForge s1 (stripAbstractBytesProv slice1) .strictUcg630Ub
+        decodeScalarLayoutBytesNoForge s0 slice0 .strictUcg630Ub (layoutPointerBytes layouts),
+        decodeScalarLayoutBytesNoForge s1 (stripAbstractBytesProv slice1) .strictUcg630Ub (layoutPointerBytes layouts)
       with
       | .some v0, .some v1 => .some (.aggregate variantIdx [v0, v1])
       | _, _ => .none := by
-  have h0eq : decodeScalarLayoutBytesNoForge s0 slice0 .stripProvenance =
-      decodeScalarLayoutBytesNoForge s0 slice0 .strictUcg630Ub := by
+  have h0eq : decodeScalarLayoutBytesNoForge s0 slice0 .stripProvenance (layoutPointerBytes layouts) =
+      decodeScalarLayoutBytesNoForge s0 slice0 .strictUcg630Ub (layoutPointerBytes layouts) := by
     unfold decodeScalarLayoutBytesNoForge
     cases s0 with
     | initialized pk _ =>
@@ -10641,7 +11047,7 @@ theorem decodeTypedValueFromBytes_adt_scalarPair_mixed_strip
     dsimp only
     rw [hsl0, hsl1]
     dsimp only
-    rw [h0eq, decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv s1 slice1 hs1]
+    rw [h0eq, decodeScalarLayoutBytesNoForge_strip_eq_strict_stripProv s1 slice1 hs1 (layoutPointerBytes layouts)]
     rfl)
 
 /-- **Policy independence on pointer and union targets** in `decodeTypedValueFromBytes`
@@ -10894,6 +11300,19 @@ private theorem abstractBytesUniformProv_false_of_haveProv_false (bs : List Abst
       | none => rfl
       | some _ => cases h
 
+private theorem abstractBytesCoherentPtrProv?_none_of_haveProv_false
+    (bs : List AbstractByte) (hbs : abstractBytesHaveProv bs = false) :
+    abstractBytesCoherentPtrProv? bs = .none := by
+  cases bs with
+  | nil => rfl
+  | cons b rest =>
+    cases b with
+    | uninit => rfl
+    | init _ prov =>
+      cases prov with
+      | none => rfl
+      | some _ => cases hbs
+
 private theorem decodePtrBytesNoForge_ref_none_of_provFree
     (pointee : RigidTy) (ptrBytes : Nat) (bs : List AbstractByte)
     (hbs : abstractBytesHaveProv bs = false) :
@@ -10903,63 +11322,71 @@ private theorem decodePtrBytesNoForge_ref_none_of_provFree
   cases pointee with
   | slice _ =>
     dsimp only
-    cases Nat.beq (length bs) (Nat.add ptrBytes ptrBytes) with
+    cases Nat.blt 0 ptrBytes with
     | false => rfl
     | true =>
-      dsimp only
-      cases Nat.beq (length (takeAbstractBytes ptrBytes bs)) ptrBytes with
+      cases Nat.beq (length bs) (Nat.add ptrBytes ptrBytes) with
       | false => rfl
       | true =>
-        cases decodeScalarBytes (takeAbstractBytes ptrBytes bs) false with
-        | none => rfl
-        | some res =>
-          rcases res with ⟨sv, prov⟩
-          dsimp only
-          rw [abstractBytesUniformProv_false_of_haveProv_false _
-            (abstractBytesHaveProv_takeAbstractBytes_false ptrBytes bs hbs)]
+        dsimp only
+        cases Nat.beq (length (takeAbstractBytes ptrBytes bs)) ptrBytes with
+        | false => rfl
+        | true =>
+          cases decodeLittleEndianBits (takeAbstractBytes ptrBytes bs) with
+          | none => rfl
+          | some bits =>
+            dsimp only
+            rw [abstractBytesCoherentPtrProv?_none_of_haveProv_false _
+              (abstractBytesHaveProv_takeAbstractBytes_false ptrBytes bs hbs)]
   | str =>
     dsimp only
-    cases Nat.beq (length bs) (Nat.add ptrBytes ptrBytes) with
+    cases Nat.blt 0 ptrBytes with
     | false => rfl
     | true =>
-      dsimp only
-      cases Nat.beq (length (takeAbstractBytes ptrBytes bs)) ptrBytes with
+      cases Nat.beq (length bs) (Nat.add ptrBytes ptrBytes) with
       | false => rfl
       | true =>
-        cases decodeScalarBytes (takeAbstractBytes ptrBytes bs) false with
-        | none => rfl
-        | some res =>
-          rcases res with ⟨sv, prov⟩
-          dsimp only
-          rw [abstractBytesUniformProv_false_of_haveProv_false _
-            (abstractBytesHaveProv_takeAbstractBytes_false ptrBytes bs hbs)]
+        dsimp only
+        cases Nat.beq (length (takeAbstractBytes ptrBytes bs)) ptrBytes with
+        | false => rfl
+        | true =>
+          cases decodeLittleEndianBits (takeAbstractBytes ptrBytes bs) with
+          | none => rfl
+          | some bits =>
+            dsimp only
+            rw [abstractBytesCoherentPtrProv?_none_of_haveProv_false _
+              (abstractBytesHaveProv_takeAbstractBytes_false ptrBytes bs hbs)]
   | dynamic _ =>
     dsimp only
-    cases Nat.beq (length bs) (Nat.add ptrBytes ptrBytes) with
+    cases Nat.blt 0 ptrBytes with
     | false => rfl
     | true =>
-      dsimp only
-      cases Nat.beq (length (takeAbstractBytes ptrBytes bs)) ptrBytes with
+      cases Nat.beq (length bs) (Nat.add ptrBytes ptrBytes) with
       | false => rfl
       | true =>
-        cases decodeScalarBytes (takeAbstractBytes ptrBytes bs) false with
-        | none => rfl
-        | some res =>
-          rcases res with ⟨sv, prov⟩
-          dsimp only
-          rw [abstractBytesUniformProv_false_of_haveProv_false _
-            (abstractBytesHaveProv_takeAbstractBytes_false ptrBytes bs hbs)]
+        dsimp only
+        cases Nat.beq (length (takeAbstractBytes ptrBytes bs)) ptrBytes with
+        | false => rfl
+        | true =>
+          cases decodeLittleEndianBits (takeAbstractBytes ptrBytes bs) with
+          | none => rfl
+          | some bits =>
+            dsimp only
+            rw [abstractBytesCoherentPtrProv?_none_of_haveProv_false _
+              (abstractBytesHaveProv_takeAbstractBytes_false ptrBytes bs hbs)]
   | _ =>
     dsimp only
-    cases Nat.beq (length bs) ptrBytes with
+    cases Nat.blt 0 ptrBytes with
     | false => rfl
     | true =>
-      cases decodeScalarBytes bs false with
-      | none => rfl
-      | some res =>
-        rcases res with ⟨sv, prov⟩
-        dsimp only
-        rw [abstractBytesUniformProv_false_of_haveProv_false bs hbs]
+      cases Nat.beq (length bs) ptrBytes with
+      | false => rfl
+      | true =>
+        cases decodeLittleEndianBits bs with
+        | none => rfl
+        | some bits =>
+          dsimp only
+          rw [abstractBytesCoherentPtrProv?_none_of_haveProv_false bs hbs]
 
 private theorem decodePtrBytesRichNoForge_ref_none_of_provFree
     (layouts : LayoutTable) (layoutIdx : LayoutIdx) (pointee : RigidTy) (bs : List AbstractByte)
@@ -11452,10 +11879,15 @@ def floatKind08 : FloatKind → V2026_08_01.MirSemantics.FloatKind
 def scalarInt08 (s : ScalarInt) : V2026_08_01.MirAst.ScalarInt :=
   ⟨s.bits, s.sizeBytes⟩
 
+/-- Dialect translation of a `PtrByteFrag` (`V2026_06_01 → V2026_08_01`). -/
+def ptrByteFrag08 (f : PtrByteFrag) : V2026_08_01.MirSemantics.PtrByteFrag :=
+  { allocId := f.allocId, tag := f.tag, byteIdx := f.byteIdx,
+    origOffset := f.origOffset, ptrBytes := f.ptrBytes }
+
 /-- Dialect translation of `AbstractByte` (`V2026_06_01 → V2026_08_01`). -/
 def abstractByte08 : AbstractByte → V2026_08_01.MirSemantics.AbstractByte
   | .uninit => .uninit
-  | .init b prov => .init b prov
+  | .init b prov => .init b (prov.map ptrByteFrag08)
 
 /-- Dialect translation of a `nanChoices` input (`V2026_06_01 → V2026_08_01`). -/
 def nanInput08 (inp : IeeeFormat × Nat) : V2026_08_01.MirSemantics.IeeeFormat × Nat :=
@@ -12095,32 +12527,69 @@ theorem evalFloatScalarBinOp_parity
   · cases lhsTy? with | none => rfl | some ty => exact ieeeFormatOfTy?_parity ty
   · cases rhsTy? with | none => rfl | some ty => exact ieeeFormatOfTy?_parity ty
 
-private theorem mergeByteProvenance_parity (p₁ p₂ : Option (Nat × Nat)) :
-    V2026_08_01.MirSemantics.mergeByteProvenance p₁ p₂ = mergeByteProvenance p₁ p₂ := by
-  cases p₂ with
-  | none => rfl
-  | some _ => cases p₁ <;> rfl
-
-/-- `decodeLittleEndianBytes` agrees across dialects on all byte sequences. -/
-theorem decodeLittleEndianBytes_parity (bs : List AbstractByte) :
-    V2026_08_01.MirSemantics.decodeLittleEndianBytes (bs.map abstractByte08) =
-      decodeLittleEndianBytes bs := by
+private theorem decodeLittleEndianBits_parity (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.decodeLittleEndianBits (bs.map abstractByte08) =
+      decodeLittleEndianBits bs := by
   induction bs with
   | nil => rfl
   | cons b rest ih =>
     cases b with
     | uninit => rfl
     | init byte prov =>
-      unfold V2026_08_01.MirSemantics.decodeLittleEndianBytes decodeLittleEndianBytes
+      unfold V2026_08_01.MirSemantics.decodeLittleEndianBits decodeLittleEndianBits
       dsimp only [List.map, abstractByte08]
-      rewrite [ih]
-      cases decodeLittleEndianBytes rest with
+      rw [ih]
+      rfl
+
+theorem abstractBytesCoherentPtrProvAux_parity
+    (a t orig ptrBytes expectedIdx : Nat) (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.abstractBytesCoherentPtrProvAux a t orig ptrBytes expectedIdx
+        (bs.map abstractByte08) =
+      abstractBytesCoherentPtrProvAux a t orig ptrBytes expectedIdx bs := by
+  induction bs generalizing expectedIdx with
+  | nil => rfl
+  | cons b rest ih =>
+    cases b with
+    | uninit => rfl
+    | init byte prov =>
+      cases prov with
       | none => rfl
-      | some res =>
-        rcases res with ⟨highBits, restProv⟩
-        exact congrArg
-          (fun p => Option.some (Nat.add byte.toBitVec.toNat (Nat.mul 256 highBits), p))
-          (mergeByteProvenance_parity prov restProv)
+      | some f =>
+        unfold V2026_08_01.MirSemantics.abstractBytesCoherentPtrProvAux abstractBytesCoherentPtrProvAux
+        dsimp only [List.map, abstractByte08, Option.map, ptrByteFrag08]
+        rw [ih]
+
+private theorem abstractBytesCoherentPtrProv?_parity (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? (bs.map abstractByte08) =
+      (abstractBytesCoherentPtrProv? bs).map ptrByteFrag08 := by
+  cases bs with
+  | nil => rfl
+  | cons b rest =>
+    cases b with
+    | uninit => rfl
+    | init byte prov =>
+      cases prov with
+      | none => rfl
+      | some f =>
+        unfold V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? abstractBytesCoherentPtrProv?
+        dsimp only [List.map, abstractByte08, Option.map, ptrByteFrag08]
+        rw [abstractBytesCoherentPtrProvAux_parity]
+        cases Bool.and (Nat.blt 0 f.ptrBytes)
+          (Bool.and (Nat.beq f.byteIdx 0)
+            (abstractBytesCoherentPtrProvAux f.allocId f.tag f.origOffset f.ptrBytes 1 rest)) <;> rfl
+
+/-- `decodeLittleEndianBytes` agrees across dialects on all byte sequences. -/
+theorem decodeLittleEndianBytes_parity (bs : List AbstractByte) :
+    V2026_08_01.MirSemantics.decodeLittleEndianBytes (bs.map abstractByte08) =
+      decodeLittleEndianBytes bs := by
+  unfold V2026_08_01.MirSemantics.decodeLittleEndianBytes decodeLittleEndianBytes
+  rw [decodeLittleEndianBits_parity, abstractBytesCoherentPtrProv?_parity]
+  cases decodeLittleEndianBits bs with
+  | none => rfl
+  | some bits =>
+    cases abstractBytesCoherentPtrProv? bs with
+    | none => rfl
+    | some f => rfl
 
 /-- `decodeScalarBytes` agrees across dialects on all byte sequences. -/
 theorem decodeScalarBytes_parity (bs : List AbstractByte) (signed : Bool) :
@@ -12136,37 +12605,14 @@ theorem decodeScalarBytes_parity (bs : List AbstractByte) (signed : Bool) :
     | none => rfl
     | some res => rcases res with ⟨bits, prov⟩; rfl
 
-/-- `abstractBytesAllProvAux` agrees across dialects on all byte sequences. -/
-theorem abstractBytesAllProvAux_parity (allocId tag : Nat) (bs : List AbstractByte) :
-    V2026_08_01.MirSemantics.abstractBytesAllProvAux allocId tag (bs.map abstractByte08) =
-      abstractBytesAllProvAux allocId tag bs := by
-  induction bs with
-  | nil => rfl
-  | cons b rest ih =>
-    cases b with
-    | uninit => rfl
-    | init _ prov =>
-      cases prov with
-      | none => rfl
-      | some p =>
-        rcases p with ⟨a, t⟩
-        show Bool.and (Bool.and (Nat.beq a allocId) (Nat.beq t tag))
-            (V2026_08_01.MirSemantics.abstractBytesAllProvAux allocId tag (rest.map abstractByte08)) = _
-        rw [ih]; rfl
-
 /-- `abstractBytesUniformProv` agrees across dialects on all byte sequences. -/
 theorem abstractBytesUniformProv_parity (bs : List AbstractByte) :
     V2026_08_01.MirSemantics.abstractBytesUniformProv (bs.map abstractByte08) =
       abstractBytesUniformProv bs := by
-  cases bs with
-  | nil => rfl
-  | cons b rest =>
-    cases b with
-    | uninit => rfl
-    | init _ prov =>
-      cases prov with
-      | none => rfl
-      | some p => rcases p with ⟨a, t⟩; exact abstractBytesAllProvAux_parity a t rest
+  unfold V2026_08_01.MirSemantics.abstractBytesUniformProv abstractBytesUniformProv
+    V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv abstractBytesCoherentPtrProv
+  rw [abstractBytesCoherentPtrProv?_parity]
+  cases abstractBytesCoherentPtrProv? bs <;> rfl
 
 /-- `primitiveKindByteWidth` agrees across dialects. -/
 theorem primitiveKindByteWidth_parity (pk : PrimitiveKind) :
@@ -12284,30 +12730,23 @@ theorem decodeScalarLayoutBytesNoForge_parity
         cases pk with
         | pointer _ =>
           dsimp only [scalarLayout08, primitiveKind08]
-          rw [decodeScalarBytes_parity, abstractBytesUniformProv_parity]
-          cases decodeScalarBytes bs false with
+          rw [decodeLittleEndianBits_parity, abstractBytesCoherentPtrProv?_parity]
+          cases decodeLittleEndianBits bs with
           | none => rfl
-          | some res =>
-            rcases res with ⟨sv, prov⟩
-            dsimp only [Option.map, scalarInt08]
-            cases abstractBytesUniformProv bs with
-            | true =>
-              cases prov with
-              | some p => rcases p with ⟨allocId, _⟩; rfl
-              | none =>
+          | some bits =>
+            dsimp only
+            cases abstractBytesCoherentPtrProv? bs with
+            | some frag =>
+              dsimp only [Option.map, ptrByteFrag08]
+              cases Nat.beq frag.ptrBytes sz with
+              | true => rfl
+              | false =>
                 rw [wrappingRangeContains_parity]
-                cases wrappingRangeContains vr sv.bits with
-                | true =>
-                  show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
-                  rw [scalarInt06_scalarInt08]
-                | false => rfl
-            | false =>
+                cases wrappingRangeContains vr bits <;> rfl
+            | none =>
+              dsimp only [Option.map]
               rw [wrappingRangeContains_parity]
-              cases wrappingRangeContains vr sv.bits with
-              | true =>
-                show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
-                rw [scalarInt06_scalarInt08]
-              | false => rfl
+              cases wrappingRangeContains vr bits <;> rfl
         | int _ _ =>
           dsimp only [scalarLayout08, primitiveKind08]
           cases policy with
@@ -12336,22 +12775,16 @@ theorem decodeScalarLayoutBytesNoForge_parity
         cases pk with
         | pointer _ =>
           dsimp only [scalarLayout08, primitiveKind08]
-          rw [decodeScalarBytes_parity, abstractBytesUniformProv_parity]
-          cases decodeScalarBytes bs false with
+          rw [decodeLittleEndianBits_parity, abstractBytesCoherentPtrProv?_parity]
+          cases decodeLittleEndianBits bs with
           | none => rfl
-          | some res =>
-            rcases res with ⟨sv, prov⟩
-            dsimp only [Option.map, scalarInt08]
-            cases abstractBytesUniformProv bs with
-            | true =>
-              cases prov with
-              | some p => rcases p with ⟨allocId, _⟩; rfl
-              | none =>
-                show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
-                rw [scalarInt06_scalarInt08]
-            | false =>
-              show Option.some (Value.scalar (scalarInt06 (scalarInt08 sv))) = _
-              rw [scalarInt06_scalarInt08]
+          | some bits =>
+            dsimp only
+            cases abstractBytesCoherentPtrProv? bs with
+            | some frag =>
+              dsimp only [Option.map, ptrByteFrag08]
+              cases Nat.beq frag.ptrBytes sz <;> rfl
+            | none => rfl
         | int _ _ =>
           dsimp only [scalarLayout08, primitiveKind08]
           cases policy with
@@ -12977,6 +13410,129 @@ theorem EvalRvalueFloatRel_floatToFloat_const_parity
     mem08 localDecls08 layouts08 ⟨bits, sizeBytes⟩ res08 rfl rfl
     (ieeeFormatOfTy?_parity srcTy) (ieeeFormatOfTy?_parity targetTy)
 
+private theorem validateValueForTy?_scalar_of_isFloatTy
+    (layouts : LayoutTable) (ty : Ty) (sc : ScalarInt) (h : isFloatTy ty = true) :
+    validateValueForTy? layouts ty (.scalar sc) = true := by
+  cases ty with
+  | mk kind li =>
+    cases kind with
+    | float _ => rfl
+    | _ => cases h
+
+private theorem validateValueForTy?_scalar_of_isFloatTy08
+    (layouts : V2026_08_01.Layout.LayoutTable) (ty : V2026_08_01.MirAst.Ty)
+    (sc : V2026_08_01.MirAst.ScalarInt)
+    (h : V2026_08_01.MirSemantics.isFloatTy ty = true) :
+    V2026_08_01.MirSemantics.validateValueForTy? layouts ty (.scalar sc) = true := by
+  cases ty with
+  | mk kind li =>
+    cases kind with
+    | float _ => rfl
+    | _ => cases h
+
+private theorem evalOperand_copy_scalar_ok
+    (locals : List LocalSlot) (idx : Nat) (sc : ScalarInt)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (callStack : List SavedCallerFrame)
+    (decl : LocalDecl)
+    (hLoc : get? locals idx = .some (.init (.scalar sc)))
+    (hDecl : get? localDecls idx = .some decl)
+    (hVal : validateValueForTy? layouts decl.ty (.scalar sc) = true) :
+    evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals localDecls callStack =
+      .ok (.scalar sc) locals := by
+  unfold evalOperand
+  dsimp only
+  rw [hLoc]
+  cases localDecls with
+  | nil => cases hDecl
+  | cons d ds =>
+    dsimp only [placeTyResolved, placeTy, readProjectedValue]
+    rw [hDecl]
+    dsimp only [materializeReadPtrValue]
+    rw [hVal]
+
+private theorem evalOperand_move_scalar_ok
+    (locals locals' : List LocalSlot) (idx : Nat) (sc : ScalarInt)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (localDecls : List LocalDecl) (callStack : List SavedCallerFrame)
+    (decl : LocalDecl)
+    (hLoc : get? locals idx = .some (.init (.scalar sc)))
+    (hSet : set? locals idx .uninit = .some locals')
+    (hDecl : get? localDecls idx = .some decl)
+    (hVal : validateValueForTy? layouts decl.ty (.scalar sc) = true) :
+    evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals localDecls callStack =
+      .ok (.scalar sc) locals' := by
+  unfold evalOperand
+  dsimp only
+  rw [hLoc]
+  dsimp only [readProjectedValue, valueContainsUninit]
+  rw [hSet]
+  cases localDecls with
+  | nil => cases hDecl
+  | cons d ds =>
+    dsimp only [placeTyResolved, placeTy]
+    rw [hDecl]
+    dsimp only [materializeReadPtrValue]
+    rw [hVal]
+
+private theorem evalOperand08_copy_scalar_ok
+    (locals : List V2026_08_01.MirSemantics.LocalSlot) (idx : Nat)
+    (sc : V2026_08_01.MirAst.ScalarInt)
+    (borrows : List V2026_08_01.MirSemantics.BorrowEntry)
+    (globals : List V2026_08_01.MirAst.CapturedAllocation)
+    (layouts : V2026_08_01.Layout.LayoutTable)
+    (callerLocals : List V2026_08_01.MirSemantics.LocalSlot)
+    (localDecls : List V2026_08_01.MirAst.LocalDecl)
+    (callStack : List V2026_08_01.MirSemantics.SavedCallerFrame)
+    (decl : V2026_08_01.MirAst.LocalDecl)
+    (hLoc : get? locals idx = .some (.init (.scalar sc)))
+    (hDecl : get? localDecls idx = .some decl)
+    (hVal : V2026_08_01.MirSemantics.validateValueForTy? layouts decl.ty (.scalar sc) = true) :
+    V2026_08_01.MirSemantics.evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals localDecls callStack =
+      .ok (.scalar sc) locals := by
+  unfold V2026_08_01.MirSemantics.evalOperand
+  dsimp only
+  rw [hLoc]
+  cases localDecls with
+  | nil => cases hDecl
+  | cons d ds =>
+    dsimp only [V2026_08_01.MirSemantics.placeTyResolved, V2026_08_01.MirSemantics.placeTy,
+      V2026_08_01.MirSemantics.readProjectedValue]
+    rw [hDecl]
+    dsimp only [V2026_08_01.MirSemantics.materializeReadPtrValue]
+    rw [hVal]
+
+private theorem evalOperand08_move_scalar_ok
+    (locals locals' : List V2026_08_01.MirSemantics.LocalSlot) (idx : Nat)
+    (sc : V2026_08_01.MirAst.ScalarInt)
+    (borrows : List V2026_08_01.MirSemantics.BorrowEntry)
+    (globals : List V2026_08_01.MirAst.CapturedAllocation)
+    (layouts : V2026_08_01.Layout.LayoutTable)
+    (callerLocals : List V2026_08_01.MirSemantics.LocalSlot)
+    (localDecls : List V2026_08_01.MirAst.LocalDecl)
+    (callStack : List V2026_08_01.MirSemantics.SavedCallerFrame)
+    (decl : V2026_08_01.MirAst.LocalDecl)
+    (hLoc : get? locals idx = .some (.init (.scalar sc)))
+    (hSet : set? locals idx .uninit = .some locals')
+    (hDecl : get? localDecls idx = .some decl)
+    (hVal : V2026_08_01.MirSemantics.validateValueForTy? layouts decl.ty (.scalar sc) = true) :
+    V2026_08_01.MirSemantics.evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals localDecls callStack =
+      .ok (.scalar sc) locals' := by
+  unfold V2026_08_01.MirSemantics.evalOperand
+  dsimp only
+  rw [hLoc]
+  dsimp only [V2026_08_01.MirSemantics.readProjectedValue]
+  rw [hSet]
+  cases localDecls with
+  | nil => cases hDecl
+  | cons d ds =>
+    dsimp only [V2026_08_01.MirSemantics.placeTyResolved, V2026_08_01.MirSemantics.placeTy]
+    rw [hDecl]
+    dsimp only [V2026_08_01.MirSemantics.materializeReadPtrValue]
+    rw [hVal]
+
 /-- **Local-variable specialization (`copy _idx`)**: `EvalRvalueFloatRel` cross-dialect parity
 on float `.unaryOp .neg` reading scalar local `_idx`. -/
 theorem EvalRvalueFloatRel_unaryNeg_float_local_copy_parity
@@ -12999,12 +13555,12 @@ theorem EvalRvalueFloatRel_unaryNeg_float_local_copy_parity
           locals06 (.unaryOp .neg (.copy ⟨idx, .nil⟩)) mem06 localDecls06 layouts06
           (rvalueResWith06 locals06 mem06 res08) ∧
         ∀ v l' m', res08 = .ok v l' m' → l' = locals08 ∧ m' = mem08) := by
-  have hEval06 : evalOperand locals06 (.copy ⟨idx, .nil⟩) mem06.borrows mem06.globals layouts06 mem06.callerLocals localDecls06 mem06.callStack =
-      .ok (.scalar sc) locals06 := by
-    unfold evalOperand; dsimp only; rw [hLoc06]; rfl
-  have hEval08 : V2026_08_01.MirSemantics.evalOperand locals08 (.copy ⟨idx, .nil⟩) mem08.borrows mem08.globals layouts08 mem08.callerLocals localDecls08 mem08.callStack =
-      .ok (.scalar (scalarInt08 sc)) locals08 := by
-    unfold V2026_08_01.MirSemantics.evalOperand; dsimp only; rw [hLoc08]; rfl
+  have hEval06 := evalOperand_copy_scalar_ok locals06 idx sc mem06.borrows mem06.globals layouts06
+    mem06.callerLocals localDecls06 mem06.callStack decl06 hLoc06 hDecl06
+    (validateValueForTy?_scalar_of_isFloatTy layouts06 decl06.ty sc hFloat06)
+  have hEval08 := evalOperand08_copy_scalar_ok locals08 idx (scalarInt08 sc) mem08.borrows mem08.globals layouts08
+    mem08.callerLocals localDecls08 mem08.callStack decl08 hLoc08 hDecl08
+    (validateValueForTy?_scalar_of_isFloatTy08 layouts08 decl08.ty (scalarInt08 sc) hFloat08)
   have hTy06 : operandTy localDecls06 layouts06 (.copy ⟨idx, .nil⟩) = .some decl06.ty := by
     unfold operandTy placeTy; dsimp only; rw [hDecl06]
   have hTy08 : V2026_08_01.MirSemantics.operandTy localDecls08 layouts08 (.copy ⟨idx, .nil⟩) = .some decl08.ty := by
@@ -13018,7 +13574,7 @@ theorem EvalRvalueFloatRel_unaryNeg_float_local_copy_parity
     (by rw [hTy06, hTy08]; exact hFmt)
 
 /-- **Local-variable specialization (`copy _lhs`, `copy _rhs`)**: `EvalRvalueFloatRel`
-cross-dialect parity on float `.binaryOp` reading two scalar locals. -/
+cross-dialect parity on float `.binaryOp` reading two valid scalar locals. -/
 theorem EvalRvalueFloatRel_binaryOp_float_local_copy_parity
     (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
     (op : BinOp) (hNotOff : op ≠ .offset) (lhsIdx rhsIdx : Nat) (lhs rhs : ScalarInt)
@@ -13035,6 +13591,10 @@ theorem EvalRvalueFloatRel_binaryOp_float_local_copy_parity
     (hRD06 : get? localDecls06 rhsIdx = .some rDecl06)
     (hLD08 : get? localDecls08 lhsIdx = .some lDecl08)
     (hRD08 : get? localDecls08 rhsIdx = .some rDecl08)
+    (hValidL06 : validateValueForTy? layouts06 lDecl06.ty (.scalar lhs) = true)
+    (hValidR06 : validateValueForTy? layouts06 rDecl06.ty (.scalar rhs) = true)
+    (hValidL08 : V2026_08_01.MirSemantics.validateValueForTy? layouts08 lDecl08.ty (.scalar (scalarInt08 lhs)) = true)
+    (hValidR08 : V2026_08_01.MirSemantics.validateValueForTy? layouts08 rDecl08.ty (.scalar (scalarInt08 rhs)) = true)
     (hFloat06 : Bool.or (isFloatTy lDecl06.ty) (isFloatTy rDecl06.ty) = true)
     (hFloat08 : Bool.or (V2026_08_01.MirSemantics.isFloatTy lDecl08.ty)
         (V2026_08_01.MirSemantics.isFloatTy rDecl08.ty) = true)
@@ -13047,14 +13607,14 @@ theorem EvalRvalueFloatRel_binaryOp_float_local_copy_parity
           locals06 (.binaryOp op (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩))
           mem06 localDecls06 layouts06 (rvalueResWith06 locals06 mem06 res08) ∧
         ∀ v l' m', res08 = .ok v l' m' → l' = locals08 ∧ m' = mem08) := by
-  have hl06 : evalOperand locals06 (.copy ⟨lhsIdx, .nil⟩) mem06.borrows mem06.globals layouts06 mem06.callerLocals localDecls06 mem06.callStack =
-      .ok (.scalar lhs) locals06 := by unfold evalOperand; dsimp only; rw [hL06]; rfl
-  have hr06 : evalOperand locals06 (.copy ⟨rhsIdx, .nil⟩) mem06.borrows mem06.globals layouts06 mem06.callerLocals localDecls06 mem06.callStack =
-      .ok (.scalar rhs) locals06 := by unfold evalOperand; dsimp only; rw [hR06]; rfl
-  have hl08 : V2026_08_01.MirSemantics.evalOperand locals08 (.copy ⟨lhsIdx, .nil⟩) mem08.borrows mem08.globals layouts08 mem08.callerLocals localDecls08 mem08.callStack =
-      .ok (.scalar (scalarInt08 lhs)) locals08 := by unfold V2026_08_01.MirSemantics.evalOperand; dsimp only; rw [hL08]; rfl
-  have hr08 : V2026_08_01.MirSemantics.evalOperand locals08 (.copy ⟨rhsIdx, .nil⟩) mem08.borrows mem08.globals layouts08 mem08.callerLocals localDecls08 mem08.callStack =
-      .ok (.scalar (scalarInt08 rhs)) locals08 := by unfold V2026_08_01.MirSemantics.evalOperand; dsimp only; rw [hR08]; rfl
+  have hl06 := evalOperand_copy_scalar_ok locals06 lhsIdx lhs mem06.borrows mem06.globals layouts06
+    mem06.callerLocals localDecls06 mem06.callStack lDecl06 hL06 hLD06 hValidL06
+  have hr06 := evalOperand_copy_scalar_ok locals06 rhsIdx rhs mem06.borrows mem06.globals layouts06
+    mem06.callerLocals localDecls06 mem06.callStack rDecl06 hR06 hRD06 hValidR06
+  have hl08 := evalOperand08_copy_scalar_ok locals08 lhsIdx (scalarInt08 lhs) mem08.borrows mem08.globals layouts08
+    mem08.callerLocals localDecls08 mem08.callStack lDecl08 hL08 hLD08 hValidL08
+  have hr08 := evalOperand08_copy_scalar_ok locals08 rhsIdx (scalarInt08 rhs) mem08.borrows mem08.globals layouts08
+    mem08.callerLocals localDecls08 mem08.callStack rDecl08 hR08 hRD08 hValidR08
   have hLT06 : operandTy localDecls06 layouts06 (.copy ⟨lhsIdx, .nil⟩) = .some lDecl06.ty := by
     unfold operandTy placeTy; dsimp only; rw [hLD06]
   have hRT06 : operandTy localDecls06 layouts06 (.copy ⟨rhsIdx, .nil⟩) = .some rDecl06.ty := by
@@ -13074,7 +13634,7 @@ theorem EvalRvalueFloatRel_binaryOp_float_local_copy_parity
     (by rw [hRT06, hRT08]; exact hFmtR)
 
 /-- **Local-variable specialization (`copy _lhs`, `move _rhs`)**: `EvalRvalueFloatRel`
-cross-dialect parity on float `.binaryOp` when moving out of `_rhs`, threading the updated
+cross-dialect parity on float `.binaryOp` when moving out of valid scalar `_rhs`, threading the updated
 `locals06'` / `locals08'` post-states across both dialects. -/
 theorem EvalRvalueFloatRel_binaryOp_float_local_move_parity
     (mode : FloatArithMode) (policy : Ptr2IntTransmutePolicy)
@@ -13094,6 +13654,10 @@ theorem EvalRvalueFloatRel_binaryOp_float_local_move_parity
     (hRD06 : get? localDecls06 rhsIdx = .some rDecl06)
     (hLD08 : get? localDecls08 lhsIdx = .some lDecl08)
     (hRD08 : get? localDecls08 rhsIdx = .some rDecl08)
+    (hValidL06 : validateValueForTy? layouts06 lDecl06.ty (.scalar lhs) = true)
+    (hValidR06 : validateValueForTy? layouts06 rDecl06.ty (.scalar rhs) = true)
+    (hValidL08 : V2026_08_01.MirSemantics.validateValueForTy? layouts08 lDecl08.ty (.scalar (scalarInt08 lhs)) = true)
+    (hValidR08 : V2026_08_01.MirSemantics.validateValueForTy? layouts08 rDecl08.ty (.scalar (scalarInt08 rhs)) = true)
     (hFloat06 : Bool.or (isFloatTy lDecl06.ty) (isFloatTy rDecl06.ty) = true)
     (hFloat08 : Bool.or (V2026_08_01.MirSemantics.isFloatTy lDecl08.ty)
         (V2026_08_01.MirSemantics.isFloatTy rDecl08.ty) = true)
@@ -13106,14 +13670,14 @@ theorem EvalRvalueFloatRel_binaryOp_float_local_move_parity
           locals06 (.binaryOp op (.copy ⟨lhsIdx, .nil⟩) (.move ⟨rhsIdx, .nil⟩))
           mem06 localDecls06 layouts06 (rvalueResWith06 locals06' mem06 res08) ∧
         ∀ v l' m', res08 = .ok v l' m' → l' = locals08' ∧ m' = mem08) := by
-  have hl06 : evalOperand locals06 (.copy ⟨lhsIdx, .nil⟩) mem06.borrows mem06.globals layouts06 mem06.callerLocals localDecls06 mem06.callStack =
-      .ok (.scalar lhs) locals06 := by unfold evalOperand; dsimp only; rw [hL06]; rfl
-  have hr06 : evalOperand locals06 (.move ⟨rhsIdx, .nil⟩) mem06.borrows mem06.globals layouts06 mem06.callerLocals localDecls06 mem06.callStack =
-      .ok (.scalar rhs) locals06' := by unfold evalOperand; dsimp only; rw [hR06]; dsimp only [readProjectedValue, valueContainsUninit]; rw [hSet06]
-  have hl08 : V2026_08_01.MirSemantics.evalOperand locals08 (.copy ⟨lhsIdx, .nil⟩) mem08.borrows mem08.globals layouts08 mem08.callerLocals localDecls08 mem08.callStack =
-      .ok (.scalar (scalarInt08 lhs)) locals08 := by unfold V2026_08_01.MirSemantics.evalOperand; dsimp only; rw [hL08]; rfl
-  have hr08 : V2026_08_01.MirSemantics.evalOperand locals08 (.move ⟨rhsIdx, .nil⟩) mem08.borrows mem08.globals layouts08 mem08.callerLocals localDecls08 mem08.callStack =
-      .ok (.scalar (scalarInt08 rhs)) locals08' := by unfold V2026_08_01.MirSemantics.evalOperand; dsimp only; rw [hR08]; dsimp only [V2026_08_01.MirSemantics.readProjectedValue]; rw [hSet08]
+  have hl06 := evalOperand_copy_scalar_ok locals06 lhsIdx lhs mem06.borrows mem06.globals layouts06
+    mem06.callerLocals localDecls06 mem06.callStack lDecl06 hL06 hLD06 hValidL06
+  have hr06 := evalOperand_move_scalar_ok locals06 locals06' rhsIdx rhs mem06.borrows mem06.globals layouts06
+    mem06.callerLocals localDecls06 mem06.callStack rDecl06 hR06 hSet06 hRD06 hValidR06
+  have hl08 := evalOperand08_copy_scalar_ok locals08 lhsIdx (scalarInt08 lhs) mem08.borrows mem08.globals layouts08
+    mem08.callerLocals localDecls08 mem08.callStack lDecl08 hL08 hLD08 hValidL08
+  have hr08 := evalOperand08_move_scalar_ok locals08 locals08' rhsIdx (scalarInt08 rhs) mem08.borrows mem08.globals layouts08
+    mem08.callerLocals localDecls08 mem08.callStack rDecl08 hR08 hSet08 hRD08 hValidR08
   have hLT06 : operandTy localDecls06 layouts06 (.copy ⟨lhsIdx, .nil⟩) = .some lDecl06.ty := by
     unfold operandTy placeTy; dsimp only; rw [hLD06]
   have hRT06 : operandTy localDecls06 layouts06 (.move ⟨rhsIdx, .nil⟩) = .some rDecl06.ty := by
@@ -16562,10 +17126,12 @@ theorem decodeTypedValueFromBytes_padding_vs_field_provenance_witness :
        .init 0 .none, .init 0 .none, .init 0 .none, .init 0 .none]
     let paddingProv : List AbstractByte :=
       .init 0x11 .none ::
-        .init 0 (.some (7, 7)) :: .init 0 (.some (7, 7)) :: .init 0 (.some (7, 7)) ::
+        .init 0 (.some { allocId := 7, tag := 7, byteIdx := 0, origOffset := 0, ptrBytes := 8 }) ::
+        .init 0 (.some { allocId := 7, tag := 7, byteIdx := 1, origOffset := 0, ptrBytes := 8 }) ::
+        .init 0 (.some { allocId := 7, tag := 7, byteIdx := 2, origOffset := 0, ptrBytes := 8 }) ::
         .uninit :: .uninit :: .uninit :: .uninit :: tail
     let fieldProv : List AbstractByte :=
-      .init 0x11 (.some (7, 7)) ::
+      .init 0x11 (.some { allocId := 7, tag := 7, byteIdx := 0, origOffset := 0, ptrBytes := 8 }) ::
         .uninit :: .uninit :: .uninit :: .uninit :: .uninit :: .uninit :: .uninit :: tail
     let decoded : Value := .aggregate 0 [.scalar ⟨0x11, 1⟩, .scalar ⟨42, 8⟩]
     abstractBytesHaveProv paddingProv = true ∧
@@ -17037,7 +17603,7 @@ def axiomAudit_places :=
   And.intro (@evalFloatScalarBinOp_parity) <|
   And.intro (@decodeLittleEndianBytes_parity) <|
   And.intro (@decodeScalarBytes_parity) <|
-  And.intro (@abstractBytesAllProvAux_parity) <|
+  And.intro (@abstractBytesCoherentPtrProvAux_parity) <|
   And.intro (@abstractBytesUniformProv_parity) <|
   And.intro (@primitiveKindByteWidth_parity) <|
   And.intro (@scalarLayoutByteWidth_parity) <|

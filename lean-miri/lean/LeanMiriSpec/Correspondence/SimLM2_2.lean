@@ -8,6 +8,7 @@ This file may not be copied, modified, or distributed except according to
 those terms.
 -/
 
+import Lean
 import LeanMiriSpec.Correspondence.Simulation
 import LeanMiriSpec.Correspondence.SimLM1_2
 import LeanMiriSpec.Correspondence.SimLM1_4
@@ -926,6 +927,131 @@ theorem MemoryAllocDisjoint_deinitFrameLocal
       rw [Array.getElem?_set_ne _ (Ne.symm h2)] at hj
       exact hdisj i j mp₁ mp₂ l₁ l₂ hne hi hj
 
+theorem scalarBits_lt_of_fieldSize
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} {fSz : Miri.ABI.Size}
+    (hrel : ScalarRel sc msc)
+    (hsz : fSz = translateSizeBytes sc.sizeBytes) :
+    sc.bits < scalarModulus fSz.bytes.toNat := by
+  rcases hrel with ⟨hvb, hcan, _, _⟩
+  have hbytes : fSz.bytes.toNat = sc.sizeBytes := by
+    rw [hsz]
+    rcases hvb with h1 | h1 | h1 | h1 | h1 <;> (rw [h1]; rfl)
+  rw [hbytes]
+  exact hcan
+
+theorem scalarBle_max_of_fieldSize
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} {fSz : Miri.ABI.Size}
+    (hrel : ScalarRel sc msc)
+    (hsz : fSz = translateSizeBytes sc.sizeBytes) :
+    Nat.ble sc.bits (scalarModulus fSz.bytes.toNat - 1) = true := by
+  rw [Nat.ble_eq]
+  exact Nat.le_sub_one_of_lt (scalarBits_lt_of_fieldSize hrel hsz)
+
+def wrapZeroScalarVal (sc : MirAst.ScalarInt) : List ProjectionElem → Value
+  | [] => .scalar sc
+  | _ :: rest => .aggregate 0 [wrapZeroScalarVal sc rest]
+
+theorem ZeroScalarWrappedVal.eq_wrapZeroScalarVal
+    {sc : MirAst.ScalarInt} {v : Value} {projs : List ProjectionElem}
+    (h : ZeroScalarWrappedVal sc v projs) :
+    v = wrapZeroScalarVal sc projs := by
+  induction h with
+  | bare => rfl
+  | wrap_cons _ rest _ _ ih =>
+    dsimp [wrapZeroScalarVal]
+    rw [ih]
+
+theorem ImmediateStructRel.shapes_from_lists
+    {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {v : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
+    (h : ImmediateStructRel ty layouts fields paths v imm) :
+    (fields.length = 1 ∧
+      ∃ sc,
+        v = wrapZeroScalarVal sc (paths.headD []) ∧
+        Nat.ble sc.bits
+          (scalarModulus ((fields[0]?.map (·.fieldLayout.size.bytes.toNat)).getD 0) - 1) = true) ∨
+    (fields.length = 2 ∧
+      ∃ sc₀ sc₁,
+        v = .aggregate 0
+          [wrapZeroScalarVal sc₀ (paths[0]?.getD []).tail,
+           wrapZeroScalarVal sc₁ (paths[1]?.getD []).tail] ∧
+        Nat.ble sc₀.bits
+          (scalarModulus ((fields[0]?.map (·.fieldLayout.size.bytes.toNat)).getD 0) - 1) = true ∧
+        Nat.ble sc₁.bits
+          (scalarModulus ((fields[1]?.map (·.fieldLayout.size.bytes.toNat)).getD 0) - 1) = true) := by
+  cases h with
+  | scalarWrapper f₀ p₀ _ sc msc v _ _ _ _ _ _ _ hw hrel hsz _ _ =>
+    exact Or.inl ⟨rfl, sc, hw.eq_wrapZeroScalarVal, scalarBle_max_of_fieldSize hrel hsz⟩
+  | scalarPair f₀ f₁ mid₀ mid₁ z₀ z₁ _ _ _ sc₀ sc₁ msc₀ msc₁ v₀ v₁
+      _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ hw₀ hw₁ hrel₀ hrel₁ hsz₀ hsz₁ _ _ _ _ =>
+    exact Or.inr ⟨rfl, sc₀, sc₁,
+      by rw [hw₀.eq_wrapZeroScalarVal, hw₁.eq_wrapZeroScalarVal]; rfl,
+      scalarBle_max_of_fieldSize hrel₀ hsz₀,
+      scalarBle_max_of_fieldSize hrel₁ hsz₁⟩
+
+theorem validateScalarLayoutValForTy_int_of_ble {bw e : Nat} {signed : Bool} {sc : MirAst.ScalarInt}
+    (hble : Nat.ble sc.bits e = true)
+    (he : Nat.beq e 0x10FFFF = false := by rfl) :
+    validateScalarLayoutValForTy? (.initialized (.int bw signed) { start := 0, end_ := e }) (.scalar sc) = true := by
+  rcases sc with ⟨b, sz⟩
+  unfold validateScalarLayoutValForTy? wrappingRangeContains
+  have h0e : Nat.ble 0 e = true := rfl
+  have h0b : Nat.ble 0 b = true := rfl
+  simp only [h0e, h0b, hble, he, Bool.true_and, Bool.and_false]
+
+elab "lm22_whnf_validate_tac" : tactic => do
+  Lean.Elab.Tactic.withMainContext do
+    let normScalarArg (a : Lean.Expr) : Lean.Elab.Tactic.TacticM Lean.Expr :=
+      Lean.Meta.transform a (pre := fun s => do
+        if s.isFVar then return .done s
+        let s' ← Lean.Meta.whnfCore s
+        if s' != s then return .visit s'
+        let some sDef ← Lean.Meta.unfoldDefinition? s | return .continue
+        return .visit sDef)
+    let mut g ← Lean.Elab.Tactic.getMainGoal
+    let lctx ← Lean.MonadLCtx.getLCtx
+    for ldecl in lctx do
+      if !ldecl.isImplementationDetail then
+        let lt := ldecl.type
+        if lt.isAppOfArity ``Eq 3 then
+          let lhs := lt.getArg! 1
+          if lhs.isAppOfArity ``Nat.ble 2 then
+            let b0 := lhs.getArg! 0
+            let b1 ← normScalarArg (lhs.getArg! 1)
+            let lhs' := Lean.mkApp2 lhs.getAppFn b0 b1
+            let lt' := Lean.mkApp3 lt.getAppFn (lt.getArg! 0) lhs' (lt.getArg! 2)
+            if lt' != lt then
+              g ← g.replaceLocalDeclDefEq ldecl.fvarId lt'
+    let tgt ← g.getType
+    let tgt' ← Lean.Meta.transform tgt (pre := fun e => do
+      if e.isAppOf ``validateScalarLayoutValForTy? then
+        let args ← e.getAppArgs.mapM normScalarArg
+        return .done (Lean.mkAppN e.getAppFn args)
+      let e' ← Lean.Meta.whnfCore e
+      if e' != e then return .visit e'
+      let some eDef ← Lean.Meta.unfoldDefinition? e | return .continue
+      return .visit eDef)
+    g ← g.replaceTargetDefEq tgt'
+    Lean.Elab.Tactic.replaceMainGoal [g]
+
+macro "lm22_prove_validate_tac" : tactic =>
+  `(tactic| (
+    lm22_whnf_validate_tac
+    repeat (first | rfl | rw [validateScalarLayoutValForTy_int_of_ble (by assumption) rfl])))
+
+macro "lm22_imm_read_valid_tac" : tactic =>
+  `(tactic| (
+    intro v imm hsr
+    rcases ImmediateStructRel.shapes_from_lists hsr with
+      ⟨hlen, sc, hv, _⟩ | ⟨hlen, sc₀, sc₁, hv, _, _⟩
+    · first
+      | exact absurd hlen (by decide)
+      | (rw [hv]; lm22_prove_validate_tac)
+    · first
+      | exact absurd hlen (by decide)
+      | (rw [hv]; lm22_prove_validate_tac)))
+
 /-- 100% syntactic (state-independent) typing predicate for `LM-2.2` operands:
 1. `constScalar`: primitive scalar constant;
 2. `primLocal`: `Copy(_idx)` or `Move(_idx)` of a primitive scalar local with
@@ -970,6 +1096,9 @@ inductive WellTypedLM2_2Operand
       (fields : List StructFieldDesc) (paths : List (List ProjectionElem)) :
       get? body.localDecls idx = some decl →
       IsImmediateStructTy env body.layouts decl.ty fields paths →
+      (read_valid : ∀ v imm, ImmediateStructRel decl.ty body.layouts fields paths v imm →
+        validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, []⟩) v = true :=
+        by lm22_imm_read_valid_tac) →
       WellTypedLM2_2Operand body env stEnv (mkPlaceOperand isMove ⟨idx, []⟩) decl.ty
   | projectedSubStruct (isMove : Bool) (idx : Local)
       (projs : List ProjectionElem) (subTy : Ty)
@@ -978,6 +1107,10 @@ inductive WellTypedLM2_2Operand
         [[.field 0 mid₀], [.field 1 mid₁]] →
       WellTypedLM2_2ProjectedSubStructRead body env idx projs subTy sf₀ sf₁ mid₀ mid₁ →
       (not_union : placeTouchesUnion body.localDecls body.layouts ⟨idx, projs⟩ = false := by rfl) →
+      (read_valid : ∀ v imm, ImmediateStructRel subTy body.layouts [sf₀, sf₁]
+          [[.field 0 mid₀], [.field 1 mid₁]] v imm →
+        validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, projs⟩) v = true :=
+        by lm22_imm_read_valid_tac) →
       WellTypedLM2_2Operand body env stEnv (mkPlaceOperand isMove ⟨idx, projs⟩) subTy
   | projectedScalarWrap (isMove : Bool) (idx : Local)
       (projs : List ProjectionElem) (subTy : Ty)
@@ -986,6 +1119,10 @@ inductive WellTypedLM2_2Operand
         [[.field 0 mid₀]] →
       WellTypedLM2_2ProjectedScalarWrapRead body env idx projs subTy sf₀ mid₀ →
       (not_union : placeTouchesUnion body.localDecls body.layouts ⟨idx, projs⟩ = false := by rfl) →
+      (read_valid : ∀ v imm, ImmediateStructRel subTy body.layouts [sf₀]
+          [[.field 0 mid₀]] v imm →
+        validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, projs⟩) v = true :=
+        by lm22_imm_read_valid_tac) →
       WellTypedLM2_2Operand body env stEnv (mkPlaceOperand isMove ⟨idx, projs⟩) subTy
 
 private theorem WellTypedLM2_2ProjectedSubStructRead.decl_and_chain
@@ -1044,9 +1181,9 @@ theorem WellTypedLM2_2Operand.usesStructMemCopyDest_false
   | projectedScalar _ _ _ _ _ hproj _ =>
     rcases hproj with ⟨_, _, _, _, _, _, _, _, _, _, hprim, _⟩
     exact hprim.usesStructMemCopyDest_false ref
-  | immStructLocal _ _ _ _ _ _ hspec => exact hspec.usesStructMemCopyDest_false ref
-  | projectedSubStruct _ _ _ _ _ _ _ _ hspec _ _ => exact hspec.usesStructMemCopyDest_false ref
-  | projectedScalarWrap _ _ _ _ _ _ hspec _ _ => exact hspec.usesStructMemCopyDest_false ref
+  | immStructLocal _ _ _ _ _ _ hspec _ => exact hspec.usesStructMemCopyDest_false ref
+  | projectedSubStruct _ _ _ _ _ _ _ _ hspec _ _ _ => exact hspec.usesStructMemCopyDest_false ref
+  | projectedScalarWrap _ _ _ _ _ _ hspec _ _ _ => exact hspec.usesStructMemCopyDest_false ref
 
 theorem WellTypedLM2_2Operand.toSyntacticFieldOperand
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
@@ -1066,16 +1203,16 @@ theorem WellTypedLM2_2Operand.toSyntacticFieldOperand
     rw [get?_eq_getElem?] at hdecl
     have hlt := (List.getElem?_eq_some_iff.mp hdecl).1
     cases isMove <;> exact ⟨hlt, hchain.only_fields⟩
-  | immStructLocal isMove idx decl _ _ hdecl _ =>
+  | immStructLocal isMove idx decl _ _ hdecl _ _ =>
     rw [get?_eq_getElem?] at hdecl
     have hlt := (List.getElem?_eq_some_iff.mp hdecl).1
     cases isMove <;> exact ⟨hlt, fun _ hp => nomatch hp⟩
-  | projectedSubStruct isMove idx projs _ _ _ _ _ _ hproj _ =>
+  | projectedSubStruct isMove idx projs _ _ _ _ _ _ hproj _ _ =>
     obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
     rw [get?_eq_getElem?] at hdecl
     have hlt := (List.getElem?_eq_some_iff.mp hdecl).1
     cases isMove <;> exact ⟨hlt, hchain.only_fields⟩
-  | projectedScalarWrap isMove idx projs _ _ _ _ hproj _ =>
+  | projectedScalarWrap isMove idx projs _ _ _ _ hproj _ _ =>
     obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
     rw [get?_eq_getElem?] at hdecl
     have hlt := (List.getElem?_eq_some_iff.mp hdecl).1
@@ -1168,51 +1305,469 @@ theorem ValidFieldProjChain.resolveProjectedTy_eq
   | single _ _ _ _ _ _ _ _ => rfl
   | cons _ _ midTy _ _ _ _ _ _ _ _ _ ih => exact ih midTy
 
-theorem WellTypedLM2_2Operand.evalOperand_localDecls_eq
-    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
-    {op : MirAst.Operand} {ty : Ty}
-    (hop : WellTypedLM2_2Operand body env stEnv op ty)
-    (locals : List LocalSlot) (globals : List CapturedAllocation) :
-    evalOperand locals op .nil globals body.layouts .nil body.localDecls =
-      evalOperand locals op .nil globals body.layouts .nil .nil := by
-  have helper : ∀ isMove idx projs,
-      projs ≠ [] → (∀ p ∈ projs, ∃ i t, p = .field i t) →
-      placeTouchesUnion body.localDecls body.layouts ⟨idx, projs⟩ = false →
-      evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals body.layouts
-        .nil body.localDecls =
-      evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals body.layouts
-        .nil .nil := by
-    intro isMove idx projs hne hfields hnu
+private theorem resolveProjectedFieldNextTy_kind_eq
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (baseTy : Ty) (fieldIdx : Nat) (fieldTy : Ty) :
+    ∃ nextTy,
+      resolveProjectedTyResolved localDecls layouts baseTy [.field fieldIdx fieldTy] = some nextTy ∧
+      nextTy.kind = fieldTy.kind ∧
+      (∀ rest, resolveProjectedTyResolved localDecls layouts baseTy (.field fieldIdx fieldTy :: rest) =
+        resolveProjectedTyResolved localDecls layouts nextTy rest) := by
+  refine ⟨_, rfl, ?_, fun _ => rfl⟩
+  have hk := resolveTyWithLocalDecls_kind_eq_sim localDecls layouts fieldTy
+  cases isUnresolvedLayoutIdx layouts fieldTy.layoutIdx
+  · rfl
+  · dsimp only
+    cases LayoutTable.lookup layouts baseTy.layoutIdx with
+    | none => exact hk
+    | some l =>
+      dsimp only
+      cases l.variants with
+      | single _ =>
+        dsimp only
+        cases get? l.fieldLayouts fieldIdx with
+        | some _ => rfl
+        | none => exact hk
+      | _ => exact hk
+
+theorem ValidFieldProjChain.resolveProjectedTyResolved_kind_eq
+    {layouts : LayoutTable} {baseLay : Miri.Interpreter.LocalLayout}
+    {projs : List ProjectionElem} {leafTy : Ty} {totalOff : Miri.ABI.Size}
+    (h : ValidFieldProjChain layouts baseLay projs leafTy totalOff)
+    (localDecls : List LocalDecl) (baseTy : Ty) :
+    ∃ rTy, resolveProjectedTyResolved localDecls layouts baseTy projs = some rTy ∧
+      rTy.kind = leafTy.kind := by
+  induction h generalizing baseTy with
+  | single _ idx fty _ _ _ _ _ =>
+    obtain ⟨nextTy, heq, hk, _⟩ := resolveProjectedFieldNextTy_kind_eq localDecls layouts baseTy idx fty
+    exact ⟨nextTy, heq, hk⟩
+  | cons _ idx midTy rest _ _ _ _ _ _ _ _ ih =>
+    obtain ⟨nextTy, _, _, hstep⟩ := resolveProjectedFieldNextTy_kind_eq localDecls layouts baseTy idx midTy
+    rw [hstep]
+    exact ih nextTy
+
+theorem IsPrimScalarTy.isScalarOrPtrTyKind {ty : Ty} (h : IsPrimScalarTy ty) :
+    IsScalarOrPtrTyKind ty.kind = true := by
+  rcases ty with ⟨kind, _⟩
+  rcases h with hk | hk | ⟨_, hk⟩ | ⟨_, hk⟩ <;> dsimp only at hk <;> subst hk <;> rfl
+
+theorem ImmediateStructRel.materializeReadPtrValue_eq
+    {ty : Ty} {layouts : LayoutTable}
+    {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
+    {v : Value} {imm : Miri.Interpreter.Immediate AnnealProv}
+    (h : ImmediateStructRel ty layouts fields paths v imm)
+    (tyOpt : Option Ty) :
+    materializeReadPtrValue layouts tyOpt v = some v := by
+  cases h with
+  | scalarWrapper _ _ _ _ _ _ _ _ _ _ _ _ _ hw _ _ _ _ =>
+    cases hw with
+    | bare => cases tyOpt <;> rfl
+    | wrap_cons _ _ _ _ => cases tyOpt <;> rfl
+  | scalarPair _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ =>
+    cases tyOpt <;> rfl
+
+private theorem evalOperand_unproj_ub_of_nil_ub
+    {locals : List LocalSlot} {isMove : Bool} {idx : Local}
+    {globals : List CapturedAllocation} {layouts : LayoutTable} {localDecls : List LocalDecl}
+    (hub : evalOperand locals (mkPlaceOperand isMove ⟨idx, []⟩) .nil globals layouts .nil .nil = .ub) :
+    evalOperand locals (mkPlaceOperand isMove ⟨idx, []⟩) .nil globals layouts .nil localDecls = .ub := by
+  cases localDecls with
+  | nil => exact hub
+  | cons d ds =>
+    cases isMove with
+    | false =>
+      simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte] at hub ⊢
+      unfold evalOperand at hub ⊢
+      dsimp only at hub ⊢
+      cases hslot : get? locals idx with
+      | none => rfl
+      | some sl =>
+        rw [hslot] at hub
+        cases sl with
+        | dead | uninit => rfl
+        | init rv =>
+          dsimp only at hub ⊢
+          cases hrv : readProjectedValue locals rv .nil with
+          | ub => rfl
+          | unsupported => rw [hrv] at hub; cases hub
+          | ok _ => rw [hrv] at hub; cases hub
+    | true =>
+      simp only [mkPlaceOperand, ↓reduceIte] at hub ⊢
+      unfold evalOperand at hub ⊢
+      dsimp only at hub ⊢
+      cases hslot : get? locals idx with
+      | none => rfl
+      | some sl =>
+        rw [hslot] at hub
+        cases sl with
+        | dead | uninit => rfl
+        | init rv =>
+          dsimp only at hub ⊢
+          cases hrv : readProjectedValue locals rv .nil with
+          | ub => rfl
+          | unsupported => rw [hrv] at hub; cases hub
+          | ok validVal =>
+            rw [hrv] at hub
+            dsimp only at hub ⊢
+            cases hset : set? locals idx .uninit with
+            | some _ => rw [hset] at hub; cases hub
+            | none =>
+              cases materializeReadPtrValue layouts (placeTyResolved (d :: ds) layouts ⟨idx, []⟩) validVal with
+              | none => rfl
+              | some matVal =>
+                dsimp only
+                cases validateValueForTy? layouts (placeTyResolved (d :: ds) layouts ⟨idx, []⟩) matVal with
+                | false => rfl
+                | true => rfl
+
+private theorem evalOperand_proj_ub_of_nil_ub
+    {locals : List LocalSlot} {isMove : Bool} {idx : Local} {projs : List ProjectionElem}
+    {globals : List CapturedAllocation} {layouts : LayoutTable} {localDecls : List LocalDecl}
+    (hne : projs ≠ []) (hfields : ∀ p ∈ projs, ∃ i t, p = .field i t)
+    (hnu : placeTouchesUnion localDecls layouts ⟨idx, projs⟩ = false)
+    (hub : evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals layouts .nil .nil = .ub) :
+    evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals layouts .nil localDecls = .ub := by
+  cases localDecls with
+  | nil => exact hub
+  | cons d ds =>
     cases projs with
     | nil => exact False.elim (hne rfl)
     | cons p0 ps =>
       obtain ⟨i0, t0, rfl⟩ := hfields p0 List.mem_cons_self
       cases isMove <;> {
-        simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte]
-        unfold evalOperand
-        dsimp only
-        cases get? locals idx with
+        simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte] at hub ⊢
+        unfold evalOperand at hub ⊢
+        dsimp only at hub ⊢
+        cases hslot : get? locals idx with
         | none => rfl
         | some sl =>
           cases sl with
           | dead | uninit => rfl
-          | init rootVal =>
-            dsimp only [readProjectedForLocal]
+          | init rv =>
+            rw [hslot] at hub
+            dsimp only [placeTouchesUnion] at hub
             rw [hnu]
+            dsimp only at hub ⊢
+            cases hrv : readProjectedValue locals rv (.field i0 t0 :: ps) with
+            | ub => rfl
+            | unsupported => rw [hrv] at hub; cases hub
+            | ok _ => rw [hrv] at hub; cases hub
       }
+
+theorem WellTypedLM2_2Operand.evalOperand_ub_of_nil_ub
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
+    {op : MirAst.Operand} {ty : Ty}
+    (hop : WellTypedLM2_2Operand body env stEnv op ty)
+    {locals : List LocalSlot} {globals : List CapturedAllocation}
+    (hub : evalOperand locals op .nil globals body.layouts .nil .nil = .ub) :
+    evalOperand locals op .nil globals body.layouts .nil body.localDecls = .ub := by
   cases hop with
-  | constScalar => rfl
-  | primLocal isMove _ _ _ _ _ _ => cases isMove <;> rfl
-  | immStructLocal isMove _ _ _ _ _ _ => cases isMove <;> rfl
-  | projectedScalar isMove idx projs _ _ hproj hnu =>
+  | constScalar => exact hub
+  | primLocal _ _ _ _ _ _ _ => exact evalOperand_unproj_ub_of_nil_ub hub
+  | immStructLocal _ _ _ _ _ _ _ _ => exact evalOperand_unproj_ub_of_nil_ub hub
+  | projectedScalar _ _ _ _ _ hproj hnu =>
     rcases hproj with ⟨_, _, _, _, _, _, _, _, _, _, _, hchain⟩
-    exact helper isMove idx projs hchain.ne_nil hchain.only_fields hnu
-  | projectedSubStruct isMove idx projs _ _ _ _ _ _ hproj hnu =>
+    exact evalOperand_proj_ub_of_nil_ub hchain.ne_nil hchain.only_fields hnu hub
+  | projectedSubStruct _ _ _ _ _ _ _ _ _ hproj hnu _ =>
     obtain ⟨_, _, _, hchain⟩ := hproj.decl_and_chain
-    exact helper isMove idx projs hchain.ne_nil hchain.only_fields hnu
-  | projectedScalarWrap isMove idx projs _ _ _ _ hproj hnu =>
+    exact evalOperand_proj_ub_of_nil_ub hchain.ne_nil hchain.only_fields hnu hub
+  | projectedScalarWrap _ _ _ _ _ _ _ hproj hnu _ =>
     obtain ⟨_, _, _, hchain⟩ := hproj.decl_and_chain
-    exact helper isMove idx projs hchain.ne_nil hchain.only_fields hnu
+    exact evalOperand_proj_ub_of_nil_ub hchain.ne_nil hchain.only_fields hnu hub
+
+private theorem evalOperand_unproj_localDecls_of_nil_ok
+    {locals locals' : List LocalSlot} {isMove : Bool} {idx : Local} {v : Value}
+    {globals : List CapturedAllocation} {layouts : LayoutTable} {localDecls : List LocalDecl}
+    (hok : evalOperand locals (mkPlaceOperand isMove ⟨idx, []⟩) .nil globals layouts .nil .nil = .ok v locals') :
+    evalOperand locals (mkPlaceOperand isMove ⟨idx, []⟩) .nil globals layouts .nil localDecls = .ub ∨
+    ∃ v', evalOperand locals (mkPlaceOperand isMove ⟨idx, []⟩) .nil globals layouts .nil localDecls = .ok v' locals' := by
+  cases localDecls with
+  | nil => exact Or.inr ⟨v, hok⟩
+  | cons d ds =>
+    cases isMove with
+    | false =>
+      simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte] at hok ⊢
+      unfold evalOperand at hok ⊢
+      dsimp only at hok ⊢
+      cases hslot : get? locals idx with
+      | none => rw [hslot] at hok; cases hok
+      | some sl =>
+        rw [hslot] at hok
+        cases sl with
+        | dead | uninit => cases hok
+        | init rv =>
+          dsimp only at hok ⊢
+          cases hrv : readProjectedValue locals rv .nil with
+          | ub | unsupported => rw [hrv] at hok; cases hok
+          | ok fv =>
+            rw [hrv] at hok
+            injection hok with _ hloc
+            subst hloc
+            dsimp only
+            cases materializeReadPtrValue layouts (placeTyResolved (d :: ds) layouts ⟨idx, []⟩) fv with
+            | none => exact Or.inl rfl
+            | some matVal =>
+              dsimp only
+              cases validateValueForTy? layouts (placeTyResolved (d :: ds) layouts ⟨idx, []⟩) matVal with
+              | false => exact Or.inl rfl
+              | true => exact Or.inr ⟨matVal, rfl⟩
+    | true =>
+      simp only [mkPlaceOperand, ↓reduceIte] at hok ⊢
+      unfold evalOperand at hok ⊢
+      dsimp only at hok ⊢
+      cases hslot : get? locals idx with
+      | none => rw [hslot] at hok; cases hok
+      | some sl =>
+        rw [hslot] at hok
+        cases sl with
+        | dead | uninit => cases hok
+        | init rv =>
+          dsimp only at hok ⊢
+          cases hrv : readProjectedValue locals rv .nil with
+          | ub | unsupported => rw [hrv] at hok; cases hok
+          | ok fv =>
+            rw [hrv] at hok
+            dsimp only at hok ⊢
+            cases hset : set? locals idx .uninit with
+            | none => rw [hset] at hok; cases hok
+            | some l_out =>
+              rw [hset] at hok
+              injection hok with _ hloc
+              subst hloc
+              cases materializeReadPtrValue layouts (placeTyResolved (d :: ds) layouts ⟨idx, []⟩) fv with
+              | none => exact Or.inl rfl
+              | some matVal =>
+                dsimp only
+                cases validateValueForTy? layouts (placeTyResolved (d :: ds) layouts ⟨idx, []⟩) matVal with
+                | false => exact Or.inl rfl
+                | true => exact Or.inr ⟨matVal, rfl⟩
+
+private theorem evalOperand_proj_localDecls_of_nil_ok
+    {locals locals' : List LocalSlot} {isMove : Bool} {idx : Local} {projs : List ProjectionElem} {v : Value}
+    {globals : List CapturedAllocation} {layouts : LayoutTable} {localDecls : List LocalDecl}
+    (hne : projs ≠ []) (hfields : ∀ p ∈ projs, ∃ i t, p = .field i t)
+    (hnu : placeTouchesUnion localDecls layouts ⟨idx, projs⟩ = false)
+    (hok : evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals layouts .nil .nil = .ok v locals') :
+    evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals layouts .nil localDecls = .ub ∨
+    ∃ v', evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals layouts .nil localDecls = .ok v' locals' := by
+  cases localDecls with
+  | nil => exact Or.inr ⟨v, hok⟩
+  | cons d ds =>
+    cases projs with
+    | nil => exact False.elim (hne rfl)
+    | cons p0 ps =>
+      obtain ⟨i0, t0, rfl⟩ := hfields p0 List.mem_cons_self
+      cases isMove <;> {
+        simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte] at hok ⊢
+        unfold evalOperand at hok ⊢
+        dsimp only at hok ⊢
+        cases hslot : get? locals idx with
+        | none => rw [hslot] at hok; cases hok
+        | some sl =>
+          rw [hslot] at hok
+          cases sl with
+          | dead | uninit => cases hok
+          | init rv =>
+            dsimp only [placeTouchesUnion] at hok
+            rw [hnu]
+            dsimp only at hok ⊢
+            cases hrv : readProjectedValue locals rv (.field i0 t0 :: ps) with
+            | ub | unsupported => rw [hrv] at hok; cases hok
+            | ok fv =>
+              rw [hrv] at hok
+              injection hok with _ hloc
+              subst hloc
+              dsimp only
+              cases materializeReadPtrValue layouts (placeTyResolved (d :: ds) layouts ⟨idx, .field i0 t0 :: ps⟩) fv with
+              | none => exact Or.inl rfl
+              | some matVal =>
+                dsimp only
+                cases validateValueForTy? layouts (placeTyResolved (d :: ds) layouts ⟨idx, .field i0 t0 :: ps⟩) matVal with
+                | false => exact Or.inl rfl
+                | true => exact Or.inr ⟨matVal, rfl⟩
+      }
+
+theorem WellTypedLM2_2Operand.evalOperand_localDecls_of_nil_ok
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
+    {op : MirAst.Operand} {ty : Ty} {v : Value}
+    (hop : WellTypedLM2_2Operand body env stEnv op ty)
+    {locals locals' : List LocalSlot} {globals : List CapturedAllocation}
+    (hok : evalOperand locals op .nil globals body.layouts .nil .nil = .ok v locals') :
+    evalOperand locals op .nil globals body.layouts .nil body.localDecls = .ub ∨
+    ∃ v', evalOperand locals op .nil globals body.layouts .nil body.localDecls = .ok v' locals' := by
+  cases hop with
+  | constScalar => exact Or.inr ⟨v, hok⟩
+  | primLocal _ _ _ _ _ _ _ => exact evalOperand_unproj_localDecls_of_nil_ok hok
+  | immStructLocal _ _ _ _ _ _ _ _ => exact evalOperand_unproj_localDecls_of_nil_ok hok
+  | projectedScalar _ _ _ _ _ hproj hnu =>
+    rcases hproj with ⟨_, _, _, _, _, _, _, _, _, _, _, hchain⟩
+    exact evalOperand_proj_localDecls_of_nil_ok hchain.ne_nil hchain.only_fields hnu hok
+  | projectedSubStruct _ _ _ _ _ _ _ _ _ hproj hnu _ =>
+    obtain ⟨_, _, _, hchain⟩ := hproj.decl_and_chain
+    exact evalOperand_proj_localDecls_of_nil_ok hchain.ne_nil hchain.only_fields hnu hok
+  | projectedScalarWrap _ _ _ _ _ _ _ hproj hnu _ =>
+    obtain ⟨_, _, _, hchain⟩ := hproj.decl_and_chain
+    exact evalOperand_proj_localDecls_of_nil_ok hchain.ne_nil hchain.only_fields hnu hok
+
+private theorem evalOperand_unproj_ok_of_mat_val
+    {locals locals' : List LocalSlot} {isMove : Bool} {idx : Local} {v : Value}
+    {globals : List CapturedAllocation} {layouts : LayoutTable} {localDecls : List LocalDecl}
+    (hmat : materializeReadPtrValue layouts (placeTyResolved localDecls layouts ⟨idx, []⟩) v = some v)
+    (hval : validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨idx, []⟩) v = true)
+    (hok : evalOperand locals (mkPlaceOperand isMove ⟨idx, []⟩) .nil globals layouts .nil .nil = .ok v locals') :
+    evalOperand locals (mkPlaceOperand isMove ⟨idx, []⟩) .nil globals layouts .nil localDecls = .ok v locals' := by
+  cases localDecls with
+  | nil => exact hok
+  | cons d ds =>
+    cases isMove with
+    | false =>
+      simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte] at hok ⊢
+      unfold evalOperand at hok ⊢
+      dsimp only at hok ⊢
+      cases hslot : get? locals idx with
+      | none => rw [hslot] at hok; cases hok
+      | some sl =>
+        rw [hslot] at hok
+        cases sl with
+        | dead | uninit => cases hok
+        | init rv =>
+          dsimp only at hok ⊢
+          cases hrv : readProjectedValue locals rv .nil with
+          | ub | unsupported => rw [hrv] at hok; cases hok
+          | ok fv =>
+            rw [hrv] at hok
+            injection hok with hfv hloc
+            subst hfv hloc
+            dsimp only
+            rw [hmat]; dsimp only; rw [hval]
+    | true =>
+      simp only [mkPlaceOperand, ↓reduceIte] at hok ⊢
+      unfold evalOperand at hok ⊢
+      dsimp only at hok ⊢
+      cases hslot : get? locals idx with
+      | none => rw [hslot] at hok; cases hok
+      | some sl =>
+        rw [hslot] at hok
+        cases sl with
+        | dead | uninit => cases hok
+        | init rv =>
+          dsimp only at hok ⊢
+          cases hrv : readProjectedValue locals rv .nil with
+          | ub | unsupported => rw [hrv] at hok; cases hok
+          | ok fv =>
+            rw [hrv] at hok
+            dsimp only at hok ⊢
+            cases hset : set? locals idx .uninit with
+            | none => rw [hset] at hok; cases hok
+            | some l_out =>
+              rw [hset] at hok
+              injection hok with hfv hloc
+              subst hfv hloc
+              rw [hmat]; dsimp only; rw [hval]
+
+private theorem evalOperand_proj_ok_of_mat_val
+    {locals locals' : List LocalSlot} {isMove : Bool} {idx : Local} {projs : List ProjectionElem} {v : Value}
+    {globals : List CapturedAllocation} {layouts : LayoutTable} {localDecls : List LocalDecl}
+    (hne : projs ≠ []) (hfields : ∀ p ∈ projs, ∃ i t, p = .field i t)
+    (hnu : placeTouchesUnion localDecls layouts ⟨idx, projs⟩ = false)
+    (hmat : materializeReadPtrValue layouts (placeTyResolved localDecls layouts ⟨idx, projs⟩) v = some v)
+    (hval : validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨idx, projs⟩) v = true)
+    (hok : evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals layouts .nil .nil = .ok v locals') :
+    evalOperand locals (mkPlaceOperand isMove ⟨idx, projs⟩) .nil globals layouts .nil localDecls = .ok v locals' := by
+  cases localDecls with
+  | nil => exact hok
+  | cons d ds =>
+    cases projs with
+    | nil => exact False.elim (hne rfl)
+    | cons p0 ps =>
+      obtain ⟨i0, t0, rfl⟩ := hfields p0 List.mem_cons_self
+      cases isMove <;> {
+        simp only [mkPlaceOperand, Bool.false_eq_true, ↓reduceIte] at hok ⊢
+        unfold evalOperand at hok ⊢
+        dsimp only at hok ⊢
+        cases hslot : get? locals idx with
+        | none => rw [hslot] at hok; cases hok
+        | some sl =>
+          rw [hslot] at hok
+          cases sl with
+          | dead | uninit => cases hok
+          | init rv =>
+            dsimp only [placeTouchesUnion] at hok
+            rw [hnu]
+            dsimp only at hok ⊢
+            cases hrv : readProjectedValue locals rv (.field i0 t0 :: ps) with
+            | ub | unsupported => rw [hrv] at hok; cases hok
+            | ok fv =>
+              rw [hrv] at hok
+              injection hok with hfv hloc
+              subst hfv hloc
+              dsimp only
+              rw [hmat]; dsimp only; rw [hval]
+      }
+
+theorem WellTypedLM2_2Operand.evalOperand_ok_of_valRel
+    {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
+    {op : MirAst.Operand} {ty : Ty} {v : Value}
+    {imm : Miri.Interpreter.Immediate AnnealProv}
+    (hop : WellTypedLM2_2Operand body env stEnv op ty)
+    (hv : LM2_2OperandValRel env body.layouts ty v imm)
+    {locals locals' : List LocalSlot} {globals : List CapturedAllocation}
+    (hok : evalOperand locals op .nil globals body.layouts .nil .nil = .ok v locals') :
+    evalOperand locals op .nil globals body.layouts .nil body.localDecls = .ok v locals' := by
+  cases hop with
+  | constScalar => exact hok
+  | primLocal isMove idx decl hdecl henv hprim _ =>
+    cases hv with
+    | immStruct _ _ _ _ hsub _ =>
+      have he := hsub.env_eq; rw [henv] at he; cases he
+    | primScalar sc msc _ _ himm =>
+      obtain ⟨rTy, hrTy, hrk⟩ := placeTyResolved_root_kind_of_get? (layouts := body.layouts) hdecl
+      obtain ⟨hmat, hval⟩ :=
+        himm.readValid_of_scalarOrPtr (hprim.size_ne_zero (layouts := body.layouts)) hprim.isScalarOrPtrTyKind hrk
+      rw [← hrTy] at hmat hval
+      exact evalOperand_unproj_ok_of_mat_val hmat hval hok
+  | projectedScalar isMove idx projs leafTy henv_leaf hproj hnu =>
+    rcases hproj with ⟨decl, _, _, _, _, _, hdecl, _, _, _, hprim_leaf, hchain⟩
+    cases hv with
+    | immStruct _ _ _ _ hsub _ =>
+      have he := hsub.env_eq; rw [henv_leaf] at he; cases he
+    | primScalar sc msc _ _ himm =>
+      obtain ⟨rTy, hrTy_proj, hrk⟩ := hchain.resolveProjectedTyResolved_kind_eq body.localDecls decl.ty
+      have hrTy : placeTyResolved body.localDecls body.layouts ⟨idx, projs⟩ = some rTy := by
+        dsimp only [placeTyResolved]; rw [hdecl]; exact hrTy_proj
+      obtain ⟨hmat, hval⟩ :=
+        himm.readValid_of_scalarOrPtr (hprim_leaf.size_ne_zero (layouts := body.layouts))
+          hprim_leaf.isScalarOrPtrTyKind hrk
+      rw [← hrTy] at hmat hval
+      exact evalOperand_proj_ok_of_mat_val hchain.ne_nil hchain.only_fields hnu hmat hval hok
+  | immStructLocal isMove idx decl fields paths hdecl hspec hread_valid =>
+    cases hv with
+    | primScalar _ _ henv _ _ =>
+      have he := hspec.env_eq; rw [henv] at he; cases he
+    | immStruct fields' paths' _ _ hspec' hsr =>
+      have heq := hspec.env_eq.symm.trans hspec'.env_eq
+      injection heq with hp; injection hp with hf hp'; subst hf hp'
+      exact evalOperand_unproj_ok_of_mat_val (hsr.materializeReadPtrValue_eq _) (hread_valid _ _ hsr) hok
+  | projectedSubStruct isMove idx projs subTy sf₀ sf₁ mid₀ mid₁ hspec hproj hnu hread_valid =>
+    obtain ⟨_, _, _, hchain⟩ := hproj.decl_and_chain
+    cases hv with
+    | primScalar _ _ henv _ _ =>
+      have he := hspec.env_eq; rw [henv] at he; cases he
+    | immStruct fields' paths' _ _ hspec' hsr =>
+      have heq := hspec.env_eq.symm.trans hspec'.env_eq
+      injection heq with hp; injection hp with hf hp'; subst hf hp'
+      exact evalOperand_proj_ok_of_mat_val hchain.ne_nil hchain.only_fields hnu
+        (hsr.materializeReadPtrValue_eq _) (hread_valid _ _ hsr) hok
+  | projectedScalarWrap isMove idx projs subTy sf₀ mid₀ hspec hproj hnu hread_valid =>
+    obtain ⟨_, _, _, hchain⟩ := hproj.decl_and_chain
+    cases hv with
+    | primScalar _ _ henv _ _ =>
+      have he := hspec.env_eq; rw [henv] at he; cases he
+    | immStruct fields' paths' _ _ hspec' hsr =>
+      have heq := hspec.env_eq.symm.trans hspec'.env_eq
+      injection heq with hp; injection hp with hf hp'; subst hf hp'
+      exact evalOperand_proj_ok_of_mat_val hchain.ne_nil hchain.only_fields hnu
+        (hsr.materializeReadPtrValue_eq _) (hread_valid _ _ hsr) hok
 
 theorem WellTypedLM2_2Operand.validateLoadedValue_true
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
@@ -1260,7 +1815,7 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
         · obtain ⟨hsz, hv⟩ := hchar hk
           simp [hsz, hv]
       }
-  | immStructLocal isMove idx decl _ _ hdecl hspec =>
+  | immStructLocal isMove idx decl _ _ hdecl hspec _ =>
     have hnb := hspec.not_bool
     have hnc := hspec.not_char
     cases isMove <;> {
@@ -1272,7 +1827,7 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
       · exact absurd hk hnb
       · exact absurd hk hnc
     }
-  | projectedSubStruct isMove idx projs _ _ _ _ _ hspec hproj _ =>
+  | projectedSubStruct isMove idx projs _ _ _ _ _ hspec hproj _ _ =>
     obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
     have hnb := hspec.not_bool
     have hnc := hspec.not_char
@@ -1287,7 +1842,7 @@ theorem WellTypedLM2_2Operand.validateLoadedValue_true
       · exact absurd hk hnb
       · exact absurd hk hnc
     }
-  | projectedScalarWrap isMove idx projs _ _ _ hspec hproj _ =>
+  | projectedScalarWrap isMove idx projs _ _ _ hspec hproj _ _ =>
     obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
     have hnb := hspec.not_bool
     have hnc := hspec.not_char
@@ -1678,7 +2233,7 @@ theorem evalLM2_2Operand_except
           exact hj_old lay0 (by rw [Array.getElem?_eq_getElem hlt_mf, hls0])
         · rw [Array.getElem?_set_ne _ hij]; exact hj_old l
     · rw [ha, hm]; exact .ub _ _
-  | immStructLocal isMove idx decl fields paths hdecl hspec =>
+  | immStructLocal isMove idx decl fields paths hdecl hspec _ =>
     have henv := hspec.env_eq
     have hne_excl : excl ≠ some idx := by
       intro heq; have hna := hno_excl idx heq; cases isMove <;> exact hna rfl
@@ -1739,7 +2294,7 @@ theorem evalLM2_2Operand_except
         hcache (.immStruct fields paths v imm hspec himm)
         (fun c' hc' => .structUninitImm fields paths c' henv hc')
         (fun tf => hread_ind { m with stack := ⟨#[tf]⟩ } rfl)
-  | projectedSubStruct isMove idx projs _ sf₀ sf₁ mid₀ mid₁ hspec hproj _ =>
+  | projectedSubStruct isMove idx projs _ sf₀ sf₁ mid₀ mid₁ hspec hproj _ _ =>
     obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
     have hne_excl : excl ≠ some idx := by
       intro heq; have hna := hno_excl idx heq; cases isMove <;> exact hna rfl
@@ -1789,7 +2344,7 @@ theorem evalLM2_2Operand_except
           exact hj_old lay0 (by rw [Array.getElem?_eq_getElem hlt_mf, hls0])
         · rw [Array.getElem?_set_ne _ hij]; exact hj_old l
     · rw [ha, hm]; exact .ub _ _
-  | projectedScalarWrap isMove idx projs _ sf₀ mid₀ hspec hproj _ =>
+  | projectedScalarWrap isMove idx projs _ sf₀ mid₀ hspec hproj _ _ =>
     obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
     have hne_excl : excl ≠ some idx := by
       intro heq; have hna := hno_excl idx heq; cases isMove <;> exact hna rfl
@@ -2371,31 +2926,56 @@ theorem WellTypedLM2_2AggFields.evalOperands_not_unsupported_and_preserves_dst
         injection hok with _ hloc; subst hloc
         exact (hok_rest vs' locals₂ hev_rest).trans (hpres₁ dstIdx hno_acc.not_move)
 
-theorem WellTypedLM2_2AggFields.evalOperands_localDecls_eq
+theorem WellTypedLM2_2AggFields.evalOperands_not_unsupported_and_preserves_dst_localDecls
     {body : CapturedMir} {env : StructTypeEnv}
     {dstIdx : Local} {dstLay : Miri.Interpreter.LocalLayout}
     {fields : List StructFieldDesc} {paths : List (List ProjectionElem)}
     {stEnv : LM2_2StaticEnv} {fieldIdx k : Nat} {ops : List MirAst.Operand}
     (h : WellTypedLM2_2AggFields body env dstIdx dstLay fields paths stEnv fieldIdx k ops)
-    (locals : List LocalSlot) (globals : List CapturedAllocation) :
-    evalOperands locals ops .nil globals body.layouts .nil body.localDecls =
-      evalOperands locals ops .nil globals body.layouts .nil .nil := by
+    {locals : List LocalSlot} (hlen : locals.length = body.localDecls.length)
+    (globals : List CapturedAllocation) :
+    evalOperands locals ops .nil globals body.layouts .nil body.localDecls ≠ .unsupported ∧
+    ∀ vs locals_end,
+      evalOperands locals ops .nil globals body.layouts .nil body.localDecls = .ok vs locals_end →
+      get? locals_end dstIdx = get? locals dstIdx := by
   induction h generalizing locals with
-  | nil _ _ => rfl
-  | cons stEnv_c _ _ _ op rest _ hspec _ ih =>
-    have hop : ∃ opTy, WellTypedLM2_2Operand body env stEnv_c op opTy := by
+  | nil _ _ =>
+    refine ⟨nofun, fun _ locals_end hok => ?_⟩
+    injection hok with _ hloc; subst hloc; rfl
+  | cons stEnv_c _ _ _ op rest hno_acc hspec _ ih =>
+    have hop_ex : ∃ opTy, WellTypedLM2_2Operand body env stEnv_c op opTy := by
       cases hspec with
       | primLeaf _ _ hop _ _ _ _ _ _ _ _ => exact ⟨_, hop⟩
       | scalarWrapSub _ _ _ _ _ hop _ _ _ _ _ _ _ _ => exact ⟨_, hop⟩
       | scalarPairSub _ _ _ _ _ _ _ _ _ _ _ _ hop _ _ _ _ _ _ _ _ _ _ _ _ _ => exact ⟨_, hop⟩
-    obtain ⟨_, hop⟩ := hop
+    obtain ⟨_, hop⟩ := hop_ex
+    obtain ⟨hne_op, hok_op⟩ :=
+      (hspec.toSyntacticFieldOperand hlen).evalOperand_shape globals body.layouts
     dsimp only [evalOperands]
-    rw [hop.evalOperand_localDecls_eq]
-    cases evalOperand locals op .nil globals body.layouts .nil .nil with
-    | ub | unsupported => rfl
-    | ok _ locals₁ =>
-      dsimp only
-      rw [ih locals₁]
+    cases hev_nil : evalOperand locals op .nil globals body.layouts .nil .nil with
+    | unsupported => exact absurd hev_nil hne_op
+    | ub =>
+      rw [hop.evalOperand_ub_of_nil_ub hev_nil]
+      exact ⟨nofun, fun _ _ hok => nomatch hok⟩
+    | ok v locals₁ =>
+      obtain ⟨hlen₁, hpres₁⟩ := hok_op v locals₁ hev_nil
+      obtain ⟨hne_rest, hok_rest⟩ := ih (hlen₁.trans hlen)
+      rcases hop.evalOperand_localDecls_of_nil_ok hev_nil with hub_ld | ⟨v', hok_ld⟩
+      · rw [hub_ld]
+        exact ⟨nofun, fun _ _ hok => nomatch hok⟩
+      · rw [hok_ld]
+        dsimp only
+        refine ⟨by
+          cases hev_r : evalOperands locals₁ rest .nil globals body.layouts .nil body.localDecls with
+          | unsupported => exact absurd hev_r hne_rest
+          | ub | ok _ _ => nofun, fun vs locals_end hok => ?_⟩
+        cases hev_rest : evalOperands locals₁ rest .nil globals body.layouts .nil body.localDecls with
+        | unsupported => exact absurd hev_rest hne_rest
+        | ub => rw [hev_rest] at hok; cases hok
+        | ok vs' locals₂ =>
+          rw [hev_rest] at hok
+          injection hok with _ hloc; subst hloc
+          exact (hok_rest vs' locals₂ hev_rest).trans (hpres₁ dstIdx hno_acc.not_move)
 
 theorem aggHooks_projectField_local_ok
     {localDecls : List LocalDecl} {layouts : LayoutTable}
@@ -3101,7 +3681,7 @@ private theorem WellTypedLM2_2Operand.annealEvalOperand_indirect_usesStructMemCo
           rw [show translateOperand (mkPlaceOperand true ⟨idx, []⟩) = .Move ⟨idx, #[]⟩ from rfl,
             annealEvalOperand_move_live hframes hlt_mf hdecl hmls_eq hcache] at hok
           injection hok with hok'; injection hok' with _ hl; exact hl.symm
-    | immStructLocal isMove idx decl _ _ hdecl _ =>
+    | immStructLocal isMove idx decl _ _ hdecl _ _ =>
       have hne : excl ≠ some idx := fun heq => by
         have hna := hno_excl idx heq; cases isMove <;> exact hna rfl
       obtain ⟨_, mls, hlt_mf, _, _, _, hmls_eq, hloc⟩ := hframe.lookup_local hne hdecl
@@ -3133,12 +3713,12 @@ private theorem WellTypedLM2_2Operand.annealEvalOperand_indirect_usesStructMemCo
       have hne : excl ≠ some idx := fun heq => by
         have hna := hno_excl idx heq; cases isMove <;> exact hna rfl
       exact annealEvalOperand_projected_indirect_layout_eq hframes hframe hne hdecl hchain hok
-    | projectedSubStruct isMove idx projs _ _ _ _ _ _ hproj _ =>
+    | projectedSubStruct isMove idx projs _ _ _ _ _ _ hproj _ _ =>
       obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
       have hne : excl ≠ some idx := fun heq => by
         have hna := hno_excl idx heq; cases isMove <;> exact hna rfl
       exact annealEvalOperand_projected_indirect_layout_eq hframes hframe hne hdecl hchain hok
-    | projectedScalarWrap isMove idx projs _ _ _ _ hproj _ =>
+    | projectedScalarWrap isMove idx projs _ _ _ _ hproj _ _ =>
       obtain ⟨decl, _, hdecl, hchain⟩ := hproj.decl_and_chain
       have hne : excl ≠ some idx := fun heq => by
         have hna := hno_excl idx heq; cases isMove <;> exact hna rfl
@@ -3232,13 +3812,13 @@ theorem agg_write_tail
     (hovf : baseAddr.toNat + (translateTy decl.ty body.layouts).layout.size.bytes.toNat < 2 ^ 64)
     (halign : mp.ptr.offset.isAligned (translateTy decl.ty body.layouts).layout.align.abi = .ok true)
     (hpart : PartialStructState body.layouts decl.ty fields paths k doneVals localAlloc.allocation words) :
-    (evalOperands curLocals rest .nil globals body.layouts .nil = .ub ∧
+    (evalOperands curLocals rest .nil globals body.layouts .nil body.localDecls = .ub ∧
       ∃ msg m_err,
         writeAggregateFieldsAux (annealAggregateHooksLM2_2 body.localDecls body.layouts)
           ⟨.local 0 dstIdx none id0, translateTy decl.ty body.layouts⟩
           fieldIdx (rest.map translateOperand) m = .error (.undefinedBehavior msg) m_err) ∨
     ∃ tailVals locals_end m_end tf_end,
-      evalOperands curLocals rest .nil globals body.layouts .nil = .ok tailVals locals_end ∧
+      evalOperands curLocals rest .nil globals body.layouts .nil body.localDecls = .ok tailVals locals_end ∧
       writeAggregateFieldsAux (annealAggregateHooksLM2_2 body.localDecls body.layouts)
         ⟨.local 0 dstIdx none id0, translateTy decl.ty body.layouts⟩
         fieldIdx (rest.map translateOperand) m = .ok () m_end ∧
@@ -3324,7 +3904,7 @@ theorem agg_write_tail
     | ub m' msg =>
       dsimp only at hev_op
       left
-      refine ⟨by dsimp [evalOperands]; rw [hev_op], msg, m', ?_⟩
+      refine ⟨by dsimp [evalOperands]; rw [hop.evalOperand_ub_of_nil_ub hev_op], msg, m', ?_⟩
       dsimp only [List.map]
       rw [hstep_eq]
       exact EStateM.bind_eq_error (EStateM.bind_eq_error hm_op)
@@ -3369,7 +3949,7 @@ theorem agg_write_tail
         ⟨tailVals, locals_end, m_end, tf_end, hok_rest, hm_ok_rest, hf_end, hid_end, hrc_end,
           hrp_end, hpres_end, hfr_end, hdisj_end, hsup_end, hinit_end, himm_end⟩
       · left
-        refine ⟨by dsimp only [evalOperands]; rw [hev_op]; dsimp only; rw [hub_rest],
+        refine ⟨by dsimp only [evalOperands]; rw [hop.evalOperand_ok_of_valRel hvRel hev_op]; dsimp only; rw [hub_rest],
           msg, m_err, ?_⟩
         dsimp only [List.map]
         rw [hstep_eq, EStateM.bind_eq_ok (by rw [EStateM.bind_eq_ok hm_op]; exact hw_ok)]
@@ -3379,7 +3959,7 @@ theorem agg_write_tail
           rw [List.append_assoc]; rfl
         rw [happ_assoc] at hfr_end hinit_end
         refine ⟨v_f :: tailVals, locals_end, m_end, tf_end,
-          by dsimp only [evalOperands]; rw [hev_op]; dsimp only; rw [hok_rest],
+          by dsimp only [evalOperands]; rw [hop.evalOperand_ok_of_valRel hvRel hev_op]; dsimp only; rw [hok_rest],
           by
             dsimp only [List.map]
             rw [hstep_eq, EStateM.bind_eq_ok (by rw [EStateM.bind_eq_ok hm_op]; exact hw_ok)]
@@ -3489,7 +4069,7 @@ private theorem finish_agg_from_mid
       unfold evalStmt; dsimp only
       rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller, evalOperands_borrows_nil_callStack_eq]
       dsimp only [evalOperands]; rw [hev_op₀]; dsimp only
-      rw [htail.evalOperands_localDecls_eq, hub_rest]
+      rw [hub_rest]
     have hm_ub :
         Miri.Interpreter.Step.evalStatement (annealStepHooksLM2_2 body.localDecls body.layouts) ()
           (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate kind (op₀ :: rest)), span⟩) m =
@@ -3508,7 +4088,7 @@ private theorem finish_agg_from_mid
       unfold evalStmt; dsimp only
       rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller, evalOperands_borrows_nil_callStack_eq]
       dsimp only [evalOperands]; rw [hev_op₀]; dsimp only
-      rw [htail.evalOperands_localDecls_eq, hok_rest]
+      rw [hok_rest]
       dsimp only; rw [hdst_end]
       cases slot_dst with
       | dead => exact absurd rfl hnot_dead
@@ -3848,7 +4428,7 @@ theorem evalRvalue_aggregate_tuple_struct_simulation
               body.localDecls body.layouts = MirStepNode.fail .ub := by
           unfold evalStmt; dsimp only
           rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller, evalOperands_borrows_nil_callStack_eq]
-          dsimp only [evalOperands]; rw [hop₀.evalOperand_localDecls_eq, hev_op₀]
+          dsimp only [evalOperands]; rw [hop₀.evalOperand_ub_of_nil_ub hev_op₀]
         have hm_ub :
             Miri.Interpreter.Step.evalStatement (annealStepHooksLM2_2 body.localDecls body.layouts) ()
               (translateStmt ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate kind (op₀ :: rest)), span⟩) m =
@@ -3861,8 +4441,8 @@ theorem evalRvalue_aggregate_tuple_struct_simulation
       | ok v₀ locals₁ tf₁ imm₀ _ hfr₁ hvRel₀ _ _ hid₁ hrc₁ hrp₁ hsz₁ hpres_acc hpres_mv hinit₁ himm₁ hdisj₁ =>
         have hev_op₀_ld :
             evalOperand s.frame.locals op₀ .nil s.memory.globals body.layouts .nil body.localDecls =
-              .ok v₀ locals₁ := by
-          rw [hop₀.evalOperand_localDecls_eq]; exact hev_op₀
+              .ok v₀ locals₁ :=
+          hop₀.evalOperand_ok_of_valRel hvRel₀ hev_op₀
         have hlt₁ : dstIdx < tf₁.locals.size := by
           rw [hsz₁, cacheFrameLocalLayout_size]; exact hlt_dst0
         have hdst_tf₁ : tf₁.locals[dstIdx]'hlt₁ =
@@ -3884,15 +4464,14 @@ theorem evalRvalue_aggregate_tuple_struct_simulation
           rw [henv] at henv_none; cases henv_none
         | structDead _ _ _ _ _ =>
           obtain ⟨hne_rest, hpres_rest⟩ :=
-            htail.evalOperands_not_unsupported_and_preserves_dst hfr₁.af_locals_len s.memory.globals
+            htail.evalOperands_not_unsupported_and_preserves_dst_localDecls hfr₁.af_locals_len s.memory.globals
           have ha_ub :
               evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.aggregate kind (op₀ :: rest)), span⟩
                 body.localDecls body.layouts = MirStepNode.fail .ub := by
             unfold evalStmt; dsimp only
             rw [evalRvalue_aggregate_eq hk_kind, hbor, hcaller, evalOperands_borrows_nil_callStack_eq]
             dsimp only [evalOperands]; rw [hev_op₀_ld]; dsimp only
-            rw [htail.evalOperands_localDecls_eq]
-            cases hr : evalOperands locals₁ rest .nil s.memory.globals body.layouts .nil with
+            cases hr : evalOperands locals₁ rest .nil s.memory.globals body.layouts .nil body.localDecls with
             | unsupported => exact absurd hr hne_rest
             | ub => rfl
             | ok tailVals locals_end =>
@@ -4107,7 +4686,7 @@ private theorem evalRvalue_use_wt_ub
     (hbor : mem.borrows = .nil) (hcaller : mem.callerLocals = .nil)
     (hev : evalOperand locals op .nil mem.globals body.layouts .nil = .ub) :
     evalRvalue locals (.use op) mem body.localDecls body.layouts = .ub := by
-  rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller, hop.evalOperand_localDecls_eq, hev]
+  rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller, hop.evalOperand_ub_of_nil_ub hev]
 
 private theorem evalRvalue_use_wt_ok
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv}
@@ -4118,9 +4697,51 @@ private theorem evalRvalue_use_wt_ok
     (hbor : mem.borrows = .nil) (hcaller : mem.callerLocals = .nil)
     (hev : evalOperand locals op .nil mem.globals body.layouts .nil = .ok v locals') :
     evalRvalue locals (.use op) mem body.localDecls body.layouts = .ok v locals' mem := by
-  rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller, hop.evalOperand_localDecls_eq, hev]
+  rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller, hop.evalOperand_ok_of_valRel hv hev]
   dsimp only
   rw [hop.validateLoadedValue_true hv]
+
+private theorem materializeReadPtrValue_of_memory_repr
+    {body : CapturedMir} {idx : Local} {decl : LocalDecl} {v : Value}
+    (hdecl : get? body.localDecls idx = some decl)
+    (hmem : (translateTy decl.ty body.layouts).layout.backendRepr = .Memory (sized := true)) :
+    materializeReadPtrValue body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, .nil⟩) v = some v := by
+  obtain ⟨rTy, hrTy, hrk⟩ := placeTyResolved_root_kind_of_get? (layouts := body.layouts) hdecl
+  rw [hrTy]
+  rcases rTy with ⟨rk, rl⟩; dsimp only at hrk
+  rcases dty : decl.ty with ⟨dk, dl⟩
+  rw [dty] at hrk hmem; dsimp only at hrk; subst hrk
+  have hnot_ptr : ∀ pointee, rk ≠ RigidTy.rawPtr .mut pointee ∧ rk ≠ RigidTy.rawPtr .not pointee ∧
+      rk ≠ RigidTy.ref .mut pointee ∧ rk ≠ RigidTy.ref .not pointee := by
+    intro pointee
+    refine ⟨?_, ?_, ?_, ?_⟩ <;>
+      (intro h; subst h; simp [translateTy, pointerLayoutData] at hmem)
+  have hnot_fn : ∀ args ret s abi, rk ≠ RigidTy.fnPtr args ret s abi := by
+    intro args ret s abi h; subst h; simp [translateTy, pointerLayoutData] at hmem
+  cases v with
+  | aggregate varIdx rawVals =>
+    cases varIdx with
+    | zero =>
+      change materializeReadPtrValue body.layouts (some { kind := rk, layoutIdx := rl })
+        (.aggregate 0 rawVals) = some (.aggregate 0 rawVals)
+      simp only [materializeReadPtrValue]
+      cases Nat.blt 2 (length rawVals)
+      · rfl
+      · cases rk with
+        | float fk => cases fk <;> rfl
+        | array ek _ => cases ek <;> rfl
+        | rawPtr m p =>
+          cases m
+          · exact absurd rfl (hnot_ptr p).2.1
+          · exact absurd rfl (hnot_ptr p).1
+        | ref m p =>
+          cases m
+          · exact absurd rfl (hnot_ptr p).2.2.2
+          · exact absurd rfl (hnot_ptr p).2.2.1
+        | fnPtr args ret s abi => exact absurd rfl (hnot_fn args ret s abi)
+        | _ => rfl
+    | succ _ => rfl
+  | _ => rfl
 
 private theorem validateLoadedValue_of_memory_repr
     {body : CapturedMir} {isMove : Bool} {idx : Local} {decl : LocalDecl} {v : Value}
@@ -6281,6 +6902,213 @@ theorem StateRelLM2_2.extract_structMemPlaceRel
     injection hfp with hp; injection hp with h1 h2; subst h1 h2
     exact ⟨mp, tf, lay, hframes, hmls, hsmpr⟩
 
+private theorem NoZeroByteLeavesList.eq_nil_of_zero
+    {vs : List Value} (h : NoZeroByteLeavesList vs)
+    (hz : valueLeafBytes.valueLeafBytesList vs = 0) : vs = [] := by
+  cases vs with
+  | nil => rfl
+  | cons _ _ =>
+    have hx := valueLeafBytes_pos_of_noZeroByteLeaves h.1
+    dsimp [valueLeafBytes.valueLeafBytesList] at hz
+    omega
+
+private theorem scalarBytes_of_fieldSize
+    {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt} {fSz : Miri.ABI.Size}
+    (hrel : ScalarRel sc msc) (hsz : fSz = translateSizeBytes sc.sizeBytes) :
+    fSz.bytes.toNat = sc.sizeBytes := by
+  rw [hsz]
+  rcases hrel.validBytes with h1 | h1 | h1 | h1 | h1 <;> (rw [h1]; rfl)
+
+theorem StructMemPlaceRel.inv_padded_1_1
+    {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+    {f₀ f₁ : StructFieldDesc} {t₀ m₁ t₁ : Ty}
+    {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (h : StructMemPlaceRel mach ty layouts [f₀, f₁]
+      [[.field 0 t₀], [.field 1 m₁, .field 0 t₁]] rootVal mp) :
+    ∃ sc₀ sc₁,
+      rootVal = .aggregate 0 [.scalar sc₀, .aggregate 0 [.scalar sc₁]] ∧
+      Nat.ble sc₀.bits (scalarModulus f₀.fieldLayout.size.bytes.toNat - 1) = true ∧
+      Nat.ble sc₁.bits (scalarModulus f₁.fieldLayout.size.bytes.toNat - 1) = true := by
+  rcases h with ⟨_, _, _, _, _, _, _, ⟨_, hnz_root⟩, hleaf_bytes,
+    _, _, _, _, _, _, _, _, _, _, _, _, _, _, hfields, _⟩
+  obtain ⟨_, _, _, hvpath₀, sc₀, msc₀, hrpv₀, hrel₀, hsz₀, _, _, _, _⟩ := hfields 0 (by simp)
+  obtain ⟨_, _, _, hvpath₁, sc₁, msc₁, hrpv₁, hrel₁, hsz₁, _, _, _, _⟩ := hfields 1 (by simp)
+  dsimp at hvpath₀ hrpv₀ hsz₀ hvpath₁ hrpv₁ hsz₁
+  obtain ⟨vs, v₀, hrv0, hget0, hr0, _, _⟩ := validPath_cons_inv hvpath₀ hrpv₀
+  obtain ⟨vs', sub₁, hrv1, hget1, hr_sub₁, hvp_sub₁, _⟩ := validPath_cons_inv hvpath₁ hrpv₁
+  subst hrv0; injection hrv1 with _ hvs_eq; subst hvs_eq
+  dsimp [readProjectedValue] at hr0
+  cases hvc0 : valueContainsUninit v₀ <;> rw [hvc0] at hr0 <;> cases hr0
+  obtain ⟨ws, w₁, hsub_eq, hwget0, hwr1, _, _⟩ := validPath_cons_inv (hvp_sub₁ nofun) hr_sub₁
+  subst hsub_eq
+  dsimp [readProjectedValue] at hwr1
+  cases hvc1 : valueContainsUninit w₁ <;> rw [hvc1] at hwr1 <;> cases hwr1
+  cases vs with
+  | nil => rw [get?_eq_getElem?] at hget0; cases hget0
+  | cons u0 vs_tl0 =>
+    rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hget0; subst hget0
+    cases vs_tl0 with
+    | nil => rw [get?_eq_getElem?] at hget1; cases hget1
+    | cons u1 vs_tl =>
+      rw [get?_eq_getElem?, List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at hget1
+      subst hget1
+      cases ws with
+      | nil => rw [get?_eq_getElem?] at hwget0; cases hwget0
+      | cons z0 ws_tl =>
+        rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hwget0; subst hwget0
+        rcases hnz_root with ⟨_, ⟨_, hnz_ws⟩, hnz_vs⟩
+        have hb0 := scalarBytes_of_fieldSize hrel₀ hsz₀
+        have hb1 := scalarBytes_of_fieldSize hrel₁ hsz₁
+        dsimp [valueLeafBytes, valueLeafBytes.valueLeafBytesList, structSumFieldBytes] at hleaf_bytes
+        have hws_nil := hnz_ws.eq_nil_of_zero (by omega)
+        have hvs_nil := hnz_vs.eq_nil_of_zero (by omega)
+        subst hws_nil hvs_nil
+        exact ⟨sc₀, sc₁, rfl, scalarBle_max_of_fieldSize hrel₀ hsz₀, scalarBle_max_of_fieldSize hrel₁ hsz₁⟩
+
+theorem StructMemPlaceRel.inv_nested_1_2
+    {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+    {f₀ f₁ f₂ : StructFieldDesc} {t₀ m₁ t₁ t₂ : Ty}
+    {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (h : StructMemPlaceRel mach ty layouts [f₀, f₁, f₂]
+      [[.field 0 t₀], [.field 1 m₁, .field 0 t₁], [.field 1 m₁, .field 1 t₂]] rootVal mp) :
+    ∃ sc₀ sc₁ sc₂,
+      rootVal = .aggregate 0 [.scalar sc₀, .aggregate 0 [.scalar sc₁, .scalar sc₂]] ∧
+      Nat.ble sc₀.bits (scalarModulus f₀.fieldLayout.size.bytes.toNat - 1) = true ∧
+      Nat.ble sc₁.bits (scalarModulus f₁.fieldLayout.size.bytes.toNat - 1) = true ∧
+      Nat.ble sc₂.bits (scalarModulus f₂.fieldLayout.size.bytes.toNat - 1) = true := by
+  rcases h with ⟨_, _, _, _, _, _, _, ⟨_, hnz_root⟩, hleaf_bytes,
+    _, _, _, _, _, _, _, _, _, _, _, _, _, _, hfields, _⟩
+  obtain ⟨_, _, _, hvpath₀, sc₀, msc₀, hrpv₀, hrel₀, hsz₀, _, _, _, _⟩ := hfields 0 (by simp)
+  obtain ⟨_, _, _, hvpath₁, sc₁, msc₁, hrpv₁, hrel₁, hsz₁, _, _, _, _⟩ := hfields 1 (by simp)
+  obtain ⟨_, _, _, hvpath₂, sc₂, msc₂, hrpv₂, hrel₂, hsz₂, _, _, _, _⟩ := hfields 2 (by simp)
+  dsimp at hvpath₀ hrpv₀ hsz₀ hvpath₁ hrpv₁ hsz₁ hvpath₂ hrpv₂ hsz₂
+  obtain ⟨vs, v₀, hrv0, hget0, hr0, _, _⟩ := validPath_cons_inv hvpath₀ hrpv₀
+  obtain ⟨vs1, sub₁, hrv1, hget1, hr_sub₁, hvp_sub₁, _⟩ := validPath_cons_inv hvpath₁ hrpv₁
+  obtain ⟨vs2, sub₂, hrv2, hget2, hr_sub₂, hvp_sub₂, _⟩ := validPath_cons_inv hvpath₂ hrpv₂
+  subst hrv0
+  injection hrv1 with _ hvs1; subst hvs1
+  injection hrv2 with _ hvs2; subst hvs2
+  have hsub12 := Option.some.inj (hget1.symm.trans hget2); subst hsub12
+  dsimp [readProjectedValue] at hr0
+  cases hvc0 : valueContainsUninit v₀ <;> rw [hvc0] at hr0 <;> cases hr0
+  obtain ⟨ws, w₁, hsub_eq1, hwget0, hwr1, _, _⟩ := validPath_cons_inv (hvp_sub₁ nofun) hr_sub₁
+  obtain ⟨ws', w₂, hsub_eq2, hwget1, hwr2, _, _⟩ := validPath_cons_inv (hvp_sub₂ nofun) hr_sub₂
+  subst hsub_eq1; injection hsub_eq2 with _ hws_eq; subst hws_eq
+  dsimp [readProjectedValue] at hwr1 hwr2
+  cases hvc1 : valueContainsUninit w₁ <;> rw [hvc1] at hwr1 <;> cases hwr1
+  cases hvc2 : valueContainsUninit w₂ <;> rw [hvc2] at hwr2 <;> cases hwr2
+  cases vs with
+  | nil => rw [get?_eq_getElem?] at hget0; cases hget0
+  | cons u0 vs_tl0 =>
+    rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hget0; subst hget0
+    cases vs_tl0 with
+    | nil => rw [get?_eq_getElem?] at hget1; cases hget1
+    | cons u1 vs_tl =>
+      rw [get?_eq_getElem?, List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at hget1
+      subst hget1
+      cases ws with
+      | nil => rw [get?_eq_getElem?] at hwget0; cases hwget0
+      | cons z0 ws_tl0 =>
+        rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hwget0; subst hwget0
+        cases ws_tl0 with
+        | nil => rw [get?_eq_getElem?] at hwget1; cases hwget1
+        | cons z1 ws_tl =>
+          rw [get?_eq_getElem?, List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at hwget1
+          subst hwget1
+          rcases hnz_root with ⟨_, ⟨_, _, hnz_ws⟩, hnz_vs⟩
+          have hb0 := scalarBytes_of_fieldSize hrel₀ hsz₀
+          have hb1 := scalarBytes_of_fieldSize hrel₁ hsz₁
+          have hb2 := scalarBytes_of_fieldSize hrel₂ hsz₂
+          dsimp [valueLeafBytes, valueLeafBytes.valueLeafBytesList, structSumFieldBytes] at hleaf_bytes
+          have hws_nil := hnz_ws.eq_nil_of_zero (by omega)
+          have hvs_nil := hnz_vs.eq_nil_of_zero (by omega)
+          subst hws_nil hvs_nil
+          exact ⟨sc₀, sc₁, sc₂, rfl,
+            scalarBle_max_of_fieldSize hrel₀ hsz₀,
+            scalarBle_max_of_fieldSize hrel₁ hsz₁,
+            scalarBle_max_of_fieldSize hrel₂ hsz₂⟩
+
+theorem StructMemPlaceRel.inv_super_1_3
+    {mach : AnnealMachine} {ty : Ty} {layouts : LayoutTable}
+    {f₀ f₁ f₂ f₃ : StructFieldDesc} {t₀ m₁ t₁ t₂ t₃ : Ty}
+    {rootVal : Value} {mp : Miri.Interpreter.MemPlace AnnealProv}
+    (h : StructMemPlaceRel mach ty layouts [f₀, f₁, f₂, f₃]
+      [[.field 0 t₀], [.field 1 m₁, .field 0 t₁],
+       [.field 1 m₁, .field 1 t₂], [.field 1 m₁, .field 2 t₃]] rootVal mp) :
+    ∃ sc₀ sc₁ sc₂ sc₃,
+      rootVal = .aggregate 0 [.scalar sc₀, .aggregate 0 [.scalar sc₁, .scalar sc₂, .scalar sc₃]] ∧
+      Nat.ble sc₀.bits (scalarModulus f₀.fieldLayout.size.bytes.toNat - 1) = true ∧
+      Nat.ble sc₁.bits (scalarModulus f₁.fieldLayout.size.bytes.toNat - 1) = true ∧
+      Nat.ble sc₂.bits (scalarModulus f₂.fieldLayout.size.bytes.toNat - 1) = true ∧
+      Nat.ble sc₃.bits (scalarModulus f₃.fieldLayout.size.bytes.toNat - 1) = true := by
+  rcases h with ⟨_, _, _, _, _, _, _, ⟨_, hnz_root⟩, hleaf_bytes,
+    _, _, _, _, _, _, _, _, _, _, _, _, _, _, hfields, _⟩
+  obtain ⟨_, _, _, hvpath₀, sc₀, msc₀, hrpv₀, hrel₀, hsz₀, _, _, _, _⟩ := hfields 0 (by simp)
+  obtain ⟨_, _, _, hvpath₁, sc₁, msc₁, hrpv₁, hrel₁, hsz₁, _, _, _, _⟩ := hfields 1 (by simp)
+  obtain ⟨_, _, _, hvpath₂, sc₂, msc₂, hrpv₂, hrel₂, hsz₂, _, _, _, _⟩ := hfields 2 (by simp)
+  obtain ⟨_, _, _, hvpath₃, sc₃, msc₃, hrpv₃, hrel₃, hsz₃, _, _, _, _⟩ := hfields 3 (by simp)
+  dsimp at hvpath₀ hrpv₀ hsz₀ hvpath₁ hrpv₁ hsz₁ hvpath₂ hrpv₂ hsz₂ hvpath₃ hrpv₃ hsz₃
+  obtain ⟨vs, v₀, hrv0, hget0, hr0, _, _⟩ := validPath_cons_inv hvpath₀ hrpv₀
+  obtain ⟨vs1, sub₁, hrv1, hget1, hr_sub₁, hvp_sub₁, _⟩ := validPath_cons_inv hvpath₁ hrpv₁
+  obtain ⟨vs2, sub₂, hrv2, hget2, hr_sub₂, hvp_sub₂, _⟩ := validPath_cons_inv hvpath₂ hrpv₂
+  obtain ⟨vs3, sub₃, hrv3, hget3, hr_sub₃, hvp_sub₃, _⟩ := validPath_cons_inv hvpath₃ hrpv₃
+  subst hrv0
+  injection hrv1 with _ hvs1; subst hvs1
+  injection hrv2 with _ hvs2; subst hvs2
+  injection hrv3 with _ hvs3; subst hvs3
+  have hsub12 := Option.some.inj (hget1.symm.trans hget2); subst hsub12
+  have hsub13 := Option.some.inj (hget1.symm.trans hget3); subst hsub13
+  dsimp [readProjectedValue] at hr0
+  cases hvc0 : valueContainsUninit v₀ <;> rw [hvc0] at hr0 <;> cases hr0
+  obtain ⟨ws, w₁, hsub_eq1, hwget0, hwr1, _, _⟩ := validPath_cons_inv (hvp_sub₁ nofun) hr_sub₁
+  obtain ⟨ws2, w₂, hsub_eq2, hwget1, hwr2, _, _⟩ := validPath_cons_inv (hvp_sub₂ nofun) hr_sub₂
+  obtain ⟨ws3, w₃, hsub_eq3, hwget2, hwr3, _, _⟩ := validPath_cons_inv (hvp_sub₃ nofun) hr_sub₃
+  subst hsub_eq1
+  injection hsub_eq2 with _ hws2; subst hws2
+  injection hsub_eq3 with _ hws3; subst hws3
+  dsimp [readProjectedValue] at hwr1 hwr2 hwr3
+  cases hvc1 : valueContainsUninit w₁ <;> rw [hvc1] at hwr1 <;> cases hwr1
+  cases hvc2 : valueContainsUninit w₂ <;> rw [hvc2] at hwr2 <;> cases hwr2
+  cases hvc3 : valueContainsUninit w₃ <;> rw [hvc3] at hwr3 <;> cases hwr3
+  cases vs with
+  | nil => rw [get?_eq_getElem?] at hget0; cases hget0
+  | cons u0 vs_tl0 =>
+    rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hget0; subst hget0
+    cases vs_tl0 with
+    | nil => rw [get?_eq_getElem?] at hget1; cases hget1
+    | cons u1 vs_tl =>
+      rw [get?_eq_getElem?, List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at hget1
+      subst hget1
+      cases ws with
+      | nil => rw [get?_eq_getElem?] at hwget0; cases hwget0
+      | cons z0 ws_tl0 =>
+        rw [get?_eq_getElem?, List.getElem?_cons_zero, Option.some.injEq] at hwget0; subst hwget0
+        cases ws_tl0 with
+        | nil => rw [get?_eq_getElem?] at hwget1; cases hwget1
+        | cons z1 ws_tl1 =>
+          rw [get?_eq_getElem?, List.getElem?_cons_succ, List.getElem?_cons_zero, Option.some.injEq] at hwget1
+          subst hwget1
+          cases ws_tl1 with
+          | nil => rw [get?_eq_getElem?] at hwget2; cases hwget2
+          | cons z2 ws_tl =>
+            rw [get?_eq_getElem?, List.getElem?_cons_succ, List.getElem?_cons_succ, List.getElem?_cons_zero,
+              Option.some.injEq] at hwget2
+            subst hwget2
+            rcases hnz_root with ⟨_, ⟨_, _, _, hnz_ws⟩, hnz_vs⟩
+            have hb0 := scalarBytes_of_fieldSize hrel₀ hsz₀
+            have hb1 := scalarBytes_of_fieldSize hrel₁ hsz₁
+            have hb2 := scalarBytes_of_fieldSize hrel₂ hsz₂
+            have hb3 := scalarBytes_of_fieldSize hrel₃ hsz₃
+            dsimp [valueLeafBytes, valueLeafBytes.valueLeafBytesList, structSumFieldBytes] at hleaf_bytes
+            have hws_nil := hnz_ws.eq_nil_of_zero (by omega)
+            have hvs_nil := hnz_vs.eq_nil_of_zero (by omega)
+            subst hws_nil hvs_nil
+            exact ⟨sc₀, sc₁, sc₂, sc₃, rfl,
+              scalarBle_max_of_fieldSize hrel₀ hsz₀,
+              scalarBle_max_of_fieldSize hrel₁ hsz₁,
+              scalarBle_max_of_fieldSize hrel₂ hsz₂,
+              scalarBle_max_of_fieldSize hrel₃ hsz₃⟩
+
 /-- 100% syntactic (state-independent) typing predicate for a whole-value
 copy or move `_dst = Rvalue.Use(copy _src)` / `_dst = Rvalue.Use(move _src)` of
 a `.Memory`-ABI aggregate (`srcIdx ≠ dstIdx`), routed through
@@ -6311,7 +7139,10 @@ inductive WellTypedLM2_2UseAssignMemStruct
       (nz_size : (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
       (size_lt_4g : (translateTy decl.ty body.layouts).layout.size.bytes.toNat < 2 ^ 32)
       (is_sized : (translateTy decl.ty body.layouts).layout.isSized = true)
-      (align_le : (translateTy decl.ty body.layouts).layout.align.abi.pow2 ≤ 29) :
+      (align_le : (translateTy decl.ty body.layouts).layout.align.abi.pow2 ≤ 29)
+      (read_valid : ∀ mach rootVal mp,
+        StructMemPlaceRel mach decl.ty body.layouts fields paths rootVal mp →
+        validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨srcIdx, .nil⟩) rootVal = true) :
       WellTypedLM2_2UseAssignMemStruct body env stEnv dstIdx isMove srcIdx
 
 /-- Whole-value `.Memory` struct copy/move simulation
@@ -6345,7 +7176,7 @@ theorem step_assign_use_memory_struct_lm2_2_simulation
   cases hwt with
   | mk decl srcDecl fields paths topOffsets memoryIndex
       hne_sd hdecl hsrc_decl hty_eq henv hsrc_state hmem_repr harb hnz_sz
-      hsz4g hsized halign_le =>
+      hsz4g hsized halign_le hread_valid =>
     rcases srcDecl with ⟨srcMut, srcTy, srcName⟩
     dsimp only at hty_eq
     subst hty_eq
@@ -6461,6 +7292,9 @@ theorem step_assign_use_memory_struct_lm2_2_simulation
     | structInd fs_s ps_s rootVal srcMp c_s henv_s _ hsmpr_d =>
       have hfp_s := henv.symm.trans henv_s
       injection hfp_s with hfp_s'; injection hfp_s' with hfs_s hps_s; subst hfs_s hps_s
+      have hrv_src :
+          validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨srcIdx, .nil⟩) rootVal = true :=
+        hread_valid m.machine rootVal srcMp hsmpr_d
       rcases hsmpr_d with
         ⟨srcId, _, srcBase, srcLocal, words_s, hvalid_s, hplen_s, hagg_s, hleaf_s,
           hprov_s, _, _, hlive_s, hbase_s, hptr_s, _, _, _, hbs_s,
@@ -6590,17 +7424,18 @@ theorem step_assign_use_memory_struct_lm2_2_simulation
           { s.frame with locals := locals₁ } tf₁ :=
         ⟨hfr₁.body_eq, hfr₁.location_eq, hfr₁.af_locals_len, hfr₁.mf_locals_size,
           fun i d sl ml _ hd hs hm => hfr₁.locals_rel i d sl ml hd hs hm⟩
+      have hev_op_ld :
+          evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil body.localDecls =
+            .ok rootVal locals₁ :=
+        evalOperand_unproj_ok_of_mat_val
+          (materializeReadPtrValue_of_memory_repr hsrc_decl hmem_repr) hrv_src hev_op
       have ha_ok_of : slot_dst ≠ .dead →
           evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.use op), span⟩
             body.localDecls body.layouts =
           MirStepNode.step (advanceStmt s (locals₁.set dstIdx (.init rootVal)) s.memory) := by
         intro hnot_dead
         unfold evalStmt; dsimp only
-        rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller,
-          show evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil body.localDecls =
-              evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil .nil by
-            cases isMove <;> rfl,
-          hev_op]
+        rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller, hev_op_ld]
         dsimp only
         rw [validateLoadedValue_of_memory_repr hsrc_decl hmem_repr]; dsimp only
         rw [hprot, hbor, hdst_loc₁]
@@ -6677,11 +7512,7 @@ theorem step_assign_use_memory_struct_lm2_2_simulation
         have ha_ub : evalStmt s ⟨.assign ⟨dstIdx, .nil⟩ (.use op), span⟩
             body.localDecls body.layouts = MirStepNode.fail .ub := by
           unfold evalStmt; dsimp only
-          rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller,
-            show evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil body.localDecls =
-                evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil .nil by
-              cases isMove <;> rfl,
-            hev_op]
+          rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller, hev_op_ld]
           dsimp only
           rw [validateLoadedValue_of_memory_repr hsrc_decl hmem_repr]; dsimp only
           rw [hprot, hbor, hdst_loc₁, hslot_dead]
@@ -6840,7 +7671,10 @@ inductive WellTypedLM2_2SelfMoveMemStruct
       (nz_size : (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
       (size_lt_4g : (translateTy decl.ty body.layouts).layout.size.bytes.toNat < 2 ^ 32)
       (is_sized : (translateTy decl.ty body.layouts).layout.isSized = true)
-      (align_le : (translateTy decl.ty body.layouts).layout.align.abi.pow2 ≤ 29) :
+      (align_le : (translateTy decl.ty body.layouts).layout.align.abi.pow2 ≤ 29)
+      (read_valid : ∀ mach rootVal mp,
+        StructMemPlaceRel mach decl.ty body.layouts fields paths rootVal mp →
+        validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, .nil⟩) rootVal = true) :
       WellTypedLM2_2SelfMoveMemStruct body env stEnv idx
 
 /-- Lockstep simulation of self-move `_idx = Rvalue.Use(move _idx)` on a
@@ -6867,7 +7701,7 @@ theorem step_assign_self_move_memory_struct_lm2_2_simulation
       (Miri.Interpreter.Step.step (annealStepHooksLM2_2 body.localDecls body.layouts) () m) := by
   cases hwt with
   | mk decl fields paths topOffsets memoryIndex
-      hdecl henv hsrc_state hmem_repr harb hnz_sz hsz4g hsized halign_le =>
+      hdecl henv hsrc_state hmem_repr harb hnz_sz hsz4g hsized halign_le hread_valid =>
     rcases hstate with
       ⟨topFrame, hframes, hretCont, ⟨retLay, hretPlace⟩, hframe,
         hinit_env, himm_env, hsupply, hcal, hstack, hbor, hprot, hcaller, hdisj⟩
@@ -6965,6 +7799,9 @@ theorem step_assign_self_move_memory_struct_lm2_2_simulation
     | structInd fs_s ps_s rootVal srcMp c_s henv_s _ hsmpr_s =>
       have hfp_s := henv.symm.trans henv_s
       injection hfp_s with hfp_s'; injection hfp_s' with hfs_s hps_s; subst hfs_s hps_s
+      have hrv_self :
+          validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, .nil⟩) rootVal = true :=
+        hread_valid m.machine rootVal srcMp hsmpr_s
       rcases hsmpr_s with
         ⟨srcId, _, srcBase, srcLocal, words_s, hvalid_s, hplen_s, hagg_s, hleaf_s,
           hprov_s, _, _, hlive_s, hbase_s, hptr_s, _, _, _, hbs_s,
@@ -7050,10 +7887,16 @@ theorem step_assign_self_move_memory_struct_lm2_2_simulation
           MirStepNode.step (advanceStmt s (locals₁.set idx (.init rootVal)) s.memory) := by
         unfold evalStmt; dsimp only
         rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller]
+        have hev_op_nil : evalOperand s.frame.locals (mkPlaceOperand true ⟨idx, []⟩)
+            .nil s.memory.globals body.layouts .nil .nil = .ok rootVal locals₁ := by
+          simp only [mkPlaceOperand, ↓reduceIte]
+          unfold evalOperand; dsimp only
+          rw [hslot0]; dsimp only [readProjectedValue]; rw [hagg_s.2.valueContainsUninit_eq_false]; dsimp only
+          rw [set?_eq_some_set hlt_af0 .uninit]
         have hev_op : evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil body.localDecls =
-            .ok rootVal locals₁ := by
-          unfold evalOperand; dsimp only [op, mkPlaceOperand, readProjectedValue]; rw [hslot0]; dsimp only [readProjectedValue]; rw [hagg_s.2.valueContainsUninit_eq_false]; dsimp only
-          rw [set?_eq_some_set hlt_af0]
+            .ok rootVal locals₁ :=
+          evalOperand_unproj_ok_of_mat_val
+            (materializeReadPtrValue_of_memory_repr hdecl hmem_repr) hrv_self hev_op_nil
         rw [hev_op]; dsimp only
         rw [show op = mkPlaceOperand true ⟨idx, .nil⟩ from rfl,
           validateLoadedValue_of_memory_repr hdecl hmem_repr]; dsimp only
@@ -7150,7 +7993,10 @@ theorem step_assign_self_copy_memory_struct_divergence
           (Miri.Memory.allocRange Miri.ABI.Size.ZERO
             (translateTy decl.ty body.layouts).layout.size)
           Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) true true
-          localAlloc.allocation = .error .copyRangesOverlap alloc') :
+          localAlloc.allocation = .error .copyRangesOverlap alloc')
+    (hread_valid :
+      validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, .nil⟩) rootVal = true :=
+      by decide) :
     stepMirFn body s =
       MirStepNode.step (advanceStmt s (s.frame.locals.set idx (.init rootVal)) s.memory) ∧
     ∃ m_err,
@@ -7176,9 +8022,13 @@ theorem step_assign_self_copy_memory_struct_divergence
       MirStepNode.step (advanceStmt s (s.frame.locals.set idx (.init rootVal)) s.memory) := by
     unfold evalStmt; dsimp only
     rw [evalRvalue_use_nil_borrows _ _ _ hbor, hcaller]
+    have hev_nil : evalOperand s.frame.locals (mkPlaceOperand false ⟨idx, []⟩) .nil s.memory.globals
+        body.layouts .nil .nil = .ok rootVal s.frame.locals := by
+      simp [mkPlaceOperand, evalOperand, readProjectedValue, hroot_init, hslot]
     have hev : evalOperand s.frame.locals (.copy ⟨idx, .nil⟩) .nil s.memory.globals
-        body.layouts .nil body.localDecls = .ok rootVal s.frame.locals := by
-      simp [evalOperand, readProjectedValue, hroot_init, hslot]
+        body.layouts .nil body.localDecls = .ok rootVal s.frame.locals :=
+      evalOperand_unproj_ok_of_mat_val
+        (materializeReadPtrValue_of_memory_repr hdecl hmem_repr) hread_valid hev_nil
     rw [hev]; dsimp only
     rw [show MirAst.Operand.copy ⟨idx, .nil⟩ = mkPlaceOperand false ⟨idx, .nil⟩ from rfl,
       validateLoadedValue_of_memory_repr hdecl hmem_repr]; dsimp only

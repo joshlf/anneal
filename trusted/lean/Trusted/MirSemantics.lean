@@ -55,14 +55,20 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalFloatArithBase FloatArithMode nanChoicesQuieted nanChoicesSignaling
   expandNanSigns nanChoices natListMem isAdmissibleQuietNaN evalFloatBinOp
   EvalFloatBinOpRel Ptr2IntTransmutePolicy
-  ScalarVal AbstractByte mergeByteProvenance
-  encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBytes
+  ScalarVal layoutPointerBytes normPtrByteOffset PtrByteFrag PtrByteFrag.beq PtrByteFrag.provPair
+  AbstractByte AbstractByte.provPair? mkInitByte mkPtrFragByte
+  abstractBytesHaveProv abstractBytesCoherentPtrProvAux
+  abstractBytesCoherentPtrProv? abstractBytesCoherentPtrProv mergeByteProvenance
+  encodeRawAbstractByteVal decodeRawAbstractByteVal? decodeRawAbstractByteVals? isRawFragByteVal
+  encodePlainLittleEndianBytes encodePtrBytesAux encodePtrBytes
+  encodeLittleEndianBytes encodeScalarBytes decodeLittleEndianBits decodeLittleEndianBytes
   decodeScalarBytes replicateUninitBytes takeAbstractBytes dropAbstractBytes
   appendAbstractBytes sliceAbstractBytes writeAbstractBytesAt
-  lookupRelocAllocId globalAllocBytesAux globalAllocSliceToAbstractBytes
+  lookupRelocEntry lookupRelocAllocId readGlobalRelocOrigOffset
+  globalAllocBytesAux globalAllocSliceToAbstractBytes
   isValidCharCode wrappingRangeContains primitiveKindByteWidth
-  scalarLayoutByteWidth decodeScalarLayoutBytes rigidTyKindByteSize
-  tupleFieldsByteSize rigidTyByteSize encodeListWith decodeArrayChunksWith
+  scalarLayoutByteWidth decodeScalarLayoutBytes rigidTyKindByteSizeFor rigidTyKindByteSize
+  tupleFieldsByteSizeFor tupleFieldsByteSize rigidTyByteSize encodeListWith decodeArrayChunksWith
   encodeUntypedValueToBytes encodeFieldsAtOffsetsWith encodeSeqFieldsWith
   encodeUnionFieldsWith
   decodeFieldsAtOffsetsWith decodeFieldsBySpan decodeSeqFieldsWith
@@ -86,7 +92,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   inferValueByteSizeAux inferElemListByteStride exactByteDivAux byteOffsetToElemIdx?
   splitLastConstantIndex? readSliceBackingAggregate? splitLastSubslice? endsWithSubslice needsThinPtrElemResolution
   startsWithArrayOrSliceProj resolveLeafTyInTargetDecls resolveStackThinPtrTargetProj?
-  evalGlobalDerefRead evalSliceFatPtrDerefRead evalPlaceRead
+  evalGlobalDerefRead evalSliceFatPtrDerefRead materializeReadPtrValue evalPlaceRead
   takeLeadingOpaqueCast stripLeadingOpaqueCast setLocalDeclTy eraseLeadingOpaqueCastDecls
   evalOperand evalOperands
   operandIsLeadingOpaqueCastMove evalOperandWithBodyCast evalOperandsWithBodyCast
@@ -96,8 +102,12 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalOperandWithBodyCast_move_of_head_not_cast evalOperandsWithBodyCast_nil
   evalOperandsWithBodyCast_cons
   extractDerefPtrVal? resolveDerefWriteFullProj writeSliceFatPtrTargetValue
-  writePlaceValue derefWriteTreeUB layoutValidForAdt layoutValidForResolvedAdt
+  writePlaceValue writePlaceValueUntyped derefWriteTreeUB layoutValidForAdt layoutValidForResolvedAdt
   resolveByteCastSrcTyAndSize evalByteCast
+  validateScalarLayoutValForTy? validateValueForTyAux validateValueForTy?
+  abstractBytesUniformProv decodePtrBytesNoForge decodeScalarLayoutBytesNoForge
+  decodeTypedValueFromBytes decodeUntypedStorageBytes
+  encodeRawAbstractByteVals overlayRawAbstractByteVals
   policyRejectsProv stripAbstractByteProv stripAbstractBytesProv
   valueHasProv valueListHasProv scalarLayoutIsPointer backendReprHasPointer
   decodeTypedKindByteSize RichAdtSpec lookupRichAdtSpec decodeRichFieldSpecs
@@ -157,7 +167,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   borrowsAfterReadAccess borrowsAfterWriteAccess untypedValueHasExactByteImage
   ResolvedMemEndpoint resolveLiveMemEndpoint endpointAccessCheck
   checkPtrArgAligned optProvEq abstractBytesEq abstractByteRefines
-  abstractBytesRefine hasUninitByte allBytesUninit allBytesMatchProv
+  abstractBytesRefine hasUninitByte allBytesUninit allBytesMatchProv allBytesMatchNone
   allBytesSameProv bytesHaveRealProvenance extractRawU8Bytes
   stripProvenanceBytes encodePtrRawBytes scalarPairOffsetsValid
   encodeFieldsAtOffsetsExactWith encodeUntypedFlatElemsExact
@@ -214,7 +224,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (
   evalNonSelectIntrinsicCall isPtrPointeeIntrinsicKind
   withConstEvalSelectIntrinsicTypeArgs rigidTysToZeroSizedOps
   constEvalSelectTupleArgOps finishMemIntrinsicCall evalCopyNonOverlappingCall
-  WriteBytesAction writeBytesAction evalWriteBytesCall
+  WriteBytesAction replicateAbstractByte writeBytesAction evalWriteBytesCall
   writeIntrinsicReturnWithProtectors resolveIntrinsicPointeeFullTy
   checkPtrPairAligned endpointBorrowsAfterRead endpointBorrowsAfterWrite
   compareUnsignedBytesI32 evalCopyCall evalCompareBytesCall evalRawEqCall

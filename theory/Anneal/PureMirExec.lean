@@ -5820,7 +5820,7 @@ private theorem commitWriteBytesDstPlaceWrite_ne_nil
     | some borrows' =>
       dsimp only
       have hne' := borrowsAfterWriteBytes_ne_nil h hbw
-      cases writePlaceValue l3 s.memory.borrows dp nv ld ly with
+      cases writePlaceValueUntyped l3 s.memory.borrows dp nv ld ly with
       | ok locals4 => exact sn_step hne'
       | unsupported => exact sn_unsup
       | ub => exact sn_fail

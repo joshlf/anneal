@@ -2918,7 +2918,7 @@ theorem evalBswap_eight (bits : Nat) :
 
 /-- Embed a `BitVec 8` byte as an initialized `AbstractByte` carrying provenance `prov`
 (`none` by default). -/
-def bvByteToAbstract (prov : Option (Nat × Nat) := none) (b : BitVec 8) : AbstractByte :=
+def bvByteToAbstract (prov : Option PtrByteFrag := none) (b : BitVec 8) : AbstractByte :=
   .init (UInt8.ofBitVec b) prov
 
 /-- Extract the payload of every initialized byte, in order, skipping `.uninit` bytes. On a
@@ -2931,25 +2931,25 @@ def extractInitBvBytes : List AbstractByte → List (BitVec 8)
   | .init b _ :: rest => b.toBitVec :: extractInitBvBytes rest
 
 /-- `bvByteToAbstract` is injective in the byte. -/
-theorem bvByteToAbstract_injective {prov : Option (Nat × Nat)} {a b : BitVec 8}
+theorem bvByteToAbstract_injective {prov : Option PtrByteFrag} {a b : BitVec 8}
     (h : bvByteToAbstract prov a = bvByteToAbstract prov b) : a = b := by
   have h' : UInt8.ofBitVec a = UInt8.ofBitVec b := (AbstractByte.init.inj h).1
   exact UInt8.ofBitVec.inj h'
 
 /-- Byte lists embedded by `bvByteToAbstract` are fully initialized. -/
-theorem allBytesInitialized_map_bvByteToAbstract (prov : Option (Nat × Nat)) :
+theorem allBytesInitialized_map_bvByteToAbstract (prov : Option PtrByteFrag) :
     ∀ bs : List (BitVec 8), allBytesInitialized (bs.map (bvByteToAbstract prov)) = true
   | [] => rfl
   | _ :: rest => allBytesInitialized_map_bvByteToAbstract prov rest
 
 /-- Left inverse: extraction undoes the embedding, for every provenance. -/
-theorem extractInitBvBytes_map (prov : Option (Nat × Nat)) :
+theorem extractInitBvBytes_map (prov : Option PtrByteFrag) :
     ∀ bs : List (BitVec 8), extractInitBvBytes (bs.map (bvByteToAbstract prov)) = bs
   | [] => rfl
   | b :: rest => congrArg (b :: ·) (extractInitBvBytes_map prov rest)
 
 /-- The embedding is injective on byte lists. -/
-theorem map_bvByteToAbstract_injective {prov : Option (Nat × Nat)} {bs cs : List (BitVec 8)}
+theorem map_bvByteToAbstract_injective {prov : Option PtrByteFrag} {bs cs : List (BitVec 8)}
     (h : bs.map (bvByteToAbstract prov) = cs.map (bvByteToAbstract prov)) : bs = cs := by
   have h' := congrArg extractInitBvBytes h
   rwa [extractInitBvBytes_map, extractInitBvBytes_map] at h'
@@ -2988,7 +2988,7 @@ theorem length_extractInitBvBytes_eq_iff :
 
 /-- Right inverse: on a list whose bytes are all initialized with the same provenance,
 re-embedding the extracted payload reproduces the list exactly. -/
-theorem map_extractInitBvBytes_of_uniform (prov : Option (Nat × Nat)) :
+theorem map_extractInitBvBytes_of_uniform (prov : Option PtrByteFrag) :
     ∀ bs : List AbstractByte, (∀ b ∈ bs, ∃ byte, b = AbstractByte.init byte prov) →
       (extractInitBvBytes bs).map (bvByteToAbstract prov) = bs
   | [], _ => rfl
@@ -3080,40 +3080,47 @@ theorem chunksOf_extractInitBvBytes (n : Nat) (bs : List AbstractByte)
             omega
           rw [ih _ hdrop_init hdrop_le]
 
-/-- `encodeLittleEndianBytes` is the embedded `Anneal.LeBytes.toLeBytesAux` byte list, for every
-byte count (including `n = 0`), every (possibly out-of-range) `bits` and every provenance. Note
-the argument orders: `encodeLittleEndianBytes bits n` vs `toLeBytesAux n bits`. -/
-theorem encodeLittleEndianBytes_eq_map (prov : Option (Nat × Nat)) : ∀ (n bits : Nat),
-    encodeLittleEndianBytes bits n prov =
-      (Anneal.LeBytes.toLeBytesAux n bits).map (bvByteToAbstract prov)
+/-- `encodeLittleEndianBytes` with `none` provenance is the embedded `Anneal.LeBytes.toLeBytesAux`
+byte list, for every byte count (including `n = 0`) and every (possibly out-of-range) `bits`. Note
+the argument orders: `encodeLittleEndianBytes bits n none` vs `toLeBytesAux n bits`. -/
+theorem encodeLittleEndianBytes_eq_map : ∀ (n bits : Nat),
+    encodeLittleEndianBytes bits n none =
+      (Anneal.LeBytes.toLeBytesAux n bits).map (bvByteToAbstract none)
   | 0, _ => rfl
   | n + 1, bits =>
-    congrArg (List.cons (bvByteToAbstract prov (BitVec.ofNat 8 bits)))
-      (encodeLittleEndianBytes_eq_map prov n (Nat.div bits 256))
+    congrArg (List.cons (bvByteToAbstract none (BitVec.ofNat 8 bits)))
+      (encodeLittleEndianBytes_eq_map n (Nat.div bits 256))
 
-/-- `encodeLittleEndianBytes` on a `BitVec (n * 8)` is the embedded `Anneal.LeBytes.toLeBytes`. -/
-theorem encodeLittleEndianBytes_toLeBytes (n : Nat) (x : BitVec (n * 8))
-    (prov : Option (Nat × Nat)) :
-    encodeLittleEndianBytes x.toNat n prov =
-      (Anneal.LeBytes.toLeBytes n x).map (bvByteToAbstract prov) :=
-  encodeLittleEndianBytes_eq_map prov n x.toNat
+/-- `encodeLittleEndianBytes` on a `BitVec (n * 8)` with `none` provenance is the embedded
+`Anneal.LeBytes.toLeBytes`. -/
+theorem encodeLittleEndianBytes_toLeBytes (n : Nat) (x : BitVec (n * 8)) :
+    encodeLittleEndianBytes x.toNat n none =
+      (Anneal.LeBytes.toLeBytes n x).map (bvByteToAbstract none) :=
+  encodeLittleEndianBytes_eq_map n x.toNat
 
-/-- `decodeLittleEndianBytes` on an embedded byte list is `Anneal.LeBytes.fromLeBytes`; the
-merged provenance is the uniform provenance (or `none` on the empty list). -/
-theorem decodeLittleEndianBytes_map (prov : Option (Nat × Nat)) : ∀ (bs : List (BitVec 8)),
-    decodeLittleEndianBytes (bs.map (bvByteToAbstract prov)) =
-      some (Anneal.LeBytes.fromLeBytes bs, match bs with | [] => none | _ :: _ => prov)
+private theorem decodeLittleEndianBits_map (prov : Option PtrByteFrag) : ∀ (bs : List (BitVec 8)),
+    decodeLittleEndianBits (bs.map (bvByteToAbstract prov)) =
+      some (Anneal.LeBytes.fromLeBytes bs)
   | [] => rfl
   | b :: rest => by
-    have hstep : decodeLittleEndianBytes ((b :: rest).map (bvByteToAbstract prov)) =
-        (match decodeLittleEndianBytes (rest.map (bvByteToAbstract prov)) with
-          | some (highBits, restProv) =>
-            some (b.toNat + 256 * highBits, mergeByteProvenance prov restProv)
+    have hstep : decodeLittleEndianBits ((b :: rest).map (bvByteToAbstract prov)) =
+        (match decodeLittleEndianBits (rest.map (bvByteToAbstract prov)) with
+          | some highBits => some (b.toNat + 256 * highBits)
           | none => none) := rfl
-    rw [hstep, decodeLittleEndianBytes_map prov rest]
-    cases rest with
-    | nil => cases prov <;> rfl
-    | cons c r => cases prov <;> rfl
+    rw [hstep, decodeLittleEndianBits_map prov rest]
+    rfl
+
+/-- `decodeLittleEndianBytes` on an embedded byte list is `Anneal.LeBytes.fromLeBytes` paired with
+the fragment-coherent pointer provenance of the buffer. -/
+theorem decodeLittleEndianBytes_map (prov : Option PtrByteFrag) (bs : List (BitVec 8)) :
+    decodeLittleEndianBytes (bs.map (bvByteToAbstract prov)) =
+      some (Anneal.LeBytes.fromLeBytes bs,
+        match abstractBytesCoherentPtrProv? (bs.map (bvByteToAbstract prov)) with
+        | some frag => some (frag.allocId, frag.tag)
+        | none => none) := by
+  unfold decodeLittleEndianBytes
+  rw [decodeLittleEndianBits_map]
+  rfl
 
 /-- `decodeLittleEndianBytes` on a provenance-free embedded byte list. -/
 theorem decodeLittleEndianBytes_map_none (bs : List (BitVec 8)) :
@@ -3122,35 +3129,49 @@ theorem decodeLittleEndianBytes_map_none (bs : List (BitVec 8)) :
   rw [decodeLittleEndianBytes_map]
   cases bs <;> rfl
 
-/-- On any fully initialized byte list (arbitrary, possibly mixed provenance),
-`decodeLittleEndianBytes` returns `fromLeBytes` of the extracted payload. -/
-theorem decodeLittleEndianBytes_of_init : ∀ (bs : List AbstractByte),
+private theorem decodeLittleEndianBits_of_init : ∀ (bs : List AbstractByte),
     allBytesInitialized bs = true →
-      ∃ prov, decodeLittleEndianBytes bs =
-        some (Anneal.LeBytes.fromLeBytes (extractInitBvBytes bs), prov)
-  | [], _ => ⟨none, rfl⟩
+      decodeLittleEndianBits bs =
+        some (Anneal.LeBytes.fromLeBytes (extractInitBvBytes bs))
+  | [], _ => rfl
   | .uninit :: _, h => nomatch h
   | .init b p :: rest, h => by
-    obtain ⟨q, hq⟩ := decodeLittleEndianBytes_of_init rest h
-    have hstep : decodeLittleEndianBytes (.init b p :: rest) =
-        (match decodeLittleEndianBytes rest with
-          | some (highBits, restProv) =>
-            some (b.toBitVec.toNat + 256 * highBits, mergeByteProvenance p restProv)
+    have hstep : decodeLittleEndianBits (.init b p :: rest) =
+        (match decodeLittleEndianBits rest with
+          | some highBits => some (b.toBitVec.toNat + 256 * highBits)
           | none => none) := rfl
-    exact ⟨mergeByteProvenance p q, by rw [hstep, hq]; rfl⟩
+    rw [hstep, decodeLittleEndianBits_of_init rest h]
+    rfl
 
-/-- A single `.uninit` byte anywhere in the list poisons `decodeLittleEndianBytes`. -/
-theorem decodeLittleEndianBytes_eq_none_of_uninit : ∀ (bs : List AbstractByte),
-    allBytesInitialized bs = false → decodeLittleEndianBytes bs = none
+/-- On any fully initialized byte list (arbitrary, possibly mixed provenance),
+`decodeLittleEndianBytes` returns `fromLeBytes` of the extracted payload. -/
+theorem decodeLittleEndianBytes_of_init (bs : List AbstractByte)
+    (h : allBytesInitialized bs = true) :
+    ∃ prov, decodeLittleEndianBytes bs =
+      some (Anneal.LeBytes.fromLeBytes (extractInitBvBytes bs), prov) :=
+  ⟨match abstractBytesCoherentPtrProv? bs with
+    | some frag => some (frag.allocId, frag.tag)
+    | none => none, by
+    unfold decodeLittleEndianBytes
+    rw [decodeLittleEndianBits_of_init bs h]
+    rfl⟩
+
+private theorem decodeLittleEndianBits_eq_none_of_uninit : ∀ (bs : List AbstractByte),
+    allBytesInitialized bs = false → decodeLittleEndianBits bs = none
   | [], h => nomatch h
   | .uninit :: _, _ => rfl
   | .init b p :: rest, h => by
-    have hstep : decodeLittleEndianBytes (.init b p :: rest) =
-        (match decodeLittleEndianBytes rest with
-          | some (highBits, restProv) =>
-            some (b.toBitVec.toNat + 256 * highBits, mergeByteProvenance p restProv)
+    have hstep : decodeLittleEndianBits (.init b p :: rest) =
+        (match decodeLittleEndianBits rest with
+          | some highBits => some (b.toBitVec.toNat + 256 * highBits)
           | none => none) := rfl
-    rw [hstep, decodeLittleEndianBytes_eq_none_of_uninit rest h]
+    rw [hstep, decodeLittleEndianBits_eq_none_of_uninit rest h]
+
+/-- A single `.uninit` byte anywhere in the list poisons `decodeLittleEndianBytes`. -/
+theorem decodeLittleEndianBytes_eq_none_of_uninit (bs : List AbstractByte)
+    (h : allBytesInitialized bs = false) : decodeLittleEndianBytes bs = none := by
+  unfold decodeLittleEndianBytes
+  rw [decodeLittleEndianBits_eq_none_of_uninit bs h]
 
 /-- `decodeLittleEndianBytes` fails exactly on lists containing an `.uninit` byte. -/
 theorem decodeLittleEndianBytes_eq_none_iff (bs : List AbstractByte) :
@@ -3165,15 +3186,56 @@ theorem decodeLittleEndianBytes_eq_none_iff (bs : List AbstractByte) :
       cases h
   · exact decodeLittleEndianBytes_eq_none_of_uninit bs
 
+private theorem decodeLittleEndianBits_encodePtrBytesAux
+    (a t origOff ptrBytes : Nat) : ∀ (n idx bits : Nat),
+    decodeLittleEndianBits (encodePtrBytesAux a t origOff ptrBytes bits idx n) =
+      some (Anneal.LeBytes.fromLeBytes (Anneal.LeBytes.toLeBytesAux n bits))
+  | 0, _, _ => rfl
+  | n + 1, idx, bits => by
+    unfold encodePtrBytesAux decodeLittleEndianBits Anneal.LeBytes.toLeBytesAux Anneal.LeBytes.fromLeBytes
+    rw [decodeLittleEndianBits_encodePtrBytesAux a t origOff ptrBytes n (idx + 1) (Nat.div bits 256)]
+    rfl
+
+private theorem abstractBytesCoherentPtrProvAux_encodePtrBytesAux
+    (a t origOff ptrBytes : Nat) : ∀ (n idx bits : Nat),
+    abstractBytesCoherentPtrProvAux a t origOff ptrBytes idx
+      (encodePtrBytesAux a t origOff ptrBytes bits idx n) =
+      Nat.beq (Nat.add idx n) ptrBytes
+  | 0, idx, _ => rfl
+  | n + 1, idx, bits => by
+    unfold encodePtrBytesAux abstractBytesCoherentPtrProvAux
+    simp only [Nat.beq_refl, Bool.and_self, Bool.true_and,
+      abstractBytesCoherentPtrProvAux_encodePtrBytesAux a t origOff ptrBytes n (idx + 1) (Nat.div bits 256)]
+    have hIdx : Nat.add (Nat.add idx 1) n = Nat.add idx (Nat.succ n) := by
+      change (idx + 1) + n = idx + (n + 1)
+      rw [Nat.add_assoc, Nat.add_comm 1 n]
+    rw [hIdx]
+
 /-- Round trip of `encodeLittleEndianBytes` followed by `decodeLittleEndianBytes` at every byte
 count `n` (including `n = 0`, where provenance collapses to `none`). -/
 theorem decodeLittleEndianBytes_encodeLittleEndianBytes (n v : Nat)
     (prov : Option (Nat × Nat)) :
     decodeLittleEndianBytes (encodeLittleEndianBytes v n prov) =
       some (v % 2 ^ (n * 8), match n with | 0 => none | _ + 1 => prov) := by
-  rw [encodeLittleEndianBytes_eq_map, decodeLittleEndianBytes_map,
-    Anneal.LeBytes.fromLeBytes_toLeBytesAux]
-  cases n <;> rfl
+  cases prov with
+  | none =>
+    rw [encodeLittleEndianBytes_eq_map, decodeLittleEndianBytes_map_none,
+      Anneal.LeBytes.fromLeBytes_toLeBytesAux]
+    cases n <;> rfl
+  | some p =>
+    rcases p with ⟨a, t⟩
+    cases n with
+    | zero => exact congrArg (fun x => some (x, none)) (Nat.mod_one v).symm
+    | succ k =>
+      unfold encodeLittleEndianBytes encodePtrBytes decodeLittleEndianBytes
+      rw [decodeLittleEndianBits_encodePtrBytesAux, Anneal.LeBytes.fromLeBytes_toLeBytesAux]
+      unfold encodePtrBytesAux abstractBytesCoherentPtrProv?
+      dsimp only
+      rw [Nat.beq_refl,
+        abstractBytesCoherentPtrProvAux_encodePtrBytesAux a t (normPtrByteOffset (k + 1) v) (k + 1) k 1 (Nat.div v 256)]
+      have hLen : Nat.add 1 k = k + 1 := Nat.add_comm 1 k
+      rw [hLen, Nat.beq_refl]
+      rfl
 
 /-- `encodeScalarBytes` rejects exactly zero-width scalars. -/
 theorem encodeScalarBytes_eq_none_iff (sv : ScalarVal) (prov : Option (Nat × Nat)) :
@@ -3187,11 +3249,14 @@ theorem encodeScalarBytes_eq_none_iff (sv : ScalarVal) (prov : Option (Nat × Na
     · rw [h] at h0; cases h0
 
 /-- `decodeScalarBytes` on a non-empty embedded byte list is `fromLeBytes` at the list's
-length. -/
-theorem decodeScalarBytes_map (prov : Option (Nat × Nat)) {bs : List (BitVec 8)}
+length, paired with the buffer's coherent pointer provenance. -/
+theorem decodeScalarBytes_map (prov : Option PtrByteFrag) {bs : List (BitVec 8)}
     (hne : bs ≠ []) (signed : Bool) :
     decodeScalarBytes (bs.map (bvByteToAbstract prov)) signed =
-      some (⟨Anneal.LeBytes.fromLeBytes bs, bs.length⟩, prov) := by
+      some (⟨Anneal.LeBytes.fromLeBytes bs, bs.length⟩,
+        match abstractBytesCoherentPtrProv? (bs.map (bvByteToAbstract prov)) with
+        | some frag => some (frag.allocId, frag.tag)
+        | none => none) := by
   cases bs with
   | nil => exact absurd rfl hne
   | cons b rest =>
@@ -3204,8 +3269,11 @@ theorem decodeScalarBytes_map (prov : Option (Nat × Nat)) {bs : List (BitVec 8)
 /-- `decodeScalarBytes` on a non-empty provenance-free embedded byte list. -/
 theorem decodeScalarBytes_map_none {bs : List (BitVec 8)} (hne : bs ≠ []) (signed : Bool) :
     decodeScalarBytes (bs.map (bvByteToAbstract none)) signed =
-      some (⟨Anneal.LeBytes.fromLeBytes bs, bs.length⟩, none) :=
-  decodeScalarBytes_map none hne signed
+      some (⟨Anneal.LeBytes.fromLeBytes bs, bs.length⟩, none) := by
+  rw [decodeScalarBytes_map none hne signed]
+  cases bs with
+  | nil => exact absurd rfl hne
+  | cons _ _ => rfl
 
 /-- `decodeScalarBytes` rejects the empty byte list (a zero-width scalar is not a scalar). -/
 theorem decodeScalarBytes_nil (signed : Bool) : decodeScalarBytes [] signed = none := rfl
@@ -3257,14 +3325,14 @@ theorem decodeScalarBytes_encodeLittleEndianBytes {n : Nat} (hn : 0 < n) (v : Na
     (prov : Option (Nat × Nat)) (signed : Bool) :
     decodeScalarBytes (encodeLittleEndianBytes v n prov) signed =
       some (⟨v % 2 ^ (n * 8), n⟩, prov) := by
-  have hne : Anneal.LeBytes.toLeBytesAux n v ≠ [] := by
-    intro h
-    have hl := Anneal.LeBytes.toLeBytesAux_length n v
-    rw [h] at hl
-    have hl' : 0 = n := hl
-    omega
-  rw [encodeLittleEndianBytes_eq_map, decodeScalarBytes_map prov hne,
-    Anneal.LeBytes.fromLeBytes_toLeBytesAux, Anneal.LeBytes.toLeBytesAux_length]
+  cases n with
+  | zero => exact absurd hn (Nat.lt_irrefl 0)
+  | succ k =>
+    unfold decodeScalarBytes
+    dsimp only
+    rw [length_encodeLittleEndianBytes]
+    have hNe0 : Nat.beq (k + 1) 0 = false := rfl
+    rw [hNe0, decodeLittleEndianBytes_encodeLittleEndianBytes]
 
 /-- `toLeBytesAux` only depends on the low `n * 8` bits. -/
 theorem toLeBytesAux_mod (n v : Nat) :
@@ -3306,14 +3374,14 @@ theorem bitVecLE_encode (sz : Nat) (hNz : 0 < sz) (x : BitVec (8 * sz)) :
 theorem bitVecLE_encode_eq_toLeBytesAux (sz : Nat) (hNz : 0 < sz) (x : BitVec (8 * sz)) :
     (bitVecLE sz hNz).encode x =
       (Anneal.LeBytes.toLeBytesAux sz x.toNat).map (bvByteToAbstract none) :=
-  encodeLittleEndianBytes_eq_map none sz x.toNat
+  encodeLittleEndianBytes_eq_map sz x.toNat
 
 /-- `bitVecLE.encode` is the embedded `Anneal.LeBytes.toLeBytes` byte list (after re-indexing the
 width from `8 * sz` to `sz * 8`). -/
 theorem bitVecLE_encode_eq_toLeBytes (sz : Nat) (hNz : 0 < sz) (x : BitVec (8 * sz)) :
     (bitVecLE sz hNz).encode x =
       (Anneal.LeBytes.toLeBytes sz (toLeWidth x)).map (bvByteToAbstract none) :=
-  encodeLittleEndianBytes_eq_map none sz x.toNat
+  encodeLittleEndianBytes_eq_map sz x.toNat
 
 /-- Closed form of `bitVecLE.decode`: an exact-length check followed by the `Trusted`
 little-endian decoder. -/
@@ -3347,7 +3415,7 @@ theorem bitVecLE_decode (sz : Nat) (hNz : 0 < sz) (bs : List AbstractByte) :
 
 /-- `bitVecLE.decode` on an embedded byte list of the right length is `fromLeBytes` (any
 provenance is accepted and discarded). -/
-theorem bitVecLE_decode_map (sz : Nat) (hNz : 0 < sz) (prov : Option (Nat × Nat))
+theorem bitVecLE_decode_map (sz : Nat) (hNz : 0 < sz) (prov : Option PtrByteFrag)
     {bs : List (BitVec 8)} (hlen : bs.length = sz) :
     (bitVecLE sz hNz).decode (bs.map (bvByteToAbstract prov)) =
       some (BitVec.ofNat (8 * sz) (Anneal.LeBytes.fromLeBytes bs)) := by
