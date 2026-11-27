@@ -7487,4 +7487,63 @@ theorem statefulVerificationResult_of_symExploreChunks_mem (c : StatefulClaim) (
   rw [symProgEntry_toMachineStateOver cfg hMem symArgs env, hb, hcal, hargs] at hR
   exact ⟨_, hR⟩
 
+/-! ## Part XXI: Generic Symbolic Loop Summarization (Ranked Cut-Point Rule)
+
+A `while`-style loop whose head is a symbolic `SwitchInt` fork is verified ONCE
+symbolically for an arbitrary environment: the continue edge runs the body
+chunk back to the head under an environment transformer `σ`, the exit edge runs
+to a root return. A rank function bounds the iterations, producing an exact
+`ReachesDoneWithinV2026` budget `rank * (k + 1) + (ke + 1)` against the
+unmodified trusted semantics (no per-iteration concrete evaluation). -/
+
+theorem loop_budget_succ (r k ke : Nat) :
+    k + (r * (k + 1) + (ke + 1)) + 1 = (r + 1) * (k + 1) + (ke + 1) := by
+  simp only [Nat.succ_mul, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
+
+/-- **Ranked symbolic loop rule.** -/
+theorem symLoop_rank_sound {cfg : SymConfig} {H Hb He H' fin : SymProg}
+    {alts : List (SymCond × SymProg)} {cs0 cs csE : List SymCond} {cC cE : SymCond}
+    {k ke : Nat} {v : SymVal}
+    (hfork : symProgStep cfg H = .branch alts cs0)
+    (hmC : (cC, Hb) ∈ alts) (hmE : (cE, He) ∈ alts)
+    (hbody : symProgRunSteps cfg k Hb = .step H' cs)
+    (hexit : symProgRunSteps cfg ke He = .ret v fin csE)
+    (rank : SymEnv → Nat) (Inv : SymEnv → Prop) (σ : SymEnv → SymEnv)
+    (post : MirOutcome → Prop)
+    (hstep : ∀ env, Inv env → rank env ≠ 0 →
+      cC.holds env ∧ condsHold env cs ∧ rank (σ env) + 1 = rank env ∧ Inv (σ env) ∧
+        H'.toMachineState cfg env = H.toMachineState cfg (σ env))
+    (hdone : ∀ env, Inv env → rank env = 0 →
+      cE.holds env ∧ condsHold env csE ∧
+        post (.normal (v.eval env, (fin.toMachineState cfg env).memory))) :
+    ∀ env, Inv env →
+      ReachesDoneWithinV2026 cfg.body post (rank env * (k + 1) + (ke + 1))
+        (H.toMachineState cfg env) := by
+  have main : ∀ (r : Nat) (env : SymEnv), rank env = r → Inv env →
+      ReachesDoneWithinV2026 cfg.body post (r * (k + 1) + (ke + 1))
+        (H.toMachineState cfg env) := by
+    intro r
+    induction r with
+    | zero =>
+      intro env hr hinv
+      obtain ⟨hcE, hcsE, hpost⟩ := hdone env hinv hr
+      have hR := reachesDoneWithinV2026_of_step
+        ((symProgStep_branch_sound hfork env).2 cE He hmE hcE)
+        (symProgRunSteps_ret_sound hexit env hcsE hpost)
+      rw [Nat.zero_mul, Nat.zero_add]
+      exact hR
+    | succ r ih =>
+      intro env hr hinv
+      obtain ⟨hcC, hcs, hrank, hinv', heq⟩ :=
+        hstep env hinv (by rw [hr]; exact Nat.succ_ne_zero r)
+      have hrank' : rank (σ env) = r := Nat.succ.inj (hrank.trans hr)
+      have hBody := symProgRunSteps_sound cfg env k hbody hcs
+      rw [heq] at hBody
+      have hR := reachesDoneWithinV2026_of_step
+        ((symProgStep_branch_sound hfork env).2 cC Hb hmC hcC)
+        (reachesDoneWithinV2026_of_stepsTo hBody (ih (σ env) hrank' hinv'))
+      rw [loop_budget_succ] at hR
+      exact hR
+  exact fun env hinv => main (rank env) env rfl hinv
+
 end Anneal.MirSymExec.ChunkedCallV2026
