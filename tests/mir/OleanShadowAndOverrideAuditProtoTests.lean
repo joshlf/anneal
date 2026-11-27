@@ -393,12 +393,14 @@ run_cmd liftCoreM do
 /--
 info: PASS T9 unreferenced Assumptions axiom rejected when allowAssumptions = false
 PASS T9 Assumptions axiom admitted only when allowAssumptions = true and allowlisted
-PASS T9 dead _native axiom reported as sorryAx-class / native
 PASS T9 reachable sorryAx rejected
+PASS T9 dead _native axiom reported as sorryAx-class / native
+PASS T9 whole-module audit (axiomRoots? = none) also catches reachable sorryAx
+PASS T9 shadowed mergeableDuplicate theorem proof smuggling sorryAx caught
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
-  withTmpDir fun dir => do
+  let (sDup, sDupImplicit) ← withTmpDir fun dir => do
     let _ ← compileModule dir `Assumptions.Extra assumptionSrc
     let env ← importWith dir #[`Assumptions.Extra]
     let s ← auditImported env {} dir
@@ -407,11 +409,27 @@ PASS T9 reachable sorryAx rejected
     let s ← auditImported env { axioms := { allowAssumptions := true, allowedAssumptions := NameSet.empty.insert `Assumptions.Extra.ax } } dir
     expect "T9 Assumptions axiom admitted only when allowAssumptions = true and allowlisted"
       (!s.violations.any fun v => v.decl == `Assumptions.Extra.ax) (renderAll s.violations)
-  let s ← liveAudit { axiomRoots? := some #[`V2Sorry.claim] }
-  expect "T9 dead _native axiom reported as sorryAx-class / native"
-    (s.violations.any fun v => v.kind == .unreferencedSorryOrNativeAxiom && v.decl == `V2Native._native.native_decide.ax_1)
+    -- B2 regression: two co-imported modules declaring mergeableDuplicate `Shared.dupThm` where
+    -- the first copy is clean (`trivial`) and the second shadowed copy uses `sorryAx`!
+    let _ ← compileModule dir `DupClean "theorem Shared.dupThm : True := trivial\n"
+    let _ ← compileModule dir `DupDirty "theorem Shared.dupThm : True := sorryAx True true\n"
+    let _ ← compileModule dir `DupRoot "import DupClean\nimport DupDirty\ntheorem useDup : True := Shared.dupThm\n"
+    let envDup ← importWith dir #[`DupRoot]
+    let sDup ← auditImported envDup { axiomRoots? := some #[`useDup] } dir
+    let sDupImplicit ← auditImported envDup {} dir
+    return (sDup, sDupImplicit)
   expect "T9 reachable sorryAx rejected"
-    (s.violations.any fun v => v.kind == .referencedUnapprovedAxiom && v.decl == `sorryAx)
+    ((← liveAudit { axiomRoots? := some #[`V2Sorry.claim] }).violations.any fun v => v.kind == .referencedUnapprovedAxiom && v.decl == `sorryAx)
+  let sImplicit ← liveAudit {}
+  expect "T9 dead _native axiom reported as sorryAx-class / native"
+    (sImplicit.violations.any fun v => v.kind == .unreferencedSorryOrNativeAxiom && v.decl == `V2Native._native.native_decide.ax_1)
+  expect "T9 whole-module audit (axiomRoots? = none) also catches reachable sorryAx"
+    (sImplicit.violations.any fun v => v.kind == .referencedUnapprovedAxiom && v.decl == `sorryAx)
+    (renderAll sImplicit.violations)
+  expect "T9 shadowed mergeableDuplicate theorem proof smuggling sorryAx caught"
+    (sDup.violations.any (fun v => v.kind == .referencedUnapprovedAxiom && v.decl == `sorryAx) &&
+     sDupImplicit.violations.any (fun v => v.kind == .referencedUnapprovedAxiom && v.decl == `sorryAx))
+    (renderAll sDup.violations)
 
 /-! ### T10: exported-only (`isModule`) environments fail closed even after `setExporting false` -/
 
@@ -609,6 +627,8 @@ PASS T15 zero / misaligned / wrapping base address rejected
 PASS T15 scalar / misaligned / out-of-bounds root pointer rejected
 PASS T15 nonzero root m_rc and non-ctor tag 244 (LeanPromise) rejected
 PASS T15 oversized root m_cs_sz and corrupted root field pointers rejected
+PASS T15 overlapping parent region and out-of-parent-bounds child pointer rejected
+PASS T15 standalone validateOleanFile rejects symlinked .olean via lstat
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -638,6 +658,20 @@ PASS T15 oversized root m_cs_sz and corrupted root field pointers rejected
     (isErr (v (setByte (setByte bs (info.rootOffset + 4) 0xff) (info.rootOffset + 5) 0xff)) (· matches .rootSizeInvalid _) &&
      isErr (v (setLE64 bs (info.rootOffset + 8) 0)) (· matches .rootChildInvalid 0 _) &&
      isErr (v (setLE64 bs (info.rootOffset + 8) (info.baseAddr + info.fileSize + 64))) (· matches .rootChildInvalid 0 _))
+  -- B2 regression: overlapping parent region and `< baseAddr` pointer outside parent bounds rejected
+  let overlapCfg : OleanHeaderConfig := { allowParentRegionPtrs := true, parentRegions := #[(info.baseAddr + 8, 1024)] }
+  let parentCfg : OleanHeaderConfig := { allowParentRegionPtrs := true, parentRegions := #[(info.baseAddr - 4096, 2048)] }
+  expect "T15 overlapping parent region and out-of-parent-bounds child pointer rejected"
+    (isErr (validateOleanBinaryBytes bs overlapCfg) (· matches .overlappingParentRegion ..) &&
+     isErr (validateOleanBinaryBytes (setLE64 bs (info.rootOffset + 8) 64) parentCfg) (· matches .rootChildInvalid 0 _))
+  withTmpDir fun dir => do
+    let realF := dir / "Real.olean"
+    let symF := dir / "Sym.olean"
+    IO.FS.writeBinFile realF bs
+    let out ← IO.Process.output { cmd := "ln", args := #["-s", realF.toString, symF.toString] }
+    unless out.exitCode == 0 do throw (IO.userError out.stderr)
+    expect "T15 standalone validateOleanFile rejects symlinked .olean via lstat"
+      ((← validateOleanFile symF) matches .error _)
 
 /-! ## Vector 4 — `Init.ShareCommon`, compiler overrides, opaque-theorem readiness -/
 
@@ -645,19 +679,20 @@ PASS T15 oversized root m_cs_sz and corrupted root field pointers rejected
 
 namespace V4Ctl
 @[inline] def inc (n : Nat) : Nat := n + 1
+@[always_inline] def fastInc (n : Nat) : Nat := n + 2
 @[noinline] def dec (n : Nat) : Nat := n - 1
 inductive Color where | red | green
 def pick : Color → Nat | .red => 0 | .green => 1
 end V4Ctl
 
 /--
-info: PASS T16 benign @[inline]/@[noinline]/generated ctorIdx produce no Vector 4 findings
+info: PASS T16 benign @[inline]/@[always_inline]/@[noinline]/generated ctorIdx produce no Vector 4 findings
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
   let s ← liveAudit
   let hs := anyHits s "V4Ctl"
-  expect "T16 benign @[inline]/@[noinline]/generated ctorIdx produce no Vector 4 findings" hs.isEmpty (renderAll hs)
+  expect "T16 benign @[inline]/@[always_inline]/@[noinline]/generated ctorIdx produce no Vector 4 findings" hs.isEmpty (renderAll hs)
 
 /-! ### T17: 100%-safe `Init.ShareCommon` exploit witness (`leanprover/lean4#16779`) -/
 
@@ -687,12 +722,14 @@ theorem proofBodyShareCommon : True :=
 end V4Share
 
 def shareImportSrc : String := "import Init.ShareCommon\ndef usesNothing : Nat := 0\n"
+def shareCompiledThmSrc : String := "theorem sneakShare : True := let _ := ShareCommon.shareCommon' (0 : Nat); trivial\n"
 
 /--
 info: PASS T17 StateFactoryBuilder / StateFactory.mk / State.shareCommon references rejected
 PASS T17 theorem proof-body ShareCommon reference caught even when kernelScanTheoremBodies = false
 PASS T17 compiled IR / LCNF references rejected
 PASS T17 direct import of Init.ShareCommon rejected
+PASS T17 compiled .olean theorem-body ShareCommon caught with kernelScanTheoremBodies = false
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
@@ -711,6 +748,15 @@ PASS T17 direct import of Init.ShareCommon rejected
     let s ← auditImported env {} dir
     expect "T17 direct import of Init.ShareCommon rejected"
       (s.violations.any fun v => v.kind == .shareCommonImport && v.module == `ShareImp) (renderAll s.violations)
+    -- B2 regression: compiled `.olean` with NO direct `import Init.ShareCommon` (`Init` imports it
+    -- transitively) and `ShareCommon.shareCommon'` ONLY inside a theorem proof body under fast-sweep
+    -- `kernelScanTheoremBodies = false`!
+    let _ ← compileModule dir `ShareThmOnly shareCompiledThmSrc
+    let envThm ← importWith dir #[`ShareThmOnly]
+    let sThm ← auditImported envThm { kernelScanTheoremBodies := false } dir
+    expect "T17 compiled .olean theorem-body ShareCommon caught with kernelScanTheoremBodies = false"
+      (sThm.violations.any fun v => v.kind == .shareCommonReference && v.decl == `sneakShare)
+      (renderAll sThm.violations)
 
 /-! ### T18: compiler-override hooks (`google/zerocopy#4321`) + B1 custom `ctorIdx` & foreign tags -/
 
@@ -817,6 +863,16 @@ run_cmd liftCoreM do
     if e.isConstOf ``V4Opaque.accZeroThm then some (mkApp2 (mkConst ``id [.zero]) tci.type e) else none
   let n := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaId
   addDecl (.defnDecl { dv with name := n, value := wrapped, all := [n] })
+  -- B2 regression (Layer A): wrap `accZeroThm` in a separate `Prop`-valued `def wrapAcc := accZeroThm`
+  -- so `Expr.find?` on `accViaWrapDef` sees NO `.thmInfo` constant directly in the major premise!
+  let wrapName := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.wrapAcc
+  addDecl (.defnDecl {
+    name := wrapName, levelParams := [], type := tci.type,
+    value := mkConst ``V4Opaque.accZeroThm, hints := .regular 1, safety := .safe, all := [wrapName] })
+  let wrappedViaDef := dv.value.replace fun e =>
+    if e.isConstOf ``V4Opaque.accZeroThm then some (mkConst wrapName) else none
+  let n2 := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaWrapDef
+  addDecl (.defnDecl { dv with name := n2, value := wrappedViaDef, all := [n2] })
 
 run_cmd liftCoreM do
   let n42 := mkNatLit 42
@@ -835,6 +891,32 @@ run_cmd liftCoreM do
   addDecl (.thmDecl { name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.viaDepStmt,
                       levelParams := [], type := mkConst ``True,
                       value := mkConst `OleanShadowAndOverrideAuditProtoTests.V4Opaque.depStmtNeedsDelta })
+  -- B2 regression (Layer B): inductive constructor index `SneakyWitness.mk : SneakyWitness accViaThm`
+  -- + `theorem exploitViaInduct : SneakyWitness 42 := SneakyWitness.mk`, and `WellFounded.fix` over a theorem!
+  let indName := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.SneakyWitness
+  let ctorName := indName.str "mk"
+  addDecl (.inductDecl [] 0 [{
+    name := indName, type := mkForall `n .default (mkConst ``Nat) (mkSort .zero),
+    ctors := [{ name := ctorName, type := mkApp (mkConst indName) (mkConst ``V4Opaque.accViaThm) }] }] false)
+  addDecl (.thmDecl {
+    name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.exploitViaInduct,
+    levelParams := [],
+    type := mkApp (mkConst indName) n42,
+    value := mkConst ctorName })
+
+theorem V4Opaque.wfEmptyThm : WellFounded (fun _ _ : Nat => False) :=
+  WellFounded.intro fun x => Acc.intro x (fun _ h => False.elim h)
+
+def V4Opaque.wfFixViaThm : Nat :=
+  @WellFounded.fix Nat (fun _ => Nat) (fun _ _ => False) V4Opaque.wfEmptyThm (fun _ _ => 42) 0
+
+run_cmd liftCoreM do
+  let n42 := mkNatLit 42
+  addDecl (.thmDecl {
+    name := `OleanShadowAndOverrideAuditProtoTests.V4Opaque.wfFixViaThm_eq,
+    levelParams := [],
+    type := mkApp3 (mkConst ``Eq [1]) (mkConst ``Nat) (mkConst ``V4Opaque.wfFixViaThm) n42,
+    value := mkApp2 (mkConst ``Eq.refl [1]) (mkConst ``Nat) n42 })
 
 /--
 info: PASS T19 Layer A flags the theorem in the Acc.rec major premise
@@ -848,6 +930,8 @@ PASS T19 live audit reports opaqueTheoremDeltaReliance for the replay target
 PASS T19 Layer A flags a theorem wrapped in `id` inside the major premise
 PASS T19 head-only test alone misses the `id`-wrapped theorem
 PASS T19 Layer B catches the `id`-wrapped theorem reliance
+PASS T19 Layer A flags a theorem aliased behind a Prop definition in the major premise
+PASS T19 Layer B catches inductive-constructor and WellFounded.fix theorem δ-reliance
 -/
 #guard_msgs in
 #eval show CoreM Unit from do
@@ -880,13 +964,23 @@ PASS T19 Layer B catches the `id`-wrapped theorem reliance
      | none => false)
   let rId ← checkOpaqueTheoremReplay env `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaId_eq
   expect "T19 Layer B catches the `id`-wrapped theorem reliance" (rId matches .deltaReliance ..) (repr rId |>.pretty)
+  let some wrapDefCi := env.find? `OleanShadowAndOverrideAuditProtoTests.V4Opaque.accViaWrapDef | throwError "missing wrapDef"
+  expect "T19 Layer A flags a theorem aliased behind a Prop definition in the major premise"
+    ((scanOpaqueTheoremReliance env wrapDefCi) matches .ok #[(``V4Opaque.accZeroThm, _)])
+  let rInd ← checkOpaqueTheoremReplay env `OleanShadowAndOverrideAuditProtoTests.V4Opaque.exploitViaInduct
+  let rWf ← checkOpaqueTheoremReplay env `OleanShadowAndOverrideAuditProtoTests.V4Opaque.wfFixViaThm_eq
+  expect "T19 Layer B catches inductive-constructor and WellFounded.fix theorem δ-reliance"
+    ((rInd matches .deltaReliance ..) && (rWf matches .deltaReliance ..))
+    s!"ind={repr rInd |>.pretty} wf={repr rWf |>.pretty}"
 
-/-! ## T21: non-toolchain module planted next to the toolchain library (A1 regression)
+/-! ## T21: non-toolchain module planted next to the toolchain library + B2 diamond-DAG & sysroot-bridge regressions
 
 A build-library sweep imports through `[buildLib, sysroot]`. A module that is *not* toolchain-named
 but sits in the sysroot directory resolves there and was loaded by `importModules` without ever
-passing Vector 3. The import-boundary check now rejects it before anything is imported. A fake
-sysroot holding a copy of `Init.Prelude` (all five parts) plus the planted module is enough. -/
+passing Vector 3. Also tests B2 regressions: a 6-module diamond DAG (`D1..D6 -> Planted`) that
+previously starved an undeduplicated `todo` queue, a tampered-githash `Init.Fake` in `sysroot`
+rejected *before* `importModules`, and a toolchain-named `Init.Bridge` in `sysroot` transitively
+importing `Planted`. -/
 
 def plantedSrc : String := "prelude\nimport Init.Prelude\ndef plantedVal : Nat := 7\n"
 def plantRootSrc : String := "prelude\nimport Init.Prelude\nimport Planted\ndef usesPlanted : Nat := plantedVal\n"
@@ -895,6 +989,9 @@ def plantRootSrc : String := "prelude\nimport Init.Prelude\nimport Planted\ndef 
 info: PASS T21 planted non-toolchain sysroot module rejected before import
 PASS T21 its importer is not loaded
 PASS T21 nothing was audited from the planted closure
+PASS T21 6-module diamond DAG does not starve pre-import boundary queue
+PASS T21 tampered-githash toolchain boundary import rejected before importModules
+PASS T21 transitive Init.Bridge -> Planted sysroot escape caught
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -917,6 +1014,44 @@ PASS T21 nothing was audited from the planted closure
     expect "T21 its importer is not loaded"
       (s.violations.any fun v => v.kind == .environmentLoadFailed && v.decl == `PlantRoot) (renderAll s.violations)
     expect "T21 nothing was audited from the planted closure" (s.modulesChecked == 0 && s.importMs == 0) s!"{s.modulesChecked}"
+    -- B2-1 regression: 6-module diamond DAG `D1 -> D2..D6`, `D2 -> D3..D6`, ..., `D6 -> Planted`
+    let buildDag := dir / "buildDag"
+    IO.FS.createDirAll buildDag
+    let _ ← compileModule buildDag `D6 "prelude\nimport Init.Prelude\nimport Planted\ndef d6 : Nat := plantedVal\n" (some s!"{buildDag}:{fakeSys}:{lib}")
+    let _ ← compileModule buildDag `D5 "prelude\nimport Init.Prelude\nimport D6\ndef d5 : Nat := d6\n" (some s!"{buildDag}:{fakeSys}:{lib}")
+    let _ ← compileModule buildDag `D4 "prelude\nimport Init.Prelude\nimport D5\nimport D6\ndef d4 : Nat := Nat.add d5 d6\n" (some s!"{buildDag}:{fakeSys}:{lib}")
+    let _ ← compileModule buildDag `D3 "prelude\nimport Init.Prelude\nimport D4\nimport D5\nimport D6\ndef d3 : Nat := d4\n" (some s!"{buildDag}:{fakeSys}:{lib}")
+    let _ ← compileModule buildDag `D2 "prelude\nimport Init.Prelude\nimport D3\nimport D4\nimport D5\nimport D6\ndef d2 : Nat := d3\n" (some s!"{buildDag}:{fakeSys}:{lib}")
+    let _ ← compileModule buildDag `D1 "prelude\nimport Init.Prelude\nimport D2\nimport D3\nimport D4\nimport D5\nimport D6\ndef d1 : Nat := d2\n" (some s!"{buildDag}:{fakeSys}:{lib}")
+    for nm in ["D1", "D2", "D3", "D4", "D5", "D6"] do IO.FS.removeFile (buildDag / s!"{nm}.lean")
+    let ((), sDag) ← AuditM.run' (auditBuildLibrary buildDag fakeSys {} (some #[`D1]))
+    expect "T21 6-module diamond DAG does not starve pre-import boundary queue"
+      (sDag.importMs == 0 && sDag.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Planted)
+      (renderAll sDag.violations)
+    -- B2-2a regression: forged-githash `Init.Fake` in `fakeSys` caught *before* `importModules`
+    let fakeOlean ← compileModule fakeSys `Init.Fake "prelude\nimport Init.Prelude\ndef fakeTc : Nat := 1\n" (some s!"{fakeSys}:{lib}")
+    IO.FS.removeFile (fakeSys / "Init" / "Fake.lean")
+    let buildBadHdr := dir / "buildBadHdr"
+    IO.FS.createDirAll buildBadHdr
+    let _ ← compileModule buildBadHdr `UseFake "prelude\nimport Init.Prelude\nimport Init.Fake\ndef u : Nat := fakeTc\n" (some s!"{buildBadHdr}:{fakeSys}:{lib}")
+    IO.FS.removeFile (buildBadHdr / "UseFake.lean")
+    let rawFake ← IO.FS.readBinFile fakeOlean
+    IO.FS.writeBinFile fakeOlean (setByte rawFake 41 0x61)
+    let ((), sHdr) ← AuditM.run' (auditBuildLibrary buildBadHdr fakeSys {} (some #[`UseFake]))
+    expect "T21 tampered-githash toolchain boundary import rejected before importModules"
+      (sHdr.importMs == 0 && sHdr.violations.any fun v => v.kind == .oleanHeaderInvalid && v.decl == `Init.Fake)
+      (renderAll sHdr.violations)
+    -- B2-2b regression: valid-header `Init.Bridge` in `fakeSys` transitively importing `Planted`
+    let _ ← compileModule fakeSys `Init.Bridge "prelude\nimport Init.Prelude\nimport Planted\ndef br : Nat := plantedVal\n" (some s!"{fakeSys}:{lib}")
+    IO.FS.removeFile (fakeSys / "Init" / "Bridge.lean")
+    let buildBr := dir / "buildBr"
+    IO.FS.createDirAll buildBr
+    let _ ← compileModule buildBr `UseBridge "prelude\nimport Init.Prelude\nimport Init.Bridge\ndef ub : Nat := br\n" (some s!"{buildBr}:{fakeSys}:{lib}")
+    IO.FS.removeFile (buildBr / "UseBridge.lean")
+    let ((), sBr) ← AuditM.run' (auditBuildLibrary buildBr fakeSys {} (some #[`UseBridge]))
+    expect "T21 transitive Init.Bridge -> Planted sysroot escape caught"
+      (sBr.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Planted)
+      (renderAll sBr.violations)
 
 /-! ## T20: real sweep over the compiled build library of this checkout
 
