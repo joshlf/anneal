@@ -551,6 +551,43 @@ theorem mrTrustedWdObserve_out_of_range (tb : Bool) (idx : Nat) (h : mrWdCaseCou
   unfold mrTrustedWdObserve
   rw [hNone]
 
+/-- **Case `13` Trusted companion (`kani#5205` / `#5196`)**: copying the whole `MaybeUninit<bool>`
+holding raw byte `2` (`wdCase13CopyMir`) succeeds under real `stepMirFn` and preserves the 1
+initialized byte, while the typed `bool` read (case `13`) is `.ub` in both modes. -/
+theorem mrTrusted_case13_union_copy_of_invalid_bool_byte_ok :
+    wdRunTrusted (.unionBytes wdMuBoolTy) wdCase13CopyMir wdTrustedFuel
+        (wdLiveState wdCase13CopyMir []) = .okUninitPreserved 1 1 ∧
+    mrTrustedWdObserve false 13 = .ub ∧ mrTrustedWdObserve true 13 = .ub := by
+  refine ⟨?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **Exact Trusted Tree Borrows mode-sensitivity `↔`**: `mrTrustedWdObserve` disagrees between
+`tb = false` and `tb = true` on `idx < 24` if and only if `idx = 19`. -/
+theorem mrTrustedWdObserve_mode_sensitivity :
+    mrTrustedWdObserve false 19 = .okScalar 999 ∧
+    mrTrustedWdObserve true 19 = .ub ∧
+    (∀ idx, idx < mrWdCaseCount →
+      (mrTrustedWdObserve false idx ≠ mrTrustedWdObserve true idx ↔ idx = 19)) := by
+  have hB := mrTrustedWdObserve_table.1
+  have hT := mrTrustedWdObserve_table.2
+  have hAll : ((List.range mrWdCaseCount).all fun idx =>
+      decide ((mrTrustedExpectedBasic[idx]? ≠ mrTrustedExpectedTb[idx]?) ↔ idx = 19)) = true := by
+    decide
+  have cellB : ∀ idx, idx < mrWdCaseCount →
+      some (mrTrustedWdObserve false idx) = mrTrustedExpectedBasic[idx]? := by
+    intro idx hi
+    have h' := congrArg (fun l => l[idx]?) hB
+    simpa [List.getElem?_map, List.getElem?_range hi] using h'
+  have cellT : ∀ idx, idx < mrWdCaseCount →
+      some (mrTrustedWdObserve true idx) = mrTrustedExpectedTb[idx]? := by
+    intro idx hi
+    have h' := congrArg (fun l => l[idx]?) hT
+    simpa [List.getElem?_map, List.getElem?_range hi] using h'
+  refine ⟨Option.some.inj (cellB 19 (by decide)), Option.some.inj (cellT 19 (by decide)), ?_⟩
+  intro idx hi
+  have hIff := of_decide_eq_true (List.all_eq_true.mp hAll idx (List.mem_range.mpr hi))
+  rw [← cellB idx hi, ← cellT idx hi] at hIff
+  simpa [Option.some.injEq] using hIff
+
 
 /-! ### Trusted root causes of the documented `D1` / `D4` cells -/
 
@@ -1591,12 +1628,15 @@ theorem ep1_minirust_universal_laws_capstone :
     type_of% mr_concurrent_basic_retag_ptr_noop ∧
     type_of% trusted_decodeTypedValueFromBytes_null_witness ∧
     type_of% trusted_intrinsicWidePointeeStep_adt_unsupported ∧
+    type_of% mrTrusted_case13_union_copy_of_invalid_bool_byte_ok ∧
+    type_of% mrTrustedWdObserve_mode_sensitivity ∧
     type_of% mr_minirust300_flip_canary :=
   ⟨mr_align8_tail_u16_full_size, mr_checkPtrM_overflow_witnesses,
    mr_union_roundtrip_and_bool_invalid_witnesses, mr_ptrOffsetInboundsM_ok_witness,
    mr_ptrOffsetInboundsM_oob_witness, mr_basic_retag_ptr_noop,
    mr_concurrent_basic_retag_ptr_noop, trusted_decodeTypedValueFromBytes_null_witness,
-   trusted_intrinsicWidePointeeStep_adt_unsupported, mr_minirust300_flip_canary⟩
+   trusted_intrinsicWidePointeeStep_adt_unsupported, mrTrusted_case13_union_copy_of_invalid_bool_byte_ok,
+   mrTrustedWdObserve_mode_sensitivity, mr_minirust300_flip_canary⟩
 
 section AxiomAudit
 open Lean Elab Command
@@ -1657,7 +1697,7 @@ run_cmd do
         throwError "{c} depends on non-standard axiom {a}"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 50 then
+  if theorems < 52 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit

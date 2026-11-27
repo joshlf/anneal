@@ -2309,6 +2309,71 @@ theorem lm_checkScalar_fnptr_int {HS : Type} (i : ScalarInt) (bits : U128)
       simp [hc', h]
   next e he => cases he
 
+/-- `D4` concrete non-vacuity witnesses for `lm_checkScalar_fnptr_int`: `0usize` is rejected with
+`invalidScalarBits 0` while non-null `4096usize` is accepted at `pointerLayoutData true`. -/
+theorem lm_checkScalar_fnptr_int_witnesses :
+    let lay : ScalarValidityLayout :=
+      ⟨Size.ofBytes 8, ⟨BitVec.ofNat 128 1, BitVec.ofNat 128 (2 ^ 64 - 1)⟩⟩
+    let cb : Scalar Provenance → Unit → EStateM.Result Unit Unit Bool := fun _ st => .error () st
+    (∃ i0 : ScalarInt, i0.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 0) ∧
+      Validity.checkScalar lay (Scalar.fromScalarInt (Prov := Provenance) i0) cb () =
+        .error (.failure (.invalidScalarBits (BitVec.ofNat 128 0) lay)) ()) ∧
+    (∃ i1 : ScalarInt, i1.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 4096) ∧
+      Validity.checkScalar lay (Scalar.fromScalarInt (Prov := Provenance) i1) cb () =
+        .ok () ()) := by
+  have h0ok : (ScalarInt.tryFromUInt (BitVec.ofNat 128 0) (Size.ofBytes 8)).toOption.join.isSome = true := by
+    decide +kernel
+  have h1ok : (ScalarInt.tryFromUInt (BitVec.ofNat 128 4096) (Size.ofBytes 8)).toOption.join.isSome = true := by
+    decide +kernel
+  cases h0 : (ScalarInt.tryFromUInt (BitVec.ofNat 128 0) (Size.ofBytes 8)).toOption.join with
+  | none => rw [h0] at h0ok; cases h0ok
+  | some i0 =>
+    cases h1 : (ScalarInt.tryFromUInt (BitVec.ofNat 128 4096) (Size.ofBytes 8)).toOption.join with
+    | none => rw [h1] at h1ok; cases h1ok
+    | some i1 =>
+      have hb0 : i0.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 0) := by
+        have hc : ((ScalarInt.tryFromUInt (BitVec.ofNat 128 0) (Size.ofBytes 8)).toOption.join.map
+            (fun i => i.toBits (Size.ofBytes 8))) = some (.ok (BitVec.ofNat 128 0)) := by
+          decide +kernel
+        rw [h0] at hc; simpa using hc
+      have hb1 : i1.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 4096) := by
+        have hc : ((ScalarInt.tryFromUInt (BitVec.ofNat 128 4096) (Size.ofBytes 8)).toOption.join.map
+            (fun i => i.toBits (Size.ofBytes 8))) = some (.ok (BitVec.ofNat 128 4096)) := by
+          decide +kernel
+        rw [h1] at hc; simpa using hc
+      refine ⟨⟨i0, hb0, ?_⟩, ⟨i1, hb1, ?_⟩⟩
+      · have h := lm_checkScalar_fnptr_int i0 (BitVec.ofNat 128 0) hb0 (fun _ st => .error () st) ()
+        simpa using h
+      · have h := lm_checkScalar_fnptr_int i1 (BitVec.ofNat 128 4096) hb1 (fun _ st => .error () st) ()
+        simpa using h
+
+/-- `D2` concrete non-vacuity witness for `lm_checkPrimitive_bool_invalid`: byte `2` fails
+`Validity.checkPrimitive .boolean` with `invalidBool 2`. -/
+theorem lm_checkPrimitive_bool_invalid_witness :
+    ∃ s : Scalar Provenance,
+      Scalar.fromUInt (Prov := Provenance) (BitVec.ofNat 128 2) (Size.ofBytes 1) = .ok s ∧
+      Validity.checkPrimitive (MachineError := Unit) (HookState := Unit)
+        .boolean lmWdBoolValidity s (fun _ st => .error () st) () =
+        .error (.failure (.invalidBool 2)) () := by
+  have hok : (Scalar.fromUInt (Prov := Provenance) (BitVec.ofNat 128 2) (Size.ofBytes 1)).toBool = true := by
+    decide +kernel
+  cases hs : Scalar.fromUInt (Prov := Provenance) (BitVec.ofNat 128 2) (Size.ofBytes 1) with
+  | error _ => rw [hs] at hok; cases hok
+  | ok s =>
+    have htb : s.toBool = .error (.scalarInt (.invalidBool 2)) := by
+      have h := lm_scalar_two_not_bool
+      rw [hs] at h; simpa [Except.bind] using h
+    exact ⟨s, rfl, lm_checkPrimitive_bool_invalid lmWdBoolValidity s (fun _ st => .error () st) () 2 htb⟩
+
+/-- `D1` concrete non-vacuity witnesses for `lm_sizeAndAlign_str` (valid `len = 0` and overflow
+`len = 2^63`) and `lm_sizeAndAlign_sliceUnit` (ZST `[()]` never overflows even at `u64::MAX`). -/
+theorem lm_sizeAndAlign_str_and_unit_witnesses :
+    lmWdRun (lmWdSizeAlign lmWdTyStr lmWdStrLay 0) = .okSizeAlign 0 1 ∧
+    lmWdRun (lmWdSizeAlign lmWdTyStr lmWdStrLay 9223372036854775808) = .ub ∧
+    lmWdRun (lmWdSizeAlign lmWdTySliceUnit lmWdSliceUnitLay 5) = .okSizeAlign 0 1 ∧
+    lmWdRun (lmWdSizeAlign lmWdTySliceUnit lmWdSliceUnitLay 18446744073709551615) = .okSizeAlign 0 1 := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
 end UniversalLaws
 
 /-! ## §3b. Direct Vendored `Miri.Interpreter.Step.step` Execution on Shared `CapturedMir` Fixtures -/
@@ -2661,8 +2726,22 @@ upgrade breaks them and flags the cells for promotion); the `D2` authority for c
 `read of uninitialized local` UB (Miri copies an uninitialized union without UB), which is why it
 is NOT used as a witness. -/
 
-/-- Adapter limit: the whole-union copies of cases `9`, `10`, `13` and the case `13` companion
-are `.unsupported` under `Step.step` (non-scalar indirect read). -/
+/-- 1-byte uninitialized stack-local backing for `MaybeUninit<bool>` (`wdCase13Mir` / `wdCase13CopyMir`). -/
+private def wdStepD2Mach1 : AnnealMachine :=
+  match Allocation.tryNew (Prov := AnnealProv) (Size.ofBytes 1) ⟨0⟩ .Uninit
+      (fun sz _ => some (Array.replicate sz.bytes.toNat 0)) with
+  | .ok a =>
+    { AnnealMachine.empty with
+      memory := { (MemoryState.empty : AnnealMemory) with
+        live := #[(wdStepAid1, ⟨.stack, a.withExtra none⟩),
+                  (wdStepAid2, ⟨.stack, a.withExtra none⟩)] },
+      addresses := { AnnealMachine.empty.addresses with
+        baseAddr := #[⟨wdStepAid1, wdStepBase1⟩, ⟨wdStepAid2, wdStepBase2⟩] } }
+  | .error _ => AnnealMachine.empty
+
+/-- Adapter limit: the whole-union copies of cases `9`, `10` (4-byte `MaybeUninit<u32>`) and
+`13` / `13` companion (1-byte `MaybeUninit<bool>`) are `.unsupported` under `Step.step`
+(non-scalar indirect read). -/
 theorem lm_step_union_copy_adapter_unsupported :
     wdRunMiriSteps (wdStepHooks wdCase9Mir) 16
         (wdMkStepState wdCase9Mir wdMuU32Ty (wdStepD2Locals wdCase9Mir) wdStepD2Mach) =
@@ -2671,12 +2750,26 @@ theorem lm_step_union_copy_adapter_unsupported :
         (wdMkStepState wdCase10Mir wdU32Ty (wdStepD2Locals wdCase10Mir) wdStepD2Mach) =
       .error (.unsupported "indirect non-scalar readImmediate") ∧
     wdRunMiriSteps (wdStepHooks wdCase13Mir) 16
-        (wdMkStepState wdCase13Mir wdBoolTy (wdStepD2Locals wdCase13Mir) wdStepD2Mach) =
+        (wdMkStepState wdCase13Mir wdBoolTy (wdStepD2Locals wdCase13Mir) wdStepD2Mach1) =
       .error (.unsupported "indirect non-scalar readImmediate") ∧
     wdRunMiriSteps (wdStepHooks wdCase13CopyMir) 16
-        (wdMkStepState wdCase13CopyMir wdMuBoolTy (wdStepD2Locals wdCase13CopyMir) wdStepD2Mach) =
+        (wdMkStepState wdCase13CopyMir wdMuBoolTy (wdStepD2Locals wdCase13CopyMir) wdStepD2Mach1) =
       .error (.unsupported "indirect non-scalar readImmediate") := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- Adapter limit (`D1` `constantIndex` wide-slice fixtures): `wdCase0Mir` and `wdCase5Mir` use
+`ProjectionElem.constantIndex` on `[u32; 3]` (`layoutIdx = 0`), which `Translate.lean` maps to
+the 1-byte `wdLayouts[0]` scalar layout rather than a `.Array` layout, so `Step.step` stops at
+`invalidProgram "len on non-array"` (and those cells rest on `lmWdObserve`'s vendored `OpTy.len`
+/ `projectIndex` / `projectionMemoryOffset` path). -/
+theorem lm_step_wide_slice_adapter_boundary :
+    wdRunMiriSteps (wdStepHooks wdCase0Mir) 16
+        (wdMkStepState wdCase0Mir wdU32Ty (wdStepD3Locals wdCase0Mir) wdStepArr3Mach) =
+      .error (.invalidProgram "len on non-array") ∧
+    wdRunMiriSteps (wdStepHooks wdCase5Mir) 16
+        (wdMkStepState wdCase5Mir wdU32Ty (wdStepD3Locals wdCase5Mir) wdStepArr3Mach) =
+      .error (.invalidProgram "len on non-array") := by
+  refine ⟨?_, ?_⟩ <;> decide +kernel
 
 /-- Adapter divergence (pinned, NOT a witness): the adapter faults case `8`'s uninitialized
 `MaybeUninit<u32>` copy (and case `12` before its typed read) with `read of uninitialized local`,
@@ -2750,6 +2843,37 @@ theorem ep1_lean_miri_widedst_maybeuninit_capstone :
    lm_sizeAndAlign_sliceU32, lm_sizeAndAlign_headerSlice, lm_sizeAndAlign_align8TailU16,
    lm_wrapping_compose, lm_fnptr_range_contains_iff, lm_case13_union_copy_of_invalid_bool_byte_ok⟩
 
+/-- **Episode 1 LeanMiri universal-laws, non-vacuity witnesses & Step-driver capstone** (symmetric
+with `MiniRustSpec.WideDstAndMaybeUninitMR.ep1_minirust_universal_laws_capstone`): bundles the
+remaining universal `D1`–`D4` laws (`str` / ZST `[()]`, `InitMask.prepareCopy` / `Allocation.copy`,
+`readScalar` uninit UB, `checkPrimitive .boolean`, `ptrOffsetInbounds`, `scalarMayBeNull`,
+`Validity.checkScalar` at `pointerLayoutData true`), all concrete non-vacuity witnesses, the
+11-fixture `Step.step` capstone, and the pinned `Step.step` adapter boundary theorems. -/
+theorem ep1_lean_miri_universal_laws_capstone :
+    type_of% lm_sizeAndAlign_str ∧
+    type_of% lm_sizeAndAlign_sliceUnit ∧
+    type_of% lm_sizeAndAlign_str_and_unit_witnesses ∧
+    type_of% lm_initMask_prepareCopy_lazy_uninit ∧
+    type_of% @lm_allocation_copy_uninit_preserves ∧
+    type_of% lm_allocation_copy_uninit_witness ∧
+    type_of% lm_checkPrimitive_bool_invalid_witness ∧
+    type_of% @lm_ptrOffsetInbounds_eq_wrapping ∧
+    type_of% lm_ptrOffsetInbounds_ok_witness ∧
+    type_of% @lm_scalarMayBeNull_int ∧
+    type_of% @lm_checkScalar_fnptr_int ∧
+    type_of% lm_checkScalar_fnptr_int_witnesses ∧
+    type_of% ep1_lean_miri_step_driver_capstone ∧
+    type_of% lm_step_union_copy_adapter_unsupported ∧
+    type_of% lm_step_uninit_union_adapter_divergence ∧
+    type_of% lm_step_wide_slice_adapter_boundary :=
+  ⟨lm_sizeAndAlign_str, lm_sizeAndAlign_sliceUnit, lm_sizeAndAlign_str_and_unit_witnesses,
+   lm_initMask_prepareCopy_lazy_uninit, @lm_allocation_copy_uninit_preserves,
+   lm_allocation_copy_uninit_witness, lm_checkPrimitive_bool_invalid_witness,
+   @lm_ptrOffsetInbounds_eq_wrapping, lm_ptrOffsetInbounds_ok_witness,
+   @lm_scalarMayBeNull_int, @lm_checkScalar_fnptr_int, lm_checkScalar_fnptr_int_witnesses,
+   ep1_lean_miri_step_driver_capstone, lm_step_union_copy_adapter_unsupported,
+   lm_step_uninit_union_adapter_divergence, lm_step_wide_slice_adapter_boundary⟩
+
 section AxiomAudit
 open Lean Elab Command
 
@@ -2817,7 +2941,7 @@ run_cmd do
         throwError "{c} depends on non-standard axiom {a}"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 53 then
+  if theorems < 57 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit
