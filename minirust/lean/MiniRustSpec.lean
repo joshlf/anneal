@@ -38,6 +38,7 @@ import MiniRustSpec.Correspondence.WideSliceDst
 import MiniRustSpec.Correspondence.IntrinsicBoundary
 import MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 import MiniRustSpec.FloatArithMR
+import MiniRustSpec.ClosureFnPtrMR
 import MiniRustSpec.Audit
 
 /-!
@@ -100,6 +101,19 @@ import MiniRustSpec.Audit
   no-forgery (`usize → &u8`, `MaybeUninit` uninit → `u64`, size mismatch), and
   shared concrete witnesses `W1–W6` (68 public theorems, all pinned by
   `axiomAudit_choiceFree` and `axiomAudit_machine`).
+* `MiniRustSpec.ClosureFnPtrMR`: dual-authority correspondence for
+  non-capturing closure function pointers. Universal laws relate `Trusted`'s
+  callee-directed closure dispatch (`calleeOwnClosureShape?`, no closure flag
+  on `FnPtrEntry`, synthesized zero-sized environment prepended to `_1`) to
+  MiniRust functions of the closure's user-visible arity across `Mach` and
+  `MachTB` (`ClosureFnPtrEntryRel`, `ClosureFnPointer(Safe|Unsafe)`
+  reification, `UnsafeFnPointer` widening, `FnPtrToPtr` pointer identity,
+  indirect `call` / `tailCall` for `Fn` / `FnMut` / `FnOnce` receivers, the
+  `const_eval_select` runtime target, and the fail-closed capturing, forged
+  `(N + 1)`-argument, ABI, `Safety`, generic-closure, and direct-call laws),
+  with kernel-checked three-way witnesses on verbatim `rustc-capture` bodies,
+  including the difftest reproducer that Miri evaluates to `9147` (pinned by
+  `#assert_closure_fn_ptr_mr_audit` and `[CLOSURE-FNPTR-AUDIT]`).
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

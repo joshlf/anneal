@@ -18,6 +18,7 @@ import MiniRustSpec.Correspondence.Provenance
 import MiniRustSpec.Correspondence.ProvenanceWitness
 import MiniRustSpec.Correspondence.WideSliceDst
 import MiniRustSpec.Correspondence.IntrinsicBoundary
+import MiniRustSpec.ClosureFnPtrMR
 
 /-!
 # Axiom audit
@@ -49,7 +50,10 @@ witnesses of `Correspondence.WideSliceDst`), or `[DEINIT-AUDIT]` (the projected-
 of `Correspondence.DeinitWindow`, the `Rvalue::Discriminant` lowering, the
 sub-place audit hook `subplace_audit_closure` of `Correspondence.DeinitBridge`
 — the one `MiniRustSpec` module that imports `Anneal.Mir.AdtAndControl` — and
-their witnesses), ending in `sorry_free=true`. A group that depends on `sorryAx` or
+their witnesses), or `[CLOSURE-FNPTR-AUDIT]` (the closure function-pointer correspondence of
+`MiniRustSpec.ClosureFnPtrMR`: callee-directed `ClosureFnPointer` laws, `ClosureFnPtrEntryRel` on
+`Mach` and `MachTB`, fail-closed laws, and three-way witnesses on verbatim `rustc-capture` bodies),
+ending in `sorry_free=true`. A group that depends on `sorryAx` or
 on any other non-standard axiom fails the build instead.
 
 `#assert_minirustspec_import_isolation` (`[IMPORT-ISOLATION]`) fails the build unless the
@@ -19112,6 +19116,60 @@ elab "#assert_all_minirustspec_standard_axioms" : command => do
         throwError "{c} (in MiniRustSpec.Audit) depends on the non-standard axiom {a}"
     checked := checked + 1
   logInfo m!"MiniRustSpec.Audit: exhaustively verified standard axioms for {checked} declarations across all MiniRustSpec.* modules"
+
+/-! ## `MiniRustSpec.ClosureFnPtrMR` (`[CLOSURE-FNPTR-AUDIT]`)
+
+Every public theorem of the closure function-pointer correspondence: the
+universal callee-directed laws, the `ClosureFnPtrEntryRel` laws on `Mach` and
+`MachTB`, the fail-closed laws, and the kernel-checked three-way witnesses on
+verbatim `rustc-capture` bodies (including the `9147` difftest reproducer). -/
+
+#check_theorem_deps "[CLOSURE-FNPTR-AUDIT]"
+  MiniRustSpec.ClosureFnPtrMR.checkClosureCalleeSig_callee_directed
+  MiniRustSpec.ClosureFnPtrMR.checkClosureCalleeSig_unlinked_ok
+  MiniRustSpec.ClosureFnPtrMR.closureCoercionTag_dispatch_flags
+  MiniRustSpec.ClosureFnPtrMR.closureFnPointer_reify_callee_directed
+  MiniRustSpec.ClosureFnPtrMR.closureFnPointer_reify_fail_closed
+  MiniRustSpec.ClosureFnPtrMR.closureFnPointer_normal_spelling_unsupported
+  MiniRustSpec.ClosureFnPtrMR.closure_entry_locals_layout
+  MiniRustSpec.ClosureFnPtrMR.initLocalsAux_succ_get?
+  MiniRustSpec.ClosureFnPtrMR.closure_entry_frame_binds_env_then_args
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_prepends_env
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_tailCall_prepends_env
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_fail_closed
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_generic_unsupported
+  MiniRustSpec.ClosureFnPtrMR.closure_direct_call_dispatches_unchanged
+  MiniRustSpec.ClosureFnPtrMR.constEvalSelect_closure_runtime_target_dispatch
+  MiniRustSpec.ClosureFnPtrMR.closure_reify_establishes_entryRel_M
+  MiniRustSpec.ClosureFnPtrMR.closureFnPtrEntryRel_call_arity
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_correspondence_M
+  MiniRustSpec.ClosureFnPtrMR.classifyOwnClosureEnvTy_by_upvars
+  MiniRustSpec.ClosureFnPtrMR.minirust_createFrameM_arity_law
+  MiniRustSpec.ClosureFnPtrMR.minirust_ptr_rel_eq_same_addr_M
+  MiniRustSpec.ClosureFnPtrMR.minirust_closure_call_return_tb_wfLive
+  MiniRustSpec.ClosureFnPtrMR.closure_coercion_widening_identity_mach_and_tb
+  MiniRustSpec.ClosureFnPtrMR.cfInit_eq_initMachineStateWithCallees
+  MiniRustSpec.ClosureFnPtrMR.cfRunStep_of_step
+  MiniRustSpec.ClosureFnPtrMR.cfRunStep_of_fail
+  MiniRustSpec.ClosureFnPtrMR.cfRunStep_of_unsupported
+  MiniRustSpec.ClosureFnPtrMR.cfShapeTag_inj
+  MiniRustSpec.ClosureFnPtrMR.cfMrAgrees_of_decide
+  MiniRustSpec.ClosureFnPtrMR.cfMrUb_of_decide
+  MiniRustSpec.ClosureFnPtrMR.cf_fn_closure_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_fnMut_closure_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_fnOnce_closure_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_zero_and_two_arg_closure_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_unsafe_closure_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_widen_and_identity_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_tailCall_closure_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_mixed_fnItem_and_closure_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_constEvalSelect_closure_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_finding_0007_parity_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_env_prepend_three_receiver_modes_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_coercion_fail_closed_witness
+  MiniRustSpec.ClosureFnPtrMR.cf_indirect_call_fail_closed_three_way_witness
+  MiniRustSpec.ClosureFnPtrMR.closure_indirect_call_law_instance_fn
+  MiniRustSpec.ClosureFnPtrMR.closureFnPtrEntryRel_instance_mach_and_tb
 
 #assert_minirustspec_import_isolation
 
