@@ -1657,7 +1657,7 @@ run_cmd do
         throwError "{c} depends on non-standard axiom {a}"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 25 then
+  if theorems < 50 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit

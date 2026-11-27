@@ -43,6 +43,14 @@ The vendored LeanMiri (`lean-miri/vendor/`, unmodified) side of the frozen 24-ca
 The memory harness (`lmAllocate`, `lmStore`, `lmLoad`, `lmRetag`, `lmTreeAccess`) is the one of
 `LeanMiriSpec.HeapAllocAndWidePtrLM`: every state change is a vendored definition.
 
+`section StepDriver` additionally executes the shared `CapturedMir` fixtures of cases `11`,
+`14`–`18`, `19` (no borrow tracker), and `20`–`23` directly through vendored
+`Miri.Interpreter.Step.step` (over `LeanMiriSpec.Correspondence.translateBody` and the
+`annealStepHooksLM2_2` adapter, with a documented harness cast-hook overlay), bundled in
+`ep1_lean_miri_step_driver_capstone`. The adapter's limits are pinned exactly: whole-union copies
+(`D2` cases `8`–`10`, `12`, `13`) are `.unsupported` / a false uninit-local UB there, and the
+`D1` `constantIndex` fixtures (`0`, `5`) do not translate, so those cells rest on the harness path.
+
 The `CapturedMir` fixtures of §0 are textually identical to those of
 `MiniRustSpec.WideDstAndMaybeUninitMR`, so Episode 2's cross-root bridge can lock them by
 `Eq.refl`.
@@ -2642,6 +2650,51 @@ theorem ep1_lean_miri_step_driver_capstone :
     ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
   · rw [lmWdObserveU.eq_src]; decide +kernel
 
+/-! ### Documented `Step.step` adapter limits for `D2` union transport
+
+The `LeanMiriSpec.Correspondence` step adapter (`annealReadImmediateLM2_2`) reads only scalar
+immediates out of memory, so whole-union copies of `MaybeUninit<T>` cannot be executed through
+`Step.step` on the shared fixtures. These theorems pin that boundary exactly (so a future adapter
+upgrade breaks them and flags the cells for promotion); the `D2` authority for cases `8`–`10`,
+`12`, `13` is the harness path (vendored `Allocation.copy` / `InitMask` / `readScalar` /
+`Validity.checkPrimitive`) of `lmWdObserve`. In particular case `8`'s adapter result is a FALSE
+`read of uninitialized local` UB (Miri copies an uninitialized union without UB), which is why it
+is NOT used as a witness. -/
+
+/-- Adapter limit: the whole-union copies of cases `9`, `10`, `13` and the case `13` companion
+are `.unsupported` under `Step.step` (non-scalar indirect read). -/
+theorem lm_step_union_copy_adapter_unsupported :
+    wdRunMiriSteps (wdStepHooks wdCase9Mir) 16
+        (wdMkStepState wdCase9Mir wdMuU32Ty (wdStepD2Locals wdCase9Mir) wdStepD2Mach) =
+      .error (.unsupported "indirect non-scalar readImmediate") ∧
+    wdRunMiriSteps (wdStepHooks wdCase10Mir) 16
+        (wdMkStepState wdCase10Mir wdU32Ty (wdStepD2Locals wdCase10Mir) wdStepD2Mach) =
+      .error (.unsupported "indirect non-scalar readImmediate") ∧
+    wdRunMiriSteps (wdStepHooks wdCase13Mir) 16
+        (wdMkStepState wdCase13Mir wdBoolTy (wdStepD2Locals wdCase13Mir) wdStepD2Mach) =
+      .error (.unsupported "indirect non-scalar readImmediate") ∧
+    wdRunMiriSteps (wdStepHooks wdCase13CopyMir) 16
+        (wdMkStepState wdCase13CopyMir wdMuBoolTy (wdStepD2Locals wdCase13CopyMir) wdStepD2Mach) =
+      .error (.unsupported "indirect non-scalar readImmediate") := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- Adapter divergence (pinned, NOT a witness): the adapter faults case `8`'s uninitialized
+`MaybeUninit<u32>` copy (and case `12` before its typed read) with `read of uninitialized local`,
+whereas vendored `Allocation.copy` (the `lmWdObserve` authority) preserves the 4 uninit bytes. -/
+theorem lm_step_uninit_union_adapter_divergence :
+    wdRunMiriSteps (wdStepHooks wdCase8Mir) 16
+        (wdMkStepState wdCase8Mir wdMuU32Ty (wdStepD2Locals wdCase8Mir) wdStepD2Mach) =
+      .error (.undefinedBehavior "read of uninitialized local") ∧
+    wdRunMiriSteps (wdStepHooks wdCase12Mir) 16
+        (wdMkStepState wdCase12Mir wdU32Ty (wdStepD2Locals wdCase12Mir) wdStepD2Mach) =
+      .error (.undefinedBehavior "read of uninitialized local") ∧
+    lmWdObserve false 8 = .okUninitPreserved 4 0 ∧ lmWdObserve true 8 = .okUninitPreserved 4 0 := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · decide +kernel
+  · decide +kernel
+  · rw [lmWdObserveU.eq_src]; decide +kernel
+  · rw [lmWdObserveU.eq_src]; decide +kernel
+
 end StepDriver
 
 /-! ## §4. Capstone -/
@@ -2764,7 +2817,7 @@ run_cmd do
         throwError "{c} depends on non-standard axiom {a}"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 20 then
+  if theorems < 53 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit
