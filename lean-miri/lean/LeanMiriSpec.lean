@@ -518,16 +518,20 @@ import LeanMiriSpec.Audit
   unmodified vendored `Step.step` / `Cast.cast` / `Call.evalCallTerminator`:
   frame-directed closure-aware `CastHooks` / `CallHooks` (`resolve_closure` to
   the body item for `FnOnce` and to `ClosureOnceShim` for `Fn` / `FnMut`, the
-  vendored `nonCapturingClosure`), universal vendored `nonCapturingClosure` and
+  vendored `nonCapturingClosure`), universal vendored `nonCapturingClosure`,
   `Cast.cast` (`ClosureFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr` pointer
-  identity) laws, the stuttering simulation `CfStutterSim` with a universally
-  sound certificate checker (`cfStutterCheck_sound`,
+  identity), `Call.passArgument`, and `Call.initStackFrame` laws (all
+  instantiated on concrete states), the full-stack stuttering simulation
+  `CfStutterSim` with exact receiver-mode `_1` checking (`cfClosureEnvRel`) and
+  a universally sound certificate checker (`cfStutterCheck_sound`,
   `cfStutterSim_zero_lockstep`), kernel-checked `FnOnce` lockstep and
   `Fn` / `FnMut` stuttering simulations across `ClosureOnceShim` (including full
   reproducer parity `159` and `9147 : u32`, panic unwinding across
   `ClosureOnceShim` + cleanup blocks, and Episode 1's `w_c8` end-to-end
-  closure), kernel-checked fail-closed negatives and boundaries, the
-  correspondence-gap postmortem, and `#assert_closure_fn_ptr_lm_audit`.
+  closure), kernel-checked fail-closed negatives, boundaries, and the
+  non-closure-specific thin-pointer / `usize`-vs-`u64` false-positive UB
+  divergence witnesses, the correspondence-gap postmortem, and
+  `#assert_closure_fn_ptr_lm_audit`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

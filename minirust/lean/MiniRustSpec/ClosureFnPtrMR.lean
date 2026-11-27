@@ -3994,6 +3994,132 @@ theorem cf_abi_divergence_not_closure_specific_witness :
   ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
    by decide +kernel⟩
 
+private theorem cfMrIndirectMach_fnFromPtr (fn : Gen.Function) (a : Nat) :
+    let mBM := cfMrIndirectMach fn [a]
+    let mTB := liftMachToTB mBM
+    let provBM : Option Prov := some (⟨4⟩, ())
+    let provTB : Option TreeBorrowsProvenance := some (⟨4⟩, [])
+    mapIndex mBM.fn_ptrs (fnName 1) "self.fn_ptrs[fn_name]" = .ok { addr := 8192, provenance := provBM } ∧
+    mapIndex mTB.fn_ptrs (fnName 1) "self.fn_ptrs[fn_name]" = .ok { addr := 8192, provenance := provTB } ∧
+    fnFromPtrM mBM (.Ptr (ThinPointer.widen { addr := 8192, provenance := provBM } none)) = .ok fn ∧
+    fnFromPtrM mTB (.Ptr (ThinPointer.widen { addr := 8192, provenance := provTB } none)) = .ok fn := by
+  dsimp only
+  have hPtrsBM : (cfMrIndirectMach fn [a]).fn_ptrs.entries =
+      [(fnName 0, { addr := 4096, provenance := some (⟨3⟩, ()) }),
+       (fnName 1, { addr := 8192, provenance := some (⟨4⟩, ()) })] := rfl
+  have hPtrsTB : (liftMachToTB (cfMrIndirectMach fn [a])).fn_ptrs.entries =
+      [(fnName 0, { addr := 4096, provenance := some (⟨3⟩, []) }),
+       (fnName 1, { addr := 8192, provenance := some (⟨4⟩, []) })] := rfl
+  have hFns : (cfMrIndirectMach fn [a]).prog.functions.entries =
+      [(fnName 0, cfMrIndirectCaller 1), (fnName 1, fn)] := rfl
+  have hFindBM :
+      List.find? (fun p : Gen.FnName × Gen.ThinPointer (Gen.Memory.Provenance BM) =>
+          decide (p.2 = { addr := 8192, provenance := some (⟨4⟩, ()) }))
+        [(fnName 0, { addr := 4096, provenance := some (⟨3⟩, ()) }),
+         (fnName 1, { addr := 8192, provenance := some (⟨4⟩, ()) })] =
+      some (fnName 1, { addr := 8192, provenance := some (⟨4⟩, ()) }) := by decide +kernel
+  have hFindTB :
+      List.find? (fun p : Gen.FnName × Gen.ThinPointer (Gen.Memory.Provenance TBM) =>
+          decide (p.2 = { addr := 8192, provenance := some (⟨4⟩, []) }))
+        [(fnName 0, { addr := 4096, provenance := some (⟨3⟩, []) }),
+         (fnName 1, { addr := 8192, provenance := some (⟨4⟩, []) })] =
+      some (fnName 1, { addr := 8192, provenance := some (⟨4⟩, []) }) := by decide +kernel
+  refine ⟨rfl, rfl, ?_, ?_⟩
+  · unfold fnFromPtrM ThinPointer.widen
+    simp only [Option.isSome_none, Bool.false_eq_true, ↓reduceIte, hPtrsBM, hFindBM]
+    change mapIndex ⟨(cfMrIndirectMach fn [a]).prog.functions.entries⟩ (fnName 1) "self.prog.functions[func_name]" = .ok fn
+    rw [hFns]; rfl
+  · unfold fnFromPtrM ThinPointer.widen
+    simp only [Option.isSome_none, Bool.false_eq_true, ↓reduceIte, hPtrsTB, hFindTB]
+    change mapIndex ⟨(cfMrIndirectMach fn [a]).prog.functions.entries⟩ (fnName 1) "self.prog.functions[func_name]" = .ok fn
+    rw [hFns]; rfl
+
+/-- **Non-vacuity instantiations of `closure_coercion_widening_identity_general_mach_and_tb`
+on `Mach` and `MachTB`** covering BOTH:
+1. `ClosureFnPointer(Safe)` -> `UnsafeFnPointer` widening -> `FnPtrToPtr` pointer identity
+   (`raw_c == raw_d`) on verbatim `widen_and_identity::{closure#0}`;
+2. direct `ClosureFnPointer(Unsafe)` -> `FnPtrToPtr` on verbatim `unsafe_closure::{closure#0}`. -/
+theorem closure_coercion_widening_identity_general_instances_mach_and_tb :
+    let dpW := "closure_matrix::widen_and_identity::{closure#0}"
+    let dpU := "closure_matrix::unsafe_closure::{closure#0}"
+    let sigSafe : MirAst.Ty := { kind := .fnPtr [cfU32K] cfU32K .safe .rust, layoutIdx := 0 }
+    let sigUnsafe : MirAst.Ty := { kind := .fnPtr [cfU32K] cfU32K .unsafe_ .rust, layoutIdx := 0 }
+    let memW : MirSemantics.Memory := { emptyMemory with callees := [cfFx_widen_and_identity_closure_0] }
+    let memU : MirSemantics.Memory := { emptyMemory with callees := [cfFx_unsafe_closure_closure_0] }
+    let p : ProvenancePtr := cfInternedPtr memW
+    let declsW : List MirAst.LocalDecl := [cfDecl (.closure dpW []) 2, cfDecl sigSafe.kind 0, cfDecl sigUnsafe.kind 0]
+    let declsU : List MirAst.LocalDecl := [cfDecl (.closure dpU []) 2, cfDecl sigUnsafe.kind 0]
+    let locsW : List LocalSlot := [.init (.aggregate 0 []), .init (.ptr p 8), .init (.ptr p 8)]
+    let locsU : List LocalSlot := [.init (.aggregate 0 []), .init (.ptr p 8)]
+    let fnW := cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 1))
+    let fnU := cfMrLeafFn 1 (cfBin .BitXor (cfLd 1) (cfU32 17))
+    let mBM_W := cfMrIndirectMach fnW [5]
+    let mTB_W := liftMachToTB mBM_W
+    let mBM_U := cfMrIndirectMach fnU [5]
+    let mTB_U := liftMachToTB mBM_U
+    (evalRvalue locsW (.cast (.pointerCoercion "ClosureFnPointer(Safe)") (.copy (locPlace 0)) sigSafe)
+        memW declsW cfFx_fn_shared_layouts =
+      .ok (.ptr p 8) locsW (cfInternedMem memW dpW sigSafe.kind) ∧
+     evalRvalue locsW (.cast (.pointerCoercion "UnsafeFnPointer") (.copy (locPlace 1)) sigUnsafe)
+        (cfInternedMem memW dpW sigSafe.kind) declsW cfFx_fn_shared_layouts =
+      .ok (.ptr p 8) locsW (cfInternedMem memW dpW sigSafe.kind) ∧
+     evalRvalue locsW (.cast .fnPtrToPtr (.copy (locPlace 1)) rawConstUnitMirTy)
+        (cfInternedMem memW dpW sigSafe.kind) declsW cfFx_fn_shared_layouts =
+      .ok (.ptr p 8) locsW (cfInternedMem memW dpW sigSafe.kind) ∧
+     evalRvalue locsW (.cast .fnPtrToPtr (.copy (locPlace 2)) rawConstUnitMirTy)
+        (cfInternedMem memW dpW sigSafe.kind) declsW cfFx_fn_shared_layouts =
+      .ok (.ptr p 8) locsW (cfInternedMem memW dpW sigSafe.kind) ∧
+     ClosureFnPtrEntryRel (cfInternedMem memW dpW sigSafe.kind) p mBM_W (fnName 1) 8192 (some (⟨4⟩, ()))
+       cfFx_widen_and_identity_closure_0 .sharedRef fnW 1 ∧
+     ∃ provTB, ClosureFnPtrEntryRel (cfInternedMem memW dpW sigSafe.kind) p mTB_W (fnName 1) 8192 provTB
+       cfFx_widen_and_identity_closure_0 .sharedRef fnW 1) ∧
+    (evalRvalue locsU (.cast (.pointerCoercion "ClosureFnPointer(Unsafe)") (.copy (locPlace 0)) sigUnsafe)
+        memU declsU cfFx_fn_shared_layouts =
+      .ok (.ptr p 8) locsU (cfInternedMem memU dpU sigUnsafe.kind) ∧
+     evalRvalue locsU (.cast .fnPtrToPtr (.copy (locPlace 1)) rawConstUnitMirTy)
+        (cfInternedMem memU dpU sigUnsafe.kind) declsU cfFx_fn_shared_layouts =
+      .ok (.ptr p 8) locsU (cfInternedMem memU dpU sigUnsafe.kind) ∧
+     ClosureFnPtrEntryRel (cfInternedMem memU dpU sigUnsafe.kind) p mBM_U (fnName 1) 8192 (some (⟨4⟩, ()))
+       cfFx_unsafe_closure_closure_0 .sharedRef fnU 1 ∧
+     ∃ provTB, ClosureFnPtrEntryRel (cfInternedMem memU dpU sigUnsafe.kind) p mTB_U (fnName 1) 8192 provTB
+       cfFx_unsafe_closure_closure_0 .sharedRef fnU 1) := by
+  dsimp only
+  let dpW := "closure_matrix::widen_and_identity::{closure#0}"
+  let dpU := "closure_matrix::unsafe_closure::{closure#0}"
+  let sigSafe : MirAst.Ty := { kind := .fnPtr [cfU32K] cfU32K .safe .rust, layoutIdx := 0 }
+  let sigUnsafe : MirAst.Ty := { kind := .fnPtr [cfU32K] cfU32K .unsafe_ .rust, layoutIdx := 0 }
+  let memW : MirSemantics.Memory := { emptyMemory with callees := [cfFx_widen_and_identity_closure_0] }
+  let memU : MirSemantics.Memory := { emptyMemory with callees := [cfFx_unsafe_closure_closure_0] }
+  let p : ProvenancePtr := cfInternedPtr memW
+  let declsW : List MirAst.LocalDecl := [cfDecl (.closure dpW []) 2, cfDecl sigSafe.kind 0, cfDecl sigUnsafe.kind 0]
+  let declsU : List MirAst.LocalDecl := [cfDecl (.closure dpU []) 2, cfDecl sigUnsafe.kind 0]
+  let locsW : List LocalSlot := [.init (.aggregate 0 []), .init (.ptr p 8), .init (.ptr p 8)]
+  let locsU : List LocalSlot := [.init (.aggregate 0 []), .init (.ptr p 8)]
+  let fnW := cfMrLeafFn 1 (cfBin .Add (cfLd 1) (cfU32 1))
+  let fnU := cfMrLeafFn 1 (cfBin .BitXor (cfLd 1) (cfU32 17))
+  let mBM_W := cfMrIndirectMach fnW [5]
+  let mTB_W := liftMachToTB mBM_W
+  let mBM_U := cfMrIndirectMach fnU [5]
+  let mTB_U := liftMachToTB mBM_U
+  let provTB : Option TreeBorrowsProvenance := some (⟨4⟩, [])
+  obtain ⟨hMapBM_W, hMapTB_W, hFnBM_W, hFnTB_W⟩ := cfMrIndirectMach_fnFromPtr fnW 5
+  obtain ⟨hMapBM_U, hMapTB_U, hFnBM_U, hFnTB_U⟩ := cfMrIndirectMach_fnFromPtr fnU 5
+  have hSafe := closure_coercion_widening_identity_general_mach_and_tb
+    locsW locsW locsW locsW locsW (.copy (locPlace 0)) (.copy (locPlace 1)) (.copy (locPlace 1)) (.copy (locPlace 2))
+    memW declsW cfFx_fn_shared_layouts "ClosureFnPointer(Safe)" dpW 2 [cfU32K] cfU32K .safe
+    (.aggregate 0 []) cfFx_widen_and_identity_closure_0 .sharedRef (fnName 1) 8192 (by decide)
+    (some (⟨4⟩, ())) provTB mBM_W mTB_W fnW fnW (Or.inr (Or.inl rfl)) (Or.inr rfl) rfl rfl rfl
+    rfl rfl rfl (cfShapeTag_inj (by decide +kernel)) rfl rfl rfl rfl rfl rfl hMapBM_W hMapTB_W hFnBM_W hFnTB_W rfl rfl rfl rfl rfl
+  have hUnsafe := closure_coercion_widening_identity_general_mach_and_tb
+    locsU locsU locsU locsU locsU (.copy (locPlace 0)) (.copy (locPlace 1)) (.copy (locPlace 1)) (.copy (locPlace 1))
+    memU declsU cfFx_fn_shared_layouts "ClosureFnPointer(Unsafe)" dpU 2 [cfU32K] cfU32K .unsafe_
+    (.aggregate 0 []) cfFx_unsafe_closure_closure_0 .sharedRef (fnName 1) 8192 (by decide)
+    (some (⟨4⟩, ())) provTB mBM_U mTB_U fnU fnU (Or.inr (Or.inr rfl)) (Or.inr rfl) rfl rfl rfl
+    rfl rfl rfl (cfShapeTag_inj (by decide +kernel)) rfl rfl rfl rfl rfl rfl hMapBM_U hMapTB_U hFnBM_U hFnTB_U rfl rfl rfl rfl rfl
+  exact ⟨⟨hSafe.1, hSafe.2.2.2.1 rfl rfl rfl, hSafe.2.2.2.2.1 rfl rfl, hSafe.2.2.2.2.2.1 rfl rfl,
+          hSafe.2.1, provTB, hSafe.2.2.1⟩,
+         ⟨hUnsafe.1, hUnsafe.2.2.2.2.1 rfl rfl, hUnsafe.2.1, provTB, hUnsafe.2.2.1⟩⟩
+
 /-! ## §6. Exhaustive Axiom, Import-Isolation, & `Classical.choice`-Free Audit -/
 
 section AxiomAudit
@@ -4066,7 +4192,8 @@ elab "#assert_closure_fn_ptr_mr_audit" : command => do
     ``closure_typed_sig_instances_mach_and_tb,
     ``closure_fixedInt_sig_instances_mach_and_tb,
     ``closure_forged_and_tailCall_law_instances_mach_and_tb,
-    ``cf_ptr_and_usize_abi_divergence_witness, ``cf_abi_divergence_not_closure_specific_witness ]
+    ``cf_ptr_and_usize_abi_divergence_witness, ``cf_abi_divergence_not_closure_specific_witness,
+    ``closure_coercion_widening_identity_general_instances_mach_and_tb ]
   for c in headline do
     match env.find? c with
     | some (.thmInfo _) => pure ()

@@ -106,14 +106,18 @@ import MiniRustSpec.Audit
   callee-directed closure dispatch (`calleeOwnClosureShape?`, no closure flag
   on `FnPtrEntry`, synthesized zero-sized environment prepended to `_1`) to
   MiniRust functions of the closure's user-visible arity across `Mach` and
-  `MachTB` (`ClosureFnPtrEntryRel`, `ClosureFnPointer(Safe|Unsafe)`
-  reification, `UnsafeFnPointer` widening, `FnPtrToPtr` pointer identity,
-  indirect `call` / `tailCall` for `Fn` / `FnMut` / `FnOnce` receivers, the
-  `const_eval_select` runtime target, and the fail-closed capturing, forged
-  `(N + 1)`-argument, ABI, `Safety`, generic-closure, and direct-call laws),
-  with kernel-checked three-way witnesses on verbatim `rustc-capture` bodies,
-  including the difftest reproducer that Miri evaluates to `9147` (pinned by
-  `#assert_closure_fn_ptr_mr_audit` and `[CLOSURE-FNPTR-AUDIT]`).
+  `MachTB` (`ClosureFnPtrEntryRel`, `ClosureFnSigRel`,
+  `ClosureFnPointer(Safe|Unsafe)` reification, `UnsafeFnPointer` widening,
+  `FnPtrToPtr` pointer identity, indirect `call` / `tailCall` for `Fn` /
+  `FnMut` / `FnOnce` receivers, the `const_eval_select` runtime target,
+  translation-derived fixed-width integer/`bool` ABI correspondence, and the
+  fail-closed capturing, forged `(N + 1)`-argument, ABI, `Safety`,
+  generic-closure, and direct-call laws), with non-vacuity instantiations and
+  kernel-checked three-way witnesses on verbatim `rustc-capture` bodies —
+  including the difftest reproducer that Miri evaluates to `9147` and
+  characterization of the pre-existing thin-pointer / `usize`-vs-`u64`
+  false-positive UB divergence (pinned by `#assert_closure_fn_ptr_mr_audit` and
+  `[CLOSURE-FNPTR-AUDIT]`).
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

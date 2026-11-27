@@ -27133,6 +27133,7 @@ open LeanMiriSpec.ClosureFnPtrLM in
   cfCall_initStackFrame_convMismatch_instance
   cfCall_initStackFrame_forged_closure_self_instance
   cfCall_initStackFrame_zero_arg_closure_instance
+  cfVendored_cast_and_nonCapturing_instances
   cf_finding_0007_driver_stutter_sim
   cf_finding_0007_main_stutter_sim
   cf_trusted_finding_parity
@@ -27152,6 +27153,7 @@ open LeanMiriSpec.ClosureFnPtrLM in
   cf_neg_safety_boundary
   cf_normal_spelling_boundary
   cf_ptr_and_usize_abi_divergence_witness
+  cf_abi_divergence_not_closure_specific_witness
 
 open LeanMiriSpec.ClosureFnPtrLM in
 example :

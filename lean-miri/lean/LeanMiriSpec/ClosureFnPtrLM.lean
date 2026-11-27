@@ -147,13 +147,15 @@ and frames are pushed and popped by the vendored `Stack` operations.
   `core::panicking::panic_fmt`) are modeled by a small stub body and an unwind
   entry hook invoking vendored `ControlFlow.unwindToBlock` for the unwinding
   witnesses.
-* Non-vacuity of all four universal vendored `Call` laws: every universal law of
-  §14 is instantiated on concrete initial states and closure bodies
-  (`cfCall_passArgument_abiMismatch_instance`,
+* Non-vacuity of all universal vendored Miri laws (§14): every universal law on
+  unmodified vendored `ExecutionCallLeaves.nonCapturingClosure`, `Cast.cast`,
+  `Call.passArgument`, and `Call.initStackFrame` is instantiated on concrete
+  initial states and closure bodies (`cfCall_passArgument_abiMismatch_instance`,
   `cfCall_initStackFrame_convMismatch_instance`,
-  `cfCall_initStackFrame_forged_closure_self_instance`, and
+  `cfCall_initStackFrame_forged_closure_self_instance`,
   `cfCall_initStackFrame_zero_arg_closure_instance` covering both the
-  `"AbiMismatchReturn"` and `pushDone` branches), discharging every
+  `"AbiMismatchReturn"` and `pushDone` branches, and
+  `cfVendored_cast_and_nonCapturing_instances`), discharging every
   intermediate-frame and state premise without vacuity.
 * The `ClosureOnceShim` MIR (`cfShimBody`) is hand-constructed from rustc's
   `make_shim` output for `FnOnce::call_once` (it is not a `rustc-capture`
@@ -164,9 +166,13 @@ and frames are pushed and popped by the vendored `Stack` operations.
   `defPath`, MIR location `(block, stmt)`, and locals via `cfLocalsRel`):
   a Trusted `.uninit` slot matches any live Miri local (because vendored
   `evalFnCallArgument` does not de-initialize moved locals), a closure body's
-  environment `_1` is exempt, data pointers are only required to be Miri
-  pointers, and borrow-tracker state is not compared. The entry-frame shape of
-  `_1` on both machines is pinned separately by `cf_closure_entry_frames_witness`.
+  environment `_1` is checked by exact receiver mode (`cfClosureEnvRel`:
+  `FnOnce` requires Trusted `.aggregate 0 []` ↔ Miri `.immediate .uninit`/`.indirect`,
+  and `Fn`/`FnMut` require Trusted `⟨1, 8⟩` ↔ Miri pointer scalar, with zero
+  blind local exemptions), data pointers are checked only for pointer-ness, and
+  borrow-tracker state is not compared. The entry-frame shape of `_1` on both
+  machines (including shim depth `3` vs direct depth `2`) is pinned separately
+  by `cf_closure_entry_frames_witness`.
 
 ## Divergences that are characterized, not hidden
 
@@ -191,11 +197,15 @@ and frames are pushed and popped by the vendored `Stack` operations.
   every non-shim frame on the call stack (body `defPath`, location, and locals):
   scalars and one- or two-scalar aggregates agree byte-for-byte
   (both in registers and in memory via vendored `Allocation.readScalar`),
-  zero-sized values agree, and function pointers denote the same linked body.
-  The closure environment local `_1` of a closure body is exempt, data-pointer
-  provenance graphs are not compared beyond pointer-ness, and no aliasing model
-  (Stacked or Tree Borrows, protectors) is installed.
-* **Thin-pointer and `usize`/`u64` ABI compatibility (`cf_ptr_and_usize_abi_divergence_witness`).**
+  zero-sized values agree, function pointers denote the same linked body, and
+  closure environment local `_1` satisfies the exact receiver-mode relation
+  `cfClosureEnvRel` (`FnOnce`: `.aggregate 0 []` ↔ `.immediate .uninit`/`.indirect`;
+  `Fn`/`FnMut`: `⟨1, 8⟩` ↔ Miri pointer scalar). Data-pointer provenance graphs
+  are not compared beyond pointer-ness, and no aliasing model (Stacked or Tree
+  Borrows, protectors) is installed.
+* **Thin-pointer and `usize`/`u64` ABI compatibility
+  (`cf_ptr_and_usize_abi_divergence_witness`,
+  `cf_abi_divergence_not_closure_specific_witness`).**
   `Trusted` (`calleeParamTysMatch` / `fnEntryCompatibleWithCallSite`) requires
   exact syntactic parameter types on indirect calls, whereas vendored Miri
   (`cfCheckArgumentCompat`: `annealRigidTyLayoutCompat` + `ArgAbi.eqAbi`)
@@ -2351,18 +2361,36 @@ def cfValRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine) :
     | _, _ => false
   | _, _ => false
 
-def cfSlotRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine) (exempt : Bool) :
-    LocalSlot → Miri.Interpreter.LocalValue AnnealProv → Bool
+/-- Exact receiver-mode agreement for closure environment local `_1` (zero blind
+wildcards in `cfRel`):
+* `FnOnce` (by-value `{closure}`): Trusted `.aggregate 0 []` matches Miri `.immediate .uninit`
+  (the `nonCapturing && localId == 1` uninitialized 1-ZST) or `.indirect _`;
+* `Fn` / `FnMut` (`&{closure}` / `&mut {closure}`): Trusted provenance-free scalar address
+  `⟨1, 8⟩` matches a Miri pointer scalar (`s.isPointer = true`, pointing to the shim's `_1`). -/
+def cfClosureEnvRel : CfClosureKind → MirSemantics.Value → Miri.Interpreter.Operand AnnealProv → Bool
+  | .fnOnce, .aggregate 0 [], .immediate .uninit => true
+  | .fnOnce, .aggregate 0 [], .indirect _ => true
+  | .fn, .scalar sc, .immediate (.scalar s) => sc.bits == 1 && sc.sizeBytes == 8 && s.isPointer
+  | .fnMut, .scalar sc, .immediate (.scalar s) => sc.bits == 1 && sc.sizeBytes == 8 && s.isPointer
+  | _, _, _ => false
+
+def cfSlotRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine)
+    (envKind : Option CfClosureKind) : LocalSlot → Miri.Interpreter.LocalValue AnnealProv → Bool
   | .dead, .dead => true
   | .uninit, .live _ => true
-  | .init v, .live op => exempt || cfValRel prog fnPtrs mach v op
+  | .init v, .live op =>
+    match envKind with
+    | some k => cfClosureEnvRel k v op
+    | none => cfValRel prog fnPtrs mach v op
   | _, _ => false
 
-def cfLocalsRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine) (envExempt : Bool) :
+def cfLocalsRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMachine)
+    (closKind : Option CfClosureKind) :
     Nat → List LocalSlot → List (Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout) → Bool
   | _, [], [] => true
   | i, a :: as, b :: bs =>
-    cfSlotRel prog fnPtrs mach (envExempt && i == 1) a b.value && cfLocalsRel prog fnPtrs mach envExempt (i + 1) as bs
+    cfSlotRel prog fnPtrs mach (if i == 1 then closKind else none) a b.value &&
+      cfLocalsRel prog fnPtrs mach closKind (i + 1) as bs
   | _, _, _ => false
 
 def cfNonShimDepth (m : AnnealStepState) : Nat :=
@@ -2379,14 +2407,14 @@ def cfSavedFramesRel (prog : CfProg) (fnPtrs : List FnPtrEntry) (mach : AnnealMa
      | some b, .mir loc =>
        stringEq b.defPath sf.callerBody.defPath &&
        loc.block == sf.frame.blockIdx && loc.statementIndex == sf.frame.stmtIdx &&
-       cfLocalsRel prog fnPtrs mach (cfClosureKind? b).isSome 0 sf.frame.locals mf.locals.toList
+       cfLocalsRel prog fnPtrs mach ((cfClosureKind? b).map Prod.fst) 0 sf.frame.locals mf.locals.toList
      | _, _ => false) &&
     cfSavedFramesRel prog fnPtrs mach sfs mfs
   | _, _ => false
 
 /-- Synchronization relation: same active body, same location, same non-shim call stack
 (every non-shim frame from active down to root agrees on body `defPath`, location, and
-locals; the environment local `_1` of a closure body is exempt). -/
+locals; closure environment `_1` satisfies the exact receiver-mode `cfClosureEnvRel`). -/
 def cfRel (prog : CfProg) (body : CapturedMir) (s : MachineState) (m : AnnealStepState) : Bool :=
   match m.stack.currentFrame? with
   | none => false
@@ -2397,7 +2425,7 @@ def cfRel (prog : CfProg) (body : CapturedMir) (s : MachineState) (m : AnnealSte
       stringEq b.defPath (activeMirBody body s).defPath &&
       loc.block == s.frame.blockIdx && loc.statementIndex == s.frame.stmtIdx &&
       cfNonShimDepth m == length s.memory.callStack + 1 &&
-      cfLocalsRel prog s.memory.fnPtrs m.machine (cfClosureKind? b).isSome 0 s.frame.locals f.locals.toList &&
+      cfLocalsRel prog s.memory.fnPtrs m.machine ((cfClosureKind? b).map Prod.fst) 0 s.frame.locals f.locals.toList &&
       cfSavedFramesRel prog s.memory.fnPtrs m.machine s.memory.callStack
         ((m.stack.frames.toList.reverse.drop 1).filter fun fr => !cfIsShimInstance fr.functionInstance)
     | _, _ => false
@@ -3129,6 +3157,104 @@ def cfUsizeDivCaller (callerArgKind : RigidTy) : CapturedMir :=
          terminator := cfHandTerm .return_, isCleanup := false }],
     fnAbi := { args := [], ret := cfFx_fn_shared.fnAbi.ret, conv := .rust, canUnwind := true },
     layouts := cfAbiDivLayouts, allocations := [] }
+
+/-- Non-closure `fn` item `fn(_1 : *const u32) -> u32 { 77 }` (no closure environment). -/
+def cfFnItemPtrPath : String := "hand::fn_item_ptr_abi"
+def cfFnItemPtrCallee : CapturedMir :=
+  { defPath := cfFnItemPtrPath, phase := .runtimeOptimized, role := .subject, argCount := 1,
+    localDecls := [cfHandDecl cfU32Ty, cfHandDecl { kind := .rawPtr .not (.uint .u32), layoutIdx := 3 }],
+    basicBlocks :=
+      [{ statements := [cfHandStmt (.assign ⟨0, []⟩ (.use (.constant { ty := cfU32Ty, val := .scalar (.int ⟨77, 4⟩) })))],
+         terminator := cfHandTerm .return_, isCleanup := false }],
+    fnAbi := { args := [{ layout := cfRawPtrLayout, mode := .direct }],
+               ret := cfFx_fn_shared.fnAbi.ret, conv := .rust, canUnwind := true },
+    layouts := cfAbiDivLayouts, allocations := [] }
+
+/-- Non-closure `fn` item `fn(_1 : u64) -> u32 { 77 }` (no closure environment). -/
+def cfFnItemUsizePath : String := "hand::fn_item_usize_abi"
+def cfFnItemUsizeCallee : CapturedMir :=
+  { defPath := cfFnItemUsizePath, phase := .runtimeOptimized, role := .subject, argCount := 1,
+    localDecls := [cfHandDecl cfU32Ty, cfHandDecl { kind := .uint .u64, layoutIdx := 4 }],
+    basicBlocks :=
+      [{ statements := [cfHandStmt (.assign ⟨0, []⟩ (.use (.constant { ty := cfU32Ty, val := .scalar (.int ⟨77, 4⟩) })))],
+         terminator := cfHandTerm .return_, isCleanup := false }],
+    fnAbi := { args := [{ layout := cfU64Layout, mode := .direct }],
+               ret := cfFx_fn_shared.fnAbi.ret, conv := .rust, canUnwind := true },
+    layouts := cfAbiDivLayouts, allocations := [] }
+
+/-- Caller reifying a non-closure `fn` item via `ReifyFnPointer` (`fn(itemArgKind) -> u32`),
+retyping to `fn(callerArgKind) -> u32`, and calling it with an 8-byte scalar `argBits`. -/
+def cfFnItemDivCaller (itemPath : String) (itemArgKind callerArgKind : RigidTy)
+    (argLay argBits : Nat) : CapturedMir :=
+  let castTy : Ty := { kind := .fnPtr [itemArgKind] (.uint .u32) .safe .rust, layoutIdx := 1 }
+  let callTy : Ty := { kind := .fnPtr [callerArgKind] (.uint .u32) .safe .rust, layoutIdx := 1 }
+  let fnDefTy : Ty := { kind := .fnDef itemPath [], layoutIdx := 2 }
+  let argTy : Ty := { kind := callerArgKind, layoutIdx := argLay }
+  { defPath := "hand::fn_item_abi_caller", phase := .runtimeOptimized, role := .subject, argCount := 0,
+    localDecls := [cfHandDecl cfU32Ty, cfHandDecl castTy, cfHandDecl callTy, cfHandDecl argTy],
+    basicBlocks :=
+      [{ statements :=
+           [ cfHandStmt (.storageLive 1),
+             cfHandStmt (.assign ⟨1, []⟩ (.cast (.pointerCoercion "ReifyFnPointer")
+               (.constant { ty := fnDefTy, val := .zeroSized }) castTy)),
+             cfHandStmt (.storageLive 2), cfHandStmt (.assign ⟨2, []⟩ (.use (.copy ⟨1, []⟩))),
+             cfHandStmt (.storageLive 3),
+             cfHandStmt (.assign ⟨3, []⟩ (.use (.constant { ty := argTy, val := .scalar (.int ⟨argBits, 8⟩) }))) ],
+         terminator := cfHandTerm (.call (.move ⟨2, []⟩) [.move ⟨3, []⟩] ⟨0, []⟩ (some 1) .continue_),
+         isCleanup := false },
+       { statements := [cfHandStmt (.storageDead 3), cfHandStmt (.storageDead 2), cfHandStmt (.storageDead 1)],
+         terminator := cfHandTerm .return_, isCleanup := false }],
+    fnAbi := { args := [], ret := cfFx_fn_shared.fnAbi.ret, conv := .rust, canUnwind := true },
+    layouts := cfAbiDivLayouts, allocations := [] }
+
+/-- Direct-forged `FnPtrEntry` caller for `calleeLocalDeclsCompatible` on a non-closure `fn` item
+(bypassing `fnEntryCompatibleWithCallSite` by matching `entry.fnSig` to the caller's transmuted type). -/
+def cfFnItemForgedTrusted (callee : CapturedMir) (callerArgKind : RigidTy) (argLay argBits : Nat) : CfObs :=
+  let sigKind : RigidTy := .fnPtr [callerArgKind] (.uint .u32) .safe .rust
+  let caller : CapturedMir :=
+    { defPath := "hand::fn_item_forged_caller", phase := .runtimeOptimized, role := .subject, argCount := 2,
+      localDecls := [cfHandDecl cfU32Ty, cfHandDecl { kind := sigKind, layoutIdx := 1 },
+                     cfHandDecl { kind := callerArgKind, layoutIdx := argLay }],
+      basicBlocks :=
+        [{ statements := [],
+           terminator := cfHandTerm (.call (.copy ⟨1, []⟩) [.copy ⟨2, []⟩] ⟨0, []⟩ (some 1) .continue_),
+           isCleanup := false },
+         { statements := [], terminator := cfHandTerm .return_, isCleanup := false }],
+      fnAbi := { args := [{ layout := cfPtrLayout, mode := .direct }, { layout := cfU64Layout, mode := .direct }],
+                 ret := cfFx_fn_shared.fnAbi.ret, conv := .rust, canUnwind := true },
+      layouts := cfAbiDivLayouts, allocations := [] }
+  let s0 := cfInit caller [.ptr { allocId := 65536, offsetBytes := 0 } 8, .scalar ⟨argBits, 8⟩] [callee]
+  let s1 : MachineState :=
+    { s0 with memory :=
+      { s0.memory with fnPtrs := [{ allocId := 65536, defPath := callee.defPath, typeArgs := [],
+                                    fnSig := some sigKind }] } }
+  cfRun caller 64 s1
+
+/-- Single-statement `ClosureFnPointer(Safe)` caller at `bb0[0]` used to instantiate
+`cfCast_closureFnPointer_vendored_law` for both non-capturing (`upvars = []`) and capturing
+(`upvars = [.uint .u32]`) closures. -/
+def cfSingleCastCaller (closPath : String) (upvars : List RigidTy) : CapturedMir :=
+  { defPath := "hand::single_cast", phase := .runtimeOptimized, role := .subject, argCount := 1,
+    localDecls := [cfHandDecl cfSafeFn1, cfHandDecl { kind := .closure closPath upvars, layoutIdx := 2 }],
+    basicBlocks :=
+      [{ statements := [cfHandStmt (.assign ⟨0, []⟩ (.cast (.pointerCoercion "ClosureFnPointer(Safe)") (.copy ⟨1, []⟩) cfSafeFn1))],
+         terminator := cfHandTerm .return_, isCleanup := false }],
+    fnAbi := { args := [{ layout := cfZstLayout, mode := .ignore }], ret := { layout := cfPtrLayout, mode := .direct },
+               conv := .rust, canUnwind := true },
+    layouts := cfFx_fn_shared.layouts, allocations := [] }
+
+/-- By-value capturing closure body (`_1 : {closure [u32]}`) used to instantiate the capturing
+conjuncts of `cfNonCapturingClosure_vendored_law`. -/
+def cfCapFnOnceCallee : CapturedMir :=
+  { defPath := "hand::cap_fnonce::{closure#0}", phase := .runtimeOptimized, role := .subject, argCount := 1,
+    localDecls := [cfHandDecl cfU32Ty,
+                   cfHandDecl { kind := .closure "hand::cap_fnonce::{closure#0}" [.uint .u32], layoutIdx := 0 }],
+    basicBlocks :=
+      [{ statements := [cfHandStmt (.assign ⟨0, []⟩ (.use (.constant { ty := cfU32Ty, val := .scalar (.int ⟨0, 4⟩) })))],
+         terminator := cfHandTerm .return_, isCleanup := false }],
+    fnAbi := { args := [{ layout := cfFx_fn_shared.fnAbi.ret.layout, mode := .direct }],
+               ret := cfFx_fn_shared.fnAbi.ret, conv := .rust, canUnwind := true },
+    layouts := cfFx_fn_shared.layouts, allocations := [] }
 
 def cfNegProg (body : CapturedMir) (callee : CapturedMir := cfFx_fn_once_kind_closure_0) : CfProg :=
   [⟨[], body⟩, ⟨[], callee⟩]
@@ -4051,6 +4177,246 @@ theorem cfCall_initStackFrame_zero_arg_closure_instance :
                                           rw [hDone] at hLawOk
                                           exact ⟨st, st4, st6, rfl, hLawBad, hLawOk, hDepth, hTop⟩
 
+private theorem cfCastTypeInfo_singleCastCaller (prog : CfProg) (closPath : String) (upvars : List RigidTy)
+    (st : AnnealStepState) (f : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit)
+    (n : Nat)
+    (hF : st.stack.currentFrame? = some f)
+    (hLoc : f.location = .mir { block := 0, statementIndex := 0 })
+    (hFind : cfFindItem? prog closPath [] = some n) :
+    cfCastTypeInfo prog (cfSingleCastCaller closPath upvars)
+        (translateTy { kind := .closure closPath upvars, layoutIdx := 2 } cfFx_fn_shared.layouts).ty st =
+      .ok (.closure n #[] (length upvars)) st := by
+  have hSrc : cfActiveCoercionSource? (cfSingleCastCaller closPath upvars) st =
+      some ("ClosureFnPointer(Safe)", { kind := .closure closPath upvars, layoutIdx := 2 }) := by
+    simp only [cfActiveCoercionSource?, hF, hLoc]; rfl
+  have hEq : (encodeTyId { kind := .closure closPath upvars, layoutIdx := 2 } ==
+      (translateTy { kind := .closure closPath upvars, layoutIdx := 2 } cfFx_fn_shared.layouts).ty) = true :=
+    beq_self_eq_true _
+  unfold cfCastTypeInfo
+  simp only [Bind.bind, EStateM.bind, get, getThe, MonadStateOf.get, EStateM.get, Pure.pure,
+    hSrc, hEq, ↓reduceIte, hFind]
+  rfl
+
+/-- **Non-vacuity of `cfNonCapturingClosure_vendored_law` AND `cfCast_closureFnPointer_vendored_law`**:
+1. On concrete `cfMiriInit` states, unmodified vendored `ExecutionCallLeaves.nonCapturingClosure`
+   evaluates to `.ok true` for both a `ClosureOnceShim` and a non-capturing `FnOnce` closure item,
+   and to `.ok false` for capturing shims, capturing items, and non-closure items;
+2. On concrete `cfMiriInit` states at `bb0[0]`, unmodified vendored `Cast.cast` (`ClosureFnPointer(Safe)`)
+   writes `cfFunctionPointer (cfItemInstance 1)` for a non-capturing `FnOnce` closure, writes
+   `cfFunctionPointer (cfShimInstance 1)` for a non-capturing `Fn` closure, and fails with
+   `.error (.invalidProgram "capturing closure in pointer cast")` for a capturing closure. -/
+theorem cfVendored_cast_and_nonCapturing_instances :
+    let progNC : CfProg := [⟨[], cfFx_fn_once_kind_closure_0⟩, ⟨[], cfFx_fn_shared⟩]
+    let progCap : CfProg := [⟨[], cfCapFnOnceCallee⟩]
+    let progCastOnce : CfProg := [⟨[], cfSingleCastCaller cfNegClosurePath []⟩, ⟨[], cfFx_fn_once_kind_closure_0⟩]
+    let progCastFn : CfProg := [⟨[], cfSingleCastCaller cfNegFnSharedPath []⟩, ⟨[], cfFx_fn_shared_closure_0⟩]
+    let progCastCap : CfProg := [⟨[], cfSingleCastCaller cfNegClosurePath [.uint .u32]⟩, ⟨[], cfFx_fn_once_kind_closure_0⟩]
+    (∃ stNC abiNC, cfMiriInit progNC [.uninit, cfU32Imm 5] = some stNC ∧
+      cfFnAbiOfBody cfFx_fn_once_kind_closure_0 = some abiNC ∧
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler progNC) (cfShimInstance 0) (cfVendoredFnAbi abiNC) stNC = .ok true stNC ∧
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler progNC) (cfItemInstance 0) (cfVendoredFnAbi abiNC) stNC = .ok true stNC ∧
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler progNC) (cfItemInstance 1) (cfVendoredFnAbi abiNC) stNC = .ok false stNC) ∧
+    (∃ stCap abiCap, cfMiriInit progCap [cfU32Imm 5] = some stCap ∧
+      cfFnAbiOfBody cfCapFnOnceCallee = some abiCap ∧
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler progCap) (cfShimInstance 0) (cfVendoredFnAbi abiCap) stCap = .ok false stCap ∧
+      Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler progCap) (cfItemInstance 0) (cfVendoredFnAbi abiCap) stCap = .ok false stCap) ∧
+    (∃ stOnce ptrOnce st1Once, cfMiriInit progCastOnce [.uninit] = some stOnce ∧
+      cfFunctionPointer (cfItemInstance 1) stOnce = .ok ptrOnce st1Once ∧
+      let src : Miri.Interpreter.OpTy AnnealProv := ⟨.immediate .uninit, translateTy { kind := .closure cfNegClosurePath [], layoutIdx := 2 } cfFx_fn_shared.layouts⟩
+      let dst : Miri.Interpreter.RuntimePlace AnnealProv := ⟨.local 0 0 none (.ofAllocationToken 0), translateTy cfSafeFn1 cfFx_fn_shared.layouts⟩
+      Miri.Interpreter.Cast.cast (cfCastHooks progCastOnce (cfSingleCastCaller cfNegClosurePath [])) () 16 src
+          (.PointerCoercion (.ClosureFnPointer .Safe) .Implicit) dst.layout.ty dst stOnce =
+        (cfCastHooks progCastOnce (cfSingleCastCaller cfNegClosurePath [])).writePointer () ptrOnce dst st1Once) ∧
+    (∃ stFn ptrFn st1Fn, cfMiriInit progCastFn [.uninit] = some stFn ∧
+      cfFunctionPointer (cfShimInstance 1) stFn = .ok ptrFn st1Fn ∧
+      let src : Miri.Interpreter.OpTy AnnealProv := ⟨.immediate .uninit, translateTy { kind := .closure cfNegFnSharedPath [], layoutIdx := 2 } cfFx_fn_shared.layouts⟩
+      let dst : Miri.Interpreter.RuntimePlace AnnealProv := ⟨.local 0 0 none (.ofAllocationToken 0), translateTy cfSafeFn1 cfFx_fn_shared.layouts⟩
+      Miri.Interpreter.Cast.cast (cfCastHooks progCastFn (cfSingleCastCaller cfNegFnSharedPath [])) () 16 src
+          (.PointerCoercion (.ClosureFnPointer .Safe) .Implicit) dst.layout.ty dst stFn =
+        (cfCastHooks progCastFn (cfSingleCastCaller cfNegFnSharedPath [])).writePointer () ptrFn dst st1Fn) ∧
+    (∃ stCapC, cfMiriInit progCastCap [.uninit] = some stCapC ∧
+      let src : Miri.Interpreter.OpTy AnnealProv := ⟨.immediate .uninit, translateTy { kind := .closure cfNegClosurePath [.uint .u32], layoutIdx := 2 } cfFx_fn_shared.layouts⟩
+      let dst : Miri.Interpreter.RuntimePlace AnnealProv := ⟨.local 0 0 none (.ofAllocationToken 0), translateTy cfSafeFn1 cfFx_fn_shared.layouts⟩
+      Miri.Interpreter.Cast.cast (cfCastHooks progCastCap (cfSingleCastCaller cfNegClosurePath [.uint .u32])) () 16 src
+          (.PointerCoercion (.ClosureFnPointer .Safe) .Implicit) dst.layout.ty dst stCapC =
+        .error (.invalidProgram "capturing closure in pointer cast") stCapC) := by
+  dsimp only
+  let progNC : CfProg := [⟨[], cfFx_fn_once_kind_closure_0⟩, ⟨[], cfFx_fn_shared⟩]
+  let progCap : CfProg := [⟨[], cfCapFnOnceCallee⟩]
+  let progCastOnce : CfProg := [⟨[], cfSingleCastCaller cfNegClosurePath []⟩, ⟨[], cfFx_fn_once_kind_closure_0⟩]
+  let progCastFn : CfProg := [⟨[], cfSingleCastCaller cfNegFnSharedPath []⟩, ⟨[], cfFx_fn_shared_closure_0⟩]
+  let progCastCap : CfProg := [⟨[], cfSingleCastCaller cfNegClosurePath [.uint .u32]⟩, ⟨[], cfFx_fn_once_kind_closure_0⟩]
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · cases hInit : cfMiriInit progNC [.uninit, cfU32Imm 5] with
+    | none =>
+      have hc : (cfMiriInit progNC [.uninit, cfU32Imm 5]).isSome = true := by decide +kernel
+      rw [hInit] at hc; cases hc
+    | some stNC =>
+      cases hAbi : cfFnAbiOfBody cfFx_fn_once_kind_closure_0 with
+      | none =>
+        have hc : (cfFnAbiOfBody cfFx_fn_once_kind_closure_0).isSome = true := by decide +kernel
+        rw [hAbi] at hc; cases hc
+      | some abiNC =>
+        have hLaw : Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler progNC) (cfShimInstance 0) (cfVendoredFnAbi abiNC) stNC = .ok true stNC ∧
+            Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler progNC) (cfItemInstance 0) (cfVendoredFnAbi abiNC) stNC = .ok true stNC ∧
+            Miri.Interpreter.ExecutionCallLeaves.nonCapturingClosure (cfCompiler progNC) (cfItemInstance 1) (cfVendoredFnAbi abiNC) stNC = .ok false stNC := by
+          have hFr : ∃ f, stNC.stack.currentFrame? = some f ∧ cfBodyOfInstance progNC f.functionInstance = some cfFx_fn_once_kind_closure_0 := by
+            have hc : (cfMiriInit progNC [.uninit, cfU32Imm 5]).bind (fun s => s.stack.currentFrame?.map fun f => f.functionInstance == cfItemInstance 0) = some true := by decide +kernel
+            simp only [hInit, Option.bind_some] at hc
+            cases hF : stNC.stack.currentFrame? with
+            | none => rw [hF] at hc; cases hc
+            | some f =>
+              rw [hF] at hc; simp only [Option.map_some, Option.some.injEq, beq_iff_eq] at hc
+              exact ⟨f, rfl, by rw [hc]; rfl⟩
+          obtain ⟨f, hF, hB⟩ := hFr
+          cases hDecls : cfFx_fn_once_kind_closure_0.localDecls with
+          | nil =>
+            have hc : cfFx_fn_once_kind_closure_0.localDecls.length = 4 := rfl
+            rw [hDecls] at hc; cases hc
+          | cons d0 rest0 =>
+            cases rest0 with
+            | nil =>
+              have hc : cfFx_fn_once_kind_closure_0.localDecls.length = 4 := rfl
+              rw [hDecls] at hc; cases hc
+            | cons self rest =>
+              have hSelf : self.ty.kind = .closure cfNegClosurePath [] := by
+                have hc : (cfFx_fn_once_kind_closure_0.localDecls[1]?.map (·.ty.kind)) = some (.closure cfNegClosurePath []) := rfl
+                rw [hDecls] at hc; exact Option.some.inj hc
+              have hArg0 : ∃ first, (cfVendoredFnAbi abiNC).args[0]? = some first ∧ encodeTyId self.ty = first.layout.ty := by
+                have hc : (cfFnAbiOfBody cfFx_fn_once_kind_closure_0).bind (fun a => (cfVendoredFnAbi a).args[0]?.map fun f0 => encodeTyId self.ty == f0.layout.ty) = some true := by
+                  have hSelfTy : self.ty = { kind := .closure cfNegClosurePath [], layoutIdx := 1 } := by
+                    have h1 : cfFx_fn_once_kind_closure_0.localDecls[1]? = some { mutability := .mut, ty := { kind := .closure cfNegClosurePath [], layoutIdx := 1 }, debugName := none } := rfl
+                    rw [hDecls] at h1; exact congrArg LocalDecl.ty (Option.some.inj h1)
+                  rw [hSelfTy]; decide +kernel
+                simp only [hAbi, Option.bind_some] at hc
+                cases hA0 : (cfVendoredFnAbi abiNC).args[0]? with
+                | none => rw [hA0] at hc; cases hc
+                | some first =>
+                  rw [hA0] at hc; simp only [Option.map_some, Option.some.injEq, beq_iff_eq] at hc
+                  exact ⟨first, rfl, hc⟩
+              obtain ⟨first, hFirst, hTy⟩ := hArg0
+              have hAll := cfNonCapturingClosure_vendored_law progNC stNC f cfFx_fn_once_kind_closure_0 d0 self rest
+                (cfVendoredFnAbi abiNC) first hF hB hDecls hFirst hTy
+              exact ⟨hAll.1 0 cfNegClosurePath hSelf, hAll.2.1 0 ⟨[], cfFx_fn_once_kind_closure_0⟩ cfNegClosurePath rfl rfl hSelf,
+                     hAll.2.2.2.1 1 ⟨[], cfFx_fn_shared⟩ rfl rfl⟩
+        exact ⟨stNC, abiNC, rfl, rfl, hLaw⟩
+  · cases hInit : cfMiriInit progCap [cfU32Imm 5] with
+    | none =>
+      have hc : (cfMiriInit progCap [cfU32Imm 5]).isSome = true := by decide +kernel
+      rw [hInit] at hc; cases hc
+    | some stCap =>
+      cases hAbi : cfFnAbiOfBody cfCapFnOnceCallee with
+      | none =>
+        have hc : (cfFnAbiOfBody cfCapFnOnceCallee).isSome = true := by decide +kernel
+        rw [hAbi] at hc; cases hc
+      | some abiCap =>
+        have hFr : ∃ f, stCap.stack.currentFrame? = some f ∧ cfBodyOfInstance progCap f.functionInstance = some cfCapFnOnceCallee := by
+          have hc : (cfMiriInit progCap [cfU32Imm 5]).bind (fun s => s.stack.currentFrame?.map fun f => f.functionInstance == cfItemInstance 0) = some true := by decide +kernel
+          simp only [hInit, Option.bind_some] at hc
+          cases hF : stCap.stack.currentFrame? with
+          | none => rw [hF] at hc; cases hc
+          | some f =>
+            rw [hF] at hc; simp only [Option.map_some, Option.some.injEq, beq_iff_eq] at hc
+            exact ⟨f, rfl, by rw [hc]; rfl⟩
+        obtain ⟨f, hF, hB⟩ := hFr
+        have hArg0 : ∃ first, (cfVendoredFnAbi abiCap).args[0]? = some first ∧
+            encodeTyId (cfHandDecl { kind := .closure "hand::cap_fnonce::{closure#0}" [.uint .u32], layoutIdx := 0 }).ty = first.layout.ty := by
+          have hc : (cfFnAbiOfBody cfCapFnOnceCallee).bind (fun a => (cfVendoredFnAbi a).args[0]?.map fun f0 =>
+              encodeTyId (cfHandDecl { kind := .closure "hand::cap_fnonce::{closure#0}" [.uint .u32], layoutIdx := 0 }).ty == f0.layout.ty) = some true := by decide +kernel
+          simp only [hAbi, Option.bind_some] at hc
+          cases hA0 : (cfVendoredFnAbi abiCap).args[0]? with
+          | none => rw [hA0] at hc; cases hc
+          | some first =>
+            rw [hA0] at hc; simp only [Option.map_some, Option.some.injEq, beq_iff_eq] at hc
+            exact ⟨first, rfl, hc⟩
+        obtain ⟨first, hFirst, hTy⟩ := hArg0
+        have hAll := cfNonCapturingClosure_vendored_law progCap stCap f cfCapFnOnceCallee
+          (cfHandDecl cfU32Ty) (cfHandDecl { kind := .closure "hand::cap_fnonce::{closure#0}" [.uint .u32], layoutIdx := 0 }) []
+          (cfVendoredFnAbi abiCap) first hF hB rfl hFirst hTy
+        exact ⟨stCap, abiCap, rfl, rfl, hAll.2.2.1 0 "hand::cap_fnonce::{closure#0}" (.uint .u32) [] rfl,
+               hAll.2.2.2.2 0 ⟨[], cfCapFnOnceCallee⟩ (.fnOnce, 1) "hand::cap_fnonce::{closure#0}" (.uint .u32) [] rfl rfl rfl⟩
+  · cases hInit : cfMiriInit progCastOnce [.uninit] with
+    | none =>
+      have hc : (cfMiriInit progCastOnce [.uninit]).isSome = true := by decide +kernel
+      rw [hInit] at hc; cases hc
+    | some stOnce =>
+      have hFr : ∃ f, stOnce.stack.currentFrame? = some f ∧ f.location = .mir { block := 0, statementIndex := 0 } := by
+        have hc : (cfMiriInit progCastOnce [.uninit]).bind (fun s => s.stack.currentFrame?.map fun f =>
+            f.location == .mir { block := 0, statementIndex := 0 }) = some true := by decide +kernel
+        simp only [hInit, Option.bind_some] at hc
+        cases hF : stOnce.stack.currentFrame? with
+        | none => rw [hF] at hc; cases hc
+        | some f =>
+          rw [hF] at hc; simp only [Option.map_some, Option.some.injEq, beq_iff_eq] at hc
+          exact ⟨f, rfl, hc⟩
+      obtain ⟨f, hF, hLoc⟩ := hFr
+      have hInfo := cfCastTypeInfo_singleCastCaller progCastOnce cfNegClosurePath [] stOnce f 1 hF hLoc rfl
+      cases hPtr : cfFunctionPointer (cfItemInstance 1) stOnce with
+      | error _ _ =>
+        have hc : (cfMiriInit progCastOnce [.uninit]).map (fun s =>
+            match cfFunctionPointer (cfItemInstance 1) s with | .ok _ _ => true | .error _ _ => false) = some true := by decide +kernel
+        simp only [hInit, Option.map_some, hPtr] at hc; cases hc
+      | ok ptrOnce st1Once =>
+        let src : Miri.Interpreter.OpTy AnnealProv :=
+          ⟨.immediate .uninit, translateTy { kind := .closure cfNegClosurePath [], layoutIdx := 2 } cfFx_fn_shared.layouts⟩
+        let dst : Miri.Interpreter.RuntimePlace AnnealProv :=
+          ⟨.local 0 0 none (.ofAllocationToken 0), translateTy cfSafeFn1 cfFx_fn_shared.layouts⟩
+        exact ⟨stOnce, ptrOnce, st1Once, rfl, hPtr,
+          (cfCast_closureFnPointer_vendored_law progCastOnce (cfSingleCastCaller cfNegClosurePath []) 16 src dst .Safe .Implicit stOnce).1
+            1 (cfItemInstance 1) ptrOnce st1Once hInfo rfl hPtr⟩
+  · cases hInit : cfMiriInit progCastFn [.uninit] with
+    | none =>
+      have hc : (cfMiriInit progCastFn [.uninit]).isSome = true := by decide +kernel
+      rw [hInit] at hc; cases hc
+    | some stFn =>
+      have hFr : ∃ f, stFn.stack.currentFrame? = some f ∧ f.location = .mir { block := 0, statementIndex := 0 } := by
+        have hc : (cfMiriInit progCastFn [.uninit]).bind (fun s => s.stack.currentFrame?.map fun f =>
+            f.location == .mir { block := 0, statementIndex := 0 }) = some true := by decide +kernel
+        simp only [hInit, Option.bind_some] at hc
+        cases hF : stFn.stack.currentFrame? with
+        | none => rw [hF] at hc; cases hc
+        | some f =>
+          rw [hF] at hc; simp only [Option.map_some, Option.some.injEq, beq_iff_eq] at hc
+          exact ⟨f, rfl, hc⟩
+      obtain ⟨f, hF, hLoc⟩ := hFr
+      have hInfo := cfCastTypeInfo_singleCastCaller progCastFn cfNegFnSharedPath [] stFn f 1 hF hLoc rfl
+      cases hPtr : cfFunctionPointer (cfShimInstance 1) stFn with
+      | error _ _ =>
+        have hc : (cfMiriInit progCastFn [.uninit]).map (fun s =>
+            match cfFunctionPointer (cfShimInstance 1) s with | .ok _ _ => true | .error _ _ => false) = some true := by decide +kernel
+        simp only [hInit, Option.map_some, hPtr] at hc; cases hc
+      | ok ptrFn st1Fn =>
+        let src : Miri.Interpreter.OpTy AnnealProv :=
+          ⟨.immediate .uninit, translateTy { kind := .closure cfNegFnSharedPath [], layoutIdx := 2 } cfFx_fn_shared.layouts⟩
+        let dst : Miri.Interpreter.RuntimePlace AnnealProv :=
+          ⟨.local 0 0 none (.ofAllocationToken 0), translateTy cfSafeFn1 cfFx_fn_shared.layouts⟩
+        exact ⟨stFn, ptrFn, st1Fn, rfl, hPtr,
+          (cfCast_closureFnPointer_vendored_law progCastFn (cfSingleCastCaller cfNegFnSharedPath []) 16 src dst .Safe .Implicit stFn).1
+            1 (cfShimInstance 1) ptrFn st1Fn hInfo rfl hPtr⟩
+  · cases hInit : cfMiriInit progCastCap [.uninit] with
+    | none =>
+      have hc : (cfMiriInit progCastCap [.uninit]).isSome = true := by decide +kernel
+      rw [hInit] at hc; cases hc
+    | some stCapC =>
+      have hFr : ∃ f, stCapC.stack.currentFrame? = some f ∧ f.location = .mir { block := 0, statementIndex := 0 } := by
+        have hc : (cfMiriInit progCastCap [.uninit]).bind (fun s => s.stack.currentFrame?.map fun f =>
+            f.location == .mir { block := 0, statementIndex := 0 }) = some true := by decide +kernel
+        simp only [hInit, Option.bind_some] at hc
+        cases hF : stCapC.stack.currentFrame? with
+        | none => rw [hF] at hc; cases hc
+        | some f =>
+          rw [hF] at hc; simp only [Option.map_some, Option.some.injEq, beq_iff_eq] at hc
+          exact ⟨f, rfl, hc⟩
+      obtain ⟨f, hF, hLoc⟩ := hFr
+      have hInfo := cfCastTypeInfo_singleCastCaller progCastCap cfNegClosurePath [.uint .u32] stCapC f 1 hF hLoc rfl
+      let src : Miri.Interpreter.OpTy AnnealProv :=
+        ⟨.immediate .uninit, translateTy { kind := .closure cfNegClosurePath [.uint .u32], layoutIdx := 2 } cfFx_fn_shared.layouts⟩
+      let dst : Miri.Interpreter.RuntimePlace AnnealProv :=
+        ⟨.local 0 0 none (.ofAllocationToken 0), translateTy cfSafeFn1 cfFx_fn_shared.layouts⟩
+      exact ⟨stCapC, rfl,
+        (cfCast_closureFnPointer_vendored_law progCastCap (cfSingleCastCaller cfNegClosurePath [.uint .u32]) 16 src dst .Safe .Implicit stCapC).2
+          1 0 hInfo⟩
+
 /-! ## §15. Kernel-checked simulation, `finding_0007` parity, unwinding, and negative witnesses
 
 Every theorem of this section is closed by `decide +kernel` on closed terms (zero `#guard`s,
@@ -4545,6 +4911,46 @@ theorem cf_ptr_and_usize_abi_divergence_witness :
   refine ⟨by decide +kernel, ?_, by decide +kernel, ?_, by decide +kernel, ?_, by decide +kernel, ?_⟩ <;>
     (rw [cfStepHooks_eq_K]; decide +kernel)
 
+/-- **Non-closure-specific false-positive UB witness (`Trusted` vs vendored Miri `Step.step`)**:
+mirrors `MiniRustSpec.ClosureFnPtrMR.cf_abi_divergence_not_closure_specific_witness` on BOTH
+`Trusted` and unmodified vendored Miri for ordinary non-closure `fn` items (`cfClosureKind? = none`,
+`calleeOwnClosureShape? = none`):
+1. Positive controls (`*const u32` -> `*const u32`, `u64` -> `u64` via `ReifyFnPointer`):
+   BOTH `Trusted` and vendored Miri `Step.step` return `77 : u32`;
+2. Transmuted call-site signature (`fnEntryCompatibleWithCallSite`): `*const u64` -> `*const u32`
+   and `usize` -> `u64` fault with `.ub` in `Trusted`, while vendored Miri `Step.step` accepts
+   both and returns `77 : u32`;
+3. Forged `FnPtrEntry` with matching transmuted `fnSig` (directly exercising
+   `calleeLocalDeclsCompatible` on `checkFnPtrTargetCompatible`): `*const u64` -> `*const u32`
+   and `usize` -> `u64` ALSO fault with `.ub` in `Trusted`. -/
+theorem cf_abi_divergence_not_closure_specific_witness :
+    let ptrOk := cfFnItemDivCaller cfFnItemPtrPath (.rawPtr .not (.uint .u32)) (.rawPtr .not (.uint .u32)) 3 0
+    let ptrBad := cfFnItemDivCaller cfFnItemPtrPath (.rawPtr .not (.uint .u32)) (.rawPtr .not (.uint .u64)) 3 0
+    let usizeOk := cfFnItemDivCaller cfFnItemUsizePath (.uint .u64) (.uint .u64) 4 5
+    let usizeBad := cfFnItemDivCaller cfFnItemUsizePath (.uint .u64) (.uint .usize) 4 5
+    cfClosureKind? cfFnItemPtrCallee = none ∧
+    cfClosureKind? cfFnItemUsizeCallee = none ∧
+    calleeOwnClosureShape? cfFnItemPtrCallee = none ∧
+    calleeOwnClosureShape? cfFnItemUsizeCallee = none ∧
+    cfRun ptrOk 100 (cfInit ptrOk [] [cfFnItemPtrCallee]) = .scalar 77 4 ∧
+    cfMiriRunFrom (cfStepHooks [⟨[], ptrOk⟩, ⟨[], cfFnItemPtrCallee⟩]) [⟨[], ptrOk⟩, ⟨[], cfFnItemPtrCallee⟩] 100 [] =
+      .scalar 77 4 ∧
+    cfRun ptrBad 100 (cfInit ptrBad [] [cfFnItemPtrCallee]) = .ub ∧
+    cfMiriRunFrom (cfStepHooks [⟨[], ptrBad⟩, ⟨[], cfFnItemPtrCallee⟩]) [⟨[], ptrBad⟩, ⟨[], cfFnItemPtrCallee⟩] 100 [] =
+      .scalar 77 4 ∧
+    cfFnItemForgedTrusted cfFnItemPtrCallee (.rawPtr .not (.uint .u64)) 3 0 = .ub ∧
+    cfRun usizeOk 100 (cfInit usizeOk [] [cfFnItemUsizeCallee]) = .scalar 77 4 ∧
+    cfMiriRunFrom (cfStepHooks [⟨[], usizeOk⟩, ⟨[], cfFnItemUsizeCallee⟩]) [⟨[], usizeOk⟩, ⟨[], cfFnItemUsizeCallee⟩] 100 [] =
+      .scalar 77 4 ∧
+    cfRun usizeBad 100 (cfInit usizeBad [] [cfFnItemUsizeCallee]) = .ub ∧
+    cfMiriRunFrom (cfStepHooks [⟨[], usizeBad⟩, ⟨[], cfFnItemUsizeCallee⟩]) [⟨[], usizeBad⟩, ⟨[], cfFnItemUsizeCallee⟩] 100 [] =
+      .scalar 77 4 ∧
+    cfFnItemForgedTrusted cfFnItemUsizeCallee (.uint .usize) 4 5 = .ub := by
+  dsimp only
+  refine ⟨rfl, rfl, rfl, rfl, by decide +kernel, ?_, by decide +kernel, ?_, by decide +kernel,
+    by decide +kernel, ?_, by decide +kernel, ?_, by decide +kernel⟩ <;>
+    (rw [cfStepHooks_eq_K]; decide +kernel)
+
 /-! ## §16. Exhaustive Axiom and Import-Isolation Audit -/
 
 section AxiomAudit
@@ -4599,6 +5005,7 @@ elab "#assert_closure_fn_ptr_lm_audit" : command => do
     ``cfCall_passArgument_abiMismatch_instance, ``cfCall_initStackFrame_convMismatch_instance,
     ``cfCall_initStackFrame_forged_closure_self_instance,
     ``cfCall_initStackFrame_zero_arg_closure_instance,
+    ``cfVendored_cast_and_nonCapturing_instances,
     ``cf_finding_0007_driver_stutter_sim, ``cf_finding_0007_main_stutter_sim,
     ``cf_trusted_finding_parity, ``cf_fn_shared_stutter_sim, ``cf_fn_mut_stutter_sim,
     ``cf_zero_and_two_arg_stutter_sim, ``cf_unsafe_and_widen_identity_stutter_sim,
@@ -4607,7 +5014,8 @@ elab "#assert_closure_fn_ptr_lm_audit" : command => do
     ``cf_direct_closure_call_witness, ``cf_neg_capturing_fail_closed,
     ``cf_neg_forged_call_ub, ``cf_neg_transmuted_sig_ub, ``cf_neg_extern_c_ub,
     ``cf_neg_safety_boundary, ``cf_normal_spelling_boundary,
-    ``cf_ptr_and_usize_abi_divergence_witness ]
+    ``cf_ptr_and_usize_abi_divergence_witness,
+    ``cf_abi_divergence_not_closure_specific_witness ]
   for c in headline do
     let some (.thmInfo _) := env.find? c | throwError "{c} is not a theorem of this module"
   logInfo m!"LeanMiriSpec.ClosureFnPtrLM: verified {checked} declarations ({theorems} theorems, {headline.length} headline; sorry_free=true, ofReduceBool_free=true, standard_axioms_only=true, minirustspec_import_free=true)"
