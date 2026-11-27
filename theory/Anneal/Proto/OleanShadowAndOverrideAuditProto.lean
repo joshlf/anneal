@@ -1166,7 +1166,16 @@ def validateOleanBinaryBytes (bs : ByteArray) (cfg : OleanHeaderConfig := {}) :
   let root := readLE bs 88 8
   unless root % 2 == 0 do throw (.scalarRootPtr root)
   unless root % 8 == 0 do throw (.misalignedRootPtr root)
-  unless base + headerSize + 8 ≤ root && root + 8 ≤ base + size do throw (.rootOutOfBounds root)
+  -- An empty delta layer (e.g. a 96-byte `.olean.server` / `.olean.private` of a module with no
+  -- server-only or private data) stores no objects and re-roots at an object of a parent region.
+  -- That root was validated with the parent; it must lie strictly inside a known parent region.
+  let inOwn := base + headerSize + 8 ≤ root && root + 8 ≤ base + size
+  if !inOwn then
+    let inParent := cfg.allowParentRegionPtrs &&
+      cfg.parentRegions.any fun (pBase, pSize) => pBase + headerSize + 8 ≤ root && root + 8 ≤ pBase + pSize
+    unless inParent do throw (.rootOutOfBounds root)
+    return { version, githash, gmp := flags &&& 1 == 1, baseAddr := base, rootPtr := root,
+             rootOffset := 0, rootSize := 0, fileSize := size }
   let off := root - base
   -- Root object header: m_rc (u32) | m_cs_sz (u16) | m_other (u8) | m_tag (u8).
   let rc := readLE bs off 4
@@ -2757,9 +2766,27 @@ def auditBuildLibrary (buildLib sysrootLib : System.FilePath) (cfg : FourVectorC
             let hasIr ← entryExists ⟨base ++ ".ir"⟩
             if hasSrv != hasPriv || hasIrSig != hasIr then
               return (i, some (.oleanOutsideApprovedRoot, s!"incomplete toolchain companion artifacts for {i}"))
-            match ← validateOleanFile p hdr with
-            | .ok _ => return (i, none)
-            | .error e => return (i, some (.oleanHeaderInvalid, s!"{p}: {e}"))
+            -- Every existing part (not just the `.olean`) is read by `importModules` at the private
+            -- level, so each must be a symlink-free regular file inside the sysroot with a valid
+            -- pinned header *before* the import.
+            -- Layered parts are validated against the regions of the parts below them, exactly as
+            -- in `auditOleanResolutionAndShadowing`.
+            let mut oleanChain : Array (Nat × Nat) := #[]
+            let mut irChain : Array (Nat × Nat) := #[]
+            for ext in partExts do
+              let part : System.FilePath := ⟨base ++ "." ++ ext⟩
+              unless ← entryExists part do continue
+              if let .error e ← pathWithinVerifiedRoot sysStr realSys part then
+                return (i, some (.oleanOutsideApprovedRoot, s!"companion part: {e}"))
+              let isIr := ext == "ir.sig" || ext == "ir"
+              let pCfg := if isIr then { hdr with parentRegions := irChain, auxParentRegions := oleanChain }
+                else { hdr with parentRegions := oleanChain }
+              match ← validateOleanFile part pCfg with
+              | .error e => return (i, some (.oleanHeaderInvalid, s!"{part}: {e}"))
+              | .ok info =>
+                if isIr then irChain := irChain.push (info.baseAddr, info.fileSize)
+                else oleanChain := oleanChain.push (info.baseAddr, info.fileSize)
+            return (i, none)
     for bt in boundaryTasks do
       match ← IO.wait bt with
       | .error e =>

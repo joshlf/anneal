@@ -695,6 +695,35 @@ PASS T15 standalone validateOleanFile rejects symlinked .olean via lstat
     expect "T15 standalone validateOleanFile rejects symlinked .olean via lstat"
       ((← validateOleanFile symF) matches .error _)
 
+/-! ### T15b: empty delta layers re-rooted in the parent region (A3 regression)
+
+`Init.olean.server` / `Init.olean.private` are 96-byte layers with no objects whose root pointer
+targets the root of `Init.olean`. They are valid only relative to that parent region. -/
+
+/--
+info: PASS T15b empty Init.olean.server layer accepted against its parent region
+PASS T15b the same layer without parent regions fails closed
+PASS T15b a root outside every parent region is rejected
+PASS T15b all five parts of the real Init module pass the chained validation
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  let lib ← sysLib
+  let parent ← IO.FS.readBinFile (lib / "Init.olean")
+  let some pInfo := (validateOleanBinaryBytes parent).toOption | throw (IO.userError "parent failed")
+  let srv ← IO.FS.readBinFile (lib / "Init.olean.server")
+  let chained : OleanHeaderConfig := { allowParentRegionPtrs := true, parentRegions := #[(pInfo.baseAddr, pInfo.fileSize)] }
+  expect "T15b empty Init.olean.server layer accepted against its parent region"
+    ((validateOleanBinaryBytes srv chained) matches .ok _)
+  expect "T15b the same layer without parent regions fails closed"
+    (isErr (validateOleanBinaryBytes srv { allowParentRegionPtrs := true }) (· matches .rootOutOfBounds _))
+  expect "T15b a root outside every parent region is rejected"
+    (isErr (validateOleanBinaryBytes (setLE64 srv 88 (pInfo.baseAddr + pInfo.fileSize + 64)) chained) (· matches .rootOutOfBounds _))
+  let ((), s) ← AuditM.run' (auditOleanResolutionAndShadowing #[`Init]
+    { sysrootLibDir := lib, approvedBuildRoots := #[], searchPath? := some [lib], validateToolchainBinaries := true })
+  expect "T15b all five parts of the real Init module pass the chained validation"
+    (s.violations.isEmpty && s.oleansChecked == 5) s!"{renderAll s.violations} {s.oleansChecked}"
+
 /-! ## Vector 4 — `Init.ShareCommon`, compiler overrides, opaque-theorem readiness -/
 
 /-! ### T16: clean control -/
@@ -1052,6 +1081,8 @@ PASS T21 nothing was audited from the planted closure
 PASS T21 6-module diamond DAG does not starve pre-import boundary queue
 PASS T21 tampered-githash toolchain boundary import rejected before importModules
 PASS T21 transitive Init.Bridge -> Planted sysroot escape caught
+PASS T21 symlinked toolchain companion (.olean.private) rejected before importModules
+PASS T21 corrupted toolchain companion (.ir) header rejected before importModules
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -1112,6 +1143,40 @@ PASS T21 transitive Init.Bridge -> Planted sysroot escape caught
     expect "T21 transitive Init.Bridge -> Planted sysroot escape caught"
       (sBr.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Planted)
       (renderAll sBr.violations)
+    -- A3 regression: the `.olean` of a directly imported toolchain module is fine, but a companion
+    -- part that `importModules` also reads is a symlink out of the sysroot / has a corrupted header.
+    let mkSys (name : String) : IO System.FilePath := do
+      let sys := dir / name
+      IO.FS.createDirAll (sys / "Init")
+      for ext in partExts do
+        let src := lib / "Init" / s!"Prelude.{ext}"
+        if ← entryExists src then IO.FS.writeBinFile (sys / "Init" / s!"Prelude.{ext}") (← IO.FS.readBinFile src)
+      return sys
+    let buildP := dir / "buildPrelude"
+    IO.FS.createDirAll buildP
+    let _ ← compileModule buildP `UsePrelude "prelude\nimport Init.Prelude\ndef up : Nat := 0\n" (some s!"{buildP}:{lib}")
+    IO.FS.removeFile (buildP / "UsePrelude.lean")
+    let sysSym ← mkSys "sysSym"
+    let outside := dir / "outsideSys"
+    IO.FS.createDirAll outside
+    let priv := sysSym / "Init" / "Prelude.olean.private"
+    IO.FS.writeBinFile (outside / "Prelude.olean.private") (← IO.FS.readBinFile priv)
+    IO.FS.removeFile priv
+    let ln ← IO.Process.output { cmd := "ln", args := #["-s", (outside / "Prelude.olean.private").toString, priv.toString] }
+    unless ln.exitCode == 0 do throw (IO.userError ln.stderr)
+    let ((), sSym) ← AuditM.run' (auditBuildLibrary buildP sysSym {} (some #[`UsePrelude]))
+    expect "T21 symlinked toolchain companion (.olean.private) rejected before importModules"
+      (sSym.importMs == 0 && sSym.modulesChecked == 0 &&
+       sSym.violations.any fun v => v.kind == .oleanOutsideApprovedRoot && v.decl == `Init.Prelude)
+      (renderAll sSym.violations)
+    let sysBad ← mkSys "sysBadIr"
+    let irPart := sysBad / "Init" / "Prelude.ir"
+    IO.FS.writeBinFile irPart (setByte (← IO.FS.readBinFile irPart) 0 0x4f)
+    let ((), sIr) ← AuditM.run' (auditBuildLibrary buildP sysBad {} (some #[`UsePrelude]))
+    expect "T21 corrupted toolchain companion (.ir) header rejected before importModules"
+      (sIr.importMs == 0 && sIr.modulesChecked == 0 &&
+       sIr.violations.any fun v => v.kind == .oleanHeaderInvalid && v.decl == `Init.Prelude)
+      (renderAll sIr.violations)
 
 /-! ## T22: large whole-module audits screen theorem bodies in every mode (A2 regression)
 
