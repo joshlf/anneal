@@ -810,6 +810,72 @@ structure SymProg : Type where
   stack : List SymSaved
   active : Option CapturedMir
 
+/-- Env-independent entry memory of a configuration. -/
+def symEntryMemory (cfg : SymConfig) : Memory :=
+  { nextAllocId := length cfg.body.allocations
+    globals := cfg.body.allocations
+    borrows := []
+    nextTag := 1
+    callees := cfg.callees
+    callStack := []
+    activeCallee := none
+    traitImpls := cfg.body.traitImpls }
+
+/-- Compatibility of an arbitrary base `Memory` with `cfg`: pure local,
+scalar, intrinsic, and inline-callee symbolic execution is invariant over
+arbitrary `nextAllocId`, `nextTag`, `nextProtector`, `callerLocals`, `fnPtrs`,
+`exposedAllocIds`, and `rootUnwindCeiling`, requiring only matching globals,
+callees, traitImpls, and empty borrow / protector / call-stack tables. -/
+def SymMemCompat (cfg : SymConfig) (base : Memory) : Prop :=
+  base.globals = cfg.body.allocations ∧
+  base.borrows = [] ∧
+  base.activeProtectors = [] ∧
+  base.callees = cfg.callees ∧
+  base.traitImpls = cfg.body.traitImpls ∧
+  base.callStack = [] ∧
+  base.activeCallee = none
+
+/-- Entry-memory compatibility for a `StatefulClaim`: when `cfg.callees` is
+non-empty, `initMachineStateWithMemoryAndCallees` installs `callees` and
+`traitImpls` automatically, so only empty borrow/protector/call-stack tables
+and matching `globals` are required. -/
+def SymStatefulMemCompat (cfg : SymConfig) (mem : Memory) : Prop :=
+  mem.globals = cfg.body.allocations ∧
+  mem.borrows = [] ∧
+  mem.activeProtectors = [] ∧
+  mem.callStack = [] ∧
+  mem.activeCallee = none ∧
+  (cfg.callees = [] → mem.callees = [] ∧ mem.traitImpls = cfg.body.traitImpls)
+
+/-- Memory actually installed at entry by `initMachineStateWithMemoryAndCallees`. -/
+def symStatefulInitMem (cfg : SymConfig) (mem : Memory) : Memory :=
+  match cfg.callees with
+  | [] => mem
+  | _ :: _ => { mem with callees := cfg.callees, traitImpls := cfg.body.traitImpls }
+
+theorem symMemCompat_entry (cfg : SymConfig) : SymMemCompat cfg (symEntryMemory cfg) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem symMemCompat_of_stateful {cfg : SymConfig} {mem : Memory}
+    (h : SymStatefulMemCompat cfg mem) :
+    SymMemCompat cfg (symStatefulInitMem cfg mem) := by
+  obtain ⟨hg, hb, hp, hcs, hac, hnil⟩ := h
+  obtain ⟨body, callees⟩ := cfg
+  cases callees with
+  | nil =>
+    obtain ⟨hc, ht⟩ := hnil rfl
+    exact ⟨hg, hb, hp, hc, ht, hcs, hac⟩
+  | cons _ _ =>
+    exact ⟨hg, hb, hp, rfl, rfl, hcs, hac⟩
+
+/-- Trusted memory denoted by a symbolic program over an arbitrary base memory. -/
+def SymProg.toMemoryOver (base : Memory) (env : SymEnv) (p : SymProg) : Memory :=
+  { base with callStack := symStackEval env p.stack, activeCallee := p.active }
+
+/-- Trusted machine state denoted by a symbolic program over an arbitrary base memory. -/
+def SymProg.toMachineStateOver (base : Memory) (env : SymEnv) (p : SymProg) : MachineState :=
+  { frame := p.frame.eval env, memory := p.toMemoryOver base env }
+
 /-- Trusted memory denoted by a symbolic program. -/
 def SymProg.toMemory (cfg : SymConfig) (env : SymEnv) (p : SymProg) : Memory :=
   { nextAllocId := length cfg.body.allocations
@@ -825,6 +891,12 @@ def SymProg.toMemory (cfg : SymConfig) (env : SymEnv) (p : SymProg) : Memory :=
 def SymProg.toMachineState (cfg : SymConfig) (env : SymEnv) (p : SymProg) :
     MachineState :=
   { frame := p.frame.eval env, memory := p.toMemory cfg env }
+
+theorem SymProg.toMemoryOver_entry (cfg : SymConfig) (env : SymEnv) (p : SymProg) :
+    p.toMemoryOver (symEntryMemory cfg) env = p.toMemory cfg env := rfl
+
+theorem SymProg.toMachineStateOver_entry (cfg : SymConfig) (env : SymEnv) (p : SymProg) :
+    p.toMachineStateOver (symEntryMemory cfg) env = p.toMachineState cfg env := rfl
 
 /-- Symbolic counterpart of `initLocalsAux` (by `List.foldr`). -/
 def symInitLocalsAux (n : Nat) (decls : List LocalDecl) (args : List SymVal) : List SymSlot :=
@@ -1124,7 +1196,8 @@ def SymFrame.advance (f : SymFrame) (locals' : List SymSlot) : SymFrame :=
 def symStmt (globals : List CapturedAllocation) (body : CapturedMir)
     (f : SymFrame) (stmt : Statement) : Option (SymFrame × List SymCond) :=
   match stmt.kind with
-  | .nop => some (f.advance f.locals, [])
+  | .nop | .coverage | .constEvalCounter | .backwardIncompatibleDropHint _ =>
+    some (f.advance f.locals, [])
   | .storageLive loc =>
     match get? f.locals loc with
     | some _ =>
@@ -1324,6 +1397,17 @@ def symTerm (cfg : SymConfig) (p : SymProg) (body : CapturedMir) (term : Termina
             | none => .stuck
           | _ :: _ => .stuck
     | _ => .stuck
+  | .drop place target _ =>
+    match place.projection with
+    | [] =>
+      match get? p.frame.locals place.local_ with
+      | some .dead => .stuck
+      | some _ =>
+        match set? p.frame.locals place.local_ .uninit with
+        | some locals' => .step (p.jump target locals') []
+        | none => .stuck
+      | none => .stuck
+    | _ :: _ => .stuck
   | .call func argOps destination (some targetBb) unwind =>
     match extractCalleeDefPath? func with
     | none => .stuck
@@ -1489,17 +1573,6 @@ structure SymBlockCtx (body : CapturedMir) : Type where
 def SymBlockCtx.ofBody (body : CapturedMir) : SymBlockCtx body :=
   { tree := Anneal.ParametricCore.Chunk8BlockTree.ofList body.basicBlocks
     valid := Anneal.ParametricCore.valid_chunk8BlockTree_ofList body.basicBlocks }
-
-/-- Env-independent entry memory of a configuration. -/
-def symEntryMemory (cfg : SymConfig) : Memory :=
-  { nextAllocId := length cfg.body.allocations
-    globals := cfg.body.allocations
-    borrows := []
-    nextTag := 1
-    callees := cfg.callees
-    callStack := []
-    activeCallee := none
-    traitImpls := cfg.body.traitImpls }
 
 /-! ## Part V: Denotation Lemmas -/
 
@@ -2963,151 +3036,137 @@ theorem symRvalue_sound {globals : List CapturedAllocation} {layouts : LayoutTab
           | concrete _ => nomatch h
   | _ => nomatch h
 
-theorem symStmt_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir} {stmt : Statement}
-    {f' : SymFrame} {cs : List SymCond}
+theorem symStmt_sound_over {cfg : SymConfig} {base : Memory} (hMem : SymMemCompat cfg base)
+    {p : SymProg} {body : CapturedMir} {stmt : Statement} {f' : SymFrame} {cs : List SymCond}
     (h : symStmt cfg.body.allocations body p.frame stmt = some (f', cs)) (env : SymEnv)
     (hc : condsHold env cs) :
-    evalStmt (p.toMachineState cfg env) stmt body.localDecls body.layouts =
-      MirStepNode.step ({ p with frame := f' }.toMachineState cfg env) := by
-  obtain ⟨kind, span⟩ := stmt
-  cases kind with
-  | nop =>
-    simp only [symStmt] at h
-    injection h with h
-    injection h with h1 _
-    subst h1
-    rfl
-  | storageLive loc =>
-    simp only [symStmt] at h
-    dsimp only [evalStmt, SymProg.toMachineState, SymFrame.eval]
-    rw [get?_symSlotsEval]
-    cases hg : get? p.frame.locals loc with
-    | none => rw [hg] at h; nomatch h
-    | some sl =>
-      rw [hg] at h
-      dsimp only at h
-      dsimp only [Option.map]
-      rw [set?_symSlotsEval_uninit]
-      cases hs : set? p.frame.locals loc .uninit with
-      | none => rw [hs] at h; nomatch h
-      | some l' =>
-        rw [hs] at h
-        injection h with h
-        injection h with h1 _
-        subst h1
-        rfl
-  | storageDead loc =>
-    simp only [symStmt] at h
-    dsimp only [evalStmt, SymProg.toMachineState, SymFrame.eval]
-    rw [get?_symSlotsEval]
-    cases hg : get? p.frame.locals loc with
-    | none => rw [hg] at h; nomatch h
-    | some sl =>
-      rw [hg] at h
-      dsimp only at h
-      dsimp only [Option.map]
-      rw [set?_symSlotsEval_dead]
-      cases hs : set? p.frame.locals loc .dead with
-      | none => rw [hs] at h; nomatch h
-      | some l' =>
-        rw [hs] at h
-        injection h with h
-        injection h with h1 _
-        subst h1
-        rfl
-  | deinit dst =>
-    obtain ⟨dloc, dproj⟩ := dst
-    cases dproj with
-    | cons _ _ => nomatch h
-    | nil =>
+    evalStmt (p.toMachineStateOver base env) stmt body.localDecls body.layouts =
+      MirStepNode.step ({ p with frame := f' }.toMachineStateOver base env) := by
+  cases base with
+  | mk nextAllocId globals borrows nextTag callees traitImpls callStack activeCallee
+       activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds rootUnwindCeiling =>
+    obtain ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩ := hMem
+    obtain ⟨kind, span⟩ := stmt
+    cases kind with
+    | nop | coverage | constEvalCounter | backwardIncompatibleDropHint _ =>
       simp only [symStmt] at h
-      dsimp only [evalStmt, SymProg.toMachineState, SymFrame.eval]
+      injection h with h
+      injection h with h1 _
+      subst h1
+      rfl
+    | storageLive loc =>
+      simp only [symStmt] at h
+      dsimp only [evalStmt, SymProg.toMachineStateOver, SymProg.toMemoryOver, SymFrame.eval]
       rw [get?_symSlotsEval]
-      cases hg : get? p.frame.locals dloc with
+      cases hg : get? p.frame.locals loc with
       | none => rw [hg] at h; nomatch h
       | some sl =>
         rw [hg] at h
-        cases sl with
-        | dead => nomatch h
-        | uninit =>
-          dsimp only at h
-          dsimp only [Option.map, SymSlot.eval]
-          rw [set?_symSlotsEval_uninit]
-          cases hs : set? p.frame.locals dloc .uninit with
-          | none => rw [hs] at h; nomatch h
-          | some l' =>
-            rw [hs] at h
-            injection h with h; injection h with h1 _
-            subst h1
-            rfl
-        | init _ =>
-          dsimp only at h
-          dsimp only [Option.map, SymSlot.eval]
-          rw [set?_symSlotsEval_uninit]
-          cases hs : set? p.frame.locals dloc .uninit with
-          | none => rw [hs] at h; nomatch h
-          | some l' =>
-            rw [hs] at h
-            injection h with h; injection h with h1 _
-            subst h1
-            rfl
-  | assign dst rv =>
-    obtain ⟨dloc, dproj⟩ := dst
-    cases dproj with
-    | cons _ _ => nomatch h
-    | nil =>
-      simp only [symStmt] at h
-      cases hr : symRvalue cfg.body.allocations body.layouts body.localDecls p.frame.locals rv with
-      | none => rw [hr] at h; nomatch h
-      | some r =>
-        obtain ⟨v, locals₁, cs'⟩ := r
-        rw [hr] at h
         dsimp only at h
-        cases hg : get? locals₁ dloc with
+        dsimp only [Option.map]
+        rw [set?_symSlotsEval_uninit]
+        cases hs : set? p.frame.locals loc .uninit with
+        | none => rw [hs] at h; nomatch h
+        | some l' =>
+          rw [hs] at h
+          injection h with h
+          injection h with h1 _
+          subst h1
+          rfl
+    | storageDead loc =>
+      simp only [symStmt] at h
+      dsimp only [evalStmt, SymProg.toMachineStateOver, SymProg.toMemoryOver, SymFrame.eval]
+      rw [get?_symSlotsEval]
+      cases hg : get? p.frame.locals loc with
+      | none => rw [hg] at h; nomatch h
+      | some sl =>
+        rw [hg] at h
+        dsimp only at h
+        dsimp only [Option.map]
+        rw [set?_symSlotsEval_dead]
+        cases hs : set? p.frame.locals loc .dead with
+        | none => rw [hs] at h; nomatch h
+        | some l' =>
+          rw [hs] at h
+          injection h with h
+          injection h with h1 _
+          subst h1
+          rfl
+    | deinit dst =>
+      obtain ⟨dloc, dproj⟩ := dst
+      cases dproj with
+      | cons _ _ => nomatch h
+      | nil =>
+        simp only [symStmt] at h
+        dsimp only [evalStmt, SymProg.toMachineStateOver, SymProg.toMemoryOver, SymFrame.eval]
+        rw [get?_symSlotsEval]
+        cases hg : get? p.frame.locals dloc with
         | none => rw [hg] at h; nomatch h
         | some sl =>
           rw [hg] at h
           cases sl with
           | dead => nomatch h
-          | uninit =>
+          | uninit | init _ =>
             dsimp only at h
-            cases hs : set? locals₁ dloc (.init v) with
+            dsimp only [Option.map, SymSlot.eval]
+            rw [set?_symSlotsEval_uninit]
+            cases hs : set? p.frame.locals dloc .uninit with
             | none => rw [hs] at h; nomatch h
-            | some l₂ =>
+            | some l' =>
               rw [hs] at h
-              injection h with h
-              injection h with h1 hcs
+              injection h with h; injection h with h1 _
               subst h1
-              subst hcs
-              have hEval := symRvalue_sound hr env hc (p.toMemory cfg env) rfl rfl
-              dsimp only [evalStmt]
-              rw [show (p.toMachineState cfg env).frame.locals = symSlotsEval env p.frame.locals from rfl,
-                show (p.toMachineState cfg env).memory = p.toMemory cfg env from rfl, hEval]
-              dsimp only
-              rw [get?_symSlotsEval, hg]
-              dsimp only [Option.map, SymSlot.eval]
-              rw [set?_symSlotsEval_init, hs]
               rfl
-          | init w =>
-            dsimp only at h
-            cases hs : set? locals₁ dloc (.init v) with
-            | none => rw [hs] at h; nomatch h
-            | some l₂ =>
-              rw [hs] at h
-              injection h with h
-              injection h with h1 hcs
-              subst h1
-              subst hcs
-              have hEval := symRvalue_sound hr env hc (p.toMemory cfg env) rfl rfl
-              dsimp only [evalStmt]
-              rw [show (p.toMachineState cfg env).frame.locals = symSlotsEval env p.frame.locals from rfl,
-                show (p.toMachineState cfg env).memory = p.toMemory cfg env from rfl, hEval]
-              dsimp only
-              rw [get?_symSlotsEval, hg]
-              dsimp only [Option.map, SymSlot.eval]
-              rw [set?_symSlotsEval_init, hs]
-              rfl
-  | _ => nomatch h
+    | assign dst rv =>
+      obtain ⟨dloc, dproj⟩ := dst
+      cases dproj with
+      | cons _ _ => nomatch h
+      | nil =>
+        simp only [symStmt] at h
+        cases hr : symRvalue cfg.body.allocations body.layouts body.localDecls p.frame.locals rv with
+        | none => rw [hr] at h; nomatch h
+        | some r =>
+          obtain ⟨v, locals₁, cs'⟩ := r
+          rw [hr] at h
+          dsimp only at h
+          cases hg : get? locals₁ dloc with
+          | none => rw [hg] at h; nomatch h
+          | some sl =>
+            rw [hg] at h
+            cases sl with
+            | dead => nomatch h
+            | uninit | init _ =>
+              dsimp only at h
+              cases hs : set? locals₁ dloc (.init v) with
+              | none => rw [hs] at h; nomatch h
+              | some l₂ =>
+                rw [hs] at h
+                injection h with h
+                injection h with h1 hcs
+                subst h1
+                subst hcs
+                let m0 : Memory :=
+                  ⟨nextAllocId, cfg.body.allocations, [], nextTag, cfg.callees, cfg.body.traitImpls,
+                    [], none, [], nextProtector, callerLocals, fnPtrs, exposedAllocIds,
+                    rootUnwindCeiling⟩
+                have hEval := symRvalue_sound hr env hc (p.toMemoryOver m0 env) rfl rfl
+                dsimp only [evalStmt]
+                rw [show (p.toMachineStateOver m0 env).frame.locals = symSlotsEval env p.frame.locals from rfl,
+                  show (p.toMachineStateOver m0 env).memory = p.toMemoryOver m0 env from rfl, hEval]
+                dsimp only
+                rw [get?_symSlotsEval, hg]
+                dsimp only [Option.map, SymSlot.eval]
+                rw [set?_symSlotsEval_init, hs]
+                rfl
+    | _ => nomatch h
+
+theorem symStmt_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir} {stmt : Statement}
+    {f' : SymFrame} {cs : List SymCond}
+    (h : symStmt cfg.body.allocations body p.frame stmt = some (f', cs)) (env : SymEnv)
+    (hc : condsHold env cs) :
+    evalStmt (p.toMachineState cfg env) stmt body.localDecls body.layouts =
+      MirStepNode.step ({ p with frame := f' }.toMachineState cfg env) :=
+  symStmt_sound_over (symMemCompat_entry cfg) h env hc
 
 /-! ## Part VII: Side Conditions Imply Trusted Intrinsic Definedness -/
 
@@ -3656,211 +3715,250 @@ theorem evalDirectRustIntrinsic?_of_sym {kind : RustIntrinsicKind}
   rw [hk]
   cases kind <;> first | rfl | nomatch hi
 
+theorem symTerm_step_sound_obs_over {cfg : SymConfig} {base : Memory}
+    (hMem : SymMemCompat cfg base) {p : SymProg} {body : CapturedMir}
+    {term : Terminator} {p' : SymProg} {cs : List SymCond}
+    (h : symTerm cfg p body term = .step p' cs) (env : SymEnv) (hc : condsHold env cs) :
+    evalTerminator (p.toMachineStateOver base env) term (some body) =
+      MirStepNode.emitStep ((symTermObs cfg p body term).eval env)
+        (p'.toMachineStateOver base env) := by
+  cases base with
+  | mk nextAllocId globals borrows nextTag callees traitImpls callStack activeCallee
+       activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds rootUnwindCeiling =>
+    obtain ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩ := hMem
+    obtain ⟨kind, span⟩ := term
+    cases kind with
+    | goto t =>
+      simp only [symTerm] at h
+      injection h with h1 _
+      subst h1
+      rfl
+    | switchInt discr targets =>
+      simp only [symTerm] at h
+      cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals discr with
+      | none => rw [ho] at h; nomatch h
+      | some r =>
+        obtain ⟨v, locals'⟩ := r
+        rw [ho] at h
+        dsimp only at h
+        cases ha : v.asScalar? with
+        | none => rw [ha] at h; nomatch h
+        | some a =>
+          rw [ha] at h
+          dsimp only at h
+          cases hk : a.asConst? with
+          | none => rw [hk] at h; nomatch h
+          | some sc =>
+            rw [hk] at h
+            injection h with h1 _
+            subst h1
+            have hobs : symTermObs cfg p body { kind := .switchInt discr targets, span := span } =
+                .event a := by
+              simp only [symTermObs, ho, ha]
+            rw [hobs]
+            dsimp only [evalTerminator, SymProg.toMachineStateOver, SymProg.toMemoryOver,
+              SymFrame.eval, bodyLocalDeclsOf, SymObs.eval]
+            rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env,
+              symScalar_eval_of_asConst hk env]
+            rfl
+    | assert cond expected target unwind =>
+      simp only [symTerm] at h
+      cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals cond with
+      | none => rw [ho] at h; nomatch h
+      | some r =>
+        obtain ⟨v, locals'⟩ := r
+        rw [ho] at h
+        dsimp only at h
+        cases ha : v.asScalar? with
+        | none => rw [ha] at h; nomatch h
+        | some c =>
+          rw [ha] at h
+          injection h with h1 h2
+          subst h1
+          subst h2
+          dsimp only [evalTerminator, SymProg.toMachineStateOver, SymProg.toMemoryOver,
+            SymFrame.eval, bodyLocalDeclsOf]
+          rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env]
+          show _ = MirStepNode.emitStep MirObs.silent _
+          cases expected with
+          | true =>
+            have h1 : (c.eval env).bits = 1 := hc.1
+            dsimp only
+            rw [nat_beq_true_of_eq h1]
+            rfl
+          | false =>
+            have h1 : (c.eval env).bits = 0 := hc.1
+            dsimp only
+            rw [nat_beq_true_of_eq h1]
+            rfl
+    | return_ =>
+      simp only [symTerm] at h
+      cases hg : get? p.frame.locals 0 with
+      | none => rw [hg] at h; nomatch h
+      | some sl =>
+        rw [hg] at h
+        cases sl with
+        | dead => nomatch h
+        | uninit => nomatch h
+        | init v =>
+          dsimp only at h
+          cases hu : v.containsUninit with
+          | true => rw [hu] at h; nomatch h
+          | false =>
+            rw [hu] at h
+            dsimp only at h
+            cases hs : p.stack with
+            | nil => rw [hs] at h; nomatch h
+            | cons caller rest =>
+              rw [hs] at h
+              obtain ⟨cb, cf, ⟨dloc, dproj⟩, rt, ru⟩ := caller
+              cases dproj with
+              | cons _ _ => nomatch h
+              | nil =>
+                dsimp only at h
+                cases hg2 : get? cf.locals dloc with
+                | none => rw [hg2] at h; nomatch h
+                | some sl2 =>
+                  rw [hg2] at h
+                  cases sl2 with
+                  | dead => nomatch h
+                  | uninit | init _ =>
+                    dsimp only at h
+                    cases hw : set? cf.locals dloc (.init v) with
+                    | none => rw [hw] at h; nomatch h
+                    | some l' =>
+                      rw [hw] at h
+                      injection h with h1 _
+                      subst h1
+                      show _ = MirStepNode.emitStep MirObs.silent _
+                      simp only [evalTerminator, SymProg.toMachineStateOver, SymProg.toMemoryOver,
+                        SymFrame.eval, get?_symSlotsEval, hg, Option.map, SymSlot.eval,
+                        hasFrameDeallocProtectorConflict, disableFrameBorrows, hs, symStackEval_cons,
+                        SymSaved.eval, valueContainsUninit_symVal, hu, restoreCallerProtectors,
+                        writeReturnDestination, hg2, hasProtectedWriteConflict,
+                        set?_symSlotsEval_init, hw, invalidateConflictingBorrows]
+                      rfl
+    | drop place target unwind =>
+      obtain ⟨dloc, dproj⟩ := place
+      cases dproj with
+      | cons _ _ => nomatch h
+      | nil =>
+        simp only [symTerm] at h
+        cases hg : get? p.frame.locals dloc with
+        | none => rw [hg] at h; nomatch h
+        | some sl =>
+          rw [hg] at h
+          cases sl with
+          | dead => nomatch h
+          | uninit | init _ =>
+            dsimp only at h
+            cases hw : set? p.frame.locals dloc .uninit with
+            | none => rw [hw] at h; nomatch h
+            | some l' =>
+              rw [hw] at h
+              injection h with h1 _
+              subst h1
+              show _ = MirStepNode.emitStep MirObs.silent _
+              simp only [evalTerminator, SymProg.toMachineStateOver, SymProg.toMemoryOver,
+                SymFrame.eval, get?_symSlotsEval, hg, Option.map, SymSlot.eval,
+                set?_symSlotsEval_uninit, hw, invalidateConflictingBorrows]
+              rfl
+    | call func argOps destination target unwind =>
+      cases target with
+      | none => nomatch h
+      | some targetBb =>
+        simp only [symTerm] at h
+        cases hf : extractCalleeDefPath? func with
+        | none => rw [hf] at h; nomatch h
+        | some defPath =>
+          rw [hf] at h
+          dsimp only at h
+          cases ho : symOperands cfg.body.allocations body.layouts body.localDecls p.frame.locals argOps with
+          | none => rw [ho] at h; nomatch h
+          | some r =>
+            obtain ⟨args, locals'⟩ := r
+            rw [ho] at h
+            dsimp only at h
+            cases hl : lookupCallee cfg.callees body.layouts defPath (extractCalleeTypeArgs func)
+                cfg.body.traitImpls with
+            | some calleeBody =>
+              rw [hl] at h
+              injection h with h1 _
+              subst h1
+              show _ = MirStepNode.emitStep MirObs.silent _
+              simp only [evalTerminator, SymProg.toMachineStateOver, SymProg.toMemoryOver,
+                SymFrame.eval, resolveCallTarget, hf, bodyLocalDeclsOf]
+              rw [symOperands_sound env _ _ _ ho]
+              simp only [hl, checkCalleeTargetCompatible_direct, pushCalleeFrame, initLocals,
+                ← symSlotsEval_symInitLocalsAux]
+              rfl
+            | none =>
+              rw [hl] at h
+              dsimp only at h
+              cases hx : isDirectExactDivTarget
+                  { defPath := defPath, typeArgs := extractCalleeTypeArgs func, fnSig := none,
+                    isIndirect := false } with
+              | true => rw [hx] at h; nomatch h
+              | false =>
+                rw [hx] at h
+                dsimp only at h
+                cases hk : classifyRustIntrinsic? defPath with
+                | none => rw [hk] at h; nomatch h
+                | some kind =>
+                  rw [hk] at h
+                  dsimp only at h
+                  cases hi : symIntrinsic kind
+                      { defPath := defPath, typeArgs := extractCalleeTypeArgs func, fnSig := none,
+                        isIndirect := false } body.localDecls body.layouts argOps args with
+                  | none => rw [hi] at h; nomatch h
+                  | some rr =>
+                    obtain ⟨res, cs'⟩ := rr
+                    rw [hi] at h
+                    dsimp only at h
+                    obtain ⟨dloc, dproj⟩ := destination
+                    cases dproj with
+                    | cons _ _ => nomatch h
+                    | nil =>
+                      dsimp only at h
+                      cases hg : get? locals' dloc with
+                      | none => rw [hg] at h; nomatch h
+                      | some sl =>
+                        rw [hg] at h
+                        cases sl with
+                        | dead => nomatch h
+                        | uninit | init _ =>
+                          dsimp only at h
+                          cases hw : set? locals' dloc (.init (.scalar res)) with
+                          | none => rw [hw] at h; nomatch h
+                          | some l₂ =>
+                            rw [hw] at h
+                            injection h with h1 h2
+                            subst h1
+                            subst h2
+                            show _ = MirStepNode.emitStep MirObs.silent _
+                            simp only [evalTerminator, SymProg.toMachineStateOver,
+                              SymProg.toMemoryOver, SymFrame.eval, resolveCallTarget, hf,
+                              bodyLocalDeclsOf]
+                            rw [symOperands_sound env _ _ _ ho]
+                            simp only [hl, hx]
+                            rw [evalDirectRustIntrinsic?_of_sym hk hi]
+                            dsimp only
+                            rw [symIntrinsic_sound hi env hc]
+                            simp only [writeIntrinsicReturn, writePlaceValue, get?_symSlotsEval, hg,
+                              Option.map, SymSlot.eval, invalidateDirectDestWriteBorrows]
+                            rw [show (LocalSlot.init (Value.scalar (res.eval env))) =
+                              SymSlot.eval env (.init (.scalar res)) from rfl,
+                              set?_symSlotsEval, hw]
+                            rfl
+    | _ => nomatch h
+
 theorem symTerm_step_sound_obs {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
     {term : Terminator} {p' : SymProg} {cs : List SymCond}
     (h : symTerm cfg p body term = .step p' cs) (env : SymEnv) (hc : condsHold env cs) :
     evalTerminator (p.toMachineState cfg env) term (some body) =
       MirStepNode.emitStep ((symTermObs cfg p body term).eval env)
-        (p'.toMachineState cfg env) := by
-  obtain ⟨kind, span⟩ := term
-  cases kind with
-  | goto t =>
-    simp only [symTerm] at h
-    injection h with h1 _
-    subst h1
-    rfl
-  | switchInt discr targets =>
-    simp only [symTerm] at h
-    cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals discr with
-    | none => rw [ho] at h; nomatch h
-    | some r =>
-      obtain ⟨v, locals'⟩ := r
-      rw [ho] at h
-      dsimp only at h
-      cases ha : v.asScalar? with
-      | none => rw [ha] at h; nomatch h
-      | some a =>
-        rw [ha] at h
-        dsimp only at h
-        cases hk : a.asConst? with
-        | none => rw [hk] at h; nomatch h
-        | some sc =>
-          rw [hk] at h
-          injection h with h1 _
-          subst h1
-          have hobs : symTermObs cfg p body { kind := .switchInt discr targets, span := span } =
-              .event a := by
-            simp only [symTermObs, ho, ha]
-          rw [hobs]
-          dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval,
-            bodyLocalDeclsOf, SymObs.eval]
-          rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env,
-            symScalar_eval_of_asConst hk env]
-          rfl
-  | assert cond expected target unwind =>
-    simp only [symTerm] at h
-    cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals cond with
-    | none => rw [ho] at h; nomatch h
-    | some r =>
-      obtain ⟨v, locals'⟩ := r
-      rw [ho] at h
-      dsimp only at h
-      cases ha : v.asScalar? with
-      | none => rw [ha] at h; nomatch h
-      | some c =>
-        rw [ha] at h
-        injection h with h1 h2
-        subst h1
-        subst h2
-        dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval,
-          bodyLocalDeclsOf]
-        rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env]
-        show _ = MirStepNode.emitStep MirObs.silent _
-        cases expected with
-        | true =>
-          have h1 : (c.eval env).bits = 1 := hc.1
-          dsimp only
-          rw [nat_beq_true_of_eq h1]
-          rfl
-        | false =>
-          have h1 : (c.eval env).bits = 0 := hc.1
-          dsimp only
-          rw [nat_beq_true_of_eq h1]
-          rfl
-  | return_ =>
-    simp only [symTerm] at h
-    cases hg : get? p.frame.locals 0 with
-    | none => rw [hg] at h; nomatch h
-    | some sl =>
-      rw [hg] at h
-      cases sl with
-      | dead => nomatch h
-      | uninit => nomatch h
-      | init v =>
-        dsimp only at h
-        cases hu : v.containsUninit with
-        | true => rw [hu] at h; nomatch h
-        | false =>
-          rw [hu] at h
-          dsimp only at h
-          cases hs : p.stack with
-          | nil => rw [hs] at h; nomatch h
-          | cons caller rest =>
-            rw [hs] at h
-            obtain ⟨cb, cf, ⟨dloc, dproj⟩, rt, ru⟩ := caller
-            cases dproj with
-            | cons _ _ => nomatch h
-            | nil =>
-              dsimp only at h
-              cases hg2 : get? cf.locals dloc with
-              | none => rw [hg2] at h; nomatch h
-              | some sl2 =>
-                rw [hg2] at h
-                cases sl2 with
-                | dead => nomatch h
-                | uninit | init _ =>
-                  dsimp only at h
-                  cases hw : set? cf.locals dloc (.init v) with
-                  | none => rw [hw] at h; nomatch h
-                  | some l' =>
-                    rw [hw] at h
-                    injection h with h1 _
-                    subst h1
-                    show _ = MirStepNode.emitStep MirObs.silent _
-                    simp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory,
-                      SymFrame.eval, get?_symSlotsEval, hg, Option.map, SymSlot.eval,
-                      hasFrameDeallocProtectorConflict, disableFrameBorrows, hs, symStackEval_cons,
-                      SymSaved.eval, valueContainsUninit_symVal, hu, restoreCallerProtectors,
-                      writeReturnDestination, hg2, hasProtectedWriteConflict,
-                      set?_symSlotsEval_init, hw, invalidateConflictingBorrows]
-                    rfl
-  | call func argOps destination target unwind =>
-    cases target with
-    | none => nomatch h
-    | some targetBb =>
-      simp only [symTerm] at h
-      cases hf : extractCalleeDefPath? func with
-      | none => rw [hf] at h; nomatch h
-      | some defPath =>
-        rw [hf] at h
-        dsimp only at h
-        cases ho : symOperands cfg.body.allocations body.layouts body.localDecls p.frame.locals argOps with
-        | none => rw [ho] at h; nomatch h
-        | some r =>
-          obtain ⟨args, locals'⟩ := r
-          rw [ho] at h
-          dsimp only at h
-          cases hl : lookupCallee cfg.callees body.layouts defPath (extractCalleeTypeArgs func)
-              cfg.body.traitImpls with
-          | some calleeBody =>
-            rw [hl] at h
-            injection h with h1 _
-            subst h1
-            show _ = MirStepNode.emitStep MirObs.silent _
-            simp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval,
-              resolveCallTarget, hf, bodyLocalDeclsOf]
-            rw [symOperands_sound env _ _ _ ho]
-            simp only [hl, checkCalleeTargetCompatible_direct, pushCalleeFrame, initLocals,
-              ← symSlotsEval_symInitLocalsAux]
-            rfl
-          | none =>
-            rw [hl] at h
-            dsimp only at h
-            cases hx : isDirectExactDivTarget
-                { defPath := defPath, typeArgs := extractCalleeTypeArgs func, fnSig := none,
-                  isIndirect := false } with
-            | true => rw [hx] at h; nomatch h
-            | false =>
-              rw [hx] at h
-              dsimp only at h
-              cases hk : classifyRustIntrinsic? defPath with
-              | none => rw [hk] at h; nomatch h
-              | some kind =>
-                rw [hk] at h
-                dsimp only at h
-                cases hi : symIntrinsic kind
-                    { defPath := defPath, typeArgs := extractCalleeTypeArgs func, fnSig := none,
-                      isIndirect := false } body.localDecls body.layouts argOps args with
-                | none => rw [hi] at h; nomatch h
-                | some rr =>
-                  obtain ⟨res, cs'⟩ := rr
-                  rw [hi] at h
-                  dsimp only at h
-                  obtain ⟨dloc, dproj⟩ := destination
-                  cases dproj with
-                  | cons _ _ => nomatch h
-                  | nil =>
-                    dsimp only at h
-                    cases hg : get? locals' dloc with
-                    | none => rw [hg] at h; nomatch h
-                    | some sl =>
-                      rw [hg] at h
-                      cases sl with
-                      | dead => nomatch h
-                      | uninit | init _ =>
-                        dsimp only at h
-                        cases hw : set? locals' dloc (.init (.scalar res)) with
-                        | none => rw [hw] at h; nomatch h
-                        | some l₂ =>
-                          rw [hw] at h
-                          injection h with h1 h2
-                          subst h1
-                          subst h2
-                          show _ = MirStepNode.emitStep MirObs.silent _
-                          simp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory,
-                            SymFrame.eval, resolveCallTarget, hf, bodyLocalDeclsOf]
-                          rw [symOperands_sound env _ _ _ ho]
-                          simp only [hl, hx]
-                          rw [evalDirectRustIntrinsic?_of_sym hk hi]
-                          dsimp only
-                          rw [symIntrinsic_sound hi env hc]
-                          simp only [writeIntrinsicReturn, writePlaceValue, get?_symSlotsEval, hg,
-                            Option.map, SymSlot.eval, invalidateDirectDestWriteBorrows]
-                          rw [show (LocalSlot.init (Value.scalar (res.eval env))) =
-                            SymSlot.eval env (.init (.scalar res)) from rfl,
-                            set?_symSlotsEval, hw]
-                          rfl
-  | _ => nomatch h
+        (p'.toMachineState cfg env) :=
+  symTerm_step_sound_obs_over (symMemCompat_entry cfg) h env hc
 
 /-- Single-step terminator soundness (existential observation form). -/
 theorem symTerm_step_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
@@ -3870,60 +3968,80 @@ theorem symTerm_step_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
       MirStepNode.emitStep obs (p'.toMachineState cfg env) :=
   ⟨_, symTerm_step_sound_obs h env hc⟩
 
+theorem symTerm_ret_sound_over {cfg : SymConfig} {base : Memory}
+    (hMem : SymMemCompat cfg base) {p : SymProg} {body : CapturedMir}
+    {term : Terminator} {v : SymVal} {fin : SymProg} {cs : List SymCond}
+    (h : symTerm cfg p body term = .ret v fin cs) (env : SymEnv) :
+    fin = p ∧ cs = [] ∧
+      evalTerminator (p.toMachineStateOver base env) term (some body) =
+        MirStepNode.retNormal (v.eval env) (p.toMachineStateOver base env).memory := by
+  cases base with
+  | mk nextAllocId globals borrows nextTag callees traitImpls callStack activeCallee
+       activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds rootUnwindCeiling =>
+    obtain ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩ := hMem
+    obtain ⟨kind, span⟩ := term
+    cases kind with
+    | return_ =>
+      simp only [symTerm] at h
+      cases hg : get? p.frame.locals 0 with
+      | none => rw [hg] at h; nomatch h
+      | some sl =>
+        rw [hg] at h
+        cases sl with
+        | dead => nomatch h
+        | uninit => nomatch h
+        | init w =>
+          dsimp only at h
+          cases hu : w.containsUninit with
+          | true => rw [hu] at h; nomatch h
+          | false =>
+            rw [hu] at h
+            dsimp only at h
+            cases hs : p.stack with
+            | cons caller rest =>
+              rw [hs] at h
+              dsimp only at h
+              repeat' (first | contradiction | split at h)
+            | nil =>
+              rw [hs] at h
+              injection h with h1 h2 h3
+              subst h1
+              subst h2
+              subst h3
+              refine ⟨rfl, rfl, ?_⟩
+              simp only [evalTerminator, SymProg.toMachineStateOver, SymProg.toMemoryOver,
+                SymFrame.eval, get?_symSlotsEval, hg, Option.map, SymSlot.eval,
+                hasFrameDeallocProtectorConflict, disableFrameBorrows, hs, symStackEval_nil,
+                valueContainsUninit_symVal, hu]
+    | goto _ => nomatch h
+    | switchInt _ _ =>
+      simp only [symTerm] at h
+      repeat' (first | contradiction | split at h)
+    | assert _ _ _ _ =>
+      simp only [symTerm] at h
+      repeat' (first | contradiction | split at h)
+    | drop place _ _ =>
+      obtain ⟨_, dproj⟩ := place
+      cases dproj with
+      | cons _ _ => nomatch h
+      | nil =>
+        simp only [symTerm] at h
+        repeat' (first | contradiction | split at h)
+    | call _ _ _ target _ =>
+      cases target with
+      | none => nomatch h
+      | some _ =>
+        simp only [symTerm] at h
+        repeat' (first | contradiction | split at h)
+    | _ => nomatch h
+
 theorem symTerm_ret_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
     {term : Terminator} {v : SymVal} {fin : SymProg} {cs : List SymCond}
     (h : symTerm cfg p body term = .ret v fin cs) (env : SymEnv) :
     fin = p ∧ cs = [] ∧
       evalTerminator (p.toMachineState cfg env) term (some body) =
-        MirStepNode.retNormal (v.eval env) (p.toMachineState cfg env).memory := by
-  obtain ⟨kind, span⟩ := term
-  cases kind with
-  | return_ =>
-    simp only [symTerm] at h
-    cases hg : get? p.frame.locals 0 with
-    | none => rw [hg] at h; nomatch h
-    | some sl =>
-      rw [hg] at h
-      cases sl with
-      | dead => nomatch h
-      | uninit => nomatch h
-      | init w =>
-        dsimp only at h
-        cases hu : w.containsUninit with
-        | true => rw [hu] at h; nomatch h
-        | false =>
-          rw [hu] at h
-          dsimp only at h
-          cases hs : p.stack with
-          | cons caller rest =>
-            rw [hs] at h
-            dsimp only at h
-            repeat' (first | contradiction | split at h)
-          | nil =>
-            rw [hs] at h
-            injection h with h1 h2 h3
-            subst h1
-            subst h2
-            subst h3
-            refine ⟨rfl, rfl, ?_⟩
-            simp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory,
-              SymFrame.eval, get?_symSlotsEval, hg, Option.map, SymSlot.eval,
-              hasFrameDeallocProtectorConflict, disableFrameBorrows, hs, symStackEval_nil,
-              valueContainsUninit_symVal, hu]
-  | goto _ => nomatch h
-  | switchInt _ _ =>
-    simp only [symTerm] at h
-    repeat' (first | contradiction | split at h)
-  | assert _ _ _ _ =>
-    simp only [symTerm] at h
-    repeat' (first | contradiction | split at h)
-  | call _ _ _ target _ =>
-    cases target with
-    | none => nomatch h
-    | some _ =>
-      simp only [symTerm] at h
-      repeat' (first | contradiction | split at h)
-  | _ => nomatch h
+        MirStepNode.retNormal (v.eval env) (p.toMachineState cfg env).memory :=
+  symTerm_ret_sound_over (symMemCompat_entry cfg) h env
 
 theorem symSwitchAlts_sound (p : SymProg) (d : SymScalar) (l : List SymSlot)
     (o : BasicBlockIdx) (env : SymEnv) :
@@ -3954,61 +4072,81 @@ theorem symSwitchAlts_sound (p : SymProg) (d : SymScalar) (l : List SymSlot)
           | true => t | false => lookupSwitchTarget (d.eval env).bits rest o) l
       rw [nat_beq_false_of_ne hne]
 
+theorem symTerm_branch_sound_obs_over {cfg : SymConfig} {base : Memory}
+    (hMem : SymMemCompat cfg base) {p : SymProg} {body : CapturedMir}
+    {term : Terminator} {alts : List (SymCond × SymProg)} {cs : List SymCond}
+    (h : symTerm cfg p body term = .branch alts cs) (env : SymEnv) :
+    cs = [] ∧ ∀ c q, (c, q) ∈ alts → c.holds env →
+      evalTerminator (p.toMachineStateOver base env) term (some body) =
+        MirStepNode.emitStep ((symTermObs cfg p body term).eval env)
+          (q.toMachineStateOver base env) := by
+  cases base with
+  | mk nextAllocId globals borrows nextTag callees traitImpls callStack activeCallee
+       activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds rootUnwindCeiling =>
+    obtain ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩ := hMem
+    obtain ⟨kind, span⟩ := term
+    cases kind with
+    | switchInt discr targets =>
+      simp only [symTerm] at h
+      cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals discr with
+      | none => rw [ho] at h; nomatch h
+      | some r =>
+        obtain ⟨v, locals'⟩ := r
+        rw [ho] at h
+        dsimp only at h
+        cases ha : v.asScalar? with
+        | none => rw [ha] at h; nomatch h
+        | some a =>
+          rw [ha] at h
+          dsimp only at h
+          cases hk : a.asConst? with
+          | some sc => rw [hk] at h; nomatch h
+          | none =>
+            rw [hk] at h
+            injection h with h1 h2
+            subst h1
+            subst h2
+            refine ⟨rfl, fun c q hm hh => ?_⟩
+            obtain ⟨_, hq⟩ := symSwitchAlts_sound p a locals' targets.otherwise env [] _ c q hm hh
+            subst hq
+            have hobs : symTermObs cfg p body { kind := .switchInt discr targets, span := span } =
+                .event a := by
+              simp only [symTermObs, ho, ha]
+            rw [hobs]
+            dsimp only [evalTerminator, SymProg.toMachineStateOver, SymProg.toMemoryOver,
+              SymFrame.eval, bodyLocalDeclsOf, SymObs.eval]
+            rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env]
+            rfl
+    | goto _ => nomatch h
+    | return_ =>
+      simp only [symTerm] at h
+      repeat' (first | contradiction | split at h)
+    | assert _ _ _ _ =>
+      simp only [symTerm] at h
+      repeat' (first | contradiction | split at h)
+    | drop place _ _ =>
+      obtain ⟨_, dproj⟩ := place
+      cases dproj with
+      | cons _ _ => nomatch h
+      | nil =>
+        simp only [symTerm] at h
+        repeat' (first | contradiction | split at h)
+    | call _ _ _ target _ =>
+      cases target with
+      | none => nomatch h
+      | some _ =>
+        simp only [symTerm] at h
+        repeat' (first | contradiction | split at h)
+    | _ => nomatch h
+
 theorem symTerm_branch_sound_obs {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
     {term : Terminator} {alts : List (SymCond × SymProg)} {cs : List SymCond}
     (h : symTerm cfg p body term = .branch alts cs) (env : SymEnv) :
     cs = [] ∧ ∀ c q, (c, q) ∈ alts → c.holds env →
       evalTerminator (p.toMachineState cfg env) term (some body) =
         MirStepNode.emitStep ((symTermObs cfg p body term).eval env)
-          (q.toMachineState cfg env) := by
-  obtain ⟨kind, span⟩ := term
-  cases kind with
-  | switchInt discr targets =>
-    simp only [symTerm] at h
-    cases ho : symOperand cfg.body.allocations body.layouts body.localDecls p.frame.locals discr with
-    | none => rw [ho] at h; nomatch h
-    | some r =>
-      obtain ⟨v, locals'⟩ := r
-      rw [ho] at h
-      dsimp only at h
-      cases ha : v.asScalar? with
-      | none => rw [ha] at h; nomatch h
-      | some a =>
-        rw [ha] at h
-        dsimp only at h
-        cases hk : a.asConst? with
-        | some sc => rw [hk] at h; nomatch h
-        | none =>
-          rw [hk] at h
-          injection h with h1 h2
-          subst h1
-          subst h2
-          refine ⟨rfl, fun c q hm hh => ?_⟩
-          obtain ⟨_, hq⟩ := symSwitchAlts_sound p a locals' targets.otherwise env [] _ c q hm hh
-          subst hq
-          have hobs : symTermObs cfg p body { kind := .switchInt discr targets, span := span } =
-              .event a := by
-            simp only [symTermObs, ho, ha]
-          rw [hobs]
-          dsimp only [evalTerminator, SymProg.toMachineState, SymProg.toMemory, SymFrame.eval,
-            bodyLocalDeclsOf, SymObs.eval]
-          rw [symOperand_bodyCast_sound ho env, symVal_eval_of_asScalar ha env]
-          rfl
-  | goto _ => nomatch h
-  | return_ =>
-    simp only [symTerm] at h
-    repeat' (first | contradiction | split at h)
-  | assert _ _ _ _ =>
-    simp only [symTerm] at h
-    repeat' (first | contradiction | split at h)
-  | call _ _ _ target _ =>
-    cases target with
-    | none => nomatch h
-    | some _ =>
-      simp only [symTerm] at h
-      repeat' (first | contradiction | split at h)
-  | _ => nomatch h
-
+          (q.toMachineState cfg env) :=
+  symTerm_branch_sound_obs_over (symMemCompat_entry cfg) h env
 
 /-- Fork soundness (existential observation form). -/
 theorem symTerm_branch_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir}
@@ -4021,6 +4159,29 @@ theorem symTerm_branch_sound {cfg : SymConfig} {p : SymProg} {body : CapturedMir
     fun c q hm hh => ⟨_, (symTerm_branch_sound_obs h env).2 c q hm hh⟩⟩
 
 /-! ## Part X: Whole-Step Soundness against `stepMirFn` / `v2026Step` -/
+
+/-- `stepMirFn` on a denoted symbolic program over an arbitrary base memory,
+with every env-independent projection already reduced (definitional). -/
+theorem stepMirFn_toMachineStateOver (cfg : SymConfig) (base : Memory) (p : SymProg)
+    (env : SymEnv) :
+    stepMirFn cfg.body (p.toMachineStateOver base env) =
+      match (p.active.getD cfg.body).phase with
+      | .other _ => MirStepNode.unsupported
+      | _ =>
+        match get? (p.active.getD cfg.body).basicBlocks p.frame.blockIdx with
+        | none => MirStepNode.fail .ub
+        | some bb =>
+          match get? bb.statements p.frame.stmtIdx with
+          | some stmt =>
+            evalStmt (p.toMachineStateOver base env) stmt (p.active.getD cfg.body).localDecls
+              (p.active.getD cfg.body).layouts
+          | none =>
+            if p.frame.stmtIdx == length bb.statements then
+              evalTerminator (p.toMachineStateOver base env) bb.terminator
+                (some (p.active.getD cfg.body))
+            else
+              MirStepNode.fail .ub :=
+  rfl
 
 /-- `stepMirFn` on a denoted symbolic program, with every env-independent
 projection already reduced (definitional). -/
@@ -4044,21 +4205,22 @@ theorem stepMirFn_toMachineState (cfg : SymConfig) (p : SymProg) (env : SymEnv) 
               MirStepNode.fail .ub :=
   rfl
 
-/-- Dispatch lemma: the trusted step at a supported program point is the
-statement / terminator step the symbolic engine analyzed. -/
-theorem symProgStep_dispatch {cfg : SymConfig} {p : SymProg} {r : SymStepRes}
+/-- Dispatch lemma over an arbitrary base memory: the trusted step at a
+supported program point is the statement / terminator step the symbolic engine
+analyzed. -/
+theorem symProgStep_dispatch_over {cfg : SymConfig} (base : Memory) {p : SymProg} {r : SymStepRes}
     (h : symProgStep cfg p = r) (hr : r ≠ .stuck) (env : SymEnv) :
     ∃ bb, get? (p.active.getD cfg.body).basicBlocks p.frame.blockIdx = some bb ∧
       ((∃ stmt f' cs, get? bb.statements p.frame.stmtIdx = some stmt ∧
           symStmt cfg.body.allocations (p.active.getD cfg.body) p.frame stmt = some (f', cs) ∧
           r = .step { p with frame := f' } cs ∧
-          stepMirFn cfg.body (p.toMachineState cfg env) =
-            evalStmt (p.toMachineState cfg env) stmt (p.active.getD cfg.body).localDecls
+          stepMirFn cfg.body (p.toMachineStateOver base env) =
+            evalStmt (p.toMachineStateOver base env) stmt (p.active.getD cfg.body).localDecls
               (p.active.getD cfg.body).layouts) ∨
         (get? bb.statements p.frame.stmtIdx = none ∧
           symTerm cfg p (p.active.getD cfg.body) bb.terminator = r ∧
-          stepMirFn cfg.body (p.toMachineState cfg env) =
-            evalTerminator (p.toMachineState cfg env) bb.terminator
+          stepMirFn cfg.body (p.toMachineStateOver base env) =
+            evalTerminator (p.toMachineStateOver base env) bb.terminator
               (some (p.active.getD cfg.body)))) := by
   unfold symProgStep symProgStepWith at h
   dsimp only at h
@@ -4068,7 +4230,7 @@ theorem symProgStep_dispatch {cfg : SymConfig} {p : SymProg} {r : SymStepRes}
       get? (p.active.getD cfg.body).basicBlocks p.frame.blockIdx := by
     cases p.active <;> rfl
   rw [hbbEq] at h
-  rw [stepMirFn_toMachineState]
+  rw [stepMirFn_toMachineStateOver]
   cases hph : (p.active.getD cfg.body).phase with
   | other _ =>
     rw [hph] at h
@@ -4103,6 +4265,24 @@ theorem symProgStep_dispatch {cfg : SymConfig} {p : SymProg} {r : SymStepRes}
         refine Anneal.Firewall.ite_eq_elim_imp (fun hLen hTerm => ?_) (fun _ hStuck => absurd hStuck.symm hr)
         rw [Anneal.ParametricCore.ite_prop_pos hLen]
         exact Or.inr ⟨rfl, hTerm, rfl⟩
+
+/-- Dispatch lemma: the trusted step at a supported program point is the
+statement / terminator step the symbolic engine analyzed. -/
+theorem symProgStep_dispatch {cfg : SymConfig} {p : SymProg} {r : SymStepRes}
+    (h : symProgStep cfg p = r) (hr : r ≠ .stuck) (env : SymEnv) :
+    ∃ bb, get? (p.active.getD cfg.body).basicBlocks p.frame.blockIdx = some bb ∧
+      ((∃ stmt f' cs, get? bb.statements p.frame.stmtIdx = some stmt ∧
+          symStmt cfg.body.allocations (p.active.getD cfg.body) p.frame stmt = some (f', cs) ∧
+          r = .step { p with frame := f' } cs ∧
+          stepMirFn cfg.body (p.toMachineState cfg env) =
+            evalStmt (p.toMachineState cfg env) stmt (p.active.getD cfg.body).localDecls
+              (p.active.getD cfg.body).layouts) ∨
+        (get? bb.statements p.frame.stmtIdx = none ∧
+          symTerm cfg p (p.active.getD cfg.body) bb.terminator = r ∧
+          stepMirFn cfg.body (p.toMachineState cfg env) =
+            evalTerminator (p.toMachineState cfg env) bb.terminator
+              (some (p.active.getD cfg.body)))) :=
+  symProgStep_dispatch_over (symEntryMemory cfg) h hr env
 
 /-- **Single-step soundness** against unmodified `stepMirFn`. -/
 theorem symProgStep_sound {cfg : SymConfig} {p p' : SymProg} {cs : List SymCond}
@@ -6420,7 +6600,8 @@ theorem symStmt_ub_of_not_conds {cfg : SymConfig} {p : SymProg} {body : Captured
         dsimp only [evalStmt]
         rw [show (p.toMachineState cfg env).frame.locals = symSlotsEval env p.frame.locals from rfl,
           show (p.toMachineState cfg env).memory = p.toMemory cfg env from rfl, hUb]
-  | nop => simp only [symStmt] at h; nomatch h
+  | nop | coverage | constEvalCounter | backwardIncompatibleDropHint _ =>
+    simp only [symStmt] at h; nomatch h
   | storageLive _ =>
     simp only [symStmt] at h
     repeat' (first | contradiction | (injection h with h; injection h with _ h; nomatch h) | split at h)
@@ -6791,5 +6972,519 @@ theorem verificationResult_of_symExplore (c : Claim) (cfg : SymConfig)
   unfold ExecWithinStepsV2026
   rw [← hb, ← hcal, ← hEntry]
   exact hR
+
+/-! ## Part XX: General-Memory Stateful Bridges & Chunked All-Paths Exploration (`symExploreChunks`)
+
+1. **Memory-frame generality (`SymMemCompat` / `SymStatefulMemCompat`):**
+   Lifts single-step, multi-step, chunked, and all-paths soundness from the
+   singleton `symEntryMemory cfg` to EVERY compatible `Memory` (arbitrary
+   `nextAllocId`, `nextTag`, `nextProtector`, `callerLocals`, `fnPtrs`,
+   `exposedAllocIds`, and `rootUnwindCeiling`), yielding family-wide
+   `StatefulVerificationResult` certificates that preserve all base memory
+   fields.
+2. **Chunked all-paths exploration (`symExploreChunks`):**
+   Combines step-chunking (`symProgRunSteps`) with automatic branch-splitting
+   (`symExploreAlts`) in a single `List.foldr` combinator (zero unsafe
+   recursive auxiliaries, reduces by `rfl`), discharging multi-frame branching
+   functions without the single-step heartbeat blowup of `symExplore`. -/
+
+theorem symProgEntry_toMachineStateOver (cfg : SymConfig) {mem : Memory}
+    (hMem : SymStatefulMemCompat cfg mem) (args : List SymVal) (env : SymEnv) :
+    (symProgEntry cfg args).toMachineStateOver (symStatefulInitMem cfg mem) env =
+      Trusted.VerificationResult.initMachineStateWithMemoryAndCallees cfg.body
+        (symValsEval env args) mem cfg.callees := by
+  obtain ⟨_, _, _, hcs, hac, _⟩ := hMem
+  obtain ⟨body, callees⟩ := cfg
+  cases callees with
+  | nil =>
+    cases mem with
+    | mk _ _ _ _ _ _ callStack activeCallee _ _ _ _ _ _ =>
+      dsimp only at hcs hac
+      subst hcs; subst hac
+      simp only [SymProg.toMachineStateOver, SymProg.toMemoryOver, symProgEntry, SymFrame.eval,
+        symStatefulInitMem, symStackEval_nil, symSlotsEval_symInitLocalsAux,
+        Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
+        Trusted.VerificationResult.initMachineStateWithMemory, initLocals]
+  | cons _ _ =>
+    cases mem with
+    | mk _ _ _ _ _ _ callStack activeCallee _ _ _ _ _ _ =>
+      dsimp only at hcs hac
+      subst hcs; subst hac
+      simp only [SymProg.toMachineStateOver, SymProg.toMemoryOver, symProgEntry, SymFrame.eval,
+        symStatefulInitMem, symStackEval_nil, symSlotsEval_symInitLocalsAux,
+        Trusted.VerificationResult.initMachineStateWithMemoryAndCallees,
+        Trusted.VerificationResult.initMachineStateWithMemory, initLocals]
+
+theorem symProgStep_sound_over {cfg : SymConfig} {base : Memory} (hMem : SymMemCompat cfg base)
+    {p p' : SymProg} {cs : List SymCond} (h : symProgStep cfg p = .step p' cs) (env : SymEnv)
+    (hc : condsHold env cs) :
+    ∃ obs, stepMirFn cfg.body (p.toMachineStateOver base env) =
+      MirStepNode.emitStep obs (p'.toMachineStateOver base env) := by
+  obtain ⟨bb, _, hcase⟩ := symProgStep_dispatch_over base h (fun h' => SymStepRes.noConfusion h') env
+  rcases hcase with ⟨stmt, f', cs', _, hst, hr, hstep⟩ | ⟨_, ht, hstep⟩
+  · injection hr with h1 h2; subst h1; subst h2
+    rw [hstep, symStmt_sound_over hMem hst env hc]
+    exact ⟨.silent, rfl⟩
+  · rw [hstep]
+    exact ⟨_, symTerm_step_sound_obs_over hMem ht env hc⟩
+
+theorem symProgStep_v2026_sound_over {cfg : SymConfig} {base : Memory}
+    (hMem : SymMemCompat cfg base) {p p' : SymProg} {cs : List SymCond}
+    (h : symProgStep cfg p = .step p' cs) (env : SymEnv) (hc : condsHold env cs) :
+    v2026Step cfg.body (p.toMachineStateOver base env) = .step (p'.toMachineStateOver base env) := by
+  obtain ⟨obs, hs⟩ := symProgStep_sound_over hMem h env hc
+  unfold v2026Step
+  rw [hs]
+  exact ofV2026MirStepNode_emitStep obs _
+
+theorem symProgStep_ret_sound_over {cfg : SymConfig} {base : Memory}
+    (hMem : SymMemCompat cfg base) {p : SymProg} {v : SymVal} {fin : SymProg} {cs : List SymCond}
+    (h : symProgStep cfg p = .ret v fin cs) (env : SymEnv) :
+    fin = p ∧ cs = [] ∧
+      stepMirFn cfg.body (p.toMachineStateOver base env) =
+        MirStepNode.retNormal (v.eval env) (p.toMachineStateOver base env).memory := by
+  obtain ⟨bb, _, hcase⟩ := symProgStep_dispatch_over base h (fun h' => SymStepRes.noConfusion h') env
+  rcases hcase with ⟨_, _, _, _, _, hr, _⟩ | ⟨_, ht, hstep⟩
+  · nomatch hr
+  · rw [hstep]; exact symTerm_ret_sound_over hMem ht env
+
+theorem symProgStep_ret_v2026_sound_over {cfg : SymConfig} {base : Memory}
+    (hMem : SymMemCompat cfg base) {p : SymProg} {v : SymVal} {fin : SymProg} {cs : List SymCond}
+    (h : symProgStep cfg p = .ret v fin cs) (env : SymEnv) :
+    v2026Step cfg.body (p.toMachineStateOver base env) =
+      .done (.normal (v.eval env, (p.toMachineStateOver base env).memory)) := by
+  obtain ⟨_, _, hs⟩ := symProgStep_ret_sound_over hMem h env
+  unfold v2026Step
+  rw [hs]
+  rfl
+
+theorem symProgStep_branch_sound_over {cfg : SymConfig} {base : Memory}
+    (hMem : SymMemCompat cfg base) {p : SymProg} {alts : List (SymCond × SymProg)}
+    {cs : List SymCond} (h : symProgStep cfg p = .branch alts cs) (env : SymEnv) :
+    cs = [] ∧ ∀ c q, (c, q) ∈ alts → c.holds env →
+      v2026Step cfg.body (p.toMachineStateOver base env) = .step (q.toMachineStateOver base env) := by
+  obtain ⟨bb, _, hcase⟩ := symProgStep_dispatch_over base h (fun h' => SymStepRes.noConfusion h') env
+  rcases hcase with ⟨_, _, _, _, _, hr, _⟩ | ⟨_, ht, hstep⟩
+  · nomatch hr
+  · obtain ⟨hcs, halts⟩ := symTerm_branch_sound_obs_over hMem ht env
+    refine ⟨hcs, fun c q hm hh => ?_⟩
+    unfold v2026Step
+    rw [hstep, halts c q hm hh]
+    exact ofV2026MirStepNode_emitStep _ _
+
+theorem symProgRunSteps_sound_over (cfg : SymConfig) {base : Memory}
+    (hMem : SymMemCompat cfg base) (env : SymEnv) :
+    ∀ (k : Nat) {p q : SymProg} {cs : List SymCond},
+      symProgRunSteps cfg k p = .step q cs → condsHold env cs →
+      StepsToV2026 cfg.body k (p.toMachineStateOver base env) (q.toMachineStateOver base env)
+  | 0, p, q, cs, h, _ => by
+    rw [symProgRunSteps_zero] at h; injection h with h1 _; subst h1
+    exact StepsToV2026.refl _
+  | k + 1, p, q, cs, h, hc => by
+    rw [symProgRunSteps_succ] at h
+    cases hs : symProgStep cfg p with
+    | step p₁ cs₁ =>
+      rw [hs] at h
+      obtain ⟨cs₂, h₂, hcs⟩ := addConds_eq_step h; subst hcs
+      have hc' := (condsHold_append env cs₁ cs₂).mp hc
+      exact StepsToV2026.step (symProgStep_v2026_sound_over hMem hs env hc'.1)
+        (symProgRunSteps_sound_over cfg hMem env k h₂ hc'.2)
+    | ret _ _ _ => rw [hs] at h; nomatch h
+    | branch _ _ => rw [hs] at h; nomatch h
+    | stuck => rw [hs] at h; nomatch h
+
+theorem symProgRunSteps_ret_exact_over (cfg : SymConfig) {base : Memory}
+    (hMem : SymMemCompat cfg base) (env : SymEnv) :
+    ∀ (k : Nat) {p : SymProg} {v : SymVal} {fin : SymProg} {cs : List SymCond},
+      symProgRunSteps cfg k p = .ret v fin cs → condsHold env cs →
+      ∃ j, j + 1 ≤ k ∧
+        StepsToV2026 cfg.body j (p.toMachineStateOver base env) (fin.toMachineStateOver base env) ∧
+        v2026Step cfg.body (fin.toMachineStateOver base env) =
+          .done (.normal (v.eval env, (fin.toMachineStateOver base env).memory))
+  | 0, _, _, _, _, h, _ => by rw [symProgRunSteps_zero] at h; nomatch h
+  | k + 1, p, v, fin, cs, h, hc => by
+    rw [symProgRunSteps_succ] at h
+    cases hs : symProgStep cfg p with
+    | step p₁ cs₁ =>
+      rw [hs] at h
+      obtain ⟨cs₂, h₂, hcs⟩ := addConds_eq_ret h; subst hcs
+      have hc' := (condsHold_append env cs₁ cs₂).mp hc
+      obtain ⟨j, hj, hsteps, hdone⟩ := symProgRunSteps_ret_exact_over cfg hMem env k h₂ hc'.2
+      exact ⟨j + 1, Nat.succ_le_succ hj,
+        StepsToV2026.step (symProgStep_v2026_sound_over hMem hs env hc'.1) hsteps, hdone⟩
+    | ret v' fin' cs' =>
+      rw [hs] at h; injection h with h1 h2 h3; subst h1; subst h2; subst h3
+      obtain ⟨hfin, _, _⟩ := symProgStep_ret_sound_over hMem hs env; subst hfin
+      exact ⟨0, Nat.succ_le_succ (Nat.zero_le k), StepsToV2026.refl _,
+        symProgStep_ret_v2026_sound_over hMem hs env⟩
+    | branch _ _ => rw [hs] at h; nomatch h
+    | stuck => rw [hs] at h; nomatch h
+
+theorem symProgRunSteps_ret_sound_over {cfg : SymConfig} {base : Memory}
+    (hMem : SymMemCompat cfg base) {k : Nat} {p : SymProg} {v : SymVal} {fin : SymProg}
+    {cs : List SymCond} (h : symProgRunSteps cfg k p = .ret v fin cs) (env : SymEnv)
+    (hc : condsHold env cs) {post : MirOutcome → Prop}
+    (hpost : post (.normal (v.eval env, (fin.toMachineStateOver base env).memory))) :
+    ReachesDoneWithinV2026 cfg.body post k (p.toMachineStateOver base env) := by
+  obtain ⟨j, hj, hsteps, hdone⟩ := symProgRunSteps_ret_exact_over cfg hMem env k h hc
+  exact ReachesDoneWithinV2026.mono hj
+    (reachesDoneWithinV2026_of_stepsTo hsteps (reachesDoneWithinV2026_of_done hdone hpost))
+
+theorem symProgRunSteps_branch_sound_over (cfg : SymConfig) {base : Memory}
+    (hMem : SymMemCompat cfg base) (env : SymEnv) :
+    ∀ (k : Nat) {p : SymProg} {alts : List (SymCond × SymProg)} {cs : List SymCond},
+      symProgRunSteps cfg k p = .branch alts cs → condsHold env cs →
+      ∃ (j : Nat) (fork : SymProg), j + 1 ≤ k ∧
+        StepsToV2026 cfg.body j (p.toMachineStateOver base env)
+          (fork.toMachineStateOver base env) ∧
+        ∀ c q, (c, q) ∈ alts → c.holds env →
+          v2026Step cfg.body (fork.toMachineStateOver base env) =
+            .step (q.toMachineStateOver base env)
+  | 0, _, _, _, h, _ => by rw [symProgRunSteps_zero] at h; nomatch h
+  | k + 1, p, alts, cs, h, hc => by
+    rw [symProgRunSteps_succ] at h
+    cases hs : symProgStep cfg p with
+    | step p₁ cs₁ =>
+      rw [hs] at h
+      obtain ⟨cs₂, h₂, hcs⟩ := addConds_eq_branch h; subst hcs
+      have hc' := (condsHold_append env cs₁ cs₂).mp hc
+      obtain ⟨j, fork, hj, hsteps, halts⟩ := symProgRunSteps_branch_sound_over cfg hMem env k h₂ hc'.2
+      exact ⟨j + 1, fork, Nat.succ_le_succ hj,
+        StepsToV2026.step (symProgStep_v2026_sound_over hMem hs env hc'.1) hsteps, halts⟩
+    | branch alts' cs' =>
+      rw [hs] at h; injection h with h1 h2; subst h1; subst h2
+      exact ⟨0, p, Nat.succ_le_succ (Nat.zero_le k), StepsToV2026.refl _,
+        (symProgStep_branch_sound_over hMem hs env).2⟩
+    | ret _ _ _ => rw [hs] at h; nomatch h
+    | stuck => rw [hs] at h; nomatch h
+
+/-- Multi-chunk soundness over ANY compatible entry `Memory` (`SymStatefulMemCompat`). -/
+theorem symRunChunks_sound_over {cfg : SymConfig} {mem : Memory}
+    (hMem : SymStatefulMemCompat cfg mem) {ks : List SymChunk} {args : List SymVal}
+    {v : SymVal} {fin : SymProg} {cs : List SymCond}
+    (h : symRunChunks cfg ks (symProgEntry cfg args) = .ret v fin cs) (env : SymEnv)
+    (hc : condsHold env cs) {post : MirOutcome → Prop}
+    (hpost : post (.normal (v.eval env,
+      (fin.toMachineStateOver (symStatefulInitMem cfg mem) env).memory))) :
+    ExecStatefulWithinStepsV2026 cfg.body (symValsEval env args) mem cfg.callees post
+        (chunksTotal ks) ∧
+      MirWpConverges cfg.body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees cfg.body
+          (symValsEval env args) mem cfg.callees) post ∧
+      MirNoUBTree (mirTree cfg.body
+        (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees cfg.body
+          (symValsEval env args) mem cfg.callees)) := by
+  rw [symRunChunks_eq] at h
+  have hR := symProgRunSteps_ret_sound_over (symMemCompat_of_stateful hMem) h env hc hpost
+  rw [symProgEntry_toMachineStateOver cfg hMem args env] at hR
+  exact ⟨hR, mirWpConverges_of_reachesDoneWithinV2026 hR, mirNoUBTree_of_reachesDoneWithinV2026 hR⟩
+
+/-- Family-wide `StatefulVerificationResult` (panic-forbidding) from a symbolic
+chunk pipeline over EVERY compatible `Memory` (`SymStatefulMemCompat cfg mem`:
+arbitrary `nextAllocId`, `nextTag`, `nextProtector`, `callerLocals`, `fnPtrs`,
+`exposedAllocIds`, and `rootUnwindCeiling`). -/
+theorem statefulVerificationResult_of_symRunChunks_mem (c : StatefulClaim) (cfg : SymConfig)
+    (hb : cfg.body = c.body) (hcal : cfg.callees = c.callees)
+    (ks : List SymChunk) (symArgs : List SymVal) (v : SymVal) (fin : SymProg)
+    (cs : List SymCond)
+    (h : symRunChunks cfg ks (symProgEntry cfg symArgs) = .ret v fin cs)
+    (henv : ∀ args mem, c.pre args mem → SymStatefulMemCompat cfg mem ∧
+      ∃ env : SymEnv, symValsEval env symArgs = args ∧ condsHold env cs ∧
+        c.post args mem (v.eval env)
+          (fin.toMachineStateOver (symStatefulInitMem cfg mem) env).memory) :
+    StatefulVerificationResult c := by
+  refine verifyStatefulMirNoPanic_of_execWithinStepsV2026 c (fun args mem hPre => ?_)
+  obtain ⟨hMem, env, hargs, hc, hpost⟩ := henv args mem hPre
+  obtain ⟨hS, _⟩ := symRunChunks_sound_over hMem h env hc
+    (post := mirNormalPost (c.post args mem)) hpost
+  rw [hb, hcal, hargs] at hS
+  exact ⟨_, hS⟩
+
+/-- All-paths `symExplore` soundness over ANY compatible base memory. -/
+theorem symExplore_sound_over (cfg : SymConfig) {base : Memory} (hMem : SymMemCompat cfg base) :
+    ∀ (n : Nat) {pc : List SymCond} {p : SymProg} {leaves : List SymLeaf}
+      (env : SymEnv) {post : MirOutcome → Prop},
+      symExplore cfg n pc p = some leaves →
+      (∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+        post (.normal (l.2.1.eval env, (l.2.2.toMachineStateOver base env).memory))) →
+      ReachesDoneWithinV2026 cfg.body post n (p.toMachineStateOver base env)
+  | 0, _, _, _, _, _, h, _ => nomatch h
+  | n + 1, pc, p, leaves, env, post, h, ⟨l, hm, hc, hpost⟩ => by
+    have h' : (match symProgStep cfg p with
+        | .step q cs => symExplore cfg n (pc ++ cs) q
+        | .ret v fin cs => some [(pc ++ cs, v, fin)]
+        | .branch alts cs => symExploreAlts (symExplore cfg n) (pc ++ cs) alts
+        | .stuck => none) = some leaves := h
+    cases hs : symProgStep cfg p with
+    | step q cs =>
+      rw [hs] at h'
+      obtain ⟨rest, hr⟩ := symExplore_prefix cfg n h' hm
+      rw [hr] at hc
+      have hcs : condsHold env cs :=
+        ((condsHold_append env cs rest).mp
+          ((condsHold_append env pc (cs ++ rest)).mp (List.append_assoc pc cs rest ▸ hc)).2).1
+      exact reachesDoneWithinV2026_of_step (symProgStep_v2026_sound_over hMem hs env hcs)
+        (symExplore_sound_over cfg hMem n env h' ⟨l, hm, hr ▸ hc, hpost⟩)
+    | ret v fin cs =>
+      rw [hs] at h'; injection h' with h''; subst h''
+      cases hm with
+      | tail _ h => nomatch h
+      | head =>
+        obtain ⟨hfin, _, _⟩ := symProgStep_ret_sound_over hMem hs env; subst hfin
+        exact ReachesDoneWithinV2026.mono (Nat.succ_le_succ (Nat.zero_le n))
+          (reachesDoneWithinV2026_of_done (symProgStep_ret_v2026_sound_over hMem hs env) hpost)
+    | branch alts cs =>
+      rw [hs] at h'
+      obtain ⟨c, q, sub, hmem, hih, hl⟩ := symExploreAlts_mem h' hm
+      obtain ⟨rest, hr⟩ := symExplore_prefix cfg n hih hl
+      have hc' : condsHold env ((pc ++ cs) ++ [c] ++ rest) := hr ▸ hc
+      have hcc : c.holds env :=
+        ((condsHold_append env [c] rest).mp
+          ((condsHold_append env (pc ++ cs) ([c] ++ rest)).mp
+            (by rw [← List.append_assoc]; exact hc')).2).1.1
+      exact reachesDoneWithinV2026_of_step ((symProgStep_branch_sound_over hMem hs env).2 c q hmem hcc)
+        (symExplore_sound_over cfg hMem n env hih ⟨l, hl, hc, hpost⟩)
+    | stuck => rw [hs] at h'; nomatch h'
+
+/-- Full adequacy bundle for `symExplore` (`ExecWithinStepsV2026`,
+`MirWpConverges`, `MirNoUBTree`). -/
+theorem symExplore_sound_full {cfg : SymConfig} {fuel : Nat} {args : List SymVal}
+    {leaves : List SymLeaf} (h : symExplore cfg fuel [] (symProgEntry cfg args) = some leaves)
+    (env : SymEnv) {post : MirOutcome → Prop}
+    (hleaf : ∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+      post (.normal (l.2.1.eval env, (l.2.2.toMachineState cfg env).memory))) :
+    ExecWithinStepsV2026 cfg.body (symValsEval env args) cfg.callees post fuel ∧
+      MirWpConverges cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees) post ∧
+      MirNoUBTree (mirTree cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees)) := by
+  have hR := symExplore_sound cfg fuel env h hleaf
+  have hE : ExecWithinStepsV2026 cfg.body (symValsEval env args) cfg.callees post fuel := by
+    unfold ExecWithinStepsV2026; rw [← symProgEntry_toMachineState]; exact hR
+  exact ⟨hE, mirWpConverges_of_reachesDoneWithinV2026 hE, mirNoUBTree_of_reachesDoneWithinV2026 hE⟩
+
+/-- Standalone (`callees = []`) `mirCallTree` adequacy for `symExplore`. -/
+theorem symExplore_mirCallTree_sound {cfg : SymConfig} (hcal : cfg.callees = []) {fuel : Nat}
+    {args : List SymVal} {leaves : List SymLeaf}
+    (h : symExplore cfg fuel [] (symProgEntry cfg args) = some leaves) (env : SymEnv)
+    {post : MirOutcome → Prop}
+    (hleaf : ∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+      post (.normal (l.2.1.eval env, (l.2.2.toMachineState cfg env).memory))) :
+    MirNoUBTree (mirCallTree cfg.body (symValsEval env args)) ∧
+      ∀ tr out, Trusted.ITree.ReachesRet (mirCallTree cfg.body (symValsEval env args)) tr out →
+        post out := by
+  have hR := symExplore_sound cfg fuel env h hleaf
+  have hExec : execStepOutcome (v2026Step cfg.body) post (fun _ => False) fuel
+      (initMachineState cfg.body (symValsEval env args)) := by
+    have hE := reachesDoneWithinV2026_iff_execStepOutcome.mp hR
+    rw [symProgEntry_toMachineState, hcal] at hE
+    exact hE
+  exact ⟨mirNoUBTree_mirCallTree_of_v2026Exec hExec,
+    reachesRet_post_mirCallTree_of_v2026Exec hExec⟩
+
+/-- Family-wide `StatefulVerificationResult` from `symExplore` over EVERY
+compatible `Memory` (`SymStatefulMemCompat`). -/
+theorem statefulVerificationResult_of_symExplore_mem (c : StatefulClaim) (cfg : SymConfig)
+    (hb : cfg.body = c.body) (hcal : cfg.callees = c.callees) (fuel : Nat)
+    (symArgs : List SymVal) (leaves : List SymLeaf)
+    (h : symExplore cfg fuel [] (symProgEntry cfg symArgs) = some leaves)
+    (henv : ∀ args mem, c.pre args mem → SymStatefulMemCompat cfg mem ∧
+      ∃ env : SymEnv, symValsEval env symArgs = args ∧
+        ∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+          c.post args mem (l.2.1.eval env)
+            (l.2.2.toMachineStateOver (symStatefulInitMem cfg mem) env).memory) :
+    StatefulVerificationResult c := by
+  refine verifyStatefulMirNoPanic_of_execWithinStepsV2026 c (fun args mem hPre => ?_)
+  obtain ⟨hMem, env, hargs, l, hm, hc, hpost⟩ := henv args mem hPre
+  have hR := symExplore_sound_over cfg (symMemCompat_of_stateful hMem) fuel env
+    (post := mirNormalPost (c.post args mem)) h ⟨l, hm, hc, hpost⟩
+  rw [symProgEntry_toMachineStateOver cfg hMem symArgs env, hb, hcal, hargs] at hR
+  exact ⟨fuel, hR⟩
+
+/-- Chunked all-paths exploration: runs each chunk `k ∈ ks` via `symProgRunSteps`
+(returning immediately on `.ret`, continuing on `.step`, and fanning out over
+all fork alternatives via `symExploreAlts` on `.branch`). Defined via
+`List.foldr` (zero unsafe recursive auxiliaries, reduces by `rfl`). -/
+def symExploreChunks (cfg : SymConfig) (ks : List SymChunk) :
+    List SymCond → SymProg → Option (List SymLeaf) :=
+  ks.foldr
+    (fun k ih pc p =>
+      match symProgRunSteps cfg k p with
+      | .step q cs => ih (pc ++ cs) q
+      | .ret v fin cs => some [(pc ++ cs, v, fin)]
+      | .branch alts cs => symExploreAlts ih (pc ++ cs) alts
+      | .stuck => none)
+    (fun _ _ => none)
+
+theorem symExploreChunks_nil (cfg : SymConfig) (pc : List SymCond) (p : SymProg) :
+    symExploreChunks cfg [] pc p = none := rfl
+
+theorem symExploreChunks_cons (cfg : SymConfig) (k : SymChunk) (ks : List SymChunk)
+    (pc : List SymCond) (p : SymProg) :
+    symExploreChunks cfg (k :: ks) pc p =
+      match symProgRunSteps cfg k p with
+      | .step q cs => symExploreChunks cfg ks (pc ++ cs) q
+      | .ret v fin cs => some [(pc ++ cs, v, fin)]
+      | .branch alts cs => symExploreAlts (symExploreChunks cfg ks) (pc ++ cs) alts
+      | .stuck => none := rfl
+
+theorem symExploreChunks_prefix (cfg : SymConfig) :
+    ∀ (ks : List SymChunk) {pc : List SymCond} {p : SymProg} {leaves : List SymLeaf}
+      {l : SymLeaf},
+      symExploreChunks cfg ks pc p = some leaves → l ∈ leaves →
+      ∃ rest, l.1 = pc ++ rest
+  | [], _, _, _, _, h, _ => nomatch h
+  | k :: ks, pc, p, leaves, l, h, hm => by
+    rw [symExploreChunks_cons] at h
+    cases hs : symProgRunSteps cfg k p with
+    | step q cs =>
+      rw [hs] at h
+      obtain ⟨rest, hr⟩ := symExploreChunks_prefix cfg ks h hm
+      exact ⟨cs ++ rest, by rw [hr, List.append_assoc]⟩
+    | ret v fin cs =>
+      rw [hs] at h; injection h with h'; subst h'
+      cases hm with
+      | head => exact ⟨cs, rfl⟩
+      | tail _ h => nomatch h
+    | branch alts cs =>
+      rw [hs] at h
+      obtain ⟨c, q, sub, _, hih, hl⟩ := symExploreAlts_mem h hm
+      obtain ⟨rest, hr⟩ := symExploreChunks_prefix cfg ks hih hl
+      exact ⟨cs ++ [c] ++ rest, by rw [hr, List.append_assoc, List.append_assoc,
+        List.append_assoc]⟩
+    | stuck => rw [hs] at h; nomatch h
+
+/-- **Chunked all-paths soundness over any compatible base memory**: if
+`symExploreChunks cfg ks pc p = some leaves` and SOME leaf's conditions hold
+with its return satisfying `post`, unmodified trusted execution reaches `.done`
+within `chunksTotal ks` steps. -/
+theorem symExploreChunks_sound_over (cfg : SymConfig) {base : Memory}
+    (hMem : SymMemCompat cfg base) :
+    ∀ (ks : List SymChunk) {pc : List SymCond} {p : SymProg} {leaves : List SymLeaf}
+      (env : SymEnv) {post : MirOutcome → Prop},
+      symExploreChunks cfg ks pc p = some leaves →
+      (∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+        post (.normal (l.2.1.eval env, (l.2.2.toMachineStateOver base env).memory))) →
+      ReachesDoneWithinV2026 cfg.body post (chunksTotal ks) (p.toMachineStateOver base env)
+  | [], _, _, _, _, _, h, _ => nomatch h
+  | k :: ks, pc, p, leaves, env, post, h, ⟨l, hm, hc, hpost⟩ => by
+    rw [symExploreChunks_cons] at h
+    cases hs : symProgRunSteps cfg k p with
+    | step q cs =>
+      rw [hs] at h
+      obtain ⟨rest, hr⟩ := symExploreChunks_prefix cfg ks h hm
+      rw [hr] at hc
+      have hcs : condsHold env cs :=
+        ((condsHold_append env cs rest).mp
+          ((condsHold_append env pc (cs ++ rest)).mp (List.append_assoc pc cs rest ▸ hc)).2).1
+      have hSteps := symProgRunSteps_sound_over cfg hMem env k hs hcs
+      have hRest := symExploreChunks_sound_over cfg hMem ks env h ⟨l, hm, hr ▸ hc, hpost⟩
+      exact reachesDoneWithinV2026_of_stepsTo hSteps hRest
+    | ret v fin cs =>
+      rw [hs] at h; injection h with h'; subst h'
+      cases hm with
+      | tail _ h => nomatch h
+      | head =>
+        have hcs : condsHold env cs := ((condsHold_append env pc cs).mp hc).2
+        have hR := symProgRunSteps_ret_sound_over hMem hs env hcs hpost
+        exact ReachesDoneWithinV2026.mono (Nat.le_add_right k (chunksTotal ks)) hR
+    | branch alts cs =>
+      rw [hs] at h
+      obtain ⟨c, q, sub, hmem, hih, hl⟩ := symExploreAlts_mem h hm
+      obtain ⟨rest, hr⟩ := symExploreChunks_prefix cfg ks hih hl
+      have hc' : condsHold env ((pc ++ cs) ++ [c] ++ rest) := hr ▸ hc
+      have hpcCs : condsHold env (pc ++ cs) :=
+        ((condsHold_append env (pc ++ cs) ([c] ++ rest)).mp
+          (by rw [← List.append_assoc]; exact hc')).1
+      have hcs : condsHold env cs := ((condsHold_append env pc cs).mp hpcCs).2
+      have hcc : c.holds env :=
+        ((condsHold_append env [c] rest).mp
+          ((condsHold_append env (pc ++ cs) ([c] ++ rest)).mp
+            (by rw [← List.append_assoc]; exact hc')).2).1.1
+      obtain ⟨j, fork, hj, hsteps, halts⟩ := symProgRunSteps_branch_sound_over cfg hMem env k hs hcs
+      have hForkStep := halts c q hmem hcc
+      have hRest := symExploreChunks_sound_over cfg hMem ks env hih ⟨l, hl, hc, hpost⟩
+      have hTotal := reachesDoneWithinV2026_of_stepsTo hsteps
+        (reachesDoneWithinV2026_of_step hForkStep hRest)
+      have hLe : j + (chunksTotal ks + 1) ≤ k + chunksTotal ks := by
+        have h1 : j + (chunksTotal ks + 1) = (j + 1) + chunksTotal ks := by
+          rw [Nat.add_comm (chunksTotal ks) 1, ← Nat.add_assoc]
+        rw [h1]
+        exact Nat.add_le_add_right hj (chunksTotal ks)
+      exact ReachesDoneWithinV2026.mono hLe hTotal
+    | stuck => rw [hs] at h; nomatch h
+
+/-- End-to-end chunked all-paths soundness (`ReachesDoneWithinV2026`,
+`ExecWithinStepsV2026`, `MirWpConverges`, `MirNoUBTree`). -/
+theorem symExploreChunks_sound {cfg : SymConfig} {ks : List SymChunk} {args : List SymVal}
+    {leaves : List SymLeaf} (h : symExploreChunks cfg ks [] (symProgEntry cfg args) = some leaves)
+    (env : SymEnv) {post : MirOutcome → Prop}
+    (hleaf : ∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+      post (.normal (l.2.1.eval env, (l.2.2.toMachineState cfg env).memory))) :
+    ReachesDoneWithinV2026 cfg.body post (chunksTotal ks)
+        ((symProgEntry cfg args).toMachineState cfg env) ∧
+      ExecWithinStepsV2026 cfg.body (symValsEval env args) cfg.callees post (chunksTotal ks) ∧
+      MirWpConverges cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees) post ∧
+      MirNoUBTree (mirTree cfg.body
+        (initMachineStateWithCallees cfg.body (symValsEval env args) cfg.callees)) := by
+  have hR := symExploreChunks_sound_over cfg (symMemCompat_entry cfg) ks env h hleaf
+  have hE : ExecWithinStepsV2026 cfg.body (symValsEval env args) cfg.callees post (chunksTotal ks) := by
+    unfold ExecWithinStepsV2026; rw [← symProgEntry_toMachineState]; exact hR
+  exact ⟨hR, hE, mirWpConverges_of_reachesDoneWithinV2026 hE,
+    mirNoUBTree_of_reachesDoneWithinV2026 hE⟩
+
+/-- Standalone (`callees = []`) `mirCallTree` adequacy for `symExploreChunks`. -/
+theorem symExploreChunks_mirCallTree_sound {cfg : SymConfig} (hcal : cfg.callees = [])
+    {ks : List SymChunk} {args : List SymVal} {leaves : List SymLeaf}
+    (h : symExploreChunks cfg ks [] (symProgEntry cfg args) = some leaves) (env : SymEnv)
+    {post : MirOutcome → Prop}
+    (hleaf : ∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+      post (.normal (l.2.1.eval env, (l.2.2.toMachineState cfg env).memory))) :
+    MirNoUBTree (mirCallTree cfg.body (symValsEval env args)) ∧
+      ∀ tr out, Trusted.ITree.ReachesRet (mirCallTree cfg.body (symValsEval env args)) tr out →
+        post out := by
+  obtain ⟨hR, _⟩ := symExploreChunks_sound h env hleaf
+  have hExec : execStepOutcome (v2026Step cfg.body) post (fun _ => False) (chunksTotal ks)
+      (initMachineState cfg.body (symValsEval env args)) := by
+    have hE := reachesDoneWithinV2026_iff_execStepOutcome.mp hR
+    rw [symProgEntry_toMachineState, hcal] at hE
+    exact hE
+  exact ⟨mirNoUBTree_mirCallTree_of_v2026Exec hExec,
+    reachesRet_post_mirCallTree_of_v2026Exec hExec⟩
+
+/-- Stateless `VerificationResult` from chunked all-paths exploration. -/
+theorem verificationResult_of_symExploreChunks (c : Claim) (cfg : SymConfig)
+    (hb : cfg.body = c.body) (hcal : cfg.callees = c.callees)
+    (ks : List SymChunk) (symArgs : List SymVal) (leaves : List SymLeaf)
+    (h : symExploreChunks cfg ks [] (symProgEntry cfg symArgs) = some leaves)
+    (henv : ∀ args, c.pre args → ∃ env : SymEnv, symValsEval env symArgs = args ∧
+      ∃ l, l ∈ leaves ∧ condsHold env l.1 ∧ c.post args (l.2.1.eval env)) :
+    VerificationResult c := by
+  refine verifyMirNoPanic_of_execWithinStepsV2026 c (fun args hPre => ?_)
+  obtain ⟨env, hargs, l, hm, hc, hpost⟩ := henv args hPre
+  obtain ⟨_, hE, _⟩ := symExploreChunks_sound h env
+    (post := mirNormalPost (fun retVal _ => c.post args retVal)) ⟨l, hm, hc, hpost⟩
+  rw [hb, hcal, hargs] at hE
+  exact ⟨_, hE⟩
+
+/-- Family-wide `StatefulVerificationResult` from chunked all-paths exploration
+over EVERY compatible `Memory` (`SymStatefulMemCompat`). -/
+theorem statefulVerificationResult_of_symExploreChunks_mem (c : StatefulClaim) (cfg : SymConfig)
+    (hb : cfg.body = c.body) (hcal : cfg.callees = c.callees)
+    (ks : List SymChunk) (symArgs : List SymVal) (leaves : List SymLeaf)
+    (h : symExploreChunks cfg ks [] (symProgEntry cfg symArgs) = some leaves)
+    (henv : ∀ args mem, c.pre args mem → SymStatefulMemCompat cfg mem ∧
+      ∃ env : SymEnv, symValsEval env symArgs = args ∧
+        ∃ l, l ∈ leaves ∧ condsHold env l.1 ∧
+          c.post args mem (l.2.1.eval env)
+            (l.2.2.toMachineStateOver (symStatefulInitMem cfg mem) env).memory) :
+    StatefulVerificationResult c := by
+  refine verifyStatefulMirNoPanic_of_execWithinStepsV2026 c (fun args mem hPre => ?_)
+  obtain ⟨hMem, env, hargs, l, hm, hc, hpost⟩ := henv args mem hPre
+  have hR := symExploreChunks_sound_over cfg (symMemCompat_of_stateful hMem) ks env
+    (post := mirNormalPost (c.post args mem)) h ⟨l, hm, hc, hpost⟩
+  rw [symProgEntry_toMachineStateOver cfg hMem symArgs env, hb, hcal, hargs] at hR
+  exact ⟨_, hR⟩
 
 end Anneal.MirSymExec.ChunkedCallV2026

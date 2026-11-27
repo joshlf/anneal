@@ -390,6 +390,34 @@ theorem add_scaled_statefulVerificationResult :
   exact ⟨hmem, scaledEnv b m k, hargs ▸ rfl, scaled_conds_hold hb hm hk hmk hbmk,
     ⟨b, m, k, hargs, add_scaled_symbolic_value hb hm hk hmk hbmk⟩⟩
 
+/-- Family-wide stateful claim for `add_scaled` quantifying over EVERY
+compatible memory (`SymStatefulMemCompat`: arbitrary `nextAllocId`, `nextTag`,
+`nextProtector`, `callerLocals`, `fnPtrs`, `exposedAllocIds`, and
+`rootUnwindCeiling`) and asserting preservation of all those fields. -/
+def addScaledStatefulMemClaim : StatefulClaim :=
+  { body := addScaledCallerBody
+    pre := fun args mem => (∃ b m k, args = [su b, su m, su k] ∧ b < M64 ∧ m < M64 ∧ k < M64 ∧
+      b + m * k < M64) ∧ SymStatefulMemCompat scaledCfg mem
+    post := fun args mem r mem' =>
+      (∃ b m k, args = [su b, su m, su k] ∧ r = su (b + m * k)) ∧
+      mem'.nextAllocId = mem.nextAllocId ∧ mem'.globals = mem.globals ∧
+      mem'.borrows = [] ∧ mem'.nextTag = mem.nextTag ∧
+      mem'.nextProtector = mem.nextProtector ∧ mem'.callerLocals = mem.callerLocals ∧
+      mem'.fnPtrs = mem.fnPtrs ∧ mem'.exposedAllocIds = mem.exposedAllocIds ∧
+      mem'.rootUnwindCeiling = mem.rootUnwindCeiling
+    callees := [mulScaledCalleeBody] }
+
+theorem add_scaled_statefulVerificationResult_mem :
+    StatefulVerificationResult addScaledStatefulMemClaim := by
+  refine statefulVerificationResult_of_symRunChunks_mem addScaledStatefulMemClaim scaledCfg rfl rfl
+    [6, 7, 7, 4] [.scalar vb, .scalar vm, .scalar vk] (.scalar vres) scaledFin scaledConds
+    scaled_chunks ?_
+  intro args mem ⟨⟨b, m, k, hargs, hb, hm, hk, hbmk⟩, hMem⟩
+  have hmk : m * k < M64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hbmk
+  exact ⟨hMem, scaledEnv b m k, hargs ▸ rfl, scaled_conds_hold hb hm hk hmk hbmk,
+    ⟨⟨b, m, k, hargs, add_scaled_symbolic_value hb hm hk hmk hbmk⟩,
+     rfl, rfl, hMem.2.1, rfl, rfl, rfl, rfl, rfl, rfl⟩⟩
+
 /-- Dense `Chunk8BlockTree` (`SymBlockCtx`) + `Anneal.Firewall` (`Firewall` /
 `IndexedCut`) + `BoolCertCut` convergence witness for `add_scaled`. -/
 def scaledBlockCtx : SymBlockCtx scaledCfg.body := SymBlockCtx.ofBody scaledCfg.body
@@ -959,6 +987,248 @@ theorem sel_verificationResult_explore : VerificationResult selClaim := by
     cases hu with
     | head => exact Nat.succ_ne_zero n
     | tail _ h => nomatch h
+
+/-- Direct unmodified `mirCallTree` adequacy for `sel` from `symExplore`. -/
+theorem sel_mirCallTree_explore (x : Nat) :
+    MirNoUBTree (mirCallTree selBody [.scalar ⟨x, 1⟩]) ∧
+      ∀ tr out, Trusted.ITree.ReachesRet (mirCallTree selBody [.scalar ⟨x, 1⟩]) tr out →
+        mirNormalPost (fun r _ => r = .scalar ⟨match x with | 0 => 1 | n + 1 => n + 1, 1⟩) out := by
+  refine symExplore_mirCallTree_sound rfl sel_explore (selEnv x) ?_
+  cases x with
+  | zero => exact ⟨_, List.Mem.head _, ⟨⟨rfl, fun _ h => nomatch h⟩, trivial⟩, rfl⟩
+  | succ n =>
+    refine ⟨_, List.Mem.tail _ (List.Mem.head _), ⟨fun u hu => ?_, trivial⟩, rfl⟩
+    cases hu with
+    | head => exact Nat.succ_ne_zero n
+    | tail _ h => nomatch h
+
+/-- Family-wide `StatefulVerificationResult` for `sel` over EVERY compatible
+memory (`SymStatefulMemCompat`), proving exact `mem' = mem` preservation. -/
+def selStatefulMemClaim : StatefulClaim :=
+  { body := selBody
+    pre := fun args mem => (∃ x, args = [.scalar ⟨x, 1⟩]) ∧ SymStatefulMemCompat selCfg mem
+    post := fun args mem r mem' =>
+      (∃ x, args = [.scalar ⟨x, 1⟩] ∧
+        r = .scalar ⟨match x with | 0 => 1 | n + 1 => n + 1, 1⟩) ∧ mem' = mem }
+
+theorem sel_statefulVerificationResult_explore_mem :
+    StatefulVerificationResult selStatefulMemClaim := by
+  refine statefulVerificationResult_of_symExplore_mem selStatefulMemClaim selCfg rfl rfl 3
+    [.scalar vs] _ sel_explore ?_
+  intro args mem ⟨⟨x, hx⟩, hMem⟩
+  subst hx
+  have hMemEq : ∀ env,
+      { mem with callStack := symStackEval env [], activeCallee := none } = mem := by
+    intro _
+    cases mem with
+    | mk _ _ _ _ _ _ cs ac _ _ _ _ _ _ =>
+      obtain ⟨_, _, _, hcs, hac, _⟩ := hMem
+      dsimp only at hcs hac; subst hcs; subst hac; rfl
+  refine ⟨hMem, selEnv x, rfl, ?_⟩
+  cases x with
+  | zero =>
+    exact ⟨_, List.Mem.head _, ⟨⟨rfl, fun _ h => nomatch h⟩, trivial⟩, ⟨⟨0, rfl, rfl⟩, hMemEq _⟩⟩
+  | succ n =>
+    refine ⟨_, List.Mem.tail _ (List.Mem.head _), ⟨fun u hu => ?_, trivial⟩,
+      ⟨⟨n + 1, rfl, rfl⟩, hMemEq _⟩⟩
+    cases hu with
+    | head => exact Nat.succ_ne_zero n
+    | tail _ h => nomatch h
+
+/-! ### Chunked all-paths multi-frame exploration (`symExploreChunks` + `coverage` + `drop`) -/
+
+def u8TyBranch : Ty := { kind := .uint .u8, layoutIdx := 2 }
+
+/--
+```text
+fn add_scaled_branch(flag: u8, base: usize, metadata: usize, multiple: usize) -> usize {
+  // bb0: Coverage; switchInt(copy _1) [0 -> bb1, otherwise -> bb2]
+  // bb1: _0 = const 0_usize; drop(_1) -> bb4
+  // bb2: StorageLive(_5); _5 = mul_scaled(copy _3, copy _4) -> bb3
+  // bb3: _0 = core::intrinsics::unchecked_add::<usize>(copy _2, move _5) -> bb5
+  // bb4: return
+  // bb5: StorageDead(_5); drop(_1) -> bb4
+}
+``` -/
+def addScaledBranchBody : CapturedMir :=
+  { defPath := "add_scaled::add_scaled_branch"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 4
+    localDecls :=
+      [ decl usizeTy "_0", decl u8TyBranch "flag", decl usizeTy "base"
+      , decl usizeTy "metadata", decl usizeTy "multiple", decl usizeTy "_5" ]
+    basicBlocks :=
+      [ { statements := [st .coverage]
+          terminator := tm (.switchInt (.copy (pl 1)) { branches := [(0, 1)], otherwise := 2 })
+          isCleanup := false }
+      , { statements :=
+            [ st (.assign (pl 0) (.use (.constant { ty := usizeTy, val := .scalar (.int ⟨0, 8⟩) }))) ]
+          terminator := tm (.drop (pl 1) 4 .continue_)
+          isCleanup := false }
+      , { statements := [st (.storageLive 5)]
+          terminator := tm (.call (fnOp "add_scaled::mul_scaled" [])
+            [.copy (pl 3), .copy (pl 4)] (pl 5) (some 3) .continue_)
+          isCleanup := false }
+      , { statements := []
+          terminator := tm (.call (fnOp "core::intrinsics::unchecked_add" [.uint .usize])
+            [.copy (pl 2), .move (pl 5)] (pl 0) (some 5) .continue_)
+          isCleanup := false }
+      , { statements := []
+          terminator := tm .return_
+          isCleanup := false }
+      , { statements := [st (.storageDead 5)]
+          terminator := tm (.drop (pl 1) 4 .continue_)
+          isCleanup := false } ]
+    fnAbi :=
+      { args := [{ layout := u8Layout, mode := .direct }, { layout := usizeLayout, mode := .direct },
+                 { layout := usizeLayout, mode := .direct }, { layout := usizeLayout, mode := .direct }]
+        ret := { layout := usizeLayout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts :=
+      { pointerBits := 64, isLittleEndian := true, entries := [usizeLayout, boolLayout, u8Layout] }
+    allocations := [] }
+
+def addScaledBranchCfg : SymConfig :=
+  { body := addScaledBranchBody, callees := [mulScaledCalleeBody] }
+
+abbrev vflg : SymScalar := .var 3 1
+
+def addScaledBranchEntry : SymProg :=
+  symProgEntry addScaledBranchCfg [.scalar vflg, .scalar vb, .scalar vm, .scalar vk]
+
+def addScaledBranchZeroFin : SymProg :=
+  { frame := { blockIdx := 4, stmtIdx := 0
+               locals := [.init (.concrete (.scalar ⟨0, 8⟩)), U, I vb, I vm, I vk, D] }
+    stack := [], active := none }
+
+def addScaledBranchNzFin : SymProg :=
+  { frame := { blockIdx := 4, stmtIdx := 0
+               locals := [I vres, U, I vb, I vm, I vk, D] }
+    stack := [], active := some addScaledBranchBody }
+
+/-- Automatic chunked all-paths exploration of multi-frame branching
+`add_scaled_branch` (inline `mul_scaled` + `unchecked_add` + `coverage` + `drop`)
+in 4 chunks `[2, 5, 5, 3]` by ONE `rfl` (no heartbeat blowup!). -/
+theorem addScaledBranch_exploreChunks :
+    symExploreChunks addScaledBranchCfg [2, 5, 5, 3] [] addScaledBranchEntry =
+      some [ ([.switchBranchEq vflg 0 []], .concrete (.scalar ⟨0, 8⟩), addScaledBranchZeroFin)
+           , ([.switchBranchOtherwise vflg [0], .assertHolds (.const ⟨1, 1⟩) true,
+               .noOverflowMul false vm vk, .noOverflowAdd false vb vmk],
+              .scalar vres, addScaledBranchNzFin) ] := rfl
+
+def branchEnv (f b m k : Nat) : SymEnv
+  | 0 => b
+  | 1 => m
+  | 2 => k
+  | 3 => f
+  | _ => 0
+
+theorem branch_vmk_eval {f b m k : Nat} (hm : m < M64) (hk : k < M64) (hmk : m * k < M64) :
+    vmk.eval (branchEnv f b m k) = ⟨m * k, 8⟩ := by
+  show (evalUncheckedMul ⟨m, 8⟩ ⟨k, 8⟩ false).getD symDefaultScalar = _
+  rw [evalUncheckedMul_unsigned_eq eight_ne_zero hm hk hmk]; rfl
+
+theorem branch_vres_eval {f b m k : Nat} (hb : b < M64) (hm : m < M64) (hk : k < M64)
+    (hmk : m * k < M64) (hbmk : b + m * k < M64) :
+    vres.eval (branchEnv f b m k) = ⟨b + m * k, 8⟩ := by
+  show (evalUncheckedAdd (vb.eval (branchEnv f b m k)) (vmk.eval (branchEnv f b m k)) false).getD
+    symDefaultScalar = _
+  rw [branch_vmk_eval hm hk hmk]
+  show (evalUncheckedAdd ⟨b, 8⟩ ⟨m * k, 8⟩ false).getD symDefaultScalar = _
+  rw [evalUncheckedAdd_unsigned_eq eight_ne_zero hb hmk hbmk]; rfl
+
+def addScaledBranchClaim : Claim :=
+  { body := addScaledBranchBody
+    pre := fun args => ∃ f b m k, args = [.scalar ⟨f, 1⟩, su b, su m, su k] ∧
+      (f ≠ 0 → b < M64 ∧ m < M64 ∧ k < M64 ∧ b + m * k < M64)
+    post := fun args r => ∃ f b m k, args = [.scalar ⟨f, 1⟩, su b, su m, su k] ∧
+      r = su (match f with | 0 => 0 | _ + 1 => b + m * k)
+    callees := [mulScaledCalleeBody] }
+
+theorem addScaledBranch_verificationResult_exploreChunks :
+    VerificationResult addScaledBranchClaim := by
+  refine verificationResult_of_symExploreChunks addScaledBranchClaim addScaledBranchCfg rfl rfl
+    [2, 5, 5, 3] [.scalar vflg, .scalar vb, .scalar vm, .scalar vk] _
+    addScaledBranch_exploreChunks ?_
+  intro args ⟨f, b, m, k, hargs, hok⟩
+  subst hargs
+  refine ⟨branchEnv f b m k, rfl, ?_⟩
+  cases f with
+  | zero =>
+    exact ⟨_, List.Mem.head _, ⟨⟨rfl, fun _ h => nomatch h⟩, trivial⟩, ⟨0, b, m, k, rfl, rfl⟩⟩
+  | succ f' =>
+    obtain ⟨hb, hm, hk, hbmk⟩ := hok (Nat.succ_ne_zero f')
+    have hmk : m * k < M64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hbmk
+    refine ⟨_, List.Mem.tail _ (List.Mem.head _), ?_, ?_⟩
+    · refine ⟨fun u hu => ?_, rfl, ⟨⟨eight_ne_zero, rfl⟩, ?_⟩, ?_, trivial⟩
+      · cases hu with
+        | head => exact Nat.succ_ne_zero f'
+        | tail _ h => nomatch h
+      · show wrapScalarBits m (scalarModulus 8) * wrapScalarBits k (scalarModulus 8) < scalarModulus 8
+        rw [wrapScalarBits_of_lt hm, wrapScalarBits_of_lt hk]; exact hmk
+      · show ScWidthsOk (vb.eval (branchEnv (f' + 1) b m k)) (vmk.eval (branchEnv (f' + 1) b m k)) ∧
+          scBits (vb.eval (branchEnv (f' + 1) b m k)) +
+            scBitsAt (vb.eval (branchEnv (f' + 1) b m k)) (vmk.eval (branchEnv (f' + 1) b m k)) <
+              scalarModulus (vb.eval (branchEnv (f' + 1) b m k)).sizeBytes
+        rw [branch_vmk_eval hm hk hmk]
+        refine ⟨⟨eight_ne_zero, rfl⟩, ?_⟩
+        show wrapScalarBits b (scalarModulus 8) + wrapScalarBits (m * k) (scalarModulus 8) <
+          scalarModulus 8
+        rw [wrapScalarBits_of_lt hb, wrapScalarBits_of_lt hmk]; exact hbmk
+    · refine ⟨f' + 1, b, m, k, rfl, ?_⟩
+      show Value.scalar (vres.eval (branchEnv (f' + 1) b m k)) = su (b + m * k)
+      rw [branch_vres_eval hb hm hk hmk hbmk]
+
+def addScaledBranchStatefulClaim : StatefulClaim :=
+  { body := addScaledBranchBody
+    pre := fun args mem => (∃ f b m k, args = [.scalar ⟨f, 1⟩, su b, su m, su k] ∧
+      (f ≠ 0 → b < M64 ∧ m < M64 ∧ k < M64 ∧ b + m * k < M64)) ∧
+      SymStatefulMemCompat addScaledBranchCfg mem
+    post := fun args mem r mem' =>
+      (∃ f b m k, args = [.scalar ⟨f, 1⟩, su b, su m, su k] ∧
+        r = su (match f with | 0 => 0 | _ + 1 => b + m * k)) ∧
+      mem'.nextAllocId = mem.nextAllocId ∧ mem'.globals = mem.globals ∧
+      mem'.borrows = [] ∧ mem'.callerLocals = mem.callerLocals ∧
+      mem'.fnPtrs = mem.fnPtrs ∧ mem'.exposedAllocIds = mem.exposedAllocIds ∧
+      mem'.rootUnwindCeiling = mem.rootUnwindCeiling
+    callees := [mulScaledCalleeBody] }
+
+theorem addScaledBranch_statefulVerificationResult_exploreChunks_mem :
+    StatefulVerificationResult addScaledBranchStatefulClaim := by
+  refine statefulVerificationResult_of_symExploreChunks_mem addScaledBranchStatefulClaim
+    addScaledBranchCfg rfl rfl [2, 5, 5, 3] [.scalar vflg, .scalar vb, .scalar vm, .scalar vk] _
+    addScaledBranch_exploreChunks ?_
+  intro args mem ⟨⟨f, b, m, k, hargs, hok⟩, hMem⟩
+  subst hargs
+  refine ⟨hMem, branchEnv f b m k, rfl, ?_⟩
+  cases f with
+  | zero =>
+    exact ⟨_, List.Mem.head _, ⟨⟨rfl, fun _ h => nomatch h⟩, trivial⟩,
+      ⟨⟨0, b, m, k, rfl, rfl⟩, rfl, rfl, hMem.2.1, rfl, rfl, rfl, rfl⟩⟩
+  | succ f' =>
+    obtain ⟨hb, hm, hk, hbmk⟩ := hok (Nat.succ_ne_zero f')
+    have hmk : m * k < M64 := Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hbmk
+    refine ⟨_, List.Mem.tail _ (List.Mem.head _), ?_, ?_⟩
+    · refine ⟨fun u hu => ?_, rfl, ⟨⟨eight_ne_zero, rfl⟩, ?_⟩, ?_, trivial⟩
+      · cases hu with
+        | head => exact Nat.succ_ne_zero f'
+        | tail _ h => nomatch h
+      · show wrapScalarBits m (scalarModulus 8) * wrapScalarBits k (scalarModulus 8) < scalarModulus 8
+        rw [wrapScalarBits_of_lt hm, wrapScalarBits_of_lt hk]; exact hmk
+      · show ScWidthsOk (vb.eval (branchEnv (f' + 1) b m k)) (vmk.eval (branchEnv (f' + 1) b m k)) ∧
+          scBits (vb.eval (branchEnv (f' + 1) b m k)) +
+            scBitsAt (vb.eval (branchEnv (f' + 1) b m k)) (vmk.eval (branchEnv (f' + 1) b m k)) <
+              scalarModulus (vb.eval (branchEnv (f' + 1) b m k)).sizeBytes
+        rw [branch_vmk_eval hm hk hmk]
+        refine ⟨⟨eight_ne_zero, rfl⟩, ?_⟩
+        show wrapScalarBits b (scalarModulus 8) + wrapScalarBits (m * k) (scalarModulus 8) <
+          scalarModulus 8
+        rw [wrapScalarBits_of_lt hb, wrapScalarBits_of_lt hmk]; exact hbmk
+    · refine ⟨⟨f' + 1, b, m, k, rfl, ?_⟩, rfl, rfl, hMem.2.1, rfl, rfl, rfl, rfl⟩
+      show Value.scalar (vres.eval (branchEnv (f' + 1) b m k)) = su (b + m * k)
+      rw [branch_vres_eval hb hm hk hmk hbmk]
 
 /-! ## Pillar 2: Bounded Loop via `StepBoundV2026` + `CnfOrd.Worklist` + `WlpV2026` -/
 
@@ -2136,11 +2406,25 @@ theorem assert_continue_panic_forall (x : Nat) (Q : Value → Memory → Prop) (
 #print axioms symProgRunSteps_assert_panic_refutes
 #print axioms verificationResult_of_symRunChunks
 #print axioms statefulVerificationResult_of_symRunChunks
+#print axioms statefulVerificationResult_of_symRunChunks_mem
+#print axioms symExplore_sound
+#print axioms symExplore_sound_full
+#print axioms symExplore_mirCallTree_sound
+#print axioms statefulVerificationResult_of_symExplore_mem
+#print axioms symExploreChunks_sound
+#print axioms symExploreChunks_mirCallTree_sound
+#print axioms verificationResult_of_symExploreChunks
+#print axioms statefulVerificationResult_of_symExploreChunks_mem
 #print axioms add_scaled_symbolic
 #print axioms add_scaled_execStepOutcome
 #print axioms add_scaled_blockCtx_firewall
 #print axioms add_scaled_verificationResult
 #print axioms add_scaled_statefulVerificationResult
+#print axioms add_scaled_statefulVerificationResult_mem
+#print axioms addScaledBranch_verificationResult_exploreChunks
+#print axioms addScaledBranch_statefulVerificationResult_exploreChunks_mem
+#print axioms sel_mirCallTree_explore
+#print axioms sel_statefulVerificationResult_explore_mem
 #print axioms checkedAddCast_symbolic
 #print axioms checkedAddCast_overflow_ub_forall
 #print axioms binUncheckedAdd_overflow_ub_forall
@@ -2234,7 +2518,11 @@ def keyTestTheorems : Array Lean.Name :=
     ``cd_not_tight_forall, ``cd_verificationResult_forall, ``cd_statefulVerificationResult_forall,
     ``spin_partial_not_total, ``add_scaled_mul_overflow_ub_forall,
     ``add_scaled_add_overflow_ub_forall, ``sel_emits_event_zero, ``sel_emits_event_succ,
-    ``scaled_add_call_silent, ``cd_iter_forall, ``sel_verificationResult_explore]
+    ``scaled_add_call_silent, ``cd_iter_forall, ``sel_verificationResult_explore,
+    ``sel_mirCallTree_explore, ``sel_statefulVerificationResult_explore_mem,
+    ``add_scaled_statefulVerificationResult_mem,
+    ``addScaledBranch_verificationResult_exploreChunks,
+    ``addScaledBranch_statefulVerificationResult_exploreChunks_mem]
 
 run_cmd auditAxioms keyTestTheorems choiceFreeAxioms
 
