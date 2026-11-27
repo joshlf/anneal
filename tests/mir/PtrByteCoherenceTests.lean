@@ -2860,6 +2860,159 @@ theorem a1_lockstep_parity :
       .agg 0 [.ptr 9 0x10 4, .scalar 2 4]] := by
   exact ⟨rfl, rfl, rfl, rfl⟩
 
+/-! ## §4c. `[adv ep1-B2]` Wide-Pointer Byte-Permutation Regressions
+
+End-to-end `copy_nonoverlapping::<u8>` permutations of wide pointers (A1's new
+`copyBytesSubplace` / `decodeUntypedStorageBytes` wide-pointer paths): swapping the data and
+metadata halves of `&[u8]` / `*const [u8]`, swapping two data bytes, sourcing a `&dyn` vtable half
+from plain slice-length bytes, assembling a `&[u8]` from its halves in either order (and from a
+duplicated metadata half), and pinning the Brief §1.5 W5 / §3.1(h) policy that an untyped copy of
+pointer bytes into `u64` storage faults under `.strictUcg630Ub`. -/
+
+section B2Fixtures06
+
+open V06
+
+def b2Target_06 : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+def b2SliceVal_06 : Value := .aggregate 0 [.ptr b2Target_06 8, .scalar ⟨3, 8⟩]
+def b2DynVal_06 : Value := .aggregate 0 [.ptr b2Target_06 8, .ptr vtPtr64_06 8]
+
+/-- Locals: `0` src `&[u8]`, `1` dst `&[u8]`, `2` dst `*const [u8]`, `3` src `&dyn T`,
+`4` dst `&dyn T`, `5`/`6`/`7` = `&0` at byte `0`/`8`/`1`, `8`/`9`/`10` = `&mut 1` at `0`/`8`/`1`,
+`11`/`12` = `&mut 2` at `0`/`8`, `13`/`14` = `&3` at `0`/`8`, `15`/`16` = `&mut 4` at `0`/`8`,
+`17` dst `u64`, `18` = `&mut 17`, `19` uninit dst `&[u8]`, `20`/`21` = `&mut 19` at `0`/`8`. -/
+def b2Decls_06 : List LocalDecl :=
+  [{ mutability := .not, ty := tyRefSliceU8_06, debugName := none },
+   { mutability := .mut, ty := tyRefSliceU8_06, debugName := none },
+   { mutability := .mut, ty := tyRawSliceU8_06, debugName := none },
+   { mutability := .not, ty := tyRefDyn_06, debugName := none },
+   { mutability := .mut, ty := tyRefDyn_06, debugName := none }] ++
+  List.replicate 3 { mutability := .not, ty := tyRawPtrU8_06, debugName := none } ++
+  List.replicate 5 { mutability := .not, ty := tyMutPtrU8_06, debugName := none } ++
+  List.replicate 2 { mutability := .not, ty := tyRawPtrU8_06, debugName := none } ++
+  List.replicate 2 { mutability := .not, ty := tyMutPtrU8_06, debugName := none } ++
+  [{ mutability := .mut, ty := tyU64_06, debugName := none },
+   { mutability := .not, ty := tyMutPtrU8_06, debugName := none },
+   { mutability := .mut, ty := tyRefSliceU8_06, debugName := none },
+   { mutability := .not, ty := tyMutPtrU8_06, debugName := none },
+   { mutability := .not, ty := tyMutPtrU8_06, debugName := none }]
+
+def b2P_06 (a o : Nat) : LocalSlot := .init (.ptr { allocId := a, offsetBytes := o } 8)
+
+def b2State_06 : MachineState :=
+  mkState06
+    ([.init b2SliceVal_06, .init b2SliceVal_06, .init b2SliceVal_06, .init b2DynVal_06,
+      .init b2DynVal_06, b2P_06 10 0, b2P_06 10 8, b2P_06 10 1, b2P_06 11 0, b2P_06 11 8,
+      b2P_06 11 1, b2P_06 12 0, b2P_06 12 8, b2P_06 13 0, b2P_06 13 8, b2P_06 14 0, b2P_06 14 8,
+      .init (.scalar ⟨0, 8⟩), b2P_06 15 0, .uninit, b2P_06 16 0, b2P_06 16 8])
+    { emptyMemory with
+      borrows := [b1Frozen_06 10 0, b1Active_06 11 1, b1Active_06 12 2, b1Frozen_06 13 3,
+        b1Active_06 14 4, b1Active_06 15 17, b1Active_06 16 19] }
+
+def b2C_06 (n : Nat) : Operand := b1Count_06 n 8 tyUsize_06
+
+def b2Read_06 (stmts : List Statement) (p : Place) : Option PlaceReadResult :=
+  b1ReadAfter_06 b2Decls_06 a1Layouts64_06 b2State_06 stmts p
+
+end B2Fixtures06
+
+/-- B2 (§3.1(e) end to end through bytewise copies, `V2026_06_01`): swapping the data and length
+halves of `&[u8]` or `*const [u8]` faults (the length half now carries pointer provenance); a
+data-byte `0`/`1` swap faults for `&[u8]` and strips provenance for `*const [u8]`; a plain
+length half copied into a `&dyn T` vtable half faults; a `&[u8]` assembled from its halves in
+either order is the original value, while a lone data half or a duplicated length half faults;
+an untyped copy of pointer bytes into `u64` storage faults under `.strictUcg630Ub` (W5). -/
+theorem b2_wide_ptr_byte_permutations_v06 :
+    b2Read_06 [b1Copy_06 5 8 (b2C_06 16)] ⟨1, []⟩ = some (.ok b2SliceVal_06 []) ∧
+    b2Read_06 [b1Copy_06 5 9 (b2C_06 8), b1Copy_06 6 8 (b2C_06 8)] ⟨1, []⟩ = some .ub ∧
+    b2Read_06 [b1Copy_06 5 12 (b2C_06 8), b1Copy_06 6 11 (b2C_06 8)] ⟨2, []⟩ = some .ub ∧
+    b2Read_06 [b1Copy_06 5 8 (b2C_06 16), b1Copy_06 7 8 (b2C_06 1), b1Copy_06 5 10 (b2C_06 1)]
+      ⟨1, []⟩ = some .ub ∧
+    b2Read_06 [b1Copy_06 5 11 (b2C_06 16), b1Copy_06 7 11 (b2C_06 1)] ⟨2, []⟩ =
+      some (.ok (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨3, 8⟩]) []) ∧
+    b2Read_06 [b1Copy_06 6 16 (b2C_06 8)] ⟨4, []⟩ = some .ub ∧
+    b2Read_06 [b1Copy_06 13 15 (b2C_06 8)] ⟨4, []⟩ = some (.ok b2DynVal_06 []) ∧
+    b2Read_06 [b1Copy_06 5 20 (b2C_06 8)] ⟨19, []⟩ = some .ub ∧
+    b2Read_06 [b1Copy_06 5 20 (b2C_06 8), b1Copy_06 6 21 (b2C_06 8)] ⟨19, []⟩ =
+      some (.ok b2SliceVal_06 []) ∧
+    b2Read_06 [b1Copy_06 6 21 (b2C_06 8), b1Copy_06 5 20 (b2C_06 8)] ⟨19, []⟩ =
+      some (.ok b2SliceVal_06 []) ∧
+    b2Read_06 [b1Copy_06 6 20 (b2C_06 8), b1Copy_06 6 21 (b2C_06 8)] ⟨19, []⟩ = some .ub ∧
+    IsUbStep06 (V06.evalStmt b2State_06 (b1Copy_06 13 18 (b2C_06 8)) b2Decls_06 a1Layouts64_06) := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+section B2Fixtures08
+
+open V08
+
+def b2Target_08 : ProvenancePtr := { allocId := 1, offsetBytes := 0 }
+def b2SliceVal_08 : Value := .aggregate 0 [.ptr b2Target_08 8, .scalar ⟨3, 8⟩]
+def b2DynVal_08 : Value := .aggregate 0 [.ptr b2Target_08 8, .ptr vtPtr64_08 8]
+
+/-- Locals: `0` src `&[u8]`, `1` dst `&[u8]`, `2` dst `*const [u8]`, `3` src `&dyn T`,
+`4` dst `&dyn T`, `5`/`6`/`7` = `&0` at byte `0`/`8`/`1`, `8`/`9`/`10` = `&mut 1` at `0`/`8`/`1`,
+`11`/`12` = `&mut 2` at `0`/`8`, `13`/`14` = `&3` at `0`/`8`, `15`/`16` = `&mut 4` at `0`/`8`,
+`17` dst `u64`, `18` = `&mut 17`, `19` uninit dst `&[u8]`, `20`/`21` = `&mut 19` at `0`/`8`. -/
+def b2Decls_08 : List LocalDecl :=
+  [{ mutability := .not, ty := tyRefSliceU8_08, debugName := none },
+   { mutability := .mut, ty := tyRefSliceU8_08, debugName := none },
+   { mutability := .mut, ty := tyRawSliceU8_08, debugName := none },
+   { mutability := .not, ty := tyRefDyn_08, debugName := none },
+   { mutability := .mut, ty := tyRefDyn_08, debugName := none }] ++
+  List.replicate 3 { mutability := .not, ty := tyRawPtrU8_08, debugName := none } ++
+  List.replicate 5 { mutability := .not, ty := tyMutPtrU8_08, debugName := none } ++
+  List.replicate 2 { mutability := .not, ty := tyRawPtrU8_08, debugName := none } ++
+  List.replicate 2 { mutability := .not, ty := tyMutPtrU8_08, debugName := none } ++
+  [{ mutability := .mut, ty := tyU64_08, debugName := none },
+   { mutability := .not, ty := tyMutPtrU8_08, debugName := none },
+   { mutability := .mut, ty := tyRefSliceU8_08, debugName := none },
+   { mutability := .not, ty := tyMutPtrU8_08, debugName := none },
+   { mutability := .not, ty := tyMutPtrU8_08, debugName := none }]
+
+def b2P_08 (a o : Nat) : LocalSlot := .init (.ptr { allocId := a, offsetBytes := o } 8)
+
+def b2State_08 : MachineState :=
+  mkState08
+    ([.init b2SliceVal_08, .init b2SliceVal_08, .init b2SliceVal_08, .init b2DynVal_08,
+      .init b2DynVal_08, b2P_08 10 0, b2P_08 10 8, b2P_08 10 1, b2P_08 11 0, b2P_08 11 8,
+      b2P_08 11 1, b2P_08 12 0, b2P_08 12 8, b2P_08 13 0, b2P_08 13 8, b2P_08 14 0, b2P_08 14 8,
+      .init (.scalar ⟨0, 8⟩), b2P_08 15 0, .uninit, b2P_08 16 0, b2P_08 16 8])
+    { emptyMemory with
+      borrows := [b1Frozen_08 10 0, b1Active_08 11 1, b1Active_08 12 2, b1Frozen_08 13 3,
+        b1Active_08 14 4, b1Active_08 15 17, b1Active_08 16 19] }
+
+def b2C_08 (n : Nat) : Operand := b1Count_08 n 8 tyUsize_08
+
+def b2Read_08 (stmts : List Statement) (p : Place) : Option PlaceReadResult :=
+  b1ReadAfter_08 b2Decls_08 a1Layouts64_08 b2State_08 stmts p
+
+end B2Fixtures08
+
+/-- B2 (§3.1(e) end to end through bytewise copies, `V2026_08_01`): swapping the data and length
+halves of `&[u8]` or `*const [u8]` faults (the length half now carries pointer provenance); a
+data-byte `0`/`1` swap faults for `&[u8]` and strips provenance for `*const [u8]`; a plain
+length half copied into a `&dyn T` vtable half faults; a `&[u8]` assembled from its halves in
+either order is the original value, while a lone data half or a duplicated length half faults;
+an untyped copy of pointer bytes into `u64` storage faults under `.strictUcg630Ub` (W5). -/
+theorem b2_wide_ptr_byte_permutations_v08 :
+    b2Read_08 [b1Copy_08 5 8 (b2C_08 16)] ⟨1, []⟩ = some (.ok b2SliceVal_08 []) ∧
+    b2Read_08 [b1Copy_08 5 9 (b2C_08 8), b1Copy_08 6 8 (b2C_08 8)] ⟨1, []⟩ = some .ub ∧
+    b2Read_08 [b1Copy_08 5 12 (b2C_08 8), b1Copy_08 6 11 (b2C_08 8)] ⟨2, []⟩ = some .ub ∧
+    b2Read_08 [b1Copy_08 5 8 (b2C_08 16), b1Copy_08 7 8 (b2C_08 1), b1Copy_08 5 10 (b2C_08 1)]
+      ⟨1, []⟩ = some .ub ∧
+    b2Read_08 [b1Copy_08 5 11 (b2C_08 16), b1Copy_08 7 11 (b2C_08 1)] ⟨2, []⟩ =
+      some (.ok (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨3, 8⟩]) []) ∧
+    b2Read_08 [b1Copy_08 6 16 (b2C_08 8)] ⟨4, []⟩ = some .ub ∧
+    b2Read_08 [b1Copy_08 13 15 (b2C_08 8)] ⟨4, []⟩ = some (.ok b2DynVal_08 []) ∧
+    b2Read_08 [b1Copy_08 5 20 (b2C_08 8)] ⟨19, []⟩ = some .ub ∧
+    b2Read_08 [b1Copy_08 5 20 (b2C_08 8), b1Copy_08 6 21 (b2C_08 8)] ⟨19, []⟩ =
+      some (.ok b2SliceVal_08 []) ∧
+    b2Read_08 [b1Copy_08 6 21 (b2C_08 8), b1Copy_08 5 20 (b2C_08 8)] ⟨19, []⟩ =
+      some (.ok b2SliceVal_08 []) ∧
+    b2Read_08 [b1Copy_08 6 20 (b2C_08 8), b1Copy_08 6 21 (b2C_08 8)] ⟨19, []⟩ = some .ub ∧
+    IsUbStep08 (V08.evalStmt b2State_08 (b1Copy_08 13 18 (b2C_08 8)) b2Decls_08 a1Layouts64_08) := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
 /-! ## §5. Mechanical Local Axiom, Reachability, & Non-Triviality Audit -/
 
 open Lean Elab Command in
