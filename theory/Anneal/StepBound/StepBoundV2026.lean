@@ -53,7 +53,11 @@ onto unmodified `Trusted.Rustc.V2026_06_01.MirSemantics` via `v2026Step`,
 4. **Tight-Budget & Non-Vacuity Refutation Lemmas:** Refutation of
    `ReachesDoneWithinV2026` on diverging traces, under-budget bounds
    (`bound ≤ k`), postcondition failures, and fault trajectories, exercised on
-   concrete `CapturedMir` witnesses.
+   concrete `CapturedMir` witnesses; plus *fault exactness* against the
+   unmodified trusted tree (`reaches_mirTree_of_stepsToV2026`,
+   `not_mirNoUBTree_of_stepsTo_fault_fail`) and a concrete external-call vs
+   linked-callee multi-frame canary
+   (`canary_stepBoundV2026_extCall_vs_linked_callee`).
 -/
 
 namespace Anneal.StepBound
@@ -1987,6 +1991,81 @@ theorem not_reachesDoneWithinV2026_of_stepsTo_fault {body : CapturedMir}
         subst hEq
         exact not_reachesDoneWithinV2026_of_stepsTo_fault hTail hFault hRest
 
+/-! ### Fault Exactness against the Unmodified Trusted `mirTree` -/
+
+private theorem reaches_trans_v2026 {t u w : Trusted.ITree.ITree MirEffect MirOutcome}
+    {tr₁ tr₂ : List (Event MirEffect)}
+    (h₁ : Trusted.ITree.Reaches t tr₁ u) (h₂ : Trusted.ITree.Reaches u tr₂ w) :
+    Trusted.ITree.Reaches t (tr₁ ++ tr₂) w := by
+  induction h₁ with
+  | refl _ => exact h₂
+  | tau hObs _ ih => exact Trusted.ITree.Reaches.tau hObs (ih h₂)
+  | vis hObs hNF o _ ih => exact Trusted.ITree.Reaches.vis hObs hNF o (ih h₂)
+
+/-- Every exact `StepsToV2026 body k s s'` chain (silent `.tau` and observable
+`MirObsE` steps alike) is a finite labeled `Trusted.ITree.Reaches` path from
+`mirTree body s` to `mirTree body s'` in the unmodified trusted tree. -/
+theorem reaches_mirTree_of_stepsToV2026 {body : CapturedMir} {k : Nat}
+    {s s' : MachineState} (hSteps : StepsToV2026 body k s s') :
+    ∃ tr, Trusted.ITree.Reaches (mirTree body s) tr (mirTree body s') := by
+  induction hSteps with
+  | refl _ => exact ⟨[], Trusted.ITree.Reaches.refl _⟩
+  | @step _ s₀ s₁ _ hs _ ih =>
+    obtain ⟨tr, hR⟩ := ih
+    have hObs := mirTree_observe body s₀
+    cases v2026Step_step_iff.mp hs with
+    | inl hTau =>
+      rw [hTau] at hObs
+      exact ⟨tr, Trusted.ITree.Reaches.tau (t' := mirTree body s₁) hObs hR⟩
+    | inr hVis =>
+      obtain ⟨obs, kk, hv, hk⟩ := hVis
+      rw [hv] at hObs
+      refine ⟨_, Trusted.ITree.Reaches.vis (tr := tr)
+        (k := fun o => Trusted.ITree.ITree.cofix (stepMirState body) (kk o))
+        hObs (fun hF => hF) PUnit.unit ?_⟩
+      show Trusted.ITree.Reaches
+        (Trusted.ITree.ITree.cofix (stepMirState body) (kk PUnit.unit)) tr _
+      rw [hk]
+      exact hR
+
+private theorem faultNow_cofix_faulted (body : CapturedMir) (fk : FailureKind) :
+    Trusted.ITree.FaultNow
+      (Trusted.ITree.ITree.cofix (stepMirState body) (.faulted fk)) :=
+  ⟨_, _, _, Trusted.ITree.TauStar.refl _,
+    Trusted.ITree.ITree.observe_cofix _ _, trivial⟩
+
+/-- Fault exactness: whenever `v2026Step` reaches a genuine operational fault
+`.fault (.fail fk)` after any exact `StepsToV2026` prefix, the unmodified
+trusted tree `mirTree body s` is NOT `MirNoUBTree` (so `V2026StepFault.fail`
+classifications are never spurious). -/
+theorem not_mirNoUBTree_of_stepsTo_fault_fail {body : CapturedMir} {k : Nat}
+    {s s' : MachineState} {fk : FailureKind}
+    (hSteps : StepsToV2026 body k s s')
+    (hFault : v2026Step body s' = .fault (.fail fk)) :
+    ¬ MirNoUBTree (mirTree body s) := by
+  intro hSafe
+  obtain ⟨tr, hR⟩ := reaches_mirTree_of_stepsToV2026 hSteps
+  have hObs := mirTree_observe body s'
+  rcases v2026Step_fault_fail_iff.mp hFault with hTau | ⟨kk, hv⟩ | ⟨obs, kk, hv, hk⟩
+  · rw [hTau] at hObs
+    exact hSafe tr _ hR
+      ⟨_, _, _, Trusted.ITree.TauStar.step hObs (Trusted.ITree.TauStar.refl _),
+        Trusted.ITree.ITree.observe_cofix _ _, trivial⟩
+  · rw [hv] at hObs
+    exact hSafe tr _ hR ⟨_, _, _, Trusted.ITree.TauStar.refl _, hObs, trivial⟩
+  · rw [hv] at hObs
+    have hR₂ : Trusted.ITree.Reaches (mirTree body s')
+        [⟨.inr (.inl (.emit obs)), PUnit.unit⟩]
+        (Trusted.ITree.ITree.cofix (stepMirState body) (.faulted fk)) := by
+      refine Trusted.ITree.Reaches.vis
+        (k := fun o => Trusted.ITree.ITree.cofix (stepMirState body) (kk o))
+        hObs (fun hF => hF) PUnit.unit ?_
+      show Trusted.ITree.Reaches
+        (Trusted.ITree.ITree.cofix (stepMirState body) (kk PUnit.unit)) [] _
+      rw [hk]
+      exact Trusted.ITree.Reaches.refl _
+    exact hSafe _ _ (reaches_trans_v2026 hR hR₂) (faultNow_cofix_faulted body fk)
+
 /-! ## Part V: Concrete `V2026_06_01` Tight-Budget & Refutation Canaries -/
 
 /-- Minimal 1-block `CapturedMir` whose `bb0` faults immediately with
@@ -2429,5 +2508,124 @@ theorem canary_stepBoundV2026_byteCredit_worklist_and_statefulReactive :
       exact Or.inr ⟨1, sInit, Nat.le_refl 1, Nat.le_refl 1,
         StepsToV2026.single hStep, rfl, trivial⟩
   exact ⟨hBC, hWL, hStatefulReact⟩
+
+/-- Non-generic linked callee `fn canary_extern_id(x: u32) -> u32 { x }`. -/
+def canaryExternIdMir : CapturedMir :=
+  { defPath := "Anneal::StepBound::canary_extern_id"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 1
+    localDecls :=
+      [ { mutability := .mut, ty := u32Ty, debugName := some "_0" }
+      , { mutability := .not, ty := u32Ty, debugName := some "x" } ]
+    basicBlocks :=
+      [ { statements :=
+            [ { kind :=
+                  .assign { local_ := 0, projection := [] }
+                    (.use (.move { local_ := 1, projection := [] }))
+                span := "StepBoundV2026.lean:extern_id:bb0:0" } ]
+          terminator := { kind := .return_, span := "StepBoundV2026.lean:extern_id:bb0:1" }
+          isCleanup := false } ]
+    fnAbi :=
+      { args := [{ layout := u32Layout, mode := .direct }]
+        ret := { layout := u32Layout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [u32Layout] }
+    allocations := [] }
+
+/-- Caller `fn canary_caller() -> u32 { canary_extern_id(7) }` issuing a direct
+`TerminatorKind.call` to `Anneal::StepBound::canary_extern_id`. -/
+def canaryCallerMir : CapturedMir :=
+  { defPath := "Anneal::StepBound::canary_caller"
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := 0
+    localDecls := [ { mutability := .mut, ty := u32Ty, debugName := some "_0" } ]
+    basicBlocks :=
+      [ { statements := []
+          terminator :=
+            { kind :=
+                .call
+                  (.constant
+                    { ty := { kind := .fnDef "Anneal::StepBound::canary_extern_id" [],
+                              layoutIdx := 0 }
+                      val := .zeroSized })
+                  [.constant { ty := u32Ty, val := .scalar (.int ⟨7, 4⟩) }]
+                  { local_ := 0, projection := [] } (some 1) .continue_
+              span := "StepBoundV2026.lean:caller:bb0:0" }
+          isCleanup := false }
+      , { statements := []
+          terminator := { kind := .return_, span := "StepBoundV2026.lean:caller:bb1:0" }
+          isCleanup := false } ]
+    fnAbi :=
+      { args := []
+        ret := { layout := u32Layout, mode := .direct }
+        conv := .rust
+        canUnwind := true }
+    layouts := { pointerBits := 64, isLittleEndian := true, entries := [u32Layout] }
+    allocations := [] }
+
+/-- Concrete external-call vs linked-callee canary over unmodified trusted
+semantics (the only `ofV2026MirStepNode` branch otherwise lacking a concrete
+witness), exercising multi-frame call/return through `v2026Step`:
+1. Unlinked (`callees = []`): the direct `call` to
+   `Anneal::StepBound::canary_extern_id` is a genuine trusted
+   `.vis (.inr (.inr (.call req))) k` node, `v2026Step` classifies it as
+   `.fault (.extCall req)`, and no step bound or call-free convergence exists.
+2. Linked (`callees = [canaryExternIdMir]`): execution pushes the callee frame,
+   runs it, returns into the caller, and halts with `7` in EXACTLY `4` steps
+   (`3` is refuted), yielding call-free convergence and a choice-free
+   panic-forbidding `VerificationResult`. -/
+theorem canary_stepBoundV2026_extCall_vs_linked_callee (bound : Nat)
+    (post : MirOutcome → Prop) :
+    let s0 := initMachineState canaryCallerMir []
+    let sL := initMachineStateWithCallees canaryCallerMir [] [canaryExternIdMir]
+    let ok : MirOutcome → Prop :=
+      mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)
+    (∃ req, v2026Step canaryCallerMir s0 = .fault (.extCall req) ∧
+      ∃ k, stepMirFn canaryCallerMir s0 = .vis (.inr (.inr (.call req))) k) ∧
+    ¬ ReachesDoneWithinV2026 canaryCallerMir post bound s0 ∧
+    ¬ MirNoCallWpConverges canaryCallerMir s0 post ∧
+    ExecWithinStepsV2026 canaryCallerMir [] [canaryExternIdMir] ok 4 ∧
+    ¬ ExecWithinStepsV2026 canaryCallerMir [] [canaryExternIdMir] ok 3 ∧
+    MirNoCallWpConverges canaryCallerMir sL ok ∧
+    VerificationResult
+      { body := canaryCallerMir
+        pre := fun args => args = []
+        post := fun _ retVal => retVal = .scalar ⟨7, 4⟩
+        callees := [canaryExternIdMir] } := by
+  dsimp only
+  obtain ⟨req, hExt⟩ : ∃ req, v2026Step canaryCallerMir
+      (initMachineState canaryCallerMir []) = .fault (.extCall req) := ⟨_, rfl⟩
+  have hNoBound : ∀ b, ¬ ReachesDoneWithinV2026 canaryCallerMir post b
+      (initMachineState canaryCallerMir []) := fun b =>
+    not_reachesDoneWithinV2026_of_stepsTo_fault (StepsToV2026.refl _) hExt
+  have h4 : ExecWithinStepsV2026 canaryCallerMir [] [canaryExternIdMir]
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) 4 :=
+    reachesDoneWithinV2026_iff_execStepOutcome.mpr rfl
+  have h3 : ¬ ExecWithinStepsV2026 canaryCallerMir [] [canaryExternIdMir]
+      (mirNormalPost (fun retVal _ => retVal = .scalar ⟨7, 4⟩)) 3 :=
+    fun h => (reachesDoneWithinV2026_iff_execStepOutcome.mp h : False)
+  refine ⟨⟨req, hExt, v2026Step_fault_extCall_iff.mp hExt⟩, hNoBound bound, ?_, h4, h3,
+    mirNoCallWpConverges_iff_exists_reachesDoneWithinV2026.mpr ⟨4, h4⟩,
+    verifyMirNoPanic_of_execWithinStepsV2026 _ (fun args hArgs => ?_)⟩
+  · intro hConv
+    obtain ⟨b, hb⟩ := mirNoCallWpConverges_iff_exists_reachesDoneWithinV2026.mp hConv
+    exact hNoBound b hb
+  · subst hArgs
+    exact ⟨4, h4⟩
+
+/-- Concrete fault-exactness canary: `canaryFaultingMirBody` (`unreachable`)
+is refuted not only by `ReachesDoneWithinV2026` but by the unmodified trusted
+`MirNoUBTree`, and hence admits NO partial-correctness `VerificationResult`
+witness via any `wlpProgStrictV2026` derivation at fuel `1`. -/
+theorem canary_stepBoundV2026_fault_exact :
+    ¬ MirNoUBTree (mirTree canaryFaultingMirBody
+      (initMachineState canaryFaultingMirBody [])) ∧
+    ¬ wlpStateV2026 canaryFaultingMirBody 1
+      (initMachineState canaryFaultingMirBody []) (fun _ => True) :=
+  ⟨not_mirNoUBTree_of_stepsTo_fault_fail (StepsToV2026.refl _) rfl,
+   fun h => (wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp h : False)⟩
 
 end Anneal.StepBound

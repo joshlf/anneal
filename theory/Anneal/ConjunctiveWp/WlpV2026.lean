@@ -2534,6 +2534,34 @@ theorem verifyStatefulMirNoPanic_of_forall_wlpStateV2026 (c : StatefulClaim)
     wlpOutcomeV2026_mono (fun _ ho => mirNormalPost_imp_mirSafePost ho)
       (fun _ hf => hf) (h args mem hPre fuel))
 
+/-- `MirNoUBTree (mirCallTree body args)` from a fault-free
+`execStepOutcome (v2026Step body)` run from `initMachineState body args`. -/
+theorem mirNoUBTree_mirCallTree_of_v2026Exec {body : CapturedMir}
+    {args : List Value} {post : MirOutcome → Prop} {fuel : Nat}
+    (h : execStepOutcome (v2026Step body) post (fun _ => False) fuel
+      (initMachineState body args)) :
+    MirNoUBTree (mirCallTree body args) :=
+  treeSafe_mirTree_of_v2026Exec h
+
+/-- Return-postcondition adequacy over unmodified `mirCallTree body args`. -/
+theorem reachesRet_post_mirCallTree_of_v2026Exec {body : CapturedMir}
+    {args : List Value} {post : MirOutcome → Prop} {fuel : Nat}
+    (h : execStepOutcome (v2026Step body) post (fun _ => False) fuel
+      (initMachineState body args)) :
+    ∀ tr out, ReachesRet (mirCallTree body args) tr out → post out :=
+  reachesRet_post_of_v2026Exec h
+
+/-- Partial-correctness `MirNoUBTree (mirCallTree body args)` and return
+adequacy from strict WLP at every fuel (no termination required). -/
+theorem partialCorrectness_mirCallTree_of_forall_wlpStateV2026
+    {body : CapturedMir} {args : List Value} {post : MirOutcome → Prop}
+    (h : ∀ fuel : Nat, wlpStateV2026 body fuel (initMachineState body args) post) :
+    MirNoUBTree (mirCallTree body args) ∧
+      ∀ tr out, ReachesRet (mirCallTree body args) tr out → post out :=
+  ⟨mirNoUBTree_of_forall_wlpStateV2026 h,
+   reachesRet_post_of_forall_execWlpStateV2026
+     (fun fuel => wlpOutcomeV2026_iff_execWlpOutcomeV2026.mp (h fuel))⟩
+
 /-! ### Divergence Certificates against the Unmodified Trusted `mirTree` -/
 
 private theorem execWlp_of_infinite_trace {body : CapturedMir}
