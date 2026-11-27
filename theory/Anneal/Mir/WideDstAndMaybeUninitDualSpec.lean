@@ -516,7 +516,8 @@ def bundleOfSel (sel : Option WdDomain) (A : WdLmAuthority) (hLM : lmCheckOf sel
     WdBundle :=
   Corpus.bundle wdModel (mrSide sel) (lmSideOf sel A) (mrSide_check sel) hLM
 
-/-- **Unified 3-way bundle** over all 21 Trusted-agreeing cases × 2 modes. -/
+/-- **Unified bundle**: MiniRust gated on the 21 three-way cases × 2 modes, LeanMiri gated on
+those plus the Trusted-agreeing pin-delta case `22` (`bundle_gate_pinDelta_and_dstBoundary`). -/
 def bundleOf (A : WdLmAuthority) (hA : lmTableCheckOf A = true) : WdBundle :=
   bundleOfSel none A (lmCheckOf_of_table none A hA)
 
@@ -713,6 +714,45 @@ theorem dual_no_specPanic_all_cells (A : WdLmAuthority) (hA : lmTableCheckOf A =
   revert hi
   revert idx
   cases tb <;> decide +kernel
+
+/-- `wdVerdictOf` is injective away from `specPanic` (the only observation with no verdict). -/
+theorem wdVerdictOf_injective {a b : MrWdObs} (h : wdVerdictOf a = wdVerdictOf b)
+    (hne : wdVerdictOf a ≠ none) : a = b := by
+  cases a <;> cases b <;> first
+    | rfl
+    | exact absurd rfl hne
+    | (cases h; rfl)
+    | cases h
+
+/-- The frozen LeanMiri table agrees cell-for-cell with the MiniRust table off `pinDelta`, with
+the Trusted table off `dstBoundary`, and has no verdict-less cell. -/
+theorem lmTable_vs_tables (tb : Bool) (idx : Nat) (hi : idx < mrWdCaseCount) :
+    (wdClassOf idx ≠ .pinDelta → cellOf (lmTable tb) idx = cellOf (mrTable tb) idx) ∧
+    (wdClassOf idx ≠ .dstBoundary → cellOf (lmTable tb) idx = cellOf (trustedTable tb) idx) ∧
+    cellOf (lmTable tb) idx ≠ none := by
+  revert hi
+  revert idx
+  cases tb <;> decide +kernel
+
+/-- **Observer-level (not just verdict-level) 3-way agreement.** For any certified authority whose
+translation factors as `wdVerdictOf ∘ f` through a map `f : A.Obs → MrWdObs`, the RAW translated
+observation equals the raw MiniRust observation `mrWdObserve` on every in-range non-`pinDelta`
+cell, and equals the raw Trusted observation `mrTrustedWdObserve` on every in-range
+non-`dstBoundary` cell. The cross-root bridge instantiates this with `f := lmToMr` and
+`translation_fidelity`, which gives `lmToMr (lmWdObserve tb idx) = mrWdObserve tb idx` and
+`= mrTrustedWdObserve tb idx` directly. -/
+theorem observer_level_three_way (A : WdLmAuthority) (hA : lmTableCheckOf A = true)
+    (f : A.Obs → MrWdObs) (hf : ∀ o, A.toVerdict o = wdVerdictOf (f o))
+    (tb : Bool) (idx : Nat) (hi : idx < mrWdCaseCount) :
+    (wdClassOf idx ≠ .pinDelta → f (A.observe tb idx) = mrWdObserve tb idx) ∧
+    (wdClassOf idx ≠ .dstBoundary → f (A.observe tb idx) = mrTrustedWdObserve tb idx) := by
+  have hTab := lmTable_vs_tables tb idx hi
+  have hL : wdVerdictOf (f (A.observe tb idx)) = cellOf (lmTable tb) idx :=
+    (hf _).symm.trans (lmTableCheckOf_sound A hA tb idx hi)
+  have hne : wdVerdictOf (f (A.observe tb idx)) ≠ none := hL ▸ hTab.2.2
+  refine ⟨fun h => wdVerdictOf_injective ?_ hne, fun h => wdVerdictOf_injective ?_ hne⟩
+  · exact hL.trans ((hTab.1 h).trans (mrVerdict_cell tb idx hi).symm)
+  · exact hL.trans ((hTab.2.1 h).trans (trustedVerdict_cell tb idx hi).symm)
 
 /-- **Fail-closed `idx ≥ 24`** on all three authorities. -/
 theorem dual_fail_closed_out_of_range (A : WdLmAuthority) (hOob : WdLmFailClosed A)
@@ -977,6 +1017,14 @@ theorem rootBackedLmAuthority_failClosed : WdLmFailClosed rootBackedLmAuthority 
   show wdVerdictOf (if idx = 6 ∨ idx = 7 then mrWdObserve tb idx else mrTrustedWdObserve tb idx) = _
   rw [ite_eq_right_of_eq_false _ _ (eq_false h67)]
   exact trustedVerdict_out_of_range tb idx h
+
+/-- Non-vacuity of `observer_level_three_way`: it applies to the root-backed authority with
+`f := id`. -/
+theorem rootBacked_observer_level (tb : Bool) (idx : Nat) (hi : idx < mrWdCaseCount) :
+    type_of% (observer_level_three_way rootBackedLmAuthority rootBackedLmAuthority_tableCheck
+      (fun o => o) (fun _ => rfl) tb idx hi) :=
+  observer_level_three_way rootBackedLmAuthority rootBackedLmAuthority_tableCheck
+    (fun o => o) (fun _ => rfl) tb idx hi
 
 /-! ## §9. Capstone -/
 

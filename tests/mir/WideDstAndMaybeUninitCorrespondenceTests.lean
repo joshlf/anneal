@@ -499,12 +499,18 @@ run_cmd do
     -- 3-way copy contrast, anti-mock translation fidelity & bijection, frozen-table locks, all 5
     -- direct-certificate bundle equalities, 3-engine UB root-cause alignment, all 39 `Eq.refl`
     -- fixture locks, and the Episode 1 LeanMiri capstones into one single root theorem.
+    -- Observer-level 3-way agreement over the RAW `lmWdObserve` (via `lmToMr` + fidelity).
+    let olName := ns ++ `observer_level_three_way
+    addThmInfer olName (mkApp4 (mkConst (bNs ++ `observer_level_three_way)) authC hA lmToMr
+      (mkConst (ns ++ `translation_fidelity)))
+    added := added.push olName
     let crossName := ns ++ `ep2_cross_root_three_engine_capstone
     let crossPf ← MetaM.run' do
       let parts : List Expr :=
         [ mkConst capName,
           mkConst c13Name,
           mkConst (ns ++ `translation_fidelity),
+          mkConst olName,
           mkConst (ns ++ `lmToMr_mrToLm),
           mkConst (ns ++ `mrToLm_lmToMr),
           mkConst (ns ++ `frozenTableLock ++ `wdLmExpectedBasic),
@@ -733,6 +739,20 @@ run_cmd do
         ("forged clean termination on OOB UB case 16 (Stop.ub must not pass mrTerminatesCleanly)",
           thmD (ns ++ `forged.machineCleanStopOob16) (eqTrue (termClean false 16)) reflTrue,
           thmD (ns ++ `honest.machineNoCleanStopOob16) (eqFalse (termClean false 16)) reflFalse),
+        ("forged observer-level agreement at the pin-delta cell (LeanMiri = pinned MiniRust on 22)",
+          thmD (ns ++ `forged.observerLevelPinDelta)
+            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU false 22)) (mrObs false 22))
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU false 22))),
+          thmD (ns ++ `honest.observerLevelPinDeltaTrusted)
+            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU false 22)) (trObs false 22))
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU false 22)))),
+        ("forged observer-level agreement at a DST cell (LeanMiri = Trusted on 6)",
+          thmD (ns ++ `forged.observerLevelDst)
+            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU true 6)) (trObs true 6))
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU true 6))),
+          thmD (ns ++ `honest.observerLevelDstMr)
+            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU true 6)) (mrObs true 6))
+            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU true 6)))),
         ("forged pin delta: pinned d821c6e3 checkPtr rejects the null FnPtr",
           thmD (ns ++ `forged.pinnedCheckPtrRejectsNull) (mkEq cpTy cpL nnR) (mkRefl cpTy cpL),
           thmD (ns ++ `honest.pinnedCheckPtrAcceptsNull) (mkEq cpTy cpL cpR) (mkRefl cpTy cpL)),
@@ -898,7 +918,7 @@ run_cmd do
     { fileName := "<wd-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, lockCount, rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 118 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 34 &&
+  unless addedCount ≥ 120 && bundleCount = 5 && lockCount = 39 && rejectedCount ≥ 36 &&
       twinCount = rejectedCount && reachCount ≥ 48 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, locks={lockCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"wd cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {lockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
