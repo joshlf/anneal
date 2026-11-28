@@ -1106,12 +1106,13 @@ only in the exact shape `_private.<module segments>.0.<user segments>` (leading 
 string module, a single numeric `0` separator, non-empty all-string user suffix without a second
 marker), its user suffix may not spoof a reserved root, and a private name that claims a module
 other than the one storing it must be a verified realized auxiliary (never an axiom or opaque).
-`_at_` specialization names of IR helpers are exercised end-to-end by the self-test fixtures.
+`_at_` specialization names of IR helpers are modeled separately (`checkIRAtSpecModel`) and
+exercised end-to-end by the self-test fixtures.
 The production auditor additionally admits, after a separate kernel check, `Trusted` matcher
 realizations stored by the module that realizes them, and IR-only auxiliaries (`_redArg`,
-`_boxed`, `_cstage*`) of a foreign private helper that the storing module compiled; this model
-omits both allowances (a kind-less foreign name is always `foreignOutsideRealizedAux`) and is
-therefore stricter than the production check on those names.
+`_cstage1`, `_cstage2`, `_boxed_const_<k>`) of a foreign private helper that the storing module
+compiled; this model omits both allowances (a kind-less foreign name is always
+`foreignOutsideRealizedAux`) and is therefore stricter than the production check on those names.
 -/
 
 /-- Eliminate the left conjunct of a Boolean conjunction. -/

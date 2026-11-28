@@ -2392,9 +2392,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                      "_private.OlG31V1Src.0.Verify.fakeClaim", "spoofs reserved/toolchain namespace")
         # V1 attacks forged with `addDecl` / IR entries: foreign module claims, reserved suffixes,
         # an embedded numeric tail, nested / non-leading / non-zero / double-zero markers, a foreign
-        # private axiom, a phantom `eq_999` of a real foreign private helper, and a forged `_at_`
-        # specialization site naming `Trusted`. The same module carries a `@[tagged_return]` hook,
-        # which needs the Lean attribute API and must be refused once the Lean library is admitted.
+        # private axiom & opaque, an unloaded module claim, a phantom `eq_999` of a real foreign
+        # private helper, and a forged `_at_` specialization site naming `Trusted`. The same module
+        # carries a `@[tagged_return]` hook and a 4-phase `lcnf_ir_mismatch` (`retMismatch`: kernel
+        # 1 vs base/mono LCNF and IR 0), which reuse the admitted `Lean` library import.
         v1_meta = (
             "prelude\nimport Lean\nimport Init.Data.Array.Basic\nimport OlG31Base\nopen Lean\n"
             "def g31P (m : Name) (k : Nat) (u : List String) : Name :=\n"
