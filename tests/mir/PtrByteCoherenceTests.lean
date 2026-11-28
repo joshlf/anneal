@@ -3579,6 +3579,81 @@ theorem a2_lockstep_parity :
            .agg 0 [.scalar 0x2211 4, .scalar 0x4433 4], .none] := by
   exact ⟨rfl, rfl⟩
 
+/-! ## §4e. `[adv ep1-B3]` `core::intrinsics::copy` Permutation Regressions
+
+End-to-end `evalCopyMemory` byte permutations of a pointer staged through a `[u8; 8]` buffer:
+swapped 4-byte halves, a `p` / `p + 256` offset splice (byte `0` identically `0x00`), and a
+duplicated byte `0` all strip provenance (`*const u8` reads a provenance-less `.scalar`) or fault
+(`&u8`), while an intact 8-byte copy keeps provenance. -/
+
+def b3SwapHalves_06 (dstTy : V06.Ty) : Option ValSummary :=
+  match a2Copy1Slot_06 tyRawPtrU8_06 tyArr8U8_06 (.init (.ptr ptr64_06 8)) .uninit 0 4 4 with
+  | some s1 =>
+    match a2Copy1Slot_06 tyRawPtrU8_06 tyArr8U8_06 (.init (.ptr ptr64_06 8)) s1 4 0 4 with
+    | some s2 => a2Copy1Read_06 tyArr8U8_06 dstTy s2 .uninit 0 0 8
+    | none => none
+  | none => none
+
+def b3Splice256_06 (dstTy : V06.Ty) : Option ValSummary :=
+  match a2Copy1Slot_06 tyRawPtrU8_06 tyArr8U8_06 (.init (.ptr ptr64Zero_06 8)) .uninit 0 0 1 with
+  | some s1 =>
+    match a2Copy1Slot_06 tyRawPtrU8_06 tyArr8U8_06 (.init (.ptr ptr64Plus256_06 8)) s1 1 1 7 with
+    | some s2 => a2Copy1Read_06 tyArr8U8_06 dstTy s2 .uninit 0 0 8
+    | none => none
+  | none => none
+
+def b3DupByte0_06 (dstTy : V06.Ty) : Option ValSummary :=
+  match a2Copy1Slot_06 tyRawPtrU8_06 tyArr8U8_06 (.init (.ptr ptr64_06 8)) .uninit 0 0 8 with
+  | some s1 =>
+    match a2Copy1Slot_06 tyRawPtrU8_06 tyArr8U8_06 (.init (.ptr ptr64_06 8)) s1 0 1 1 with
+    | some s2 => a2Copy1Read_06 tyArr8U8_06 dstTy s2 .uninit 0 0 8
+    | none => none
+  | none => none
+
+def b3SwapHalves_08 (dstTy : V08.Ty) : Option ValSummary :=
+  match a2Copy1Slot_08 tyRawPtrU8_08 tyArr8U8_08 (.init (.ptr ptr64_08 8)) .uninit 0 4 4 with
+  | some s1 =>
+    match a2Copy1Slot_08 tyRawPtrU8_08 tyArr8U8_08 (.init (.ptr ptr64_08 8)) s1 4 0 4 with
+    | some s2 => a2Copy1Read_08 tyArr8U8_08 dstTy s2 .uninit 0 0 8
+    | none => none
+  | none => none
+
+def b3Splice256_08 (dstTy : V08.Ty) : Option ValSummary :=
+  match a2Copy1Slot_08 tyRawPtrU8_08 tyArr8U8_08 (.init (.ptr ptr64Zero_08 8)) .uninit 0 0 1 with
+  | some s1 =>
+    match a2Copy1Slot_08 tyRawPtrU8_08 tyArr8U8_08 (.init (.ptr ptr64Plus256_08 8)) s1 1 1 7 with
+    | some s2 => a2Copy1Read_08 tyArr8U8_08 dstTy s2 .uninit 0 0 8
+    | none => none
+  | none => none
+
+def b3DupByte0_08 (dstTy : V08.Ty) : Option ValSummary :=
+  match a2Copy1Slot_08 tyRawPtrU8_08 tyArr8U8_08 (.init (.ptr ptr64_08 8)) .uninit 0 0 8 with
+  | some s1 =>
+    match a2Copy1Slot_08 tyRawPtrU8_08 tyArr8U8_08 (.init (.ptr ptr64_08 8)) s1 0 1 1 with
+    | some s2 => a2Copy1Read_08 tyArr8U8_08 dstTy s2 .uninit 0 0 8
+    | none => none
+  | none => none
+
+/-- B3 (`evalCopyMemory` permutations, both dialects): swapped halves, a `p`/`p + 256` splice, and
+a duplicated byte `0` strip provenance for `*const u8` and fault for `&u8`; the intact copy keeps
+`.ptr`; `V2026_06_01` and `V2026_08_01` agree on every case. -/
+theorem b3_evalCopyMemory_ptr_byte_permutations_v06_v08 :
+    b3SwapHalves_06 tyRawPtrU8_06 = some (.scalar 0x1000000000 8) ∧
+    b3SwapHalves_06 tyRefU8_06 = some .none ∧
+    b3Splice256_06 tyRawPtrU8_06 = some (.scalar 256 8) ∧
+    b3Splice256_06 tyRefU8_06 = some .none ∧
+    b3DupByte0_06 tyRefU8_06 = some .none ∧
+    a2Copy1Read_06 tyRawPtrU8_06 tyRefU8_06 (.init (.ptr ptr64_06 8)) .uninit 0 0 8 =
+      some (.ptr 7 0x10 8) ∧
+    b3SwapHalves_08 tyRawPtrU8_08 = b3SwapHalves_06 tyRawPtrU8_06 ∧
+    b3SwapHalves_08 tyRefU8_08 = b3SwapHalves_06 tyRefU8_06 ∧
+    b3Splice256_08 tyRawPtrU8_08 = b3Splice256_06 tyRawPtrU8_06 ∧
+    b3Splice256_08 tyRefU8_08 = b3Splice256_06 tyRefU8_06 ∧
+    b3DupByte0_08 tyRefU8_08 = b3DupByte0_06 tyRefU8_06 ∧
+    a2Copy1Read_08 tyRawPtrU8_08 tyRefU8_08 (.init (.ptr ptr64_08 8)) .uninit 0 0 8 =
+      some (.ptr 7 0x10 8) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-! ## §5. Mechanical Local Axiom, Reachability, & Non-Triviality Audit -/
 
 open Lean Elab Command in
