@@ -2451,6 +2451,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         olean_module(ol3, "OlG31V2Found", "prelude\naxiom propext : Type\n", [])
         olean_reject(ol3, ["OlG31V2Found"], "[unapprovedAxiom]", "propext",
                      "non-toolchain re-declaration of foundational axiom", localAxiomModules=["OlG31V2Found"])
+        olean_module(ol3, "OlG31V2SorryLocal", prelude_init + "theorem unusedSorry : False := sorry\n", ["Init"])
+        olean_reject(ol3, ["OlG31V2SorryLocal"], "[sorryAxiomReached]", "sorryAx",
+                     localAxiomModules=["OlG31V2SorryLocal"])
         olean_module(ol3, "OlG31V2Dep", prelude_init + "axiom dep_cheat : False\ndef helperSpec : Nat := 1\n",
                      ["Init"])
         olean_module(ol3, "OlG31V2User", "prelude\nimport OlG31V2Dep\ntheorem claimUsesDep : helperSpec = 1 := rfl\n",
@@ -2676,6 +2679,13 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                            "[moduleProvenanceSpoofed]", "shadows toolchain", str(shadow_dir / shadow))
             direct_reject(["OlG31V3"], "[moduleProvenanceSpoofed]", "shadows toolchain",
                           artifacts=[["OlG31V3", shadow_parts]])
+        shadow_sub_dir, shadow_sub_parts = v3_copy("g31-shadow-sub")
+        (shadow_sub_dir / "Init").mkdir()
+        shutil.copyfile(lib / "Init/Core.olean", shadow_sub_dir / "Init/Core.olean")
+        expect_failure(lambda: ol3.audit_olean_request(v3_request(shadow_sub_parts)), 1, "olean-audit",
+                       "[moduleProvenanceSpoofed]", "shadows toolchain", str(shadow_sub_dir / "Init/Core.olean"))
+        direct_reject(["OlG31V3"], "[moduleProvenanceSpoofed]", "shadows toolchain",
+                      artifacts=[["OlG31V3", shadow_sub_parts]])
         root_dir, root_parts = v3_copy("g31-roots/root")
         evil_dir, evil_parts = v3_copy("g31-roots/root_evil")
         expect_failure(lambda: ol3.audit_olean_request(v3_request(evil_parts, approvedBuildRoots=[str(root_dir)])),
@@ -2683,6 +2693,12 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                        str(evil_dir / "OlG31V3.olean"))
         direct_reject(["OlG31V3"], "[moduleProvenanceSpoofed]", "escapes approvedBuildRoots",
                       artifacts=[["OlG31V3", evil_parts]], approvedBuildRoots=[str(root_dir)])
+        sym_root = ol3.stage / "g31-roots/sym-root"
+        sym_root.symlink_to(root_dir)
+        expect_failure(lambda: ol3.audit_olean_request(v3_request(root_parts, approvedBuildRoots=[str(sym_root)])),
+                       1, "olean-audit", "[moduleProvenanceSpoofed]", str(sym_root))
+        direct_reject(["OlG31V3"], "[moduleProvenanceSpoofed]", "approvedBuildRoots",
+                      artifacts=[["OlG31V3", root_parts]], approvedBuildRoots=[str(sym_root)])
         regular_root = ol3.stage / "g31-roots/regular-file"
         regular_root.write_text("not a directory\n")
         expect_failure(lambda: ol3.audit_olean_request(v3_request(root_parts, approvedBuildRoots=[str(regular_root)])),
@@ -2743,6 +2759,15 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "def usesAccWrap : Nat := accWrap accZero\n"
             "def wfHalf (n : Nat) : Nat := if h : n = 0 then 0 else wfHalf (n / 2)\n"
             "termination_by n\ndecreasing_by exact Nat.div_lt_self (Nat.pos_of_ne_zero h) (by decide)\n"
+            # Pure-`Init` `Expr.proj` scrutinee on an inductive `Prop` (direct, wrapped, and
+            # reached after unfolding `projDef`), with zero `import Lean` overhead.
+            "inductive PBox : Prop where\n  | mk (a : True)\n"
+            "theorem myPBox : PBox := .mk trivial\n"
+            "def wrapP (p : PBox) : PBox := p\n"
+            "def projDirect : True := myPBox.1\n"
+            "def projWrap : True := (wrapP myPBox).1\n"
+            "def projDef (p : PBox) : True := p.1\n"
+            "def usesProjDef : True := projDef myPBox\n"
             # Structure eta and K-like reduction survive opaque theorems: `And.casesOn`, a `match`
             # on a proof, and `cast` on an equality theorem still reduce, so they are not counted.
             "theorem myAnd : True ∧ True := ⟨trivial, trivial⟩\n"
@@ -2753,23 +2778,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         ready_off = olean_accept(ol3, ["OlG31Ready"])
         assert ready_off["opaqueTheoremReadinessFlags"] == 0, ready_off
         ready_on = olean_accept(ol3, ["OlG31Ready"], checkOpaqueTheoremReadiness=True)
-        assert ready_on["replay"] is True and ready_on["opaqueTheoremReadinessFlags"] == 7, ready_on
-        olean_module(ol3, "OlG31ReadyProj", (
-            "prelude\nimport Lean\nopen Lean\n"
-            "set_option linter.defProp false\n"
-            "structure PBox : Prop where\n  a : True\n"
-            "theorem myPBox : PBox := ⟨trivial⟩\n"
-            "def wrapP (p : PBox) : PBox := p\n"
-            "run_meta do\n"
-            "  addDecl (.defnDecl {\n"
-            "    name := `projDirect, levelParams := [], type := mkConst ``True,\n"
-            "    value := .proj ``PBox 0 (mkConst `myPBox), hints := .opaque, safety := .safe })\n"
-            "  addDecl (.defnDecl {\n"
-            "    name := `projWrap, levelParams := [], type := mkConst ``True,\n"
-            "    value := .proj ``PBox 0 (mkApp (mkConst `wrapP) (mkConst `myPBox)),\n"
-            "    hints := .opaque, safety := .safe })\n"), ["Lean"])
-        proj_on = olean_accept(ol3, ["OlG31ReadyProj"], checkOpaqueTheoremReadiness=True, **lean_roots)
-        assert proj_on["replay"] is True and proj_on["opaqueTheoremReadinessFlags"] == 2, proj_on
+        assert ready_on["replay"] is True and ready_on["opaqueTheoremReadinessFlags"] == 10, ready_on
         olean_module(ol3, "OlG31ReadyClean", prelude_init + (
             "theorem myEq : (1 : Nat) = 1 := rfl\n"
             "theorem myPf : (0 : Nat) < 1 := Nat.zero_lt_one\n"

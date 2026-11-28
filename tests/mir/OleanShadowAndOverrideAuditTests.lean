@@ -98,7 +98,9 @@ example : parseStrictPrivateName [] = none := by decide
 
 -- A malformed name that mentions the marker is a violation, not "not private".
 example : inM (rawPrivate ["M"] [.str "Innocent", .num 0, .str "Trusted", .str "foo"]) .defnDecl =
-    .malformedShape := by decide
+    .malformedShape :=
+  checkPrivateName_rejects_malformed v1Env _ (by decide) (by decide)
+    (parseStrictPrivate_rejects_embedded_num ["M"] [.str "Innocent"] 0 [.str "Trusted", .str "foo"])
 example : inM [.str "Lead", .str "_private", .str "nonlead"] .defnDecl = .malformedShape := by
   decide
 example : inM (rawPrivate ["M"] [.str "_private", .str "nest"]) .defnDecl = .malformedShape := by
@@ -967,9 +969,35 @@ example : (scanModuleOpaqueTheoremReadiness true (accWrapDecl :: readinessModule
 example : (scanModuleOpaqueTheoremReadiness true (accWrapDecl :: readinessModule)).isBlocking =
     false := rfl
 
+/-- `projDef myPBox` unfolds to `.proj myPBox`: surface value clean, unfolded form flags it. -/
+def projWrapDecl : ReadinessDecl :=
+  { name := "usesProjDef", type := .const "True" false,
+    value := some (.app (.const "projDef" false) (.const "myPBox" true)),
+    unfolded := [.proj (.const "myPBox" true)] }
+
+example : (projWrapDecl.value.map ReadinessExpr.flagged) = some false := by decide
+example : scanDeclOpaqueTheoremReadiness projWrapDecl = true :=
+  readinessScanner_flags_delta_wrapped_proj projWrapDecl (.const "myPBox" true) (by decide) rfl
+example : scanDeclOpaqueTheoremReadiness
+    { accWrapDecl with unfolded := [.recursorApp (.const "f" false) (.const "pair" false)] } =
+    false :=
+  readinessScanner_clean_decl_false _ (by decide)
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.checkPrivateName_rejects_malformed' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms checkPrivateName_rejects_malformed
+
 /-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_flags_delta_wrapped_recursor' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms readinessScanner_flags_delta_wrapped_recursor
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_flags_delta_wrapped_proj' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms readinessScanner_flags_delta_wrapped_proj
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_clean_decl_false' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms readinessScanner_clean_decl_false
 
 /-! ## 5. Axiom pins
 

@@ -1696,6 +1696,18 @@ theorem checkPrivateNameModel_of_parse (env : PrivateAuditEnv) (inp : PrivateChe
   rw [hm, htool, hparse]
   rfl
 
+/-- **V1 non-evasion (malformed shape).** Any non-toolchain name mentioning `_private` that fails
+strict structural de-mangling (embedded numeric tail, nested marker, non-leading marker, non-zero
+or double-zero separator) is rejected as `malformedShape`. -/
+theorem checkPrivateName_rejects_malformed (env : PrivateAuditEnv) (inp : PrivateCheckInput)
+    (hm : hasPrivateMentionModel inp.name = true)
+    (htool : env.toolchainModules.contains inp.declaringMod = false)
+    (hnone : parseStrictPrivateName inp.name = none) :
+    checkPrivateNameModel env inp = .malformedShape := by
+  unfold checkPrivateNameModel
+  rw [hm, htool, hnone]
+  rfl
+
 /-- A successfully de-mangled name always mentions the marker (it leads with it). -/
 theorem parseStrictPrivate_some_mentions (n : AuditName) (r : PrivateParseResult)
     (h : parseStrictPrivateName n = some r) : hasPrivateMentionModel n = true := by
@@ -3178,8 +3190,10 @@ structure ReadinessDecl where
   name : String
   type : ReadinessExpr
   value : Option ReadinessExpr := none
-  /-- Head-normal forms (δ/β/ζ, theorems never unfolded) of application subterms whose head is a
-  definition: `T.casesOn`, matchers, and other wrappers that unfold to a recursor. -/
+  /-- Head-normal forms (δ/β/ζ, theorems never unfolded) of reducible application subterms:
+  wrappers such as `WellFounded.fix` / `accWrap` unfolding to a non-K/non-eta recursor (`Acc.rec`)
+  or a projection wrapper unfolding to `.proj` (structure-eta `And.casesOn` and K-rule `cast`
+  reduce away before stopping and produce no flagged unfolded form). -/
   unfolded : List ReadinessExpr := []
   deriving DecidableEq, Repr
 
@@ -3374,13 +3388,52 @@ theorem filter_nil_of_all_false {α : Type} (p : α → Bool) :
     exact filter_nil_of_all_false p xs (fun y hy => h y (List.mem_cons.mpr (Or.inr hy)))
 
 /-- **V4 readiness (δ-wrapped recursors).** A recursor reached only after unfolding a definition
-(`And.casesOn thm f`, a `match` on a theorem) is flagged even when the surface type and value put no
-theorem in any scrutinee position. -/
+(`accWrap accZero`, `WellFounded.fix` unfolding to `Acc.rec`) is flagged even when the surface
+type and value put no theorem in any scrutinee position. -/
 theorem readinessScanner_flags_delta_wrapped_recursor (d : ReadinessDecl) (minors major : ReadinessExpr)
     (hmem : ReadinessExpr.recursorApp minors major ∈ d.unfolded) (h : major.carriesTheorem = true) :
     scanDeclOpaqueTheoremReadiness d = true :=
   bor_intro_right (List.any_eq_true.mpr
     ⟨_, hmem, readinessScanner_flags_major_premise_theorem minors major h⟩)
+
+/-- **V4 readiness (δ-wrapped projections).** A `.proj` scrutinee reached after unfolding a
+definition (`projDef myPBox`) is flagged even when the surface term holds no raw `.proj`. -/
+theorem readinessScanner_flags_delta_wrapped_proj (d : ReadinessDecl) (s : ReadinessExpr)
+    (hmem : ReadinessExpr.proj s ∈ d.unfolded) (h : s.carriesTheorem = true) :
+    scanDeclOpaqueTheoremReadiness d = true :=
+  bor_intro_right (List.any_eq_true.mpr
+    ⟨_, hmem, readinessScanner_flags_proj_scrutinee_theorem s h⟩)
+
+/-- Every surface and unfolded scrutinee position of a declaration is theorem-free. -/
+def ReadinessDecl.clean (d : ReadinessDecl) : Bool :=
+  d.type.scrutineesTheoremFree &&
+    (match d.value with | some v => v.scrutineesTheoremFree | none => true) &&
+    d.unfolded.all ReadinessExpr.scrutineesTheoremFree
+
+/-- **V4 readiness (c′′).** A declaration whose type, value, and unfolded forms are all
+scrutinee-theorem-free is never flagged. -/
+theorem readinessScanner_clean_decl_false (d : ReadinessDecl) (h : d.clean = true) :
+    scanDeclOpaqueTheoremReadiness d = false := by
+  have htv := band_elim_left h
+  have ht := readinessScanner_clean_zero_flags d.type (band_elim_left htv)
+  have hv : (match d.value with | some v => v.flagged | none => false) = false := by
+    cases hd : d.value with
+    | none => rfl
+    | some v =>
+      have hv0 := band_elim_right htv
+      rw [hd] at hv0
+      exact readinessScanner_clean_zero_flags v hv0
+  have hu : d.unfolded.any ReadinessExpr.flagged = false := by
+    cases ha : d.unfolded.any ReadinessExpr.flagged with
+    | false => rfl
+    | true =>
+      obtain ⟨e, he, hfe⟩ := List.any_eq_true.mp ha
+      have hce := List.all_eq_true.mp (band_elim_right h) e he
+      rw [readinessScanner_clean_zero_flags e hce] at hfe
+      cases hfe
+  unfold scanDeclOpaqueTheoremReadiness
+  rw [ht, hv, hu]
+  rfl
 
 /-- **V4 readiness (c′).** A module whose declarations are all clean produces `0` flags. -/
 theorem readinessScanner_clean_module_zero_flags (enabled : Bool) (ds : List ReadinessDecl)

@@ -3833,15 +3833,15 @@ def exprUsesOpaqueTheorem (env : Environment) (e : Expr) (fuel : Nat := 100000) 
       match x with
       | .proj _ _ s => if scrutineeHasThm s bm then return true else stack := (s, bm) :: stack
       | .app f a =>
-        for z in [x, (headNormalizeBudget env x 64 false).expr] do if let .const c _ := z.getAppFn then
-          let args := z.getAppArgs
-          let mi := match env.find? c with | some (.recInfo rv) => rv.getMajorIdx | some (.quotInfo qv) => (match qv.kind with | .lift => 5 | .ind => 4 | _ => args.size) | _ => args.size
-          if h : mi < args.size then if scrutineeHasThm args[mi] bm then return true
+        let zs := if match x.getAppFn with | .const c _ => (env.find? c matches some (.defnInfo _)) | .lam .. | .letE .. | .mdata .. | .proj .. => true | _ => false then [x, (headNormalizeBudget env x 64 false).expr] else [x]
+        for z in zs do match z.getAppFn with
+          | .proj _ _ s => if scrutineeHasThm s bm then return true
+          | .const c _ => let args := z.getAppArgs; let mi := match env.find? c with | some (.recInfo rv) => rv.getMajorIdx | some (.quotInfo qv) => (match qv.kind with | .lift => 5 | .ind => 4 | _ => args.size) | _ => args.size; if h : mi < args.size then if scrutineeHasThm args[mi] bm then return true
+          | _ => pure ()
         stack := (f, bm) :: (a, bm) :: stack
       | .lam _ t b _ | .forallE _ t b _ => stack := (t, bm) :: (b, bm <<< 1) :: stack
       | .letE _ t v b _ => stack := (t, bm) :: (v, bm) :: (b, (bm <<< 1) ||| (if scrutineeHasThm v bm then 1 else 0)) :: stack
-      | .mdata _ b => stack := (b, bm) :: stack
-      | _ => pure ()
+      | .mdata _ b => stack := (b, bm) :: stack | _ => pure ()
   return false
 
 /-- Provenance, inventory, policy and replay checks over one loaded environment. -/
