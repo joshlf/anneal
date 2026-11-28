@@ -67,10 +67,14 @@ the counterexamples that motivate its design:
    single bit (`canary_maskLe_strict_separation`), and is a partial, not
    total, order (`canary_maskLe_incomparable`).
 10. **Compatibility envelope:** the local `OracleGrade.licenses` table matches
-   the upper-triangular `Trusted.Framework` table cell by cell
-   (`canary_licenses_table`), unspecified `FnContract` fields default to
-   `True`, and safe functions ignore `safetyPre`
-   (`canary_fnContract_defaults`, `canary_effectiveSafetyPre`).
+   the upper-triangular `Trusted.Framework` table cell by cell for arbitrary
+   identifiers (`canary_licenses_table`), unspecified `FnContract` fields
+   default to `True` (`canary_fnContract_defaults`), safe functions ignore
+   `safetyPre` while both safe and unsafe enforce `behaviorPre`
+   (`canary_effectiveSafetyPre`), all nine `DisclosedGap` constructors match
+   (`canary_disclosedGap_constructors`), and the four pure-`Prop`
+   realizability predicates match their upstream bodies by `rfl`
+   (`canary_specRealizability_compat_bodies`).
 -/
 
 namespace Anneal.Hybrid.Canaries
@@ -629,6 +633,10 @@ theorem canary_intCut (x y : Int)
 
 /-! ## Effect-mask order laws -/
 
+/-- Effect mask guaranteeing only termination. -/
+def termOnlyMask : EffectMask :=
+  { terminates := true, noUnwind := false, noAbort := false }
+
 /-- Intermediate effect mask guaranteeing termination and no-unwind, while
 still permitting aborts. -/
 def termNoUnwindMask : EffectMask :=
@@ -638,18 +646,24 @@ def termNoUnwindMask : EffectMask :=
 theorem canary_maskLe_refl (m : EffectMask) : maskLe m m :=
   maskLe_refl m
 
-/-- Transitivity of `maskLe` along `anyExitMask ≤ termNoUnwindMask ≤ totalMask`
-and in general. -/
+/-- Non-vacuous transitivity of `maskLe` along the strict three-step chain
+`termOnlyMask < termNoUnwindMask < totalMask` (carrying `terminates = true`
+across both steps), plus general transitivity. -/
 theorem canary_maskLe_trans :
-    maskLe anyExitMask termNoUnwindMask ∧
+    maskLe termOnlyMask termNoUnwindMask ∧
     maskLe termNoUnwindMask totalMask ∧
-    maskLe anyExitMask totalMask := by
-  have h1 : maskLe anyExitMask termNoUnwindMask :=
-    ⟨fun h => Bool.noConfusion h, fun h => Bool.noConfusion h,
-      fun h => Bool.noConfusion h⟩
+    maskLe termOnlyMask totalMask ∧
+    ¬ maskLe termNoUnwindMask termOnlyMask ∧
+    ¬ maskLe totalMask termNoUnwindMask ∧
+    (∀ m1 m2 m3 : EffectMask, maskLe m1 m2 → maskLe m2 m3 → maskLe m1 m3) := by
+  have h1 : maskLe termOnlyMask termNoUnwindMask :=
+    ⟨fun _ => rfl, fun h => Bool.noConfusion h, fun h => Bool.noConfusion h⟩
   have h2 : maskLe termNoUnwindMask totalMask :=
     ⟨fun _ => rfl, fun _ => rfl, fun h => Bool.noConfusion h⟩
-  exact ⟨h1, h2, maskLe_trans h1 h2⟩
+  exact ⟨h1, h2, maskLe_trans h1 h2,
+    fun h => Bool.noConfusion (h.2.1 rfl),
+    fun h => Bool.noConfusion (h.2.2 rfl),
+    fun _ _ _ => maskLe_trans⟩
 
 /-- Strict separation of `maskLe`: weakening any single guaranteed effect bit
 (`terminates`, `noUnwind`, or `noAbort`) is rejected. -/
@@ -673,7 +687,7 @@ theorem maskLe_eq_effectMaskLe_body :
   rfl
 
 /-- Two Booleans that imply each other's truth are equal. -/
-theorem bool_eq_of_imp_true :
+private theorem bool_eq_of_imp_true :
     ∀ {a b : Bool}, (a = true → b = true) → (b = true → a = true) → a = b
   | false, false, _, _ => rfl
   | false, true, _, h => Bool.noConfusion (h rfl)
@@ -683,11 +697,12 @@ theorem bool_eq_of_imp_true :
 /-- Antisymmetry of `maskLe`: mutually bounded masks are equal. -/
 theorem canary_maskLe_antisymm :
     ∀ m1 m2 : EffectMask, maskLe m1 m2 → maskLe m2 m1 → m1 = m2
-  | ⟨_, _, _⟩, ⟨_, _, _⟩, h12, h21 => by
-    cases bool_eq_of_imp_true h12.1 h21.1
-    cases bool_eq_of_imp_true h12.2.1 h21.2.1
-    cases bool_eq_of_imp_true h12.2.2 h21.2.2
-    rfl
+  | ⟨_, _, _⟩, ⟨_, _, _⟩, h12, h21 =>
+    congr
+      (congr
+        (congrArg EffectMask.mk (bool_eq_of_imp_true h12.1 h21.1))
+        (bool_eq_of_imp_true h12.2.1 h21.2.1))
+      (bool_eq_of_imp_true h12.2.2 h21.2.2)
 
 /-- A mask guaranteeing only `noAbort`. -/
 def noAbortOnlyMask : EffectMask :=
@@ -702,26 +717,26 @@ theorem canary_maskLe_incomparable :
 
 /-! ## Compatibility envelope -/
 
-/-- Every cell of the local `OracleGrade.licenses` table, matching the
-upper-triangular `Trusted.Framework.OracleGrade.licenses`: `forwardSim` never
-licenses `termination` or `existsWitness`, and no grade licenses
-`generalHyper`. -/
-theorem canary_licenses_table :
-    (OracleGrade.unbridged "p").licenses .existsWitness = false ∧
-    (OracleGrade.unbridged "p").licenses .forallSafety = true ∧
-    (OracleGrade.unbridged "p").licenses .generalHyper = false ∧
-    (OracleGrade.unbridged "p").licenses .subsetHyper = false ∧
-    (OracleGrade.unbridged "p").licenses .termination = true ∧
-    (OracleGrade.forwardSim "o").licenses .existsWitness = false ∧
-    (OracleGrade.forwardSim "o").licenses .forallSafety = true ∧
-    (OracleGrade.forwardSim "o").licenses .generalHyper = false ∧
-    (OracleGrade.forwardSim "o").licenses .subsetHyper = true ∧
-    (OracleGrade.forwardSim "o").licenses .termination = false ∧
-    (OracleGrade.biFaultEquiv "o").licenses .existsWitness = true ∧
-    (OracleGrade.biFaultEquiv "o").licenses .forallSafety = true ∧
-    (OracleGrade.biFaultEquiv "o").licenses .generalHyper = false ∧
-    (OracleGrade.biFaultEquiv "o").licenses .subsetHyper = true ∧
-    (OracleGrade.biFaultEquiv "o").licenses .termination = true :=
+/-- Every cell of the local `OracleGrade.licenses` table for arbitrary
+profile/oracle identifiers, matching `Trusted.Framework.OracleGrade.licenses`:
+`forwardSim` never licenses `termination` or `existsWitness`, and no grade
+licenses `generalHyper`. -/
+theorem canary_licenses_table (pid oid : String) :
+    (OracleGrade.unbridged pid).licenses .existsWitness = false ∧
+    (OracleGrade.unbridged pid).licenses .forallSafety = true ∧
+    (OracleGrade.unbridged pid).licenses .generalHyper = false ∧
+    (OracleGrade.unbridged pid).licenses .subsetHyper = false ∧
+    (OracleGrade.unbridged pid).licenses .termination = true ∧
+    (OracleGrade.forwardSim oid).licenses .existsWitness = false ∧
+    (OracleGrade.forwardSim oid).licenses .forallSafety = true ∧
+    (OracleGrade.forwardSim oid).licenses .generalHyper = false ∧
+    (OracleGrade.forwardSim oid).licenses .subsetHyper = true ∧
+    (OracleGrade.forwardSim oid).licenses .termination = false ∧
+    (OracleGrade.biFaultEquiv oid).licenses .existsWitness = true ∧
+    (OracleGrade.biFaultEquiv oid).licenses .forallSafety = true ∧
+    (OracleGrade.biFaultEquiv oid).licenses .generalHyper = false ∧
+    (OracleGrade.biFaultEquiv oid).licenses .subsetHyper = true ∧
+    (OracleGrade.biFaultEquiv oid).licenses .termination = true :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
     rfl⟩
 
@@ -734,14 +749,56 @@ theorem canary_fnContract_defaults :
     c.postAbort = (fun _ _ => True) ∧ c.effects = anyExitMask :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Safe functions ignore `safetyPre`, even an unsatisfiable one; unsafe
-functions require it, and `effectiveBehaviorPre` conjoins `behaviorPre`. -/
+/-- Safe functions ignore `safetyPre` (even `False`), unsafe functions require
+it, and `effectiveBehaviorPre` genuinely conjoins `behaviorPre` for both safe
+and unsafe functions. -/
 theorem canary_effectiveSafetyPre :
-    let c : FnContract Unit Unit Unit :=
+    let cSafe : FnContract Unit Unit Unit :=
       { safetyPre := fun _ => False, effects := anyExitMask }
-    c.effectiveSafetyPre false () ∧ ¬ c.effectiveSafetyPre true () ∧
-    c.effectiveBehaviorPre false () ∧ ¬ c.effectiveBehaviorPre true () :=
+    let cBeh : FnContract Unit Unit Unit :=
+      { behaviorPre := fun _ => False, effects := anyExitMask }
+    cSafe.effectiveSafetyPre false () ∧ ¬ cSafe.effectiveSafetyPre true () ∧
+    cSafe.effectiveBehaviorPre false () ∧ ¬ cSafe.effectiveBehaviorPre true () ∧
+    cBeh.effectiveSafetyPre false () ∧ cBeh.effectiveSafetyPre true () ∧
+    ¬ cBeh.effectiveBehaviorPre false () ∧
+    ¬ cBeh.effectiveBehaviorPre true () :=
   ⟨fun h => Bool.noConfusion h, fun h => h rfl,
-    ⟨fun h => Bool.noConfusion h, True.intro⟩, fun h => h.1 rfl⟩
+    ⟨fun h => Bool.noConfusion h, True.intro⟩, fun h => h.1 rfl,
+    fun _ => True.intro, fun _ => True.intro,
+    fun h => h.2, fun h => h.2⟩
+
+/-- Pins all nine `DisclosedGap` constructors and their payload types against
+`Trusted.Framework.DisclosedGap`. -/
+theorem canary_disclosedGap_constructors (s : String) :
+    ([DisclosedGap.unbridgedSemantics s,
+      DisclosedGap.callerRawPtrAliasing s,
+      DisclosedGap.callerMemoryThreadIsolation s,
+      DisclosedGap.configuredReferenceScope s,
+      DisclosedGap.assumedExternalCallee s,
+      DisclosedGap.waivedInhabitation s,
+      DisclosedGap.selectedUnitScope,
+      DisclosedGap.rawLegacySpec,
+      DisclosedGap.unverifiedDownstream s]).length = 9 :=
+  rfl
+
+/-- Pins the four local pure-`Prop` realizability compatibility predicates to
+their verbatim upstream `Anneal.SpecRealizability` bodies by `rfl`. -/
+theorem canary_specRealizability_compat_bodies.{u, v, w} :
+    (@PostconditionDichotomy.{u, v} =
+      fun {X : Type u} {Y : Type v} (pre : X → Prop) (post : X → Y → Prop) =>
+        ∃ x, pre x ∧ (∃ y_ok, post x y_ok) ∧ (∃ y_bad, ¬ post x y_bad)) ∧
+    (@ContractDeterministicOn.{u, v, w} =
+      fun {X : Type u} {Y : Type v} {Z : Type w} (obs : Y → Z)
+          (pre : X → Prop) (post : X → Y → Prop) =>
+        ∀ x y₁ y₂, pre x → post x y₁ → post x y₂ → obs y₁ = obs y₂) ∧
+    (@ContractDeterministic.{u, v} =
+      fun {X : Type u} {Y : Type v} (pre : X → Prop) (post : X → Y → Prop) =>
+        ContractDeterministicOn id pre post) ∧
+    (@DichotomyModuloObservation.{u, v, w} =
+      fun {X : Type u} {Y : Type v} {Z : Type w} (obs : X → Y → Z)
+          (pre : X → Prop) (post : X → Y → Prop) =>
+        ∃ x, pre x ∧ ∃ y_ok y_bad,
+          obs x y_ok = obs x y_bad ∧ post x y_ok ∧ ¬ post x y_bad) :=
+  ⟨rfl, rfl, rfl, rfl⟩
 
 end Anneal.Hybrid.Canaries

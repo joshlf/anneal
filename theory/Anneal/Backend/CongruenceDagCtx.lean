@@ -1597,18 +1597,7 @@ theorem verifySteps_fold_sound (env : Nat → Nat)
   | step :: rest => fun accOpt hInit proved hEq => by
     cases accOpt with
     | none =>
-      have hEq' :
-          List.foldl
-              (fun (aOpt : Option (List ProvedClaim)) (st : DagStep) =>
-                match aOpt with
-                | none => none
-                | some prv =>
-                  match verifyStep arena ctx prv st with
-                  | none => none
-                  | some cl => some (prv ++ [cl]))
-              none rest = some proved := hEq
-      rw [verifySteps_fold_none arena ctx rest] at hEq'
-      cases hEq'
+      nomatch (verifySteps_fold_none arena ctx rest).symm.trans hEq
     | some prv =>
       have hPrv := hInit prv rfl
       have hEq' :
@@ -1628,8 +1617,7 @@ theorem verifySteps_fold_sound (env : Nat → Nat)
       cases hSt : verifyStep arena ctx prv step with
       | none =>
         intro hEq'
-        rw [verifySteps_fold_none arena ctx rest] at hEq'
-        cases hEq'
+        nomatch (verifySteps_fold_none arena ctx rest).symm.trans hEq'
       | some cl =>
         intro hEq'
         have hCl :=
