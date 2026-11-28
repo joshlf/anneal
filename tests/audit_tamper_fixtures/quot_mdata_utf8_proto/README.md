@@ -158,6 +158,25 @@ against Round B3:
   (in-memory header plus `.ir`-part bytes) must now be owned by that module
   (`shadowedConstant`).
 
+## Adversarial Hardening Regressions (Round A4 Final)
+
+`tests/mir/OleanQuotMdataUtf8ProtoTests.lean` Section 11i pins final bypasses closed after
+Round B4:
+
+- **V-S5 / `main` via `extraConstNames`**: unannotated `main` C-symbol entry points smuggled
+  via `ModuleData.extraConstNames` (in `.olean` or `.ir`) bypassed B4 in both binary and
+  memory modes; closed with `forbiddenExportAttr`.
+- **V-S5 / empty-constants binary IR hijack & orphan `extraConstNames`**: removed the
+  `if !oOwned.isEmpty` bypass in `validateModuleArtifactParts` so empty-constants modules
+  carrying `IR.Decl.fdecl `Nat.add` fail closed (`forgedIrDecl`), rejected zero-constant
+  modules declaring orphan `extraConstNames` directly on the attacker (`forgedIrDecl`),
+  rejected intra-part/intra-module duplicate `extraConstNames` (`shadowedConstant`), and
+  verified `ModuleData` root headers in `binExportedAxiomClaimsPerPart` and
+  `binExtraConstNames`.
+- **Positive 5-file `module` lambda/specialization control**: confirmed an honest compiled
+  `module` with `List.map` specialization aux IR decls passes both
+  `validateModuleArtifactParts` and `validateEnvModuleFull` with zero false positives.
+
 ## Running the Suite
 
 ```bash

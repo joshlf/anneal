@@ -1911,6 +1911,13 @@ def auditExportSurface (env : Environment) (modIdx : Nat) (modName : Name)
       if forbidMainExport && ci.name == `main && isExport env ci.name then
         st := st.record "forbiddenExportAttr" ci.name
           s!"isExport true on unannotated `main` C-symbol entry point in module {modName}"
+    for en in data.extraConstNames do
+      if let some cSym := getExportNameFor? env en then
+        st := st.record "forbiddenExportAttr" en
+          s!"getExportNameFor? resolved C symbol {cSym} on extraConstName in module {modName}"
+      if forbidMainExport && en == `main then
+        st := st.record "forbiddenExportAttr" en
+          s!"unannotated `main` C-symbol entry point via extraConstNames in module {modName}"
   if checkLiveState then
     let (liveDecls, liveMap) := exportAttr.ext.getState env
     for declName in liveDecls do
@@ -1997,9 +2004,14 @@ def validateEnvModule (env : Environment) (modName : Name)
       st := st.record "shadowedConstant" cn
         s!"duplicate constName {cn} within module {modName}"
     seenInMod := seenInMod.insert cn
+  let mut seenExtraInMod : NameSet := {}
   for en in data.extraConstNames do
     let (st1, _) := validateNameDag en en st fuel
     st := st1
+    if seenExtraInMod.contains en then
+      st := st.record "shadowedConstant" en
+        s!"duplicate extraConstName {en} within module {modName}"
+    seenExtraInMod := seenExtraInMod.insert en
     -- B4 hardening: `importModules` assigns `const2ModIdx` with `insertIfNew`, and the IR
     -- interpreter / `IR.findEnvDecl` consult ONLY the owning module's `declMapExt` entries.
     -- An earlier-imported module listing this module's IR-only name in ITS `extraConstNames`
@@ -2007,6 +2019,12 @@ def validateEnvModule (env : Environment) (modName : Name)
     if env.getModuleIdxFor? en != some modIdx then
       st := st.record "shadowedConstant" en
         s!"extraConstName {en} of {modName} is owned by module index {(env.getModuleIdxFor? en).map (·.toNat)} (IR lookup hijack)"
+  -- A4 hardening: an `.olean` with zero kernel constants (`constNames.isEmpty`) can never
+  -- legitimately declare compiler-generated auxiliary IR names in `extraConstNames`; catching
+  -- this rejects zero-constant attacker modules directly even before any victim is audited.
+  if data.constNames.isEmpty && !data.extraConstNames.isEmpty then
+    st := st.record "forgedIrDecl" modName
+      s!"module {modName} declares {data.extraConstNames.size} orphan extraConstNames with zero kernel constants"
   for ci in data.constants do
     st := validateConstantInfo ci (some modName) st fuel
   if data.constNames.size != data.constants.size then
@@ -3836,10 +3854,18 @@ def validateOleanPartsEx (rawParts : Array ByteArray) (modName : Name)
             match readArrayElems visParts extraNamesPtr with
             | .error e => st := st.record "malformedOleanRegion" modName s!"extraConstNames error: {e}"
             | .ok enPtrs =>
+              let mut partSeenExtras : NameSet := {}
               for enp in enPtrs do
                 let (st1, eInfo) := validateBinName visParts modName enp st fuel
                 st := st1
                 ownedNames := ownedNames.insert eInfo.name
+                if partSeenExtras.contains eInfo.name then
+                  st := st.record "shadowedConstant" eInfo.name
+                    s!"duplicate extraConstName {eInfo.name} in part {pIdx} of module {modName}"
+                partSeenExtras := partSeenExtras.insert eInfo.name
+                if forbidMainExport && eInfo.name == `main then
+                  st := st.record "forbiddenExportAttr" `main
+                    s!"unannotated `main` C-symbol entry point via extraConstNames in binary module {modName}"
             match readArrayElems visParts constsPtr with
             | .error e => st := st.record "malformedOleanRegion" modName s!"constants error: {e}"
             | .ok ciPtrs =>
@@ -3891,13 +3917,14 @@ def validateModuleArtifactParts (oleanParts irParts : Array ByteArray) (modName 
     (forbidMainExport : Bool := true) (fuel : Nat := 20000000) : AuditReport := Id.run do
   let (r1, oStubs, oFdecls, oIrNames, oOwned) :=
     validateOleanPartsEx oleanParts modName forbidMainExport fuel (isIrGroup := false)
-  let (r2, irFdecls, irIrNames) :=
-    if irParts.isEmpty then ({}, ({} : NameSet), ({} : NameSet))
+  let (r2, irFdecls, irIrNames, irOwned) :=
+    if irParts.isEmpty then ({}, ({} : NameSet), ({} : NameSet), ({} : NameSet))
     else
-      let (rep, _, fds, irNs, _) := validateOleanPartsEx irParts modName forbidMainExport fuel (isIrGroup := true)
-      (rep, fds, irNs)
+      let (rep, _, fds, irNs, irOwn) := validateOleanPartsEx irParts modName forbidMainExport fuel (isIrGroup := true)
+      (rep, fds, irNs, irOwn)
   let allFdecls := irFdecls.foldl (·.insert ·) oFdecls
   let allIr := irIrNames.foldl (·.insert ·) oIrNames
+  let allOwned := irOwned.foldl (·.insert ·) oOwned
   let mut vs := r1.violations ++ r2.violations
   for stub in oStubs do
     if !allFdecls.contains stub then
@@ -3906,14 +3933,16 @@ def validateModuleArtifactParts (oleanParts irParts : Array ByteArray) (modName 
         decl := stub
         detail := s!"unresolved module IR.Decl.extern opaque stub {stub} in {modName} without backing .ir fdecl"
       }
-  if !oOwned.isEmpty then
-    for f in allIr do
-      if !oOwned.contains f then
-        vs := vs.push {
-          tag := "forgedIrDecl"
-          decl := f
-          detail := s!"binary IR.Decl {f} is not owned by module {modName} (constNames ∪ extraConstNames)"
-        }
+  -- A4 hardening: unconditionally enforce IR.Decl ownership (even when `constNames` and
+  -- `extraConstNames` are both empty, closing the A3/B4 `if !oOwned.isEmpty` bypass; real `.ir`
+  -- files list their own fdecls in `extraConstNames`, so `allOwned` covers honest `.ir` too).
+  for f in allIr do
+    if !allOwned.contains f then
+      vs := vs.push {
+        tag := "forgedIrDecl"
+        decl := f
+        detail := s!"binary IR.Decl {f} is not owned by module {modName} (constNames ∪ extraConstNames)"
+      }
   return { violations := vs, stats := mergeAuditStats r1.stats r2.stats }
 
 /-- Full pure-Lean binary `.olean`/`.ir` compacted-region pointer-DAG validation over
@@ -4189,6 +4218,8 @@ def binExportedAxiomClaimsPerPart (rawParts : Array ByteArray) :
       out := out.push { isModule := false, constNames := #[], claims := #[] }
       continue
     let rh ← readObjHeader visParts p.rootPtr
+    if rh.tag != 0 || rh.other != 5 then
+      throw s!"part {pIdx} ModuleData root bad ctor (tag={rh.tag}, other={rh.other})"
     let isMod := match readScalarU8 visParts rh 0 with | .ok 1 => true | _ => false
     let mut cns : Array Name := #[]
     for cnp in ← readArrayElems visParts (← readFieldPtr visParts rh 1) do
@@ -4221,6 +4252,8 @@ def binExtraConstNames (rawParts : Array ByteArray) : Except String (Array Name)
     let p := parts[pIdx]!
     if isScalarWord p.rootPtr then continue
     let rh ← readObjHeader visParts p.rootPtr
+    if rh.tag != 0 || rh.other != 5 then
+      throw s!"part {pIdx} ModuleData root bad ctor (tag={rh.tag}, other={rh.other})"
     for w in ← readArrayElems visParts (← readFieldPtr visParts rh 3) do
       let (st, info) := validateBinName visParts .anonymous w {}
       if !st.violations.isEmpty then
@@ -4381,7 +4414,15 @@ def validateEnvModuleFull (env : Environment) (modName : Name) (oleanParts : Arr
     | .error e => return { violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := s!"ir extraConstNames decode: {e}" }] }
     | .ok ens =>
       let mut vs : Array Violation := #[]
+      let mut seenIrExtras : NameSet := {}
       for en in ens do
+        if seenIrExtras.contains en then
+          vs := vs.push { tag := "shadowedConstant", decl := en
+                          detail := s!"duplicate ir extraConstName {en} in {modName}" }
+        seenIrExtras := seenIrExtras.insert en
+        if en == `main then
+          vs := vs.push { tag := "forbiddenExportAttr", decl := `main
+                          detail := s!"unannotated `main` C-symbol entry point via .ir extraConstNames in {modName}" }
         if env.getModuleIdxFor? en != some modIdx then
           vs := vs.push { tag := "shadowedConstant", decl := en
                           detail := s!"ir extraConstName {en} of {modName} is owned by another module (IR lookup hijack)" }
@@ -5634,7 +5675,7 @@ A3 V-M2 unbound Level.param: binary=#[forgedLevelMData] memory=#[forgedLevelMDat
 
 /--
 info: B4 V-S5 IR hijack: victim aux IR decl owned by B4Attacker, IR.findEnvDecl params=0 (victim's real decl has params=2)
-B4 V-S5 IR hijack: attacker binary=#[] attacker memory=#[] (A3 ownership check satisfied via extraConstNames)
+B4 V-S5 IR hijack: attacker binary=#[] attacker memory=#[forgedIrDecl] (A4 catches orphan extraConstNames directly on attacker)
 B4 V-S5 IR hijack: victim memory(Full)=#[shadowedConstant]
 B4 V-S5 IR hijack: honest victim alone memory(Full) ok=true
 -/
@@ -5673,9 +5714,101 @@ B4 V-S5 IR hijack: honest victim alone memory(Full) ok=true
     let hijParams := ((IR.findEnvDecl env aux).map (·.params.size)).getD 99
     IO.println s!"B4 V-S5 IR hijack: victim aux IR decl owned by {owner}, IR.findEnvDecl params={hijParams} (victim's real decl has params={realParams})"
     let bA ← IO.FS.readBinFile pA
-    IO.println s!"B4 V-S5 IR hijack: attacker binary={(validateOleanParts #[bA] `B4Attacker).tags} attacker memory={(validateEnvModule env `B4Attacker).tags} (A3 ownership check satisfied via extraConstNames)"
+    IO.println s!"B4 V-S5 IR hijack: attacker binary={(validateOleanParts #[bA] `B4Attacker).tags} attacker memory={(validateEnvModule env `B4Attacker).tags} (A4 catches orphan extraConstNames directly on attacker)"
     IO.println s!"B4 V-S5 IR hijack: victim memory(Full)={(validateEnvModuleFull env `B4Victim #[bV]).tags}"
     IO.println s!"B4 V-S5 IR hijack: honest victim alone memory(Full) ok={(validateEnvModuleFull envV `B4Victim #[bV]).ok}"
+  finally
+    try IO.FS.removeDirAll dir catch _ => pure ()
+
+/-! ## Section 11i: Round-A4 Final Adversarial Regressions
+
+Pins every bypass reproduced LIVE against B4 (`ad76c198`):
+1. V-S5 unannotated `main` C-symbol exposure smuggled through `extraConstNames` (passed B4 in
+   both binary and memory modes -> now `forbiddenExportAttr`).
+2. V-S5 empty-constants (`constNames = #[]`, `extraConstNames = #[]`) binary `IR.Decl.fdecl`
+   hijacking `Nat.add` (bypassed A3/B4 `if !oOwned.isEmpty` -> now `forgedIrDecl`).
+3. Duplicate `extraConstNames` within a module (passed B4 -> now `shadowedConstant`).
+4. Honest compiled `module` with lambda/specialization aux IR decl (`HonestMod`: `xs.map`)
+   passes BOTH `validateModuleArtifactParts` and `validateEnvModuleFull` with 0 false positives. -/
+
+/--
+info: A4 V-S5 main via extraConstNames: binary=#[forbiddenExportAttr] memory=#[forbiddenExportAttr, forgedIrDecl]
+A4 V-S5 empty-constants binary IR hijack of Nat.add: binary=#[forgedIrDecl] memory=#[forgedIrDecl]
+A4 V-S5 duplicate extraConstNames: binary=#[shadowedConstant] memory=#[forgedIrDecl, shadowedConstant]
+A4 honest module with lambda/spec aux IR decls: binMod ok=true memory(Full) ok=true
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  let pid ← IO.Process.getPID
+  let dir : System.FilePath := ⟨s!"/tmp/anneal-proto-a4-{pid}"⟩
+  IO.FS.createDirAll dir
+  try
+    let libDir ← b1LibDir
+    let appDir ← IO.appDir
+    let leanBin : System.FilePath :=
+      match ← IO.getEnv "LEAN_BIN" with
+      | some p => ⟨p⟩
+      | none => ⟨appDir.toString ++ "/lean"⟩
+    let leanExe := if ← leanBin.pathExists then leanBin else ⟨"lean"⟩
+    -- (1) Unannotated `main` smuggled via `extraConstNames` (bypassed B4 in both modes).
+    let mainDecl : IR.Decl := .fdecl `main #[] .object (.ret (.var ⟨0⟩)) {}
+    let mDonorEnv := IR.declMapExt.addEntry (← mkEmptyEnvironment) mainDecl
+    let pMDonor := dir / "A4MainDonor.olean"
+    writeModule mDonorEnv pMDonor (writeIR := false)
+    let (mDonorMd, _) ← readModuleData pMDonor
+    let pMain := dir / "A4MainExtra.olean"
+    saveModuleData pMain `A4MainExtra {
+      isModule := false
+      imports := #[{ module := `Init.Core, importAll := false, isExported := true, isMeta := false }]
+      constNames := #[], constants := #[], extraConstNames := #[`main]
+      entries := mDonorMd.entries.filter (·.1 == `Lean.IR.declMapExt) }
+    let bMain ← IO.FS.readBinFile pMain
+    let envMain ← b1Import libDir [(`A4MainExtra, pMain)] `A4MainExtra
+    IO.println s!"A4 V-S5 main via extraConstNames: binary={(validateOleanParts #[bMain] `A4MainExtra).tags} memory={(validateEnvModule envMain `A4MainExtra).tags}"
+    -- (2) Empty-constants (`constNames = #[]`, `extraConstNames = #[]`) binary IR hijack of `Nat.add`.
+    let hijDecl : IR.Decl := .fdecl `Nat.add #[] .object (.ret (.var ⟨0⟩)) {}
+    let hDonorEnv := IR.declMapExt.addEntry (← mkEmptyEnvironment) hijDecl
+    let pHDonor := dir / "A4HijDonor.olean"
+    writeModule hDonorEnv pHDonor (writeIR := false)
+    let (hDonorMd, _) ← readModuleData pHDonor
+    let pEmptyHij := dir / "A4EmptyHij.olean"
+    saveModuleData pEmptyHij `A4EmptyHij {
+      isModule := false
+      imports := #[{ module := `Init.Core, importAll := false, isExported := true, isMeta := false }]
+      constNames := #[], constants := #[], extraConstNames := #[]
+      entries := hDonorMd.entries.filter (·.1 == `Lean.IR.declMapExt) }
+    let bEmptyHij ← IO.FS.readBinFile pEmptyHij
+    let envEmptyHij ← b1Import libDir [(`A4EmptyHij, pEmptyHij)] `A4EmptyHij
+    IO.println s!"A4 V-S5 empty-constants binary IR hijack of Nat.add: binary={(validateOleanParts #[bEmptyHij] `A4EmptyHij).tags} memory={(validateEnvModule envEmptyHij `A4EmptyHij).tags}"
+    -- (3) Duplicate `extraConstNames` within a module.
+    let pDupEx := dir / "A4DupExtra.olean"
+    saveModuleData pDupEx `A4DupExtra {
+      isModule := false
+      imports := #[{ module := `Init.Core, importAll := false, isExported := true, isMeta := false }]
+      constNames := #[], constants := #[], extraConstNames := #[`a4Aux, `a4Aux]
+      entries := #[] }
+    let bDupEx ← IO.FS.readBinFile pDupEx
+    let envDupEx ← b1Import libDir [(`A4DupExtra, pDupEx)] `A4DupExtra
+    IO.println s!"A4 V-S5 duplicate extraConstNames: binary={(validateOleanParts #[bDupEx] `A4DupExtra).tags} memory={(validateEnvModule envDupEx `A4DupExtra).tags}"
+    -- (4) Honest 5-file `module` with lambda/specialization aux IR decls passes both binary & Full.
+    IO.FS.writeFile (dir / "A4HonestMod.lean")
+      "module\npublic def a4HmFn (xs : List Nat) : List Nat := xs.map (fun x => x * 3 + 1)\n"
+    IO.FS.writeFile (dir / "A4HonestMod.setup.json")
+      "{\"name\":\"A4HonestMod\",\"isModule\":true,\"imports\":[{\"module\":\"Init\",\"importAll\":false,\"isExported\":true,\"isMeta\":false}],\"importArts\":{},\"dynlibs\":[],\"plugins\":[],\"options\":{}}"
+    let cH ← IO.Process.output {
+      cmd := leanExe.toString
+      args := #["-j1", "--setup", (dir / "A4HonestMod.setup.json").toString, "-o", (dir / "A4HonestMod.olean").toString, (dir / "A4HonestMod.lean").toString]
+      cwd := some dir }
+    if cH.exitCode != 0 then throw (IO.userError s!"compile A4HonestMod failed: {cH.stderr}")
+    let (olPs, irPs) ← loadModulePartsFromDisk (dir / "A4HonestMod")
+    let binRepH := validateModuleArtifactParts olPs irPs `A4HonestMod
+    searchPathRef.set [libDir]
+    let olPaths : Array System.FilePath := #[dir / "A4HonestMod.olean", dir / "A4HonestMod.olean.server", dir / "A4HonestMod.olean.private"]
+    let irPaths : Array System.FilePath := #[dir / "A4HonestMod.ir.sig", dir / "A4HonestMod.ir"]
+    let mArts : NameMap ImportArtifacts := ({} : NameMap ImportArtifacts).insert `A4HonestMod (.ofArrays #[olPaths, irPaths])
+    let envH ← importModules #[{ module := `A4HonestMod }] {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private) (arts := mArts)
+    let memRepH := validateEnvModuleFull envH `A4HonestMod olPs (irParts := irPs)
+    IO.println s!"A4 honest module with lambda/spec aux IR decls: binMod ok={binRepH.ok} memory(Full) ok={memRepH.ok}"
   finally
     try IO.FS.removeDirAll dir catch _ => pure ()
 
