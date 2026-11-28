@@ -174,7 +174,12 @@ structure ExecutionModel (Prog Body Sig Query Ret Mem : Type) where
 /-- Explicit 3-bit positive-polarity effect guarantee mask (`true` = stronger
 guarantee / narrower permitted non-normal outcomes) with zero field defaults so
 every specification states all three effect bits explicitly. Matches
-`Trusted.Framework.EffectMask`. -/
+`Trusted.Framework.EffectMask`.
+
+Note that `terminates = true` only rules out `M.diverges` (infinite step
+traces). Under MIR `--panic abort`, `.aborted` is modeled as a terminal outcome
+even though an unverified panic hook or runtime may diverge, so a literal
+termination claim under `--panic abort` also requires `noAbort = true`. -/
 structure EffectMask where
   terminates : Bool
   noUnwind   : Bool
@@ -800,7 +805,9 @@ def ContractHolds {Q Ret Mem : Type} (c : FnContract Q Ret Mem)
     OutcomeAllowed c q o)
 
 /-- Pointwise order on effect masks: `maskLe m1 m2` when `m2` guarantees
-everything `m1` does. -/
+everything `m1` does. This restates the body of upstream
+`Anneal.Framework.effectMaskLe` verbatim (pinned by
+`Anneal.Hybrid.Canaries.maskLe_eq_effectMaskLe_body`). -/
 def maskLe (m1 m2 : EffectMask) : Prop :=
   (m1.terminates = true → m2.terminates = true) ∧
   (m1.noUnwind = true → m2.noUnwind = true) ∧

@@ -60,9 +60,17 @@ the counterexamples that motivate its design:
    may replace a single producer and returns the same output
    (`canary_ratchet`), and a caller's proof carries over
    (`canary_ratchet_outer`).
-9. **Effect-mask order laws:** reflexivity, transitivity, and per-bit strict
-   separation of `maskLe` (`canary_maskLe_refl`, `canary_maskLe_trans`,
-   `canary_maskLe_strict_separation`).
+9. **Effect-mask order laws:** `maskLe` is definitionally the body of
+   upstream `Anneal.Framework.effectMaskLe` (`maskLe_eq_effectMaskLe_body`);
+   it is reflexive, transitive, and antisymmetric (`canary_maskLe_refl`,
+   `canary_maskLe_trans`, `canary_maskLe_antisymm`), rejects weakening any
+   single bit (`canary_maskLe_strict_separation`), and is a partial, not
+   total, order (`canary_maskLe_incomparable`).
+10. **Compatibility envelope:** the local `OracleGrade.licenses` table matches
+   the upper-triangular `Trusted.Framework` table cell by cell
+   (`canary_licenses_table`), unspecified `FnContract` fields default to
+   `True`, and safe functions ignore `safetyPre`
+   (`canary_fnContract_defaults`, `canary_effectiveSafetyPre`).
 -/
 
 namespace Anneal.Hybrid.Canaries
@@ -654,5 +662,86 @@ theorem canary_maskLe_strict_separation :
     fun h => Bool.noConfusion (h.1 rfl),
     fun h => Bool.noConfusion (h.2.1 rfl),
     fun h => Bool.noConfusion (h.2.2 rfl)⟩
+
+/-- `maskLe` is, by `rfl`, the body of upstream `Anneal.Framework.effectMaskLe`
+(which is absent here), so a later import swap cannot change its meaning. -/
+theorem maskLe_eq_effectMaskLe_body :
+    maskLe = fun m1 m2 =>
+      (m1.terminates = true → m2.terminates = true) ∧
+      (m1.noUnwind = true → m2.noUnwind = true) ∧
+      (m1.noAbort = true → m2.noAbort = true) :=
+  rfl
+
+/-- Two Booleans that imply each other's truth are equal. -/
+theorem bool_eq_of_imp_true :
+    ∀ {a b : Bool}, (a = true → b = true) → (b = true → a = true) → a = b
+  | false, false, _, _ => rfl
+  | false, true, _, h => Bool.noConfusion (h rfl)
+  | true, false, h, _ => Bool.noConfusion (h rfl)
+  | true, true, _, _ => rfl
+
+/-- Antisymmetry of `maskLe`: mutually bounded masks are equal. -/
+theorem canary_maskLe_antisymm :
+    ∀ m1 m2 : EffectMask, maskLe m1 m2 → maskLe m2 m1 → m1 = m2
+  | ⟨_, _, _⟩, ⟨_, _, _⟩, h12, h21 => by
+    cases bool_eq_of_imp_true h12.1 h21.1
+    cases bool_eq_of_imp_true h12.2.1 h21.2.1
+    cases bool_eq_of_imp_true h12.2.2 h21.2.2
+    rfl
+
+/-- A mask guaranteeing only `noAbort`. -/
+def noAbortOnlyMask : EffectMask :=
+  { terminates := false, noUnwind := false, noAbort := true }
+
+/-- `maskLe` is not total: guaranteeing termination and no unwinding is
+incomparable with guaranteeing only no abort. -/
+theorem canary_maskLe_incomparable :
+    ¬ maskLe termNoUnwindMask noAbortOnlyMask ∧
+    ¬ maskLe noAbortOnlyMask termNoUnwindMask :=
+  ⟨fun h => Bool.noConfusion (h.1 rfl), fun h => Bool.noConfusion (h.2.2 rfl)⟩
+
+/-! ## Compatibility envelope -/
+
+/-- Every cell of the local `OracleGrade.licenses` table, matching the
+upper-triangular `Trusted.Framework.OracleGrade.licenses`: `forwardSim` never
+licenses `termination` or `existsWitness`, and no grade licenses
+`generalHyper`. -/
+theorem canary_licenses_table :
+    (OracleGrade.unbridged "p").licenses .existsWitness = false ∧
+    (OracleGrade.unbridged "p").licenses .forallSafety = true ∧
+    (OracleGrade.unbridged "p").licenses .generalHyper = false ∧
+    (OracleGrade.unbridged "p").licenses .subsetHyper = false ∧
+    (OracleGrade.unbridged "p").licenses .termination = true ∧
+    (OracleGrade.forwardSim "o").licenses .existsWitness = false ∧
+    (OracleGrade.forwardSim "o").licenses .forallSafety = true ∧
+    (OracleGrade.forwardSim "o").licenses .generalHyper = false ∧
+    (OracleGrade.forwardSim "o").licenses .subsetHyper = true ∧
+    (OracleGrade.forwardSim "o").licenses .termination = false ∧
+    (OracleGrade.biFaultEquiv "o").licenses .existsWitness = true ∧
+    (OracleGrade.biFaultEquiv "o").licenses .forallSafety = true ∧
+    (OracleGrade.biFaultEquiv "o").licenses .generalHyper = false ∧
+    (OracleGrade.biFaultEquiv "o").licenses .subsetHyper = true ∧
+    (OracleGrade.biFaultEquiv "o").licenses .termination = true :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    rfl⟩
+
+/-- Unspecified `FnContract` fields default to `True`, while `effects` has no
+default and must be stated. -/
+theorem canary_fnContract_defaults :
+    let c : FnContract Unit Unit Unit := { effects := anyExitMask }
+    c.safetyPre = (fun _ => True) ∧ c.behaviorPre = (fun _ => True) ∧
+    c.postReturn = (fun _ _ _ => True) ∧ c.postUnwind = (fun _ _ => True) ∧
+    c.postAbort = (fun _ _ => True) ∧ c.effects = anyExitMask :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Safe functions ignore `safetyPre`, even an unsatisfiable one; unsafe
+functions require it, and `effectiveBehaviorPre` conjoins `behaviorPre`. -/
+theorem canary_effectiveSafetyPre :
+    let c : FnContract Unit Unit Unit :=
+      { safetyPre := fun _ => False, effects := anyExitMask }
+    c.effectiveSafetyPre false () ∧ ¬ c.effectiveSafetyPre true () ∧
+    c.effectiveBehaviorPre false () ∧ ¬ c.effectiveBehaviorPre true () :=
+  ⟨fun h => Bool.noConfusion h, fun h => h rfl,
+    ⟨fun h => Bool.noConfusion h, True.intro⟩, fun h => h.1 rfl⟩
 
 end Anneal.Hybrid.Canaries
