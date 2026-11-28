@@ -190,21 +190,66 @@ def forbiddenPureRootNamespaces : List Name := [
   `Lake, `IO, `BaseIO, `EIO, `EST, `ST, `Task, `System]
 
 def forbiddenSysUvPrefixes : List Name := [
-  `Init.System, `Std.Internal.UV, `Internal.UV,
+  `Init.System, `Std.Internal.UV, `Internal.UV, `Std.Async, `Std.Http,
   `Lean.LoadDynlib, `Lean.loadDynlib, `Lean.loadPlugin, `Lean.Dynlib,
-  `Dynlib]
+  `Dynlib,
+  `Lean.Syntax, `Lean.TSyntax, `Lean.TSyntaxArray, `Lean.SourceInfo,
+  `Lean.SyntaxNodeKind, `Lean.mkAtom, `Lean.mkIdent, `Lean.mkNode,
+  `Lean.mkCIdent, `Lean.mkCIdentFrom, `Lean.mkNullNode,
+  `Lean.Name, `Lean.NameMap, `Lean.NameSet,
+  `Lean.Macro, `Lean.Elab, `Lean.Meta, `Lean.Core, `Lean.Parser,
+  `Lean.Environment, `Lean.Compiler, `Lean.Internal,
+  `Lean.ConstantInfo, `Lean.Expr, `Lean.Level, `Lean.Exception, `Lean.Eval,
+  `Lean.MonadEnv, `Lean.EnvExtension, `Lean.SimplePersistentEnvExtension,
+  `Lean.PersistentEnvExtension, `Lean.ScopedEnvExtension,
+  `Lean.AttributeImpl, `Lean.registerBuiltinAttribute]
 
-def isForbiddenPureNamespace (n : Name) : Bool :=
-  let u := n.replacePrefix rootNamespace .anonymous
+partial def stripLeadingRootPrefix (n : Name) : Name :=
+  if n == rootNamespace then .anonymous
+  else if rootNamespace.isPrefixOf n then
+    stripLeadingRootPrefix (n.replacePrefix rootNamespace .anonymous)
+  else n
+
+def isForbiddenPureNamespace (n : Name) (banLeanRoot : Bool := false) : Bool :=
+  let u := stripLeadingRootPrefix n
   let r := u.getRoot
   forbiddenPureRootNamespaces.contains r ||
+    (banLeanRoot && r == `Lean) ||
     forbiddenSysUvPrefixes.any fun pre => u == pre || pre.isPrefixOf u
 
 def isForbiddenPureImport (m : Name) : Bool :=
   let r := m.getRoot
   r == `Lean || r == `Lake ||
     m == `Init.System || (`Init.System).isPrefixOf m ||
-    m == `Std.Internal.UV || (`Std.Internal.UV).isPrefixOf m
+    m == `Std.Internal.UV || (`Std.Internal.UV).isPrefixOf m ||
+    m == `Init.Meta || (`Init.Meta).isPrefixOf m ||
+    m == `Std || m == `Std.Internal ||
+    m == `Std.Async || (`Std.Async).isPrefixOf m ||
+    m == `Std.Http || (`Std.Http).isPrefixOf m
+
+def reservedKernelRoots : List Name :=
+  [`Nat, `String, `Char, `Bool, `Int, `Int8, `Int16, `Int32, `Int64, `ISize,
+   `UInt8, `UInt16, `UInt32, `UInt64, `USize, `BitVec, `Float, `Float32,
+   `ByteArray, `Subarray, `Array, `List, `Option, `Sum, `Prod, `Fin, `Subtype,
+   `Eq, `HEq, `Quot, `Classical, `Lean, `Init, `Std, `Lake, `LeanExport,
+   `LeanIR, `System, `IO, `Task, `Thunk, `Unit, `PUnit, `Empty, `PEmpty, `True,
+   `False, `And, `Or, `Not, `Iff, `Exists, `Sigma, `PSigma, `Decidable,
+   `Nonempty, `Ordering, `Rat, `Except, `EStateM, `StateM,
+   `Expected, `Captured, `SpecPreflight, `TrustedBoundary]
+
+def kernelAcceleratedNames : List Name :=
+  [`Nat.zero, `Nat.succ, `Nat.add, `Nat.sub, `Nat.mul, `Nat.pow, `Nat.gcd,
+   `Nat.mod, `Nat.div, `Nat.beq, `Nat.ble, `Nat.land, `Nat.lor, `Nat.xor,
+   `Nat.shiftLeft, `Nat.shiftRight, `String.ofList]
+
+def allowedRepoSurfaceLeanDecls : List Name := [
+  `Lean.Loop,
+  `Lean.Loop.mk,
+  `Lean.Loop.forIn_eq_of_monadTail,
+  `Lean.Order.MonadTail,
+  `Lean.Order.instCCPOPi,
+  `Lean.Order.FlatOrder.instCCPO,
+  `Lean.Order.FlatOrder.rel.refl]
 
 def isValidSourceIdent (id : Name) : Bool :=
   id.isAnonymous ||
@@ -227,14 +272,16 @@ def candidateOpenNamespaces (currNs : Name) (openDecls : List OpenDecl)
     | _ => []
   let openCandidates := openDecls.filterMap fun
     | OpenDecl.simple ns _ => some (ns ++ id)
-    | _ => none
+    | OpenDecl.explicit aliasId target =>
+      if id == aliasId then some target
+      else if aliasId.isPrefixOf id then
+        some (target ++ id.replacePrefix aliasId .anonymous)
+      else none
   (scopeCandidates currNs ++ openCandidates).eraseDups
 
 def extendOpenDeclsForOpenCmd (currNs : Name) (openDecls : List OpenDecl)
     (openStx : Syntax) : List OpenDecl :=
-  if !openStx.isOfKind ``Parser.Command.open then
-    openDecls
-  else
+  if openStx.isOfKind ``Parser.Command.open then
     let openDecl := openStx[1]
     if !openDecl.isOfKind ``Parser.Command.openSimple then
       openDecls
@@ -251,6 +298,16 @@ def extendOpenDeclsForOpenCmd (currNs : Name) (openDecls : List OpenDecl)
         let stripped := id.replacePrefix rootNamespace .anonymous
         if hasOpenDecl stripped then ods'
         else OpenDecl.simple stripped [] :: ods'
+  else if openStx.isOfKind ``Parser.Command.export &&
+      openStx.getArgs.size == 5 then
+    let nsId := openStx[1].getId
+    let itemIds := openStx[3].getArgs.map Syntax.getId
+    (candidateOpenNamespaces currNs openDecls nsId).foldl
+      (init := openDecls) fun acc ns =>
+        itemIds.foldl (init := acc) fun ods itemId =>
+          OpenDecl.explicit itemId (ns ++ itemId) :: ods
+  else
+    openDecls
 
 structure Violation where
   line : Nat
@@ -321,10 +378,74 @@ def inspectNodeKind (k : SyntaxNodeKind) (args : Array Syntax)
       errs := errs.push s!"unsupported attribute removal {attrName}"
   return errs
 
+def validateRepoExport (currNs : Name) (openDecls : List OpenDecl)
+    (args : Array Syntax) (ln col : Nat) (acc : Array Violation)
+    (isTrusted : Bool := false) : Array Violation := Id.run do
+  let mut bad := acc
+  if args.size != 5 then
+    return pushUnique bad { line := ln, column := col, message := "unsupported export shape" }
+  let nsId := args[1]!.getId
+  if !isValidSourceIdent nsId then
+    bad := pushUnique bad { line := ln, column := col, message := s!"invalid export namespace `{nsId}`" }
+  let itemIds := args[3]!.getArgs.map Syntax.getId
+  if itemIds.isEmpty then
+    bad := pushUnique bad { line := ln, column := col, message := "empty export item list" }
+  for itemId in itemIds do
+    if !isValidSourceIdent itemId then
+      bad := pushUnique bad { line := ln, column := col, message := s!"invalid export item `{itemId}`" }
+    if forbiddenPureIdentifiers.contains itemId || itemId == `autoParam ||
+        itemId == `optParam then
+      bad := pushUnique bad { line := ln, column := col, message := s!"disallowed export item `{itemId}`" }
+  for ns in candidateOpenNamespaces currNs openDecls nsId do
+    if isForbiddenPureNamespace ns (banLeanRoot := true) then
+      bad := pushUnique bad { line := ln, column := col, message := s!"cannot export from forbidden namespace `{ns}`" }
+    for itemId in itemIds do
+      let full := ns ++ itemId
+      if forbiddenPureIdentifiers.contains full || full == `autoParam ||
+          full == `optParam ||
+          isForbiddenPureNamespace full (banLeanRoot := true) then
+        bad := pushUnique bad { line := ln, column := col, message := s!"disallowed export item `{full}`" }
+  for itemId in itemIds do
+    let aliasName := (currNs ++ itemId).replacePrefix rootNamespace .anonymous
+    let aliasRoot := aliasName.getRoot
+    if !isTrusted && aliasRoot == `Trusted then
+      bad := pushUnique bad { line := ln, column := col, message := s!"non-Trusted module cannot export alias `{aliasName}` in Trusted namespace" }
+    if kernelAcceleratedNames.contains aliasName ||
+        reservedKernelRoots.contains aliasRoot then
+      bad := pushUnique bad { line := ln, column := col, message := s!"cannot export alias `{aliasName}` in reserved kernel namespace `{aliasRoot}`" }
+    if forbiddenPureIdentifiers.contains aliasName ||
+        aliasName == `autoParam || aliasName == `optParam ||
+        isForbiddenPureNamespace aliasName (banLeanRoot := true) then
+      bad := pushUnique bad { line := ln, column := col, message := s!"disallowed export alias `{aliasName}`" }
+  return bad
+
+def checkPureIdentRef (ln col : Nat) (val cand : Name) (acc : Array Violation)
+    (allowRepoSurfaceLean : Bool := false) : Array Violation :=
+  let u := stripLeadingRootPrefix cand
+  if forbiddenPureIdentifiers.contains u || u == `autoParam ||
+      u == `optParam ||
+      (isForbiddenPureNamespace u (banLeanRoot := true) &&
+        !(allowRepoSurfaceLean && allowedRepoSurfaceLeanDecls.contains u)) then
+    pushUnique acc { line := ln, column := col, message := s!"disallowed reference `{val}`" }
+  else acc
+
+partial def checkSyntaxPureRefs (fmap : FileMap) (currNs : Name)
+    (openDecls : List OpenDecl) (s : Syntax) (acc : Array Violation) :
+    Array Violation :=
+  match s with
+  | .ident _ _ val _ =>
+    let (ln, col) := posOfSyntax fmap s
+    let acc := checkPureIdentRef ln col val val acc
+    (candidateOpenNamespaces currNs openDecls val).foldl
+      (fun a cand => checkPureIdentRef ln col val cand a) acc
+  | .node _ _ args =>
+    args.foldl (fun a c => checkSyntaxPureRefs fmap currNs openDecls c a) acc
+  | _ => acc
+
 partial def inspectSyntaxFull (fmap : FileMap) (allowedKinds : NameSet) (s : Syntax)
     (acc : Array Violation) (requirePrelude : Bool := true)
     (currNs : Name := .anonymous) (openDecls : List OpenDecl := [])
-    (checkPureRefs : Bool := true)
+    (checkPureRefs : Bool := true) (isTrusted : Bool := false)
     (allowLocalSemireducible : Bool := false) : Array Violation :=
   let (ln, col) := posOfSyntax fmap s
   match s with
@@ -337,17 +458,15 @@ partial def inspectSyntaxFull (fmap : FileMap) (allowedKinds : NameSet) (s : Syn
       else pushUnique acc { line := ln, column := col, message := s!"invalid source identifier `{val}`" }
     if !checkPureRefs then acc
     else
-      let isBad (cand : Name) : Bool :=
-        forbiddenPureIdentifiers.contains cand || isForbiddenPureNamespace cand
-      let allCands := val :: candidateOpenNamespaces currNs openDecls val
-      if allCands.any isBad then
-        pushUnique acc { line := ln, column := col, message := s!"disallowed reference `{val}`" }
-      else acc
+      let allowLean := requirePrelude && !isTrusted
+      let acc := checkPureIdentRef ln col val val acc allowLean
+      (candidateOpenNamespaces currNs openDecls val).foldl
+        (fun a cand => checkPureIdentRef ln col val cand a allowLean) acc
   | .node _ k args =>
     if allowLocalSemireducible && k == ``Parser.Command.in then
       match matchLocalSemireducibleIn? args with
       | some (_, decl) =>
-        inspectSyntaxFull fmap allowedKinds decl acc requirePrelude currNs openDecls checkPureRefs
+        inspectSyntaxFull fmap allowedKinds decl acc requirePrelude currNs openDecls checkPureRefs isTrusted
       | none =>
         let acc :=
           if forbiddenPureTermKinds.contains k then
@@ -359,12 +478,12 @@ partial def inspectSyntaxFull (fmap : FileMap) (allowedKinds : NameSet) (s : Syn
         let acc := (inspectNodeKind k args requirePrelude).foldl
           (fun a msg => pushUnique a { line := ln, column := col, message := msg }) acc
         if checkPureRefs && args.size == 3 then
-          let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
-          let acc := inspectSyntaxFull fmap allowedKinds args[1]! acc requirePrelude currNs openDecls checkPureRefs
+          let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs isTrusted
+          let acc := inspectSyntaxFull fmap allowedKinds args[1]! acc requirePrelude currNs openDecls checkPureRefs isTrusted
           let nextOpen := extendOpenDeclsForOpenCmd currNs openDecls args[0]!
-          inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs nextOpen checkPureRefs
+          inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs nextOpen checkPureRefs isTrusted
         else
-          args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs) acc
+          args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs isTrusted) acc
     else
       let acc :=
         if forbiddenPureTermKinds.contains k then
@@ -376,18 +495,23 @@ partial def inspectSyntaxFull (fmap : FileMap) (allowedKinds : NameSet) (s : Syn
       let acc := (inspectNodeKind k args requirePrelude).foldl
         (fun a msg => pushUnique a { line := ln, column := col, message := msg }) acc
       if k == ``Parser.Command.in && checkPureRefs && args.size == 3 then
-        let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
-        let acc := inspectSyntaxFull fmap allowedKinds args[1]! acc requirePrelude currNs openDecls checkPureRefs
+        let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs isTrusted
+        let acc := inspectSyntaxFull fmap allowedKinds args[1]! acc requirePrelude currNs openDecls checkPureRefs isTrusted
         let nextOpen := extendOpenDeclsForOpenCmd currNs openDecls args[0]!
-        inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs nextOpen checkPureRefs
+        inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs nextOpen checkPureRefs isTrusted
       else if k == ``Parser.Command.mutual && checkPureRefs && args.size == 3 then
-        let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
+        let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs isTrusted
         let (acc, _) := args[1]!.getArgs.foldl (init := (acc, openDecls)) fun (a, mutOpen) child =>
-          let a' := inspectSyntaxFull fmap allowedKinds child a requirePrelude currNs mutOpen checkPureRefs
+          let a' := inspectSyntaxFull fmap allowedKinds child a requirePrelude currNs mutOpen checkPureRefs isTrusted
           (a', extendOpenDeclsForOpenCmd currNs mutOpen child)
-        inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs openDecls checkPureRefs
+        inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs openDecls checkPureRefs isTrusted
+      else if (k == ``Parser.Command.open || k == ``Parser.Command.namespace) && requirePrelude then
+        args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls false isTrusted) acc
+      else if k == ``Parser.Command.export && checkPureRefs then
+        let acc := validateRepoExport currNs openDecls args ln col acc isTrusted
+        args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs isTrusted) acc
       else
-        args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs) acc
+        args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs isTrusted) acc
 
 def collectScopedExtensionNamespaces (env : Environment) : IO NameSet := do
   let exts ← scopedEnvExtensionsRef.get
@@ -424,7 +548,7 @@ def checkNamespaceAllowed (scopedNamespaces : NameSet) (how : String)
     (ln col : Nat) (ns : Name) (acc : Array Violation) : Array Violation :=
   if scopedNamespaces.contains ns then
     pushUnique acc { line := ln, column := col, message := s!"cannot {how} namespace `{ns}` with scoped syntax or extensions" }
-  else if isForbiddenPureNamespace ns then
+  else if isForbiddenPureNamespace ns (banLeanRoot := true) then
     pushUnique acc { line := ln, column := col, message := s!"cannot {how} forbidden namespace `{ns}`" }
   else acc
 
@@ -525,7 +649,11 @@ partial def applyCommandScope (fmap : FileMap) (scopedNamespaces scopedPrefixes 
   let (ln, col) := posOfSyntax fmap stx
   let k := stx.getKind
   if k == ``Parser.Command.namespace then
-    return pushParseScopes scopedNamespaces true ln col stx[1].getId parserEnv scopes acc
+    let top := scopes.head!
+    let (nextEnv, nextScopes, bad) :=
+      pushParseScopes scopedNamespaces true ln col stx[1].getId parserEnv scopes acc
+    let bad := checkSyntaxPureRefs fmap top.currNamespace top.openDecls stx[1] bad
+    return (nextEnv, nextScopes, bad)
   else if k == ``Parser.Command.section then
     if stx[2].isNone then
       let top := scopes.head!
@@ -583,7 +711,21 @@ partial def applyCommandScope (fmap : FileMap) (scopedNamespaces scopedPrefixes 
           bad := checkNamespaceAllowed scopedNamespaces "open" iln icol stripped bad
           if !hasOpenDecl openDecls stripped then
             openDecls := OpenDecl.simple stripped [] :: openDecls
+    bad := checkSyntaxPureRefs fmap top.currNamespace top.openDecls stx[1] bad
     return (parserEnv, { top with openDecls := openDecls } :: scopes.tail!, bad)
+  else if k == ``Parser.Command.export && stx.getArgs.size == 5 then
+    let top := scopes.head!
+    let nsId := stx[1].getId
+    let itemIds := stx[3].getArgs.map Syntax.getId
+    let mut bad := acc
+    for itemId in itemIds do
+      let (_, bad') := checkDeclNamespacePrefixes scopedNamespaces top.currNamespace ln col itemId parserEnv bad
+      bad := bad'
+    let mut ods := top.openDecls
+    for ns in candidateOpenNamespaces top.currNamespace top.openDecls nsId do
+      for itemId in itemIds do
+        ods := OpenDecl.explicit itemId (ns ++ itemId) :: ods
+    return (parserEnv, { top with openDecls := ods } :: scopes.tail!, bad)
   else if k == ``Parser.Command.in && stx.getArgs.size == 3 then
     let top := scopes.head!
     let tmpEnv := Parser.parserExtension.pushScope parserEnv
@@ -634,15 +776,16 @@ def foundationModules : Array Name := #[
 
 def loadFoundationParserEnv : IO Environment := do
   unsafe enableInitializersExecution
-  let env ← importModules (foundationModules.map fun n => { module := n }) {}
+  let env ← importModules (foundationModules.map fun n => { module := n, importAll := true }) {}
     (trustLevel := 0) (plugins := #[]) (loadExts := true) (level := .private)
   return env
 
 def main (args : List String) : IO Unit := do
   let manifestPath := args[0]!
   let role := args[1]?.getD "theory"
+  let isTrusted := role == "trusted"
   let allowedKinds :=
-    if role == "trusted" then allowedTrustedSyntaxKinds else allowedTheorySyntaxKinds
+    if isTrusted then allowedTrustedSyntaxKinds else allowedTheorySyntaxKinds
   let allowLocalSemireducible := role == "theory"
   let rawManifest ← IO.FS.readFile manifestPath
   let filesJson ← IO.ofExcept (Json.parse rawManifest)
@@ -706,7 +849,7 @@ def main (args : List String) : IO Unit := do
           }
         bad := inspectSyntaxFull ictx.fileMap allowedKinds cmd bad
           (requirePrelude := true) (currNs := top.currNamespace) (openDecls := top.openDecls)
-          (checkPureRefs := true) (allowLocalSemireducible := allowLocalSemireducible)
+          (checkPureRefs := true) (isTrusted := isTrusted) (allowLocalSemireducible := allowLocalSemireducible)
         let (nextEnv, nextScopes, bad') :=
           applyCommandScope ictx.fileMap scopedNamespaces scopedPrefixes parserEnv scopes cmd bad
         parserEnv := nextEnv

@@ -225,6 +225,76 @@ class PreflightSyntaxCheckTests(unittest.TestCase):
             trusted_rep = preflight_syntax_check.run_syntax_preflight([admitted], role="trusted")
             self.assertFalse(trusted_rep["clean"])
 
+    def test_pr4492_autoparam_lean_root_meta_import_and_export_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            bad_meta_imp = root / "BadMetaImp.lean"
+            bad_meta_imp.write_text(
+                "prelude\nimport Init.Core\nimport Init.Meta\nimport Std.Async.Basic\n",
+                encoding="utf-8",
+            )
+            bad_autoparam = root / "BadAutoParam.lean"
+            bad_autoparam.write_text(
+                "prelude\nimport Init.Core\n"
+                "def bad1 (x : autoParam Nat `foo) : Nat := x\n"
+                "def bad2 (x : optParam Nat 0) : Nat := x\n",
+                encoding="utf-8",
+            )
+            bad_lean = root / "BadLean.lean"
+            bad_lean.write_text(
+                "prelude\nimport Init.Core\n"
+                "open Lean in\ndef bad_open : Nat := 0\n"
+                "def bad_ref := Lean.Syntax.missing\n",
+                encoding="utf-8",
+            )
+            ok_loop = root / "OkLoop.lean"
+            ok_loop.write_text(
+                "prelude\nimport Init.Core\nimport Init.Control.Do\n"
+                "def loopTy : Type := Lean.Loop\n",
+                encoding="utf-8",
+            )
+            bad_export = root / "BadExport.lean"
+            bad_export.write_text(
+                "prelude\nimport Init.Core\n"
+                "namespace Trusted\nexport Foo (bar)\nend Trusted\n"
+                "namespace Demo\nexport IO (println)\nend Demo\n",
+                encoding="utf-8",
+            )
+            rep = preflight_syntax_check.run_syntax_preflight(
+                [bad_meta_imp, bad_autoparam, bad_lean, ok_loop, bad_export],
+                role="theory",
+            )
+            by_name = {pathlib.Path(f["file"]).name: f for f in rep["files"]}
+            self.assertFalse(by_name["BadMetaImp.lean"]["clean"])
+            meta_msgs = "\n".join(v["message"] for v in by_name["BadMetaImp.lean"]["violations"])
+            self.assertIn("Init.Meta", meta_msgs)
+            self.assertIn("Std.Async.Basic", meta_msgs)
+
+            self.assertFalse(by_name["BadAutoParam.lean"]["clean"])
+            ap_msgs = "\n".join(v["message"] for v in by_name["BadAutoParam.lean"]["violations"])
+            self.assertIn("autoParam", ap_msgs)
+            self.assertIn("optParam", ap_msgs)
+
+            self.assertFalse(by_name["BadLean.lean"]["clean"])
+            self.assertTrue(by_name["OkLoop.lean"]["clean"], by_name["OkLoop.lean"]["violations"])
+            # `Lean.Loop` is permitted in theory/correspondence, rejected in trusted.
+            trusted_loop = preflight_syntax_check.run_syntax_preflight([ok_loop], role="trusted")
+            self.assertFalse(trusted_loop["clean"])
+
+            self.assertFalse(by_name["BadExport.lean"]["clean"])
+            exp_msgs = "\n".join(v["message"] for v in by_name["BadExport.lean"]["violations"])
+            self.assertIn("Trusted", exp_msgs)
+            self.assertIn("IO", exp_msgs)
+
+            # Static scanner also flags direct `import Init.Meta`.
+            scan_codes = {
+                f["code"]
+                for f in proof_health_scan.scan_file(
+                    bad_meta_imp, force_pass1=True, allow_import_prefixes=()
+                )
+            }
+            self.assertIn("DISALLOWED_IMPORT", scan_codes)
+
 
 class BuildLeanDagTests(unittest.TestCase):
     def test_lake_free_module_dag_build_cache_and_audit(self) -> None:

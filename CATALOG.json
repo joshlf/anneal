@@ -1655,7 +1655,7 @@
       "path": "lean/Workbench/Pass1/NatBitwise.lean",
       "badge": "pass1_portable",
       "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, exact `TrustedBoundary` CST syntax, axioms `⊆ [propext]`) library consolidating the `Nat.bitwise`, `Nat.land`, `Nat.lor`, `Nat.xor`, `Nat.shiftLeft`, `Nat.shiftRight`, and `Nat.testBit` lemmas missing from `foundation-lock.json` (`Init.Data.Nat.Bitwise.Lemmas` is outside the 51 locked foundation modules):",
-      "line_count": 874,
+      "line_count": 875,
       "imports": [
         "Init.Core",
         "Init.NotationExtra",

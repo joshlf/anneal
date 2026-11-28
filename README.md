@@ -24,8 +24,9 @@ scripts.
     - `InitLemmas.lean`: Consolidated `Bool`/`ite`/`dite`, generic `BEq`
       bridges, `Nat` power/div/mod, constructive `IntBalance`, and `@Nat.rec`
       total list/slice lemmas.
-    - `Firewall.lean`: 1-field `Prop` structure `Firewall tag P` and
-      zero-`Prop`-argument `IndexedCut` barriers preventing `whnf` and
+    - `Firewall.lean`: 1-field `Prop` structure `Firewall tag P`,
+      zero-`Prop`-argument `IndexedCut` barriers, and goal-directed
+      `ite_*_imp` / `ite_eq_*_imp` branch eliminators preventing `whnf` and
       `rw`/`simp` AST blowups.
     - `SpineForce.lean`: $O(1)$ `@Nat.casesOn` numeral history stripper
       (`withStrictNat`), CPS spine-forcing (`forceNat`, `forceList`,
@@ -67,7 +68,8 @@ scripts.
     list literals, and cross-module `.eq_1` diamond hazards).
   - `preflight_syntax_check.py`: Exact non-elaborating Lean 4 `Parser` CST +
     pure-reference + import + scoped-extension validator mirroring
-    `TrustedBoundary.lean` (`--role theory` or `--role trusted`).
+    `TrustedBoundary.lean` (`--role theory`, `--role correspondence`, or
+    `--role trusted`).
   - `audit_lean_hygiene.py`: Compiled `Lean.Environment` inspector (`--lake-dir`
     or Lake-free `--lean-path`) pinpointing `._unsafe_rec` parent definitions,
     `isPartial`/`isUnsafe` leaks, out-of-namespace `realizeConst` helpers,
@@ -76,6 +78,18 @@ scripts.
     project required) with `-DElab.async=false -Ddebug.skipKernelTC=false` and
     runs fresh `trustLevel := 0`, `loadExts := false` `Kernel.Environment.replay`
     plus optional namespace reachability checks.
+  - `verify_quorum.py`: Multi-kernel Lean 4 (`v4.34.1`/`v4.35.0`) NDJSON v3.1.0
+    quorum verifier (`nanoda_bin`, `con-ron`, `con-leche`, `lean4lean`,
+    optional `anneal-kc`/`palladium`) with root-scoped `leanexport`, `Nat.land`
+    export-cone guard, and automatic + `--require-mutant-reject` tampered-NDJSON
+    negative checks.
+  - `diff_oracle_runner.py`: Standard-library JSONL differential test harness
+    comparing model evaluators against native runtimes across 4-way
+    `TerminalOutcome` tags, IEEE-754 `f64` bit patterns, byte buffers, and
+    mandatory mutant kills.
+  - `stage_ref_pkg.py`: Stages a `<100 KiB` standalone 1-package
+    `reference-corpus/1` tree via `git archive` (or `--template-dir`) and runs
+    `tools/reference.py catalog` + `check`.
   - `olean_profiler.py`: Ranks `.olean` sizes and per-declaration `Expr`
     DAG/tree node hotspots across Lake workspaces or Lake-free `.olean` dirs.
   - `farkas_cert_gen.py`: Synthesizes verified `Workbench.Pass1.LinearArith`

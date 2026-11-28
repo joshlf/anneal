@@ -57,8 +57,6 @@ LOCKED_INIT_MODULES: frozenset[str] = frozenset({
     "Init.Grind.Attr",
     "Init.Grind.Interactive",
     "Init.Grind.Tactics",
-    "Init.Meta",
-    "Init.Meta.Defs",
     "Init.MetaTypes",
     "Init.Notation",
     "Init.NotationExtra",
