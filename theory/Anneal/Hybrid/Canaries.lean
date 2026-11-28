@@ -72,7 +72,11 @@ the counterexamples that motivate its design:
    default to `True` (`canary_fnContract_defaults`), safe functions ignore
    `safetyPre` while both safe and unsafe enforce `behaviorPre`
    (`canary_effectiveSafetyPre`), all nine `DisclosedGap` constructors match
-   (`canary_disclosedGap_constructors`), and the four pure-`Prop`
+   in order with no extras (`canary_disclosedGap_constructors`), as do the
+   `TerminalOutcome`, `ClaimShape`, and `OracleGrade` constructors
+   (`canary_closed_constructors`), the `EffectMask`, `FnContract`, and
+   `ExecutionModel` field layouts match (`canary_effectMask_fnContract_layout`,
+   `canary_executionModel_layout`), and the four pure-`Prop`
    realizability predicates match their upstream bodies by `rfl`
    (`canary_specRealizability_compat_bodies`).
 -/
@@ -767,18 +771,87 @@ theorem canary_effectiveSafetyPre :
     fun _ => True.intro, fun _ => True.intro,
     fun h => h.2, fun h => h.2⟩
 
-/-- Pins all nine `DisclosedGap` constructors and their payload types against
-`Trusted.Framework.DisclosedGap`. -/
+/-- Pins the nine `DisclosedGap` constructors of
+`Trusted.Framework.DisclosedGap`: their payload types, their declaration
+order (`ctorIdx` is `0` through `8`), and that no other constructor exists
+(every `ctorIdx` is below `9`). A list-length check would pass even with an
+extra, reordered, or duplicated constructor. -/
 theorem canary_disclosedGap_constructors (s : String) :
-    ([DisclosedGap.unbridgedSemantics s,
-      DisclosedGap.callerRawPtrAliasing s,
-      DisclosedGap.callerMemoryThreadIsolation s,
-      DisclosedGap.configuredReferenceScope s,
-      DisclosedGap.assumedExternalCallee s,
-      DisclosedGap.waivedInhabitation s,
-      DisclosedGap.selectedUnitScope,
-      DisclosedGap.rawLegacySpec,
-      DisclosedGap.unverifiedDownstream s]).length = 9 :=
+    [(DisclosedGap.unbridgedSemantics s).ctorIdx,
+      (DisclosedGap.callerRawPtrAliasing s).ctorIdx,
+      (DisclosedGap.callerMemoryThreadIsolation s).ctorIdx,
+      (DisclosedGap.configuredReferenceScope s).ctorIdx,
+      (DisclosedGap.assumedExternalCallee s).ctorIdx,
+      (DisclosedGap.waivedInhabitation s).ctorIdx,
+      DisclosedGap.selectedUnitScope.ctorIdx,
+      DisclosedGap.rawLegacySpec.ctorIdx,
+      (DisclosedGap.unverifiedDownstream s).ctorIdx] =
+      [0, 1, 2, 3, 4, 5, 6, 7, 8] ∧
+    ∀ g : DisclosedGap, g.ctorIdx < 9 := by
+  refine ⟨rfl, fun g => ?_⟩
+  cases g <;> exact Nat.le_of_ble_eq_true rfl
+
+/-- Pins the closed constructor sets, declaration order, and payload types of
+`TerminalOutcome`, `ClaimShape` (canonical lexicographic order), and
+`OracleGrade` against `Trusted.Framework`. -/
+theorem canary_closed_constructors {Ret Mem : Type} (r : Ret) (m : Mem)
+    (s : String) :
+    [(TerminalOutcome.returned r m).ctorIdx,
+      (TerminalOutcome.unwound (Ret := Ret) m).ctorIdx,
+      (TerminalOutcome.aborted (Ret := Ret) m).ctorIdx] = [0, 1, 2] ∧
+    (∀ o : TerminalOutcome Ret Mem, o.ctorIdx < 3) ∧
+    [ClaimShape.existsWitness.ctorIdx, ClaimShape.forallSafety.ctorIdx,
+      ClaimShape.generalHyper.ctorIdx, ClaimShape.subsetHyper.ctorIdx,
+      ClaimShape.termination.ctorIdx] = [0, 1, 2, 3, 4] ∧
+    (∀ c : ClaimShape, c.ctorIdx < 5) ∧
+    [(OracleGrade.unbridged s).ctorIdx, (OracleGrade.forwardSim s).ctorIdx,
+      (OracleGrade.biFaultEquiv s).ctorIdx] = [0, 1, 2] ∧
+    (∀ g : OracleGrade, g.ctorIdx < 3) := by
+  refine ⟨rfl, fun o => ?_, rfl, fun c => ?_, rfl, fun g => ?_⟩
+  · cases o <;> exact Nat.le_of_ble_eq_true rfl
+  · cases c <;> exact Nat.le_of_ble_eq_true rfl
+  · cases g <;> exact Nat.le_of_ble_eq_true rfl
+
+/-- Pins the field order of `EffectMask` and `FnContract`: positional
+construction agrees with named construction, so swapping two same-typed
+fields (such as `postUnwind` and `postAbort`) breaks this canary. -/
+theorem canary_effectMask_fnContract_layout {Q R M : Type} (a b c : Bool)
+    (sp bp : Q → Prop) (pr : Q → R → M → Prop) (pu pa : Q → M → Prop)
+    (e : EffectMask) :
+    EffectMask.mk a b c = { terminates := a, noUnwind := b, noAbort := c } ∧
+    FnContract.mk sp bp pr pu pa e =
+      { safetyPre := sp, behaviorPre := bp, postReturn := pr,
+        postUnwind := pu, postAbort := pa, effects := e } :=
+  ⟨rfl, rfl⟩
+
+/-- Pins the names, types, and order of all 22 `ExecutionModel` fields of
+`Trusted.Framework.ExecutionModel`. -/
+theorem canary_executionModel_layout {Prog Body Sig Query Ret Mem : Type}
+    (pid : String) (og : OracleGrade) (progAdm : Prog → Bool)
+    (bodyAdm : Prog → Body → Bool) (partialScope : Prog → Bool)
+    (bodyAt : Prog → Nat → Option Body) (uniq : Prog → Bool)
+    (ident : Body → String) (isUnsafe isExt : Body → Bool)
+    (matchesSig : Body → Sig → Bool) (mGaps : List DisclosedGap)
+    (rGaps : Body → List DisclosedGap)
+    (csGaps : ClaimShape → List DisclosedGap)
+    (entryDom : Body → Query → Prop) (retValid : Body → Ret → Mem → Prop)
+    (memValid : Mem → Prop) (execFor : Prog → Nat → Prog)
+    (wf : Prog → Query → Prop)
+    (produces : Prog → Query → TerminalOutcome Ret Mem → Prop)
+    (diverges faultsUB : Prog → Query → Prop) :
+    (ExecutionModel.mk pid og progAdm bodyAdm partialScope bodyAt uniq ident
+        isUnsafe isExt matchesSig mGaps rGaps csGaps entryDom retValid
+        memValid execFor wf produces diverges faultsUB :
+      ExecutionModel Prog Body Sig Query Ret Mem) =
+      { profileId := pid, oracleGrade := og, programAdmitted := progAdm,
+        bodyAdmitted := bodyAdm, isPartialScope := partialScope,
+        bodyAt := bodyAt, uniqueIdentities := uniq, bodyIdentity := ident,
+        bodyIsUnsafe := isUnsafe, bodyIsExternal := isExt,
+        bodyMatchesSig := matchesSig, modelGaps := mGaps,
+        requiredGaps := rGaps, claimShapeGaps := csGaps,
+        entryDom := entryDom, returnValid := retValid, memValid := memValid,
+        execForBody := execFor, wellFormed := wf, produces := produces,
+        diverges := diverges, faultsUB := faultsUB } :=
   rfl
 
 /-- Pins the four local pure-`Prop` realizability compatibility predicates to
