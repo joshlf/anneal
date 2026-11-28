@@ -81,9 +81,15 @@ the counterexamples that motivate its design:
    `TerminalOutcome`, `ClaimShape`, and `OracleGrade` constructors
    (`canary_closed_constructors`), the `EffectMask`, `FnContract`, and
    `ExecutionModel` field layouts match (`canary_effectMask_fnContract_layout`,
-   `canary_executionModel_layout`), and the four pure-`Prop`
+   `canary_executionModel_layout`), type-parameter, constructor-argument,
+   and binder names match (`canary_binder_names`), and the four pure-`Prop`
    realizability predicates match their upstream bodies by `rfl`
    (`canary_specRealizability_compat_bodies`).
+11. **Outcome gating:** `OutcomeAllowed` forbids undefined behavior under
+   every mask (`canary_outcomeAllowed_effects`), each effect bit gates
+   exactly its own outcome arm (`canary_outcomeAllowed_bit_arms`), and each
+   terminal arm also consults its postcondition
+   (`canary_outcomeAllowed_posts`).
 -/
 
 namespace Anneal.Hybrid.Canaries
@@ -915,6 +921,41 @@ theorem canary_outcomeAllowed_effects :
     fun h => Bool.noConfusion h, fun h => h,
     ⟨rfl, True.intro⟩, ⟨rfl, True.intro⟩, rfl, fun h => h⟩
 
+/-- Each effect bit gates exactly its own `RunOutcome` arm (`noUnwind` the
+`unwound` arm, `noAbort` the `aborted` arm, `terminates` the `diverged`
+arm). Comparing only `totalMask` with `anyExitMask` cannot detect two bits
+swapped inside `OutcomeAllowed`; this canary can. -/
+theorem canary_outcomeAllowed_bit_arms :
+    let cU : FnContract Unit Unit Unit :=
+      { effects := { terminates := false, noUnwind := true, noAbort := false } }
+    let cA : FnContract Unit Unit Unit := { effects := noAbortOnlyMask }
+    let cT : FnContract Unit Unit Unit := { effects := termOnlyMask }
+    ¬ OutcomeAllowed cU () (.terminal (.unwound ())) ∧
+    OutcomeAllowed cU () (.terminal (.aborted ())) ∧
+    OutcomeAllowed cU () .diverged ∧
+    OutcomeAllowed cA () (.terminal (.unwound ())) ∧
+    ¬ OutcomeAllowed cA () (.terminal (.aborted ())) ∧
+    OutcomeAllowed cA () .diverged ∧
+    OutcomeAllowed cT () (.terminal (.unwound ())) ∧
+    OutcomeAllowed cT () (.terminal (.aborted ())) ∧
+    ¬ OutcomeAllowed cT () .diverged :=
+  ⟨fun h => Bool.noConfusion h.1, ⟨rfl, True.intro⟩, rfl,
+    ⟨rfl, True.intro⟩, fun h => Bool.noConfusion h.1, rfl,
+    ⟨rfl, True.intro⟩, ⟨rfl, True.intro⟩, fun h => Bool.noConfusion h⟩
+
+/-- Every terminal arm of `OutcomeAllowed` also consults its postcondition:
+with every effect permitted, a `False` postcondition still rejects the
+matching outcome, while divergence depends only on `terminates`. -/
+theorem canary_outcomeAllowed_posts :
+    let c : FnContract Unit Unit Unit :=
+      { postReturn := fun _ _ _ => False, postUnwind := fun _ _ => False,
+        postAbort := fun _ _ => False, effects := anyExitMask }
+    ¬ OutcomeAllowed c () (.terminal (.returned () ())) ∧
+    ¬ OutcomeAllowed c () (.terminal (.unwound ())) ∧
+    ¬ OutcomeAllowed c () (.terminal (.aborted ())) ∧
+    OutcomeAllowed c () .diverged :=
+  ⟨fun h => h, fun h => h.2, fun h => h.2, rfl⟩
+
 /-- Pins the nine `DisclosedGap` constructors of
 `Trusted.Framework.DisclosedGap`: their payload types, their declaration
 order (`ctorIdx` is `0` through `8`), and that no other constructor exists
@@ -1038,5 +1079,45 @@ theorem canary_specRealizability_compat_bodies.{u, v, w} :
         ∃ x, pre x ∧ ∃ y_ok y_bad,
           obs x y_ok = obs x y_bad ∧ post x y_ok ∧ ¬ post x y_bad) :=
   ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Pins the type-parameter, constructor-argument, and binder names of
+`Trusted.Framework` (`Ret`/`Mem`, `ret`/`mem`, `profileId`, `oracleId`,
+`identity`, `stage`, `Prog`/`Body`/`Sig`/`Query`, `isUnsafe`/`q`), so named
+arguments written against `Trusted.Framework` keep elaborating after the
+import swap. Distinct type arguments also pin parameter order. -/
+theorem canary_binder_names (r : Nat) (m : Bool) (s : String)
+    (c : FnContract Unit Nat Bool) :
+    TerminalOutcome (Ret := Nat) (Mem := Bool) = TerminalOutcome Nat Bool ∧
+    FnContract (Query := String) (Ret := Nat) (Mem := Bool) =
+      FnContract String Nat Bool ∧
+    ExecutionModel (Prog := Unit) (Body := Bool) (Sig := Nat)
+        (Query := String) (Ret := Int) (Mem := Char) =
+      ExecutionModel Unit Bool Nat String Int Char ∧
+    TerminalOutcome.returned (ret := r) (mem := m) = .returned r m ∧
+    TerminalOutcome.unwound (Ret := Nat) (mem := m) = .unwound m ∧
+    TerminalOutcome.aborted (Ret := Nat) (mem := m) = .aborted m ∧
+    OracleGrade.unbridged (profileId := s) = .unbridged s ∧
+    OracleGrade.forwardSim (oracleId := s) = .forwardSim s ∧
+    OracleGrade.biFaultEquiv (oracleId := s) = .biFaultEquiv s ∧
+    DisclosedGap.unbridgedSemantics (profileId := s) =
+      .unbridgedSemantics s ∧
+    DisclosedGap.callerRawPtrAliasing (profileId := s) =
+      .callerRawPtrAliasing s ∧
+    DisclosedGap.callerMemoryThreadIsolation (profileId := s) =
+      .callerMemoryThreadIsolation s ∧
+    DisclosedGap.configuredReferenceScope (oracleId := s) =
+      .configuredReferenceScope s ∧
+    DisclosedGap.assumedExternalCallee (identity := s) =
+      .assumedExternalCallee s ∧
+    DisclosedGap.waivedInhabitation (identity := s) =
+      .waivedInhabitation s ∧
+    DisclosedGap.unverifiedDownstream (stage := s) =
+      .unverifiedDownstream s ∧
+    c.effectiveSafetyPre (isUnsafe := true) (q := ()) =
+      c.effectiveSafetyPre true () ∧
+    c.effectiveBehaviorPre (isUnsafe := false) (q := ()) =
+      c.effectiveBehaviorPre false () :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+    rfl, rfl, rfl⟩
 
 end Anneal.Hybrid.Canaries
