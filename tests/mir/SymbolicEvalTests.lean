@@ -3592,6 +3592,9 @@ def extCallThenLinkedPanicMir : CapturedMir :=
         terminator := mkTerm .return_
         isCleanup := false } ]
 
+-- Theorem `extCallThenLinkedPanic_modular_safe_panic_verified` follows
+-- `s13_linkedAndReturns_checks` below.
+
 /--
 Calls the unlinked `sym_test::external_get` into `_0` and returns it: an
 external call that returns normally admits no modular safe-panic certificate,
@@ -3783,6 +3786,9 @@ def extCallBranchesMir : CapturedMir :=
         terminator := mkTerm .return_
         isCleanup := false } ]
 
+-- Theorem `extCallBranches_modular_safe_panic_rejected` follows
+-- `s13_tailClosedChecks` below.
+
 /--
 Reaches `unreachable` (undefined behavior) after the external call returns:
 the checker rejects a fault on any answer path.
@@ -3802,6 +3808,9 @@ def extCallThenUbMir : CapturedMir :=
     , { statements := []
         terminator := mkTerm .unreachable
         isCleanup := false } ]
+
+-- Theorem `extCallThenUb_modular_safe_panic_rejected` follows
+-- `s13_tailClosedChecks` below.
 
 /--
 Calls the linked callee `sym_test::fmt_panic`, which itself performs an external
@@ -4819,6 +4828,9 @@ def v26FfiReadRegReversedClaim : Claim where
       (argsMatchCalleeParamTys v26FfiReadRegMir args)
   post args ret := MirBoolPredicateHolds v26FfiReadRegEnsMir (args ++ [ret])
 
+-- Theorems `v26FfiReadRegReversedPinnedAuto_verified` and
+-- `v26FfiReadRegReversedEqU32_verified` follow `v26Tail_checks` below.
+
 /-- Closure-deref `requires` with an intermediate local move
 (`_9 = copy (*_10); _11 = move _9; _7 = Eq(move _11, const 10)`). -/
 def v26FfiReadRegIntermMoveReqMir : CapturedMir :=
@@ -4874,6 +4886,9 @@ def v26FfiReadRegIntermMoveTotalClaim : TotalClaim where
         (mem = (initMachineState v26FfiReadRegMir args).memory))
       (argsMatchSignature (v26FfiReadRegMir.instantiate .nil) args mem)
   post args _ ret _ := MirBoolPredicateHolds v26FfiReadRegEnsMir (args ++ [ret])
+
+-- Theorem `v26FfiReadRegIntermMoveTotal_verified` follows `v26Tail_checks`
+-- below.
 
 /-- Two-parameter `u32` closure-deref short-circuit `requires` (`a == 10 && 20 == b`)
 and `ensures` (`30 == result`), discharged via both `dischargeRustPinnedContractAuto`
