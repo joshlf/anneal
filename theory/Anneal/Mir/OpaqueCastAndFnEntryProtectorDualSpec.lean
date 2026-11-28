@@ -58,6 +58,11 @@ witnesses over unmodified `Trusted.Rustc.V2026_06_01.MirSemantics`.
 * §7e exports the universal copy laws through which the cross-root bridge
   locks the shared Trusted runner of `section Fixtures` for EVERY body.
 
+**Honest lowering note for cases `2` / `7`** (§7f): their 3-way `.ub`
+agreement holds only under Anneal's move-deinit / drop-deinit lowering
+(MiniRust's case `7` program IS its case `5` program; LeanMiri's case `7` is
+its case `5` harness; upstream `minimize` returns `7` on both).
+
 **Honest fixture note for case `17`**: Trusted's canonical fixture builds a
 live `&()`, whereas MiniRust and LeanMiri check a dangling provenance-less ZST
 pointer; on the identical dangling program Trusted is conservatively `.ub`
@@ -2057,6 +2062,78 @@ theorem postBorrowck_modeSensitivity_present (A : OcFpLmAuthority)
   · exact ⟨_, rfl, rfl, rfl, rfl⟩
   · exact ⟨_, rfl, rfl, rfl, rfl⟩
 
+/-! ## §7f. Lowering-Dependent `D1` Cells (`2`, `7`)
+
+The 3-way `.ub` agreement of `D1` cases `2` (use after move) and `7` (use after
+a glue-free drop) is NOT a fact about upstream MiniRust or vendored Miri: it
+holds only under Anneal's move-deinit / drop-deinit lowering, which the
+MiniRust programs and the LeanMiri adapter adopt to mirror Trusted.
+* MiniRust lowers the move of case `2` as `Load` + `Deinit` and the drop of
+  case `7` as `Deinit`, so `ocMrProg7` IS `ocMrProg5` (the `Deinit` case);
+  under upstream `minimize` lowering both programs return `7`, NOT `.ub`.
+* LeanMiri's case `7` runs the very same `lmOcDeinitThenRead` harness as case
+  `5` (locked definitionally in the cross-root bridge), and its case `2` UB
+  comes from the Anneal adapter `annealEvalOperand`, which invalidates moved
+  locals, whereas vendored `Miri.Interpreter.evalOperand` treats `Move` like
+  `Copy` ("no invented move invalidation").
+* Only Trusted's fixture `7` contains a genuine `Drop` terminator. -/
+
+/-- Whether a `CapturedMir` body contains a `Drop` terminator. -/
+def ocBodyHasDrop (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) : Bool :=
+  b.basicBlocks.any fun bb =>
+    match bb.terminator.kind with
+    | .drop _ _ _ => true
+    | _ => false
+
+/-- **Lowering-dependent `D1` cells (`2`, `7`)**, for every certified LeanMiri
+authority and both modes:
+1. MiniRust's case `7` program is literally its case `5` (`Deinit`) program;
+2. among the 22 shared fixtures, ONLY Trusted's fixture `7` has a `Drop`
+   terminator (fixture `5` uses a `Deinit` statement instead);
+3. cases `2` and `7` are `.ub` on all three authorities;
+4. under upstream `minimize` lowering MiniRust returns `7` on both, i.e. the
+   agreement with Trusted is lowering-dependent. -/
+theorem dual_d1_lowering_dependent_cells (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) (tb : Bool) :
+    ocMrProg7 = ocMrProg5 ∧
+    mrOcObserve tb 7 = mrOcObserve tb 5 ∧
+    ocBodyHasDrop ocCase7Mir = true ∧ ocBodyHasDrop ocCase5Mir = false ∧
+    (List.range mrOcCaseCount).filter (fun i =>
+      match ocCaseFixture? i with
+      | some (b, _) => ocBodyHasDrop b
+      | none => false) = [7] ∧
+    trustedVerdict tb 2 = some .undefinedBehavior ∧
+    mrVerdict tb 2 = some .undefinedBehavior ∧
+    A.verdict tb 2 = some .undefinedBehavior ∧
+    trustedVerdict tb 7 = some .undefinedBehavior ∧
+    mrVerdict tb 7 = some .undefinedBehavior ∧
+    A.verdict tb 7 = some .undefinedBehavior ∧
+    ocRun tb [] ocMrProg2Minimize = .okScalar 7 ∧
+    ocRun tb [] ocMrProg7Minimize = .okScalar 7 ∧
+    ocVerdictOf (ocRun tb [] ocMrProg2Minimize) ≠ trustedVerdict tb 2 ∧
+    ocVerdictOf (ocRun tb [] ocMrProg7Minimize) ≠ trustedVerdict tb 7 := by
+  have hMin := mr_oc_minimize_lowering_contrasts
+  have h2M : ocRun tb [] ocMrProg2Minimize = .okScalar 7 := by
+    cases tb
+    · exact hMin.1
+    · exact hMin.2.1
+  have h7M : ocRun tb [] ocMrProg7Minimize = .okScalar 7 := by
+    cases tb
+    · exact hMin.2.2.1
+    · exact hMin.2.2.2.1
+  have hT2 : trustedVerdict tb 2 = some .undefinedBehavior := by
+    rw [trustedVerdict_cell tb 2 (by decide)]; cases tb <;> rfl
+  have hT7 : trustedVerdict tb 7 = some .undefinedBehavior := by
+    rw [trustedVerdict_cell tb 7 (by decide)]; cases tb <;> rfl
+  refine ⟨rfl, rfl, by decide +kernel, by decide +kernel, by decide +kernel,
+    hT2, ?_, ?_, hT7, ?_, ?_, h2M, h7M, ?_, ?_⟩
+  · rw [mrVerdict_cell tb 2 (by decide)]; cases tb <;> rfl
+  · rw [lmTableCheckOf_sound A hA tb 2 (by decide)]; cases tb <;> rfl
+  · rw [mrVerdict_cell tb 7 (by decide)]; cases tb <;> rfl
+  · rw [lmTableCheckOf_sound A hA tb 7 (by decide)]; cases tb <;> rfl
+  · rw [h2M, hT2]; decide
+  · rw [h7M, hT7]; decide
+
 /-! ## §7e. Verbatim-Copy Locks for the Shared Trusted Runner
 
 `section Fixtures` of `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR` is shared
@@ -2361,6 +2438,7 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone (A : OcFpLmAuthority)
     (∀ idx (hi : idx < mrOcCaseCount),
       type_of% (dual_mode_sensitivity_exact A hA idx hi)) ∧
     type_of% (dual_d1_cast_erasure_and_boundary A hA) ∧
+    (∀ tb, type_of% (dual_d1_lowering_dependent_cells A hA tb)) ∧
     type_of% (dual_d2_fnentry_protectors_and_transmute_boundary A hA) ∧
     type_of% (dual_d3_dereferenceable_and_zst_boundary A hA) ∧
     type_of% dual_d2_machine_termination_contrast ∧
@@ -2380,6 +2458,7 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone (A : OcFpLmAuthority)
    dual_fail_closed_out_of_range A hOob,
    dual_mode_sensitivity_exact A hA,
    dual_d1_cast_erasure_and_boundary A hA,
+   dual_d1_lowering_dependent_cells A hA,
    dual_d2_fnentry_protectors_and_transmute_boundary A hA,
    dual_d3_dereferenceable_and_zst_boundary A hA,
    dual_d2_machine_termination_contrast,
@@ -2616,6 +2695,7 @@ run_cmd do
       ns ++ `trustedPostBorrowckObserve_eq_uniform_erased,
       ns ++ `postBorrowckDomain_bundle_claims,
       ns ++ `postBorrowck_modeSensitivity_present,
+      ns ++ `ocBodyHasDrop, ns ++ `dual_d1_lowering_dependent_cells,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   for c in spotlightDecls do

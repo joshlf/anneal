@@ -58,6 +58,11 @@ import MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
      EVERY `idx : Nat` (`dual_d1_phase_boundary_all_nat`: LeanMiri's phase
      observer is fail-closed because it factors through the `Eq.refl`-locked
      fixture table);
+   - pins the lowering-dependent `D1` cells `2` / `7`
+     (`dual_d1_lowering_dependent_cells`): LeanMiri's case `7` IS its case `5`
+     harness (`lmCase7_is_case5_harness`, `Eq.refl` for every mode), its case
+     `2` path reaches the Anneal adapter `annealEvalOperand`, and upstream
+     `minimize` makes MiniRust return `7` on both;
    - locks LeanMiri's canonical cell `17` to its dangling-ZST companion
      harness for every mode (`lmCompanion_zstDangling_is_canonical17`) and
      closes `dual_d3_zst_fixture_divergence` (Trusted's canonical case `17` is
@@ -291,6 +296,20 @@ theorem uniform_erased_and_cast_free_canaries :
     allOcFpCompanions.all (fun c =>
       (ocBodyPlaces (ocCompanionBody c)).any ocPlaceHasCast ==
         ocCompanionIsD1 c) = true := by
+  decide +kernel
+
+/-- **Lowering-dependent `D1` cells (direct kernel execution)**: canonical
+cases `2` and `7` are `.ub` on Trusted and MiniRust, yet under upstream
+`minimize` lowering MiniRust returns `7` on both; MiniRust's case `7` run is
+its case `5` run; and only Trusted's fixture `7` carries a `Drop` terminator. -/
+theorem d1_lowering_dependent_canaries :
+    mrOcTrustedObserve false 2 = .ub ∧ mrOcObserve true 2 = .ub ∧
+    mrOcTrustedObserve true 7 = .ub ∧ mrOcObserve false 7 = .ub ∧
+    ocRun false [] ocMrProg2Minimize = .okScalar 7 ∧
+    ocRun true [] ocMrProg7Minimize = .okScalar 7 ∧
+    mrOcObserve true 7 = mrOcObserve true 5 ∧
+    ocBodyHasDrop ocCase7Mir = true ∧ ocBodyHasDrop ocCase5Mir = false ∧
+    ocBodyHasDrop ocCase7ProtectedDropMir = true := by
   decide +kernel
 
 /-- **Case `17` fixture divergence (direct kernel execution)**: MiniRust's
@@ -1426,6 +1445,19 @@ run_cmd do
       (mkApp4 (mkConst (bNs ++ `dual_d3_zst_fixture_divergence)) lmObsTy lmToMr
         compObs hC)
     added := added.push (ns ++ `dual_d3_zst_fixture_divergence)
+    -- Lowering-dependent cell `7`: LeanMiri's case `7` IS its case `5`
+    -- (`Deinit`) harness, for every mode (definitional lock).
+    let case7LockName := ns ++ `lmCase7_is_case5_harness
+    addThm case7LockName
+      (mkForall `tb .default boolTy <|
+        mkEq lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7))
+          (mkApp2 lmObserve (.bvar 0) (mkNatLit 5)))
+      (mkLambda `tb .default boolTy <|
+        mkRefl lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7)))
+    added := added.push case7LockName
+    addThmInfer (ns ++ `dual_d1_lowering_dependent_cells)
+      (mkApp2 (mkConst (bNs ++ `dual_d1_lowering_dependent_cells)) authC hA)
+    added := added.push (ns ++ `dual_d1_lowering_dependent_cells)
 
     -- 4b. Observer-level 3-way agreement over raw `lmOcObserve` + unified
     -- cross-root 3-engine capstone.
@@ -1477,6 +1509,8 @@ run_cmd do
           mkConst (ns ++ `postBorrowckDomain_bundle_claims),
           mkConst (ns ++ `postBorrowck_modeSensitivity_present),
           mkConst zstLockName,
+          mkConst case7LockName,
+          mkConst (ns ++ `dual_d1_lowering_dependent_cells),
           mkConst (ns ++ `dual_d3_zst_fixture_divergence),
           mkConst runnerUnivName ] ++
         (lockNames.toList.map mkConst)
@@ -1893,6 +1927,13 @@ run_cmd do
         (mkConst `Trusted.Rustc.V2026_06_01.MirAst.Place)
         (mkApp (mkConst (mrNs ++ `ocBodyPlaces)) mirConst)
         (mkConst (mrNs ++ `ocPlaceHasCast))
+    let ptrTysNil ← MetaM.run' do
+      let t ← inferType (mkConst (mrNs ++ `ocRun))
+      let listTy := t.bindingBody!.bindingDomain!
+      return mkApp (mkConst ``List.nil [0]) listTy.appArg!
+    let mrRunNil (tb : Bool) (prog : Name) : Expr :=
+      mkApp3 (mkConst (mrNs ++ `ocRun)) (toExpr tb) ptrTysNil
+        (mkConst (mrNs ++ prog))
     let eqCtl (what : String) (tag : Name) (ty lhs bad good : Expr) :
         String × Declaration × Declaration :=
       (what, thmD (ns ++ `forged ++ tag) (mkEq ty lhs bad) (mkRefl ty lhs),
@@ -2086,6 +2127,20 @@ run_cmd do
         eqCtl "forged D2 case 10 carries an opaqueCast place"
           `d2Case10HasCast boolTy
           (bodyHasCast (mkConst (mrNs ++ `ocCase10Mir)))
+          (toExpr true) (toExpr false),
+        -- Lowering-dependent cells `2` / `7`.
+        eqCtl "forged LM case 7 follows upstream minimize (no deinit): returns 7"
+          `lmCase7Minimize mrObsTy0 (mkApp lmToMr (lmObsU true 7))
+          (mrSc 7) (mrC `ub),
+        eqCtl "forged MR upstream-minimize case 7 is UB like Trusted"
+          `mrCase7MinimizeUb mrObsTy0 (mrRunNil false `ocMrProg7Minimize)
+          (mrC `ub) (mrSc 7),
+        eqCtl "forged MR upstream-minimize case 2 is UB like Trusted"
+          `mrCase2MinimizeUb mrObsTy0 (mrRunNil true `ocMrProg2Minimize)
+          (mrC `ub) (mrSc 7),
+        eqCtl "forged Trusted fixture 5 carries a Drop terminator"
+          `case5HasDrop boolTy
+          (mkApp (mkConst (bNs ++ `ocBodyHasDrop)) (mkConst (mrNs ++ `ocCase5Mir)))
           (toExpr true) (toExpr false) ]
     let mut rejected : Nat := 0
     let mut twins : Nat := 0
@@ -2333,6 +2388,20 @@ run_cmd do
         throwError "authority-independence audit FAILED: LM {lmTag} reaches Trusted stepMirFn"
       if seen.contains mrStepMName then
         throwError "authority-independence audit FAILED: LM {lmTag} reaches MiniRust stepM"
+    -- Lowering-dependent case `2`: the LeanMiri `Step.step` run reaches the
+    -- Anneal adapter `annealEvalOperand` (the move-invalidating operand hook)
+    -- and the vendored `Miri.Interpreter.evalOperand` (which does not
+    -- invalidate moved locals) is a distinct constant.
+    let case2Run := mkApp2 runStepC
+      (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase2Mir)))
+      (mkConst (lmNs ++ `ocU32Ty))
+    let case2Seen := reachFromExpr case2Run
+    unless env.contains `Miri.Interpreter.evalOperand do
+      throwError "lowering audit: vendored Miri.Interpreter.evalOperand missing"
+    unless case2Seen.contains `LeanMiriSpec.Correspondence.annealEvalOperand ||
+        case2Seen.contains `LeanMiriSpec.Correspondence.annealEvalOperandLM2_3 do
+      throwError "lowering audit: LM case 2 does not reach the Anneal adapter annealEvalOperand"
+    reachChecked := reachChecked + 1
     -- Positive self-test: MiniRust `mrOcObserve` IS caught by the anti-MiniRust detector.
     unless (reachFromExpr (mkConst (mrNs ++ `mrOcObserve))).contains mrStepMName do
       throwError "anti-MiniRust self-test failed: mrOcObserve not caught"
@@ -2402,7 +2471,7 @@ run_cmd do
         rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
   unless addedCount ≥ 229 && bundleCount = 8 && eqLockCount = 94 &&
-      sharedCount = 98 && rejectedCount ≥ 99 &&
+      sharedCount = 98 && rejectedCount ≥ 103 &&
       twinCount = rejectedCount && reachCount ≥ 268 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, shared={sharedCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles; {eqLockCount} Eq.refl + 2 bijection + 2 universal runner + 1 ocCombine locks covering {sharedCount}/98 shared MR/LM declarations), kernel-rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
@@ -2472,6 +2541,7 @@ run_cmd do
       `ocEraseBody_fixture_fixed_iff, `ocEraseBody_companion_fixed_iff,
       `trustedPostBorrowckObserve_eq_uniform_erased,
       `postBorrowckDomain_bundle_claims, `postBorrowck_modeSensitivity_present,
+      `ocBodyHasDrop, `dual_d1_lowering_dependent_cells,
       `ep2_opaquecast_fnentry_post_borrowck_capstone,
       `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   let isChoiceFree (axs : Array Name) : Bool :=
