@@ -27579,6 +27579,96 @@ example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
         trRead (V06.trEntriesAt pv base bs) rdOff rdLen) :=
   globalAlloc_parity pv base alloc off len pb rdOff rdLen
 
+-- `[adv ep2-A3]` statement pins (exact signatures) for B3 / A2 headline theorems.
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V06 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_06_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_06_01.MirAst.Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 64)
+    (ha : targetPtr.allocId + 1 < 2 ^ 64) (ht : targetPtr.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 8, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 8 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 8 = .ok (some (pvRt targetPtr.allocId targetPtr.tag)) ∧
+    trRead (trEntries pvCt bs) 0 8 = .ok (some (pvCt targetPtr.allocId targetPtr.tag)) ∧
+    ptrsRead #[(Size.ofBytes 0, pvRt targetPtr.allocId targetPtr.tag)] 0 8 =
+      .ok (some (pvRt targetPtr.allocId targetPtr.tag)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_reloc_correspondence_8 gId al mutbl targetPtr addr haddr ha ht
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V06 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_06_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_06_01.MirAst.Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 32)
+    (ha : targetPtr.allocId + 1 < 2 ^ 64) (ht : targetPtr.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 4, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 4 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 4 4 = some bs ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 4) [] ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 4) [] ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .uint .u32, layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 4 = .ok (some (pvRt targetPtr.allocId targetPtr.tag)) ∧
+    trRead (trEntries pvCt bs) 0 4 = .ok (some (pvCt targetPtr.allocId targetPtr.tag)) ∧
+    ptrsRead #[(Size.ofBytes 0, pvRt targetPtr.allocId targetPtr.tag)] 0 4 =
+      .ok (some (pvRt targetPtr.allocId targetPtr.tag)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_reloc_correspondence_4 gId al mutbl targetPtr addr haddr ha ht
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V08 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_08_01.MirAst Trusted.Rustc.V2026_08_01.MirSemantics Trusted.Rustc.V2026_08_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_08_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_08_01.MirAst.Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 64)
+    (ha : targetPtr.allocId + 1 < 2 ^ 64) (ht : targetPtr.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 8, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 8 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 8 = .ok (some (pvRt targetPtr.allocId targetPtr.tag)) ∧
+    trRead (trEntries pvCt bs) 0 8 = .ok (some (pvCt targetPtr.allocId targetPtr.tag)) ∧
+    ptrsRead #[(Size.ofBytes 0, pvRt targetPtr.allocId targetPtr.tag)] 0 8 =
+      .ok (some (pvRt targetPtr.allocId targetPtr.tag)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_reloc_correspondence_8 gId al mutbl targetPtr addr haddr ha ht
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V08 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_08_01.MirAst Trusted.Rustc.V2026_08_01.MirSemantics Trusted.Rustc.V2026_08_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_08_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_08_01.MirAst.Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 32)
+    (ha : targetPtr.allocId + 1 < 2 ^ 64) (ht : targetPtr.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 4, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 4 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 4 4 = some bs ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 4) [] ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 4) [] ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .uint .u32, layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 4 = .ok (some (pvRt targetPtr.allocId targetPtr.tag)) ∧
+    trRead (trEntries pvCt bs) 0 4 = .ok (some (pvCt targetPtr.allocId targetPtr.tag)) ∧
+    ptrsRead #[(Size.ofBytes 0, pvRt targetPtr.allocId targetPtr.tag)] 0 4 =
+      .ok (some (pvRt targetPtr.allocId targetPtr.tag)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_reloc_correspondence_4 gId al mutbl targetPtr addr haddr ha ht
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (base : Nat)
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) (off n : UInt64) :
+    V08.trEntriesAt pv base (bs.map byte68) = V06.trEntriesAt pv base bs ∧
+    trRead (V08.trEntriesAt pv base (bs.map byte68)) off n =
+      trRead (V06.trEntriesAt pv base bs) off n :=
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity_at pv base bs off n
+
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
 -- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.
 #assert_all_leanmirispec_and_miri_standard_axioms

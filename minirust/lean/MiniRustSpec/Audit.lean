@@ -19757,6 +19757,63 @@ example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
         MiniRustSpec.PtrByteCoherenceMR.mrProvM M (MiniRustSpec.PtrByteCoherenceMR.V06.projBytes pv bs)) :=
   MiniRustSpec.PtrByteCoherenceMR.globalAlloc_parity (M := M) pv alloc off len pb
 
+/-! `[adv ep2-A3]` statement pins (exact signatures) for B3 headline theorems. -/
+
+open MiniRustSpec MiniRustSpec.PtrByteCoherenceMR MiniRustSpec.PtrByteCoherenceMR.V06 Trusted.Sequence Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout in
+example {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (gId : Nat) (al : Align) (mutbl : Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 64) (ha2 : a2 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 8 ++ leOptBytes a2 8,
+        relocations := [(0, p1), (8, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 8 p1.allocId p1.tag).drop 4 ++
+              (encodePtrBytes a2 8 p2.allocId p2.tag).take 4
+    let misAddr : Nat := (a1 / 256 ^ 4) + (a2 % 256 ^ 4) * 256 ^ 4
+    globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    mrProvM M (projBytes pv bs) = none ∧
+    Interp.decodePtrM (M := M) (projBytes pv bs) = .ok (some ⟨(misAddr : Int), none⟩) ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub :=
+  MiniRustSpec.PtrByteCoherenceMR.V06.globalAlloc_misaligned_reloc_strips_M pv gId al mutbl p1 p2 a1 a2 ha1 ha2
+
+open MiniRustSpec MiniRustSpec.PtrByteCoherenceMR MiniRustSpec.PtrByteCoherenceMR.V08 Trusted.Sequence Trusted.Rustc.V2026_08_01.MirAst Trusted.Rustc.V2026_08_01.MirSemantics Trusted.Rustc.V2026_08_01.Layout in
+example {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (gId : Nat) (al : Align) (mutbl : Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 64) (ha2 : a2 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 8 ++ leOptBytes a2 8,
+        relocations := [(0, p1), (8, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 8 p1.allocId p1.tag).drop 4 ++
+              (encodePtrBytes a2 8 p2.allocId p2.tag).take 4
+    let misAddr : Nat := (a1 / 256 ^ 4) + (a2 % 256 ^ 4) * 256 ^ 4
+    globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    mrProvM M (projBytes pv bs) = none ∧
+    Interp.decodePtrM (M := M) (projBytes pv bs) = .ok (some ⟨(misAddr : Int), none⟩) ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub :=
+  MiniRustSpec.PtrByteCoherenceMR.V08.globalAlloc_misaligned_reloc_strips_M pv gId al mutbl p1 p2 a1 a2 ha1 ha2
+
+open MiniRustSpec MiniRustSpec.PtrByteCoherenceMR in
+example {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (c : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.isValidCharCode c =
+      Trusted.Rustc.V2026_06_01.MirSemantics.isValidCharCode c ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes c 4 =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4).map byte68 ∧
+    V08.projBytes pv (Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes c 4) =
+      V06.projBytes pv (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4) ∧
+    Interp.Type.decodeM (M := M) minirustCharType
+        (V08.projBytes pv (Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes c 4)) =
+      Interp.Type.decodeM (M := M) minirustCharType
+        (V06.projBytes pv (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4)) :=
+  MiniRustSpec.PtrByteCoherenceMR.kani5205_char_parity pv c
+
 #assert_minirustspec_import_isolation
 
 #assert_adt_control_audit_coverage
