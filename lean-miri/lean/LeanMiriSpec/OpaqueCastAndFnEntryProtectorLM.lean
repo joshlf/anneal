@@ -486,11 +486,25 @@ def ocCase17Mir : CapturedMir :=
            .assign (ocLoc 1) (.aggregate .tuple []),
            .assign (ocLoc 2) (.ref .shared (ocLoc 1)),
            .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
+/-- Case 17 dangling-ZST companion (`D3.2`): `transmute::<usize, &()>(4)` (non-null, aligned,
+no provenance) followed by deref `*_2`. -/
+def ocCase17DanglingZstMir : CapturedMir :=
+  ocBody "oc::case17_dangling_zst_ref" 0 [ocUnitTy, ocUsizeTy, ocShrRefUnitTy]
+    [ocBb [.storageLive 1, .storageLive 2, .assign (ocLoc 1) (.use (ocConstUsize 4)),
+           .assign (ocLoc 2) (.cast .transmute (.copy (ocLoc 1)) ocShrRefUnitTy),
+           .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
 /-- Case 18: null `&u32` (`transmute::<usize, &u32>(0)`). -/
 def ocCase18Mir : CapturedMir :=
   ocBody "oc::case18_null_ref" 0 [ocU32Ty, ocUsizeTy, ocShrRefU32Ty]
     [ocBb [.storageLive 1, .storageLive 2, .assign (ocLoc 1) (.use (ocConstUsize 0)),
            .assign (ocLoc 2) (.cast .transmute (.copy (ocLoc 1)) ocShrRefU32Ty),
+           .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
+/-- Case 18 ZST-null companion (`D3.3`): `transmute::<usize, &()>(0)` (null zero-sized safe
+pointer) followed by deref `*_2`. -/
+def ocCase18ZstNullMir : CapturedMir :=
+  ocBody "oc::case18_zst_null_ref" 0 [ocUnitTy, ocUsizeTy, ocShrRefUnitTy]
+    [ocBb [.storageLive 1, .storageLive 2, .assign (ocLoc 1) (.use (ocConstUsize 0)),
+           .assign (ocLoc 2) (.cast .transmute (.copy (ocLoc 1)) ocShrRefUnitTy),
            .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
 /-- Case 19: unaligned `&u32` at `base + 2` inside a live 8-byte `u64` local. -/
 def ocCase19Mir : CapturedMir :=
@@ -753,12 +767,17 @@ def lmOcD2 (tb : Bool) (k : Nat) : LmOcM LmOcFpObs := do
   let st ← lmOcMem (lmStore st p 1 3)
   let (r, st) ← match k with
     | 10 => do
-      -- callee-only: `fn(*mut u8, *mut u8)`, no `FnEntry` retag; foreign write through `p`.
+      -- callee-only: caller creates unprotected `.Default` `&mut u8` child `_3`, passes `(_3, p)`
+      -- to `fn(*mut u8, *mut u8)` (no `FnEntry` retag); foreign write `*_2 = 5` cleanly disables
+      -- unprotected `_3` without UB in Tree Borrows.
+      let (_, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Mutable .Default true)
       let st ← lmOcMem (lmStore st p 1 5)
       lmOcMem (lmLoad st p 1)
     | 11 => do
-      -- pre-`#166253` caller-signature retag at `&mut u8`, then the same foreign write.
-      let (_, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Mutable .FnEntry true)
+      -- pre-`#166253` caller-signature contrast: SAME caller `.Default` `&mut u8` child `c0`,
+      -- plus caller-signature `.FnEntry` retag protecting `c0`, then the same foreign write.
+      let (c0, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Mutable .Default true)
+      let (_, st) ← lmOcMem (lmRetag st c0 .reference lmFrozenFacts .Mutable .FnEntry true)
       let st ← lmOcMem (lmStore st p 1 5)
       lmOcMem (lmLoad st p 1)
     | 12 => do
@@ -766,12 +785,14 @@ def lmOcD2 (tb : Bool) (k : Nat) : LmOcM LmOcFpObs := do
       let st ← lmOcMem (lmStore st c 1 4)
       lmOcMem (lmLoad st c 1)
     | 13 => do
-      let (c, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Mutable .FnEntry true)
+      let (c0, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Mutable .Default true)
+      let (c, st) ← lmOcMem (lmRetag st c0 .reference lmFrozenFacts .Mutable .FnEntry true)
       let st ← lmOcMem (lmStore st c 1 4)
       let st ← lmOcMem (lmStore st p 1 5)
       lmOcMem (lmLoad st p 1)
     | 14 => do
-      let (_, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Shared .FnEntry true)
+      let (c0, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Shared .Default true)
+      let (_, st) ← lmOcMem (lmRetag st c0 .reference lmFrozenFacts .Shared .FnEntry true)
       let st ← lmOcMem (lmStore st p 1 5)
       lmOcMem (lmLoad st p 1)
     | _ => do
@@ -779,6 +800,21 @@ def lmOcD2 (tb : Bool) (k : Nat) : LmOcM LmOcFpObs := do
       lmOcMem (lmLoad st c 1)
   let st ← lmOcMem (lmEndCall st)
   let st ← if k == 12 || k == 15 then lmOcMem (lmStore st p 1 9) else pure st
+  let (v, _) ← lmOcMem (lmLoad st p 1)
+  pure (.okRetagPair r v)
+
+/-- Case `13` reverse-transmutation companion (`D2.3`): caller holds NO `&mut u8` child borrow at
+all — it passes raw `(p, p)` directly to a `fn(&mut u8, *mut u8)` callee through a transmuted
+`fn(*mut u8, *mut u8)` view; the callee's own `.FnEntry` retag on `p` still attaches a strong
+protector, making the aliased foreign write `*_2 = 5` mode-sensitive UB. -/
+def lmOcD2RevTransmute (tb : Bool) : LmOcM LmOcFpObs := do
+  let (p, st) ← lmOcMem (lmAllocate (lmInit tb) 1 1)
+  let st ← lmOcMem (lmStore st p 1 3)
+  let (c, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Mutable .FnEntry true)
+  let st ← lmOcMem (lmStore st c 1 4)
+  let st ← lmOcMem (lmStore st p 1 5)
+  let (r, st) ← lmOcMem (lmLoad st p 1)
+  let st ← lmOcMem (lmEndCall st)
   let (v, _) ← lmOcMem (lmLoad st p 1)
   pure (.okRetagPair r v)
 
@@ -790,9 +826,10 @@ def lmOcSafePtrValidity : LmOcM ScalarValidityLayout :=
   | .Scalar (.Initialized (validRange := vr) ..) => pure ⟨Size.ofBytes 8, vr⟩
   | _ => .error (.harness "pointer layout")
 
-/-- The vendored `ValidityMachine` state over the harness memory `mem` (integer alignment
-checking, deep validation, no borrow tracker / data-race detector in the validity scope). -/
-def ocValStateLm (mem : LmMem) : ValidityMachine.State MiriMemoryKind Unit :=
+/-- The vendored `ValidityMachine` state over the harness memory `mem` (configurable alignment
+checking mode, deep validation, no borrow tracker / data-race detector in the validity scope). -/
+def ocValStateLm (mem : LmMem) (alignMode : ValidityMachine.AlignmentCheck) :
+    ValidityMachine.State MiriMemoryKind Unit :=
   { stack := { frames := #[] }
     machine := {
       memory := mem
@@ -810,7 +847,7 @@ def ocValStateLm (mem : LmMem) : ValidityMachine.State MiriMemoryKind Unit :=
           addressMode := .managed
           generation := none
         }
-        payload := { payload := (), validation := .Deep, alignment := .Int }
+        payload := { payload := (), validation := .Deep, alignment := alignMode }
       }
     } }
 
@@ -840,12 +877,31 @@ vendored `ValidityMachine.checkPointerAlign` (integer alignment) on the harness 
 def lmOcValChecks (st : LmState) (p : Pointer (Option Provenance)) (size : Nat) (align : Align) :
     Except StepError Unit :=
   match ValidityMachine.checkPointerAccess ocValAccessLm p (Size.ofBytes (UInt64.ofNat size))
-      (ocValStateLm st.mem) with
+      (ocValStateLm st.mem .Int) with
   | .error e _ => .error e
   | .ok () s' =>
     match ValidityMachine.checkPointerAlign ocValAccessLm p align s' with
     | .error e _ => .error e
     | .ok () _ => .ok ()
+
+/-- Project the typed `AccessError` result of REAL vendored `ValidityMachine.checkPointerAccessResult`
+on the harness memory (for exact kernel-checked `D3` diagnostics and non-vacuity witnesses). -/
+def lmOcAccessRes (st : LmState) (p : Pointer (Option Provenance)) (size : Nat) :
+    Except StepError (Except AccessError Unit) :=
+  match ValidityMachine.checkPointerAccessResult ocValAccessLm p
+      (Size.ofBytes (UInt64.ofNat size)) (ocValStateLm st.mem .Int) with
+  | .ok r _ => .ok r
+  | .error e _ => .error e
+
+/-- Project the typed `Misalignment` result of REAL vendored `ValidityMachine.checkPointerAlignResult`
+on the harness memory under alignment mode `alignMode`. -/
+def lmOcAlignRes (st : LmState) (alignMode : ValidityMachine.AlignmentCheck)
+    (p : Pointer (Option Provenance)) (align : Align) :
+    Except StepError (Except Misalignment Unit) :=
+  match ValidityMachine.checkPointerAlignResult ocValAccessLm p align
+      (ocValStateLm st.mem alignMode) with
+  | .ok r _ => .ok r
+  | .error e _ => .error e
 
 /-- Vendored safe-pointer validity of `p` at a pointee of `size` bytes and alignment `align`:
 `Validity.checkScalar` (non-null valid range), then REAL `ValidityMachine.checkPointerAccess` and
@@ -889,6 +945,49 @@ def lmOcD3 (tb : Bool) (k : Nat) : LmOcM LmOcFpObs := do
     let (p, st) ← lmOcLive tb 4 7
     let st ← lmOcMem (lmDeallocate st p 4 4)
     lmOcPtrValidity st p 4 ⟨2⟩
+
+/-- Exact `(checkPointerAccessResult, checkPointerAlignResult)` diagnostics of all 6 `D3` cases
+(`16..21`) on REAL harness allocations (live, dangling ZST, null, misaligned live alloc, OOB live
+alloc, deallocated alloc). -/
+def lmOcD3Diag (k : Nat) :
+    Option (Except StepError (Except AccessError Unit) × Except StepError (Except Misalignment Unit)) :=
+  match k with
+  | 16 =>
+    match lmOcLive false 4 7 with
+    | .ok (p, st) => some (lmOcAccessRes st p 4, lmOcAlignRes st .Int p ⟨2⟩)
+    | .error _ => none
+  | 17 =>
+    let st := lmInit false; let p : Pointer (Option Provenance) := ⟨Size.ofBytes 4, none⟩
+    some (lmOcAccessRes st p 0, lmOcAlignRes st .Int p ⟨0⟩)
+  | 18 =>
+    let st := lmInit false; let p : Pointer (Option Provenance) := ⟨Size.ofBytes 0, none⟩
+    some (lmOcAccessRes st p 4, lmOcAlignRes st .Int p ⟨2⟩)
+  | 19 =>
+    match lmOcLive false 8 0 with
+    | .ok (p, st) =>
+      let q := lmOcAddr p 2
+      some (lmOcAccessRes st q 4, lmOcAlignRes st .Int q ⟨2⟩)
+    | .error _ => none
+  | 20 =>
+    match lmOcLive false 4 7 with
+    | .ok (p, st) =>
+      let q := lmOcAddr p 4
+      some (lmOcAccessRes st q 4, lmOcAlignRes st .Int q ⟨2⟩)
+    | .error _ => none
+  | 21 =>
+    match lmOcLive false 4 7 with
+    | .ok (p, st) =>
+      match lmOcMem (lmDeallocate st p 4 4) with
+      | .ok stDead => some (lmOcAccessRes stDead p 4, lmOcAlignRes stDead .Int p ⟨2⟩)
+      | .error _ => none
+    | .error _ => none
+  | _ =>
+    -- Companion: same misaligned live pointer as `19`, under `AlignmentCheck.None` (passes align).
+    match lmOcLive false 8 0 with
+    | .ok (p, st) =>
+      let q := lmOcAddr p 2
+      some (lmOcAccessRes st q 4, lmOcAlignRes st .None q ⟨2⟩)
+    | .error _ => none
 
 /-! ### The observer -/
 
@@ -975,6 +1074,8 @@ unroll_loops lmOcDeinitThenReadU := lmOcDeinitThenRead fuel 0
 unroll_loops lmOcProtectedDropU := lmOcProtectedDrop fuel 0
   with lmAllocateU, lmStoreU, lmRetagU, lmAccessTargetU, lmTreeAccessU
 unroll_loops lmOcD2U := lmOcD2 fuel 0 with lmAllocateU, lmStoreU, lmLoadU, lmRetagU, lmEndCallU
+unroll_loops lmOcD2RevTransmuteU := lmOcD2RevTransmute fuel 0
+  with lmAllocateU, lmStoreU, lmLoadU, lmRetagU, lmEndCallU
 unroll_loops checkPointerAccessResultU := Miri.Interpreter.ValidityMachine.checkPointerAccessResult fuel 0
   with getAllocInfoU
 unroll_loops checkPointerAccessU := Miri.Interpreter.ValidityMachine.checkPointerAccess fuel 0
@@ -984,10 +1085,14 @@ unroll_loops checkPointerAlignResultU := Miri.Interpreter.ValidityMachine.checkP
 unroll_loops checkPointerAlignU := Miri.Interpreter.ValidityMachine.checkPointerAlign fuel 0
   with checkPointerAlignResultU
 unroll_loops lmOcValChecksU := lmOcValChecks fuel 0 with checkPointerAccessU, checkPointerAlignU
+unroll_loops lmOcAccessResU := lmOcAccessRes fuel 0 with checkPointerAccessResultU
+unroll_loops lmOcAlignResU := lmOcAlignRes fuel 0 with checkPointerAlignResultU
 unroll_loops lmOcPtrValidityU := lmOcPtrValidity fuel 0 with lmOcValChecksU
 unroll_loops lmOcD3NullU := lmOcD3Null fuel 0 with lmOcPtrValidityU
 unroll_loops lmOcLiveU := lmOcLive fuel 0 with lmAllocateU, lmStoreU
 unroll_loops lmOcD3U := lmOcD3 fuel 0 with lmOcLiveU, lmOcPtrValidityU, lmDeallocateU
+unroll_loops lmOcD3DiagU := lmOcD3Diag fuel 0
+  with lmOcLiveU, lmDeallocateU, lmOcAccessResU, lmOcAlignResU
 unroll_loops lmOcCaseU := lmOcCase fuel 0
   with ocRunStepU, lmOcDeinitThenReadU, lmOcD2U, lmOcD3NullU, lmOcD3U
 unroll_loops lmOcObserveU := lmOcObserve fuel 0 with lmOcCaseU
@@ -1096,10 +1201,10 @@ theorem lmOcTrustedObserve_table :
   constructor <;> kernel_rfl
 
 /-- **`D1` (b) Step-vs-Trusted correspondence and 44-cell cross-authority agreement
-(kernel-checked)**: the LeanMiri cells (vendored `Step.step` on the cast-erased fixtures `0`–`3`,
-`9`, the vendored memory harness elsewhere) agree with Trusted `stepMirFn` on the `.opaqueCast`
-fixtures on every case except the documented fail-closed boundary `8` (Trusted `.unsupported`;
-LeanMiri reads `5`), in both modes. -/
+(kernel-checked)**: the LeanMiri cells (vendored `Step.step` on the cast-erased fixtures `0`–`4`,
+`6`, `8`, `9`, and the vendored memory / `ValidityMachine` / Tree Borrows harness elsewhere) agree
+with Trusted `stepMirFn` on the `.opaqueCast` fixtures on every case except the documented
+fail-closed boundary `8` (Trusted `.unsupported`; LeanMiri reads `5`), in both modes. -/
 theorem lmOc_trusted_agreement :
     ((List.range lmOcCaseCount).all fun idx =>
       idx == 8 || (lmOcObserve false idx == lmOcTrustedObserve false idx &&
@@ -1357,15 +1462,34 @@ theorem lm_oc_dead_local_ub_non_masking :
 
 /-- `D2.3` **reverse transmutation `fn(*mut u8, *mut u8) -> fn(&mut u8, *mut u8)` mode-sensitivity
 (kernel-checked)**: Trusted on `ocCase13RevTransmuteMir` (caller holds NO `&mut` local) and
-LeanMiri `lmOcD2 _ 13` both yield `.okRetagPair 5 5` at `tb = false` and `.ub` at `tb = true`. -/
+LeanMiri `lmOcD2RevTransmute` (no caller `&mut` reborrow — callee retags raw `p` directly with
+`.FnEntry`) both yield `.okRetagPair 5 5` at `tb = false` and `.ub` at `tb = true`. -/
 theorem lm_oc_d2_rev_transmute_mode_sensitive :
     lmOcTrustedObsOf 13 (ocRunTrustedRaw ocCase13RevTransmuteMir [ocEraseRetags ocCase13Callee]) =
       .okRetagPair 5 5 ∧
     lmOcTrustedObsOf 13 (ocRunTrustedRaw ocCase13RevTransmuteMir [ocCase13Callee]) = .ub ∧
-    lmOcRun (lmOcD2 false 13) = .okRetagPair 5 5 ∧
-    lmOcRun (lmOcD2 true 13) = .ub := by
-  rw [lmOcD2U.eq_src]
+    lmOcRun (lmOcD2RevTransmute false) = .okRetagPair 5 5 ∧
+    lmOcRun (lmOcD2RevTransmute true) = .ub := by
+  rw [lmOcD2RevTransmuteU.eq_src]
   refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- **`D3.2` / `D3.3` ZST dangling (`addr = 4`, no prov) and ZST null (`addr = 0`) companions
+(kernel-checked)**:
+* `D3.3` ZST null (`ocCase18ZstNullMir`, `transmute::<usize, &()>(0)`): BOTH Trusted `stepMirFn`
+  and LeanMiri `Validity.checkScalar` + `ValidityMachine` report `.ub` in both modes.
+* `D3.2` dangling/no-prov ZST (`ocCase17DanglingZstMir`, `transmute::<usize, &()>(4)`): LeanMiri
+  `Validity.checkScalar` + `ValidityMachine.{checkPointerAccess, checkPointerAlign}` accepts
+  `.okPtrValid` in both modes (matching MiniRust), while Trusted `stepMirFn` conservatively rejects
+  provenance-less reference transmutes with `.ub` (no-forge byte codec boundary). -/
+theorem lm_oc_d3_zst_dangling_and_null :
+    lmOcTrustedObsOf 17 (ocRunTrustedRaw ocCase17DanglingZstMir []) = .ub ∧
+    lmOcRun (lmOcPtrValidity (lmInit false) ⟨Size.ofBytes 4, none⟩ 0 ⟨0⟩) = .okPtrValid ∧
+    lmOcRun (lmOcPtrValidity (lmInit true) ⟨Size.ofBytes 4, none⟩ 0 ⟨0⟩) = .okPtrValid ∧
+    lmOcTrustedObsOf 18 (ocRunTrustedRaw ocCase18ZstNullMir []) = .ub ∧
+    lmOcRun (lmOcPtrValidity (lmInit false) ⟨Size.ofBytes 0, none⟩ 0 ⟨0⟩) = .ub ∧
+    lmOcRun (lmOcPtrValidity (lmInit true) ⟨Size.ofBytes 0, none⟩ 0 ⟨0⟩) = .ub := by
+  rw [lmOcPtrValidityU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- `D1` **`SetDiscriminant` payload companion (kernel-checked)**: vendored `Step.step` on the cast
 erasure of `ocCase6PayloadMir` (real `Discriminant.writeDiscriminant`, downcast field read) and
@@ -1768,13 +1892,17 @@ theorem lm_validityMachine_checkPointerAccess_laws {K User : Type}
     exact ⟨_, rfl⟩
 
 /-- `D3` **vendored `ValidityMachine.checkPointerAlign` laws (universal)**:
-(a) align `1` (`pow2 = 0`) or disabled alignment checking (`.None`) succeeds with unchanged state;
-(b) malformed alignment (`required.pow2 > Align.MAX.pow2`) throws `.invalidProgram`;
-(c) any misalignment returned by `checkPointerAlignResult` throws `StepError.undefinedBehavior`. -/
+(a) align `1` (`pow2 = 0`) succeeds with unchanged state;
+(b) disabled alignment checking (`alignment = .None`) with valid `required.pow2 ≤ Align.MAX.pow2`
+succeeds with unchanged state;
+(c) malformed alignment (`required.pow2 > Align.MAX.pow2`) throws `.invalidProgram`;
+(d) any misalignment returned by `checkPointerAlignResult` throws `StepError.undefinedBehavior`. -/
 theorem lm_validityMachine_checkPointerAlign_laws {K User : Type}
     (access : ValidityMachine.Access K User) (ptr : Pointer (Option Provenance))
     (required : Align) (st : ValidityMachine.State K User) :
     (required.pow2 = 0 →
+      ValidityMachine.checkPointerAlign access ptr required st = .ok () st) ∧
+    (st.machine.user.payload.alignment = .None → required.pow2 ≤ Align.MAX.pow2 →
       ValidityMachine.checkPointerAlign access ptr required st = .ok () st) ∧
     (required.pow2 > Align.MAX.pow2 →
       ValidityMachine.checkPointerAlign access ptr required st =
@@ -1783,11 +1911,16 @@ theorem lm_validityMachine_checkPointerAlign_laws {K User : Type}
       ValidityMachine.checkPointerAlignResult access ptr required st = .ok (.error mis) st' →
       ∃ ubMsg, ValidityMachine.checkPointerAlign access ptr required st =
         .error (.undefinedBehavior ubMsg) st') := by
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_⟩
   · intro h0
     unfold ValidityMachine.checkPointerAlign ValidityMachine.checkPointerAlignResult
     simp [h0, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, get, getThe, MonadStateOf.get,
       EStateM.get]
+  · intro hNone hLe
+    have hNotGt : ¬ required.pow2 > Align.MAX.pow2 := Nat.not_lt.mpr hLe
+    unfold ValidityMachine.checkPointerAlign ValidityMachine.checkPointerAlignResult
+    simp [hNone, hNotGt, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, get, getThe,
+      MonadStateOf.get, EStateM.get]
   · intro hGt
     unfold ValidityMachine.checkPointerAlign ValidityMachine.checkPointerAlignResult
     simp [hGt, Bind.bind, EStateM.bind, throw, throwThe, MonadExceptOf.throw, EStateM.throw]
@@ -1796,71 +1929,149 @@ theorem lm_validityMachine_checkPointerAlign_laws {K User : Type}
     simp only [Bind.bind, EStateM.bind, hRes]
     exact ⟨_, rfl⟩
 
-/-- Minimal `ValidityMachine.Access` and `ValidityMachine.State` for non-vacuity execution of
-real vendored `ValidityMachine.checkPointerAccess` and `ValidityMachine.checkPointerAlign`. -/
-def ocValState (alignMode : ValidityMachine.AlignmentCheck) : ValidityMachine.State Unit Unit :=
-  { stack := { frames := #[] }
-    machine := {
-      memory := MemoryState.empty
-      borrowTracker := none
-      dataRace := none
-      threads := Miri.Concurrency.ThreadManager.initial false
-      raceAllocations := #[]
-      allocationSpans := #[]
-      user := {
-        addresses := {
-          intToPtrMap := #[]
-          baseAddr := #[]
-          exposed := #[]
-          provenanceMode := .strict
-          addressMode := .managed
-          generation := none
-        }
-        payload := { payload := (), validation := .Deep, alignment := alignMode }
-      }
-    } }
+/-- `D3` **exact kernel-checked `ValidityMachine` diagnostics on REAL harness allocations
+(`16..21` + `AlignmentCheck.None` bypass)**: pins the exact `AccessError` and `Misalignment`
+returned by REAL vendored `ValidityMachine.{checkPointerAccessResult, checkPointerAlignResult}`
+over `ocValStateLm` / `ocValAccessLm` (live alloc, ZST, null `danglingIntegerPointer`, live-alloc
+`alignmentCheckFailed ⟨⟨1⟩, ⟨2⟩⟩`, live-alloc `pointerOutOfBounds`, deallocated
+`allocationLookup (.deadAllocation ⟨1⟩)`, and `.None` alignment bypass on the misaligned live
+pointer). -/
+theorem lm_d3_exact_validityMachine_diagnostics :
+    lmOcD3Diag 16 = some (.ok (.ok ()), .ok (.ok ())) ∧
+    lmOcD3Diag 17 = some (.ok (.ok ()), .ok (.ok ())) ∧
+    lmOcD3Diag 18 =
+      some (.ok (.error (.danglingIntegerPointer 0 4 (.dereferenceable "pointer"))), .ok (.ok ())) ∧
+    lmOcD3Diag 19 = some (.ok (.ok ()), .ok (.error ⟨⟨1⟩, ⟨2⟩⟩)) ∧
+    lmOcD3Diag 20 =
+      some (.ok (.error (.pointerOutOfBounds ⟨1, by decide⟩ ⟨4⟩ 4 4 (.dereferenceable "pointer"))),
+        .ok (.ok ())) ∧
+    lmOcD3Diag 21 =
+      some (.ok (.error (.allocationLookup (.deadAllocation ⟨1, by decide⟩))), .ok (.ok ())) ∧
+    lmOcD3Diag 22 = some (.ok (.ok ()), .ok (.ok ())) := by
+  rw [lmOcD3DiagU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
-def ocValAccess : ValidityMachine.Access Unit Unit where
-  runtime := RuntimeTargetDataLayout.default
-  ghostMode := false
-  globalKind := none
-  globalHooks := {
-    synchronizeMemory := fun _ h => h
-    evaluateStaticInitializer := fun mem h _ => ⟨mem, h, .error "unused"⟩
-    beforeAccessGlobal := fun mem h _ _ _ _ => ⟨mem, h, .ok ()⟩
-    adjustGlobalAllocation := fun mem h _ _ => ⟨mem, h, .error "unused"⟩
-  }
-  dynamicLayout := fun mem h _ => ⟨mem, h, .ok none⟩
-  resolvePointer := fun _ ptr _ st => .ok (.error ptr.offset.bytes) st
-  beforeAllocationAccess := fun _ => pure ()
-  diagnostic := fun _ _ _ => pure ()
-  weakMemoryWrite := fun _ _ => pure ()
-  syncAccess := fun _ _ _ => pure ()
-  retainTouched := fun m _ => m
-  memoryError := fun _ => .unsupported "unused"
+private theorem lmOcAccessRes_eq_ok_error (st : LmState) (p : Pointer (Option Provenance))
+    (sz : Nat) (e : AccessError) (h : lmOcAccessRes st p sz = .ok (.error e)) :
+    ∃ st', ValidityMachine.checkPointerAccessResult ocValAccessLm p
+      (Size.ofBytes (UInt64.ofNat sz)) (ocValStateLm st.mem .Int) = .ok (.error e) st' := by
+  unfold lmOcAccessRes at h
+  cases hR : ValidityMachine.checkPointerAccessResult ocValAccessLm p
+      (Size.ofBytes (UInt64.ofNat sz)) (ocValStateLm st.mem .Int) with
+  | error _ _ => rw [hR] at h; cases h
+  | ok r st' =>
+    rw [hR] at h
+    injection h with hr
+    subst hr
+    exact ⟨st', rfl⟩
 
-/-- `D3` **concrete non-vacuity witnesses for `ValidityMachine.{checkPointerAccess, checkPointerAlign}`**:
-executes REAL vendored `ValidityMachine.checkPointerAccess` (ZST -> `.ok ()`, dangling integer `0`
--> `.error (.undefinedBehavior ...)`) and `ValidityMachine.checkPointerAlign` (align `1` ->
-`.ok ()`, malformed `pow2 = 30` -> `.error (.invalidProgram "malformed validity alignment")`,
-misaligned dangling pointer `addr = 2` at align `4` -> `.error (.undefinedBehavior ...)`). -/
+private theorem lmOcAlignRes_eq_ok_error (st : LmState) (p : Pointer (Option Provenance))
+    (al : Align) (mis : Misalignment) (h : lmOcAlignRes st .Int p al = .ok (.error mis)) :
+    ∃ st', ValidityMachine.checkPointerAlignResult ocValAccessLm p al
+      (ocValStateLm st.mem .Int) = .ok (.error mis) st' := by
+  unfold lmOcAlignRes at h
+  cases hR : ValidityMachine.checkPointerAlignResult ocValAccessLm p al
+      (ocValStateLm st.mem .Int) with
+  | error _ _ => rw [hR] at h; cases h
+  | ok r st' =>
+    rw [hR] at h
+    injection h with hr
+    subst hr
+    exact ⟨st', rfl⟩
+
+/-- `D3` **complete non-vacuity witnesses for EVERY branch of
+`lm_validityMachine_checkPointerAccess_laws` and `lm_validityMachine_checkPointerAlign_laws` on
+REAL harness allocations (`ocValStateLm` / `ocValAccessLm`)**:
+(1) ZST `Size.ZERO` -> `.ok ()`;
+(2) dangling null `addr = 0` -> `.danglingIntegerPointer` -> `.undefinedBehavior`;
+(3) live-alloc OOB `base + 4` -> `.pointerOutOfBounds` -> `.undefinedBehavior`;
+(4) deallocated alloc `id = 1` -> `.deadAllocation` -> `.undefinedBehavior`;
+(5) align `1` (`pow2 = 0`) -> `.ok ()`;
+(6) `AlignmentCheck.None` on misaligned live alloc `base + 2` -> `.ok ()`;
+(7) malformed `pow2 = 30` -> `.invalidProgram "malformed validity alignment"`;
+(8) misaligned live alloc `base + 2` at align `4` -> `.alignmentCheckFailed` -> `.undefinedBehavior`. -/
 theorem lm_validityMachine_nonvacuity_witnesses :
-    let st := ocValState .Int
-    ValidityMachine.checkPointerAccess ocValAccess ⟨Size.ofBytes 4, none⟩ Size.ZERO st = .ok () st ∧
-    (∃ msg, ValidityMachine.checkPointerAccess ocValAccess ⟨Size.ofBytes 0, none⟩ (Size.ofBytes 4) st =
-      .error (.undefinedBehavior msg) st) ∧
-    ValidityMachine.checkPointerAlign ocValAccess ⟨Size.ofBytes 2, none⟩ ⟨0⟩ st = .ok () st ∧
-    ValidityMachine.checkPointerAlign ocValAccess ⟨Size.ofBytes 4, none⟩ ⟨30⟩ st =
-      .error (.invalidProgram "malformed validity alignment") st ∧
-    (∃ msg, ValidityMachine.checkPointerAlign ocValAccess ⟨Size.ofBytes 2, none⟩ ⟨2⟩ st =
-      .error (.undefinedBehavior msg) st) := by
-  refine ⟨(lm_validityMachine_checkPointerAccess_laws _ _ _).1,
-    (lm_validityMachine_checkPointerAccess_laws ocValAccess ⟨Size.ofBytes 0, none⟩ (ocValState .Int)).2.2.1
-      (Size.ofBytes 4) (ocValState .Int) 0 4 (.dereferenceable "pointer") rfl,
-    (lm_validityMachine_checkPointerAlign_laws _ _ _ _).1 rfl,
-    (lm_validityMachine_checkPointerAlign_laws _ _ _ _).2.1 (by decide),
-    (lm_validityMachine_checkPointerAlign_laws ocValAccess ⟨Size.ofBytes 2, none⟩ ⟨2⟩ (ocValState .Int)).2.2
-      (ocValState .Int) ⟨Align.maxAlignedFactor (Size.ofBytes 2), ⟨2⟩⟩ rfl⟩
+    let st0 := ocValStateLm (lmInit false).mem .Int
+    ValidityMachine.checkPointerAccess ocValAccessLm ⟨Size.ofBytes 4, none⟩ Size.ZERO st0 =
+      .ok () st0 ∧
+    (∃ msg st', ValidityMachine.checkPointerAccess ocValAccessLm ⟨Size.ofBytes 0, none⟩
+      (Size.ofBytes 4) st0 = .error (.undefinedBehavior msg) st') ∧
+    (∃ st p msg st',
+      lmOcLive false 4 7 = .ok (p, st) ∧
+      ValidityMachine.checkPointerAccess ocValAccessLm (lmOcAddr p 4) (Size.ofBytes 4)
+        (ocValStateLm st.mem .Int) = .error (.undefinedBehavior msg) st') ∧
+    (∃ st p stDead msg st',
+      lmOcLive false 4 7 = .ok (p, st) ∧
+      lmOcMem (lmDeallocate st p 4 4) = .ok stDead ∧
+      ValidityMachine.checkPointerAccess ocValAccessLm p (Size.ofBytes 4)
+        (ocValStateLm stDead.mem .Int) = .error (.undefinedBehavior msg) st') ∧
+    ValidityMachine.checkPointerAlign ocValAccessLm ⟨Size.ofBytes 2, none⟩ ⟨0⟩ st0 = .ok () st0 ∧
+    (∃ st p,
+      lmOcLive false 8 0 = .ok (p, st) ∧
+      ValidityMachine.checkPointerAlign ocValAccessLm (lmOcAddr p 2) ⟨2⟩
+        (ocValStateLm st.mem .None) = .ok () (ocValStateLm st.mem .None)) ∧
+    ValidityMachine.checkPointerAlign ocValAccessLm ⟨Size.ofBytes 4, none⟩ ⟨30⟩ st0 =
+      .error (.invalidProgram "malformed validity alignment") st0 ∧
+    (∃ st p msg st',
+      lmOcLive false 8 0 = .ok (p, st) ∧
+      ValidityMachine.checkPointerAlign ocValAccessLm (lmOcAddr p 2) ⟨2⟩
+        (ocValStateLm st.mem .Int) = .error (.undefinedBehavior msg) st') := by
+  have hD := lm_d3_exact_validityMachine_diagnostics
+  refine ⟨(lm_validityMachine_checkPointerAccess_laws _ _ _).1, ?_, ?_, ?_,
+    (lm_validityMachine_checkPointerAlign_laws _ _ _ _).1 rfl, ?_,
+    (lm_validityMachine_checkPointerAlign_laws _ _ _ _).2.2.1 (by decide), ?_⟩
+  · have h18 : lmOcAccessRes (lmInit false) ⟨Size.ofBytes 0, none⟩ 4 =
+        .ok (.error (.danglingIntegerPointer 0 4 (.dereferenceable "pointer"))) := by
+      have := hD.2.2.1; unfold lmOcD3Diag at this; injection this with h; exact congrArg Prod.fst h
+    obtain ⟨st', hR⟩ := lmOcAccessRes_eq_ok_error _ _ _ _ h18
+    obtain ⟨msg, hUb⟩ := (lm_validityMachine_checkPointerAccess_laws _ _ _).2.2.1 _ st' _ _ _ hR
+    exact ⟨msg, st', hUb⟩
+  · have h20 := hD.2.2.2.2.1
+    unfold lmOcD3Diag at h20
+    cases hL : lmOcLive false 4 7 with
+    | error e => rw [hL] at h20; cases h20
+    | ok ps =>
+      obtain ⟨p, st⟩ := ps
+      rw [hL] at h20
+      simp only [Option.some.injEq, Prod.mk.injEq] at h20
+      obtain ⟨st', hR⟩ := lmOcAccessRes_eq_ok_error st (lmOcAddr p 4) 4 _ h20.1
+      obtain ⟨msg, hUb⟩ := (lm_validityMachine_checkPointerAccess_laws _ _ _).2.1 _ st' _ _ _ _ _ hR
+      exact ⟨st, p, msg, st', rfl, hUb⟩
+  · have h21 := hD.2.2.2.2.2.1
+    unfold lmOcD3Diag at h21
+    cases hL : lmOcLive false 4 7 with
+    | error e => rw [hL] at h21; cases h21
+    | ok ps =>
+      obtain ⟨p, st⟩ := ps
+      rw [hL] at h21
+      dsimp only at h21
+      cases hDe : lmOcMem (lmDeallocate st p 4 4) with
+      | error e => rw [hDe] at h21; cases h21
+      | ok stDead =>
+        rw [hDe] at h21
+        simp only [Option.some.injEq, Prod.mk.injEq] at h21
+        obtain ⟨st', hR⟩ := lmOcAccessRes_eq_ok_error stDead p 4 _ h21.1
+        obtain ⟨msg, hUb⟩ := (lm_validityMachine_checkPointerAccess_laws _ _ _).2.2.2 _ st' _ hR
+        exact ⟨st, p, stDead, msg, st', rfl, hDe, hUb⟩
+  · have h22 := hD.2.2.2.2.2.2
+    unfold lmOcD3Diag at h22
+    cases hL : lmOcLive false 8 0 with
+    | error e => rw [hL] at h22; cases h22
+    | ok ps =>
+      obtain ⟨p, st⟩ := ps
+      exact ⟨st, p, rfl,
+        (lm_validityMachine_checkPointerAlign_laws _ _ _ _).2.1 rfl (by decide)⟩
+  · have h19 := hD.2.2.2.1
+    unfold lmOcD3Diag at h19
+    cases hL : lmOcLive false 8 0 with
+    | error e => rw [hL] at h19; cases h19
+    | ok ps =>
+      obtain ⟨p, st⟩ := ps
+      rw [hL] at h19
+      simp only [Option.some.injEq, Prod.mk.injEq] at h19
+      obtain ⟨st', hR⟩ := lmOcAlignRes_eq_ok_error st (lmOcAddr p 2) ⟨2⟩ _ h19.2
+      obtain ⟨msg, hUb⟩ := (lm_validityMachine_checkPointerAlign_laws _ _ _ _).2.2.2 st' _ hR
+      exact ⟨st, p, msg, st', rfl, hUb⟩
 
 /-- `D3` **case `18` non-short-circuiting witness**: BOTH the sized `&u32` null pointer AND the
 ZST `&()` null pointer independently fail `Validity.checkScalar` with UB (neither is skipped). -/
@@ -1911,6 +2122,7 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     type_of% lm_oc_protected_drop_mode_sensitive ∧
     type_of% lm_oc_dead_local_ub_non_masking ∧
     type_of% lm_oc_d2_rev_transmute_mode_sensitive ∧
+    type_of% lm_oc_d3_zst_dangling_and_null ∧
     type_of% lm_step_adapter_boundaries ∧
     type_of% @lm_retagPolicy_protector ∧
     type_of% @lm_retagPolicy_none ∧
@@ -1924,6 +2136,7 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     type_of% @lm_checkPtrAccess_zero_size ∧
     type_of% @lm_validityMachine_checkPointerAccess_laws ∧
     type_of% @lm_validityMachine_checkPointerAlign_laws ∧
+    type_of% lm_d3_exact_validityMachine_diagnostics ∧
     type_of% lm_validityMachine_nonvacuity_witnesses ∧
     type_of% lm_d3_null_both_halves_ub ∧
     type_of% @lm_safe_ptr_range_contains_iff ∧
@@ -1935,13 +2148,14 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
    @lm_opaqueCast_phase_boundary, lm_d1_phase_boundary_table, @lm_ocErasePlace_cast_free,
    @lm_ocEraseBody_cast_free, lm_oc_setDiscriminant_payload_agreement,
    lm_oc_protected_drop_mode_sensitive, lm_oc_dead_local_ub_non_masking,
-   lm_oc_d2_rev_transmute_mode_sensitive, lm_step_adapter_boundaries,
+   lm_oc_d2_rev_transmute_mode_sensitive, lm_oc_d3_zst_dangling_and_null, lm_step_adapter_boundaries,
    @lm_retagPolicy_protector, @lm_retagPolicy_none, lm_retagPolicy_fnEntry_witness,
    @lm_call_passArgument_copyAllowTransmute, @lm_call_initStackFrame_enters_fnEntry_mode,
    lm_call_initStackFrame_fnEntry_witness, @lm_machineHooks_withRetagMode_laws,
    @lm_retagPipeline_rawPointer_no_protector, @lm_globalState_endCall_laws,
    @lm_checkPtrAccess_zero_size, @lm_validityMachine_checkPointerAccess_laws,
-   @lm_validityMachine_checkPointerAlign_laws, lm_validityMachine_nonvacuity_witnesses,
+   @lm_validityMachine_checkPointerAlign_laws, lm_d3_exact_validityMachine_diagnostics,
+   lm_validityMachine_nonvacuity_witnesses,
    lm_d3_null_both_halves_ub, @lm_safe_ptr_range_contains_iff, lm_safe_ptr_validity_layout,
    @lm_scalarMayBeNull_int, rfl⟩
 
@@ -1970,7 +2184,12 @@ run_cmd do
       (ns ++ `lm_oc_dead_local_ub_non_masking, `Miri.Interpreter.Step.step),
       (ns ++ `lm_oc_d2_rev_transmute_mode_sensitive, `Miri.TreeBorrows.RetagPipeline.retagPointerValue),
       (ns ++ `lm_oc_d2_rev_transmute_mode_sensitive, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
+      (ns ++ `lm_oc_d3_zst_dangling_and_null, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `lm_oc_d3_zst_dangling_and_null, `Miri.Interpreter.ValidityMachine.checkPointerAccess),
+      (ns ++ `lm_oc_d3_zst_dangling_and_null, `Miri.Interpreter.ValidityMachine.checkPointerAlign),
       (ns ++ `lm_globalState_endCall_laws, `Miri.TreeBorrows.GlobalState.endCall),
+      (ns ++ `lm_d3_exact_validityMachine_diagnostics, `Miri.Interpreter.ValidityMachine.checkPointerAccessResult),
+      (ns ++ `lm_d3_exact_validityMachine_diagnostics, `Miri.Interpreter.ValidityMachine.checkPointerAlignResult),
       (ns ++ `lm_validityMachine_nonvacuity_witnesses, `Miri.Interpreter.ValidityMachine.checkPointerAccess),
       (ns ++ `lm_validityMachine_nonvacuity_witnesses, `Miri.Interpreter.ValidityMachine.checkPointerAlign),
       (ns ++ `lmOcObserve_table, `Miri.Interpreter.Discriminant.writeDiscriminant),
@@ -2044,7 +2263,7 @@ run_cmd do
       if let .thmInfo _ := info then theorems := theorems + 1
   if !badConstructive.isEmpty then
     throwError "constructive theorems unexpectedly depend on Classical.choice: {badConstructive}"
-  if theorems < 30 then
+  if theorems < 32 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit

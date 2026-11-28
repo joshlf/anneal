@@ -483,11 +483,25 @@ def ocCase17Mir : CapturedMir :=
            .assign (ocLoc 1) (.aggregate .tuple []),
            .assign (ocLoc 2) (.ref .shared (ocLoc 1)),
            .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
+/-- Case 17 dangling-ZST companion (`D3.2`): `transmute::<usize, &()>(4)` (non-null, aligned,
+no provenance) followed by deref `*_2`. -/
+def ocCase17DanglingZstMir : CapturedMir :=
+  ocBody "oc::case17_dangling_zst_ref" 0 [ocUnitTy, ocUsizeTy, ocShrRefUnitTy]
+    [ocBb [.storageLive 1, .storageLive 2, .assign (ocLoc 1) (.use (ocConstUsize 4)),
+           .assign (ocLoc 2) (.cast .transmute (.copy (ocLoc 1)) ocShrRefUnitTy),
+           .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
 /-- Case 18: null `&u32` (`transmute::<usize, &u32>(0)`). -/
 def ocCase18Mir : CapturedMir :=
   ocBody "oc::case18_null_ref" 0 [ocU32Ty, ocUsizeTy, ocShrRefU32Ty]
     [ocBb [.storageLive 1, .storageLive 2, .assign (ocLoc 1) (.use (ocConstUsize 0)),
            .assign (ocLoc 2) (.cast .transmute (.copy (ocLoc 1)) ocShrRefU32Ty),
+           .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
+/-- Case 18 ZST-null companion (`D3.3`): `transmute::<usize, &()>(0)` (null zero-sized safe
+pointer) followed by deref `*_2`. -/
+def ocCase18ZstNullMir : CapturedMir :=
+  ocBody "oc::case18_zst_null_ref" 0 [ocUnitTy, ocUsizeTy, ocShrRefUnitTy]
+    [ocBb [.storageLive 1, .storageLive 2, .assign (ocLoc 1) (.use (ocConstUsize 0)),
+           .assign (ocLoc 2) (.cast .transmute (.copy (ocLoc 1)) ocShrRefUnitTy),
            .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
 /-- Case 19: unaligned `&u32` at `base + 2` inside a live 8-byte `u64` local. -/
 def ocCase19Mir : CapturedMir :=
@@ -1201,6 +1215,24 @@ theorem mr_oc_setDiscriminant_payload_agreement :
     ocRun false [] ocMrProg6Payload = .okScalar 7 ∧ ocRun true [] ocMrProg6Payload = .okScalar 7 := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
+/-- **`D3.2` / `D3.3` ZST dangling (`addr = 4`, no prov) and ZST null (`addr = 0`) companions
+(kernel-checked)**:
+* `D3.3` ZST null (`ocCase18ZstNullMir`, `transmute::<usize, &()>(0)`): ALL authorities agree on
+  `.ub` (Trusted `stepMirFn`, MiniRust `checkPtrM` on `Mach`/`MachTB` for both `&()` and `Box<()>`).
+* `D3.2` dangling/no-prov ZST (`ocCase17DanglingZstMir`, `transmute::<usize, &()>(4)`): MiniRust
+  `checkPtrM` on `Mach`/`MachTB` (both `&()` and `Box<()>`) accepts `.okPtrValid` (matching
+  LeanMiri), while Trusted `stepMirFn` conservatively rejects provenance-less reference transmutes
+  with `.ub` (no-forge byte codec boundary — explaining why canonical case `17` `ocCase17Mir`
+  constructs a live `&()` for 3-way `.okPtrValid` agreement). -/
+theorem mr_oc_d3_zst_dangling_and_null :
+    mrOcTrustedObsOf .ptrValid (ocRunTrustedRaw ocCase17DanglingZstMir []) = .ub ∧
+    ocRun false ocMrZstPtrTys ocMrProg17 = .okPtrValid ∧
+    ocRun true ocMrZstPtrTys ocMrProg17 = .okPtrValid ∧
+    mrOcTrustedObsOf .ptrValid (ocRunTrustedRaw ocCase18ZstNullMir []) = .ub ∧
+    ocRun false ocMrZstPtrTys ocMrProg18 = .ub ∧
+    ocRun true ocMrZstPtrTys ocMrProg18 = .ub := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
 /-- The final `Mach` of a basic run (stopped at `Intrinsic.Exit`). -/
 def ocFinalMachBasic (prog : Program) : Option Mach :=
   match bootProgramM (M := BM) () prog with
@@ -1399,6 +1431,60 @@ theorem trusted_evalOperand_cast_deref_unsupported (locals : List LocalSlot) (l 
     rw [(trusted_projectedValue_opaqueCast locals v v t (.deref :: r)).1]
     cases v <;> rfl
   simp only [evalOperand, hu, hv, hread]
+
+/-- `D1.1` **Trusted `evalOperand` `.copy` transparency through `.opaqueCast` (universal)**:
+for any initialized local not touching a union, copying `(_l as T)…` reduces to reading through the
+erased projection tail, and for a single cast `(_l as T)` equals copying `_l` directly. -/
+theorem trusted_evalOperand_copy_opaqueCast_eq (locals : List LocalSlot) (l : Nat) (t : Ty)
+    (rest : List ProjectionElem) (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : Layout.LayoutTable) (callerLocals : List LocalSlot) (decls : List LocalDecl)
+    (callStack : List SavedCallerFrame) (v : Value)
+    (hv : Trusted.Sequence.get? locals l = some (.init v))
+    (hu : placeTouchesUnion decls layouts ⟨l, .opaqueCast t :: rest⟩ = false) :
+    evalOperand locals (.copy ⟨l, .opaqueCast t :: rest⟩) borrows globals layouts callerLocals decls
+      callStack =
+      (match readProjectedValue locals v rest with
+       | .ok fieldVal => .ok fieldVal locals
+       | .ub => .ub
+       | .unsupported => .unsupported) ∧
+    (rest = [] →
+      evalOperand locals (.copy ⟨l, .opaqueCast t :: rest⟩) borrows globals layouts callerLocals decls
+        callStack =
+      evalOperand locals (.copy ⟨l, []⟩) borrows globals layouts callerLocals decls callStack) := by
+  have hread : readProjectedValue locals v (.opaqueCast t :: rest) = readProjectedValue locals v rest :=
+    (trusted_projectedValue_opaqueCast locals v v t rest).1
+  refine ⟨?_, ?_⟩
+  · unfold evalOperand
+    dsimp only
+    rw [hv, hu]
+    dsimp only
+    rw [hread]
+    cases readProjectedValue locals v rest <;> rfl
+  · intro hNil
+    subst hNil
+    unfold evalOperand
+    dsimp only
+    rw [hv, hu]
+    dsimp only
+    rw [hread]
+
+/-- `D1.2` **Trusted `evalStmt` `.assign` transparency for pure `.opaqueCast` chains (universal,
+unconditional)**: for EVERY machine state, rvalue, declarations, and layouts, assigning through a
+pure cast chain `(_l as T₁ … as Tₙ) = rv` (`stripLeadingOpaqueCast rest = []`) produces the EXACT
+same `MirStepNode` as assigning directly to `_l = rv` (preserving rvalue UB, dead-local UB, and
+active-protector conflict UB identically). -/
+theorem trusted_evalStmt_assign_pure_cast_eq (s : MachineState) (l : Nat) (t : Ty)
+    (rest : List ProjectionElem) (rv : Rvalue) (span : String) (decls : List LocalDecl)
+    (layouts : Layout.LayoutTable) (hPure : stripLeadingOpaqueCast rest = []) :
+    evalStmt s ⟨.assign ⟨l, .opaqueCast t :: rest⟩ rv, span⟩ decls layouts =
+      evalStmt s ⟨.assign ⟨l, []⟩ rv, span⟩ decls layouts := by
+  unfold evalStmt
+  dsimp only
+  cases evalRvalue s.frame.locals rv s.memory decls layouts with
+  | ub => rfl
+  | unsupported => rfl
+  | ok val locals₁ mem₁ =>
+    simp only [stripLeadingOpaqueCast, hPure]
 
 /-- `D1` **Trusted leading-cast decl erasure (universal)**: `eraseLeadingOpaqueCastDecls` leaves
 `localDecls` unchanged when there is no leading `.opaqueCast`, and when a leading cast chain
@@ -1679,6 +1765,39 @@ theorem trusted_ocEraseRetags_retag_free (b : CapturedMir) :
   simp only [List.mem_map] at hs
   obtain ⟨s0, _, rfl⟩ := hs
   split <;> simp_all
+
+/-- `D2` **Trusted indirect fn-ptr transmutation boundary (universal)**:
+`fnEntryCompatibleWithCallSite` accepts exact-signature indirect `fn(*mut u8, *mut u8) -> u8` calls
+(for any non-intrinsic ABI), while rejecting ABI-equivalent transmuted calls between
+`fn(*mut u8, *mut u8) -> u8` and `fn(&mut u8, *mut u8) -> u8` in BOTH directions because
+`rigidTyListEq` compares `RigidTy` syntactically rather than by ABI layout. This documents why
+Trusted `D2` fixtures invoke callees by `fnDef` while MiniRust (`ocMrProg10`/`11`/`13RevTransmute`)
+and LeanMiri (`Call.passArgument` / `copyAllowTransmute`) perform the ABI-transmuted call. -/
+theorem trusted_fnEntryCompatibleWithCallSite_transmute_boundary (allocId : MirAst.AllocId)
+    (defPath : DefPath) (typeArgs : List RigidTy) (safety : Safety) (abi : Layout.CallConv)
+    (hNotIntr : callConvEq abi .rustIntrinsic = false) :
+    let rawSig : RigidTy := .fnPtr [.rawPtr .mut (.uint .u8), .rawPtr .mut (.uint .u8)] (.uint .u8) safety abi
+    let refSig : RigidTy := .fnPtr [.ref .mut (.uint .u8), .rawPtr .mut (.uint .u8)] (.uint .u8) safety abi
+    let rawEntry : FnPtrEntry := ⟨allocId, defPath, typeArgs, some rawSig⟩
+    let refEntry : FnPtrEntry := ⟨allocId, defPath, typeArgs, some refSig⟩
+    let rawTy : Ty := { kind := rawSig, layoutIdx := 5 }
+    let refTy : Ty := { kind := refSig, layoutIdx := 5 }
+    fnEntryCompatibleWithCallSite rawEntry 2 (some rawTy) = true ∧
+    fnEntryCompatibleWithCallSite rawEntry 2 (some refTy) = false ∧
+    fnEntryCompatibleWithCallSite refEntry 2 (some rawTy) = false := by
+  have hBytesRefl : ∀ bs : List UInt8, listByteEq bs bs = true := by
+    intro bs
+    induction bs with
+    | nil => rfl
+    | cons b bs ih => simp [listByteEq, ih]
+  have hAbiSelf : callConvEq abi abi = true := by
+    cases abi with
+    | other s => exact hBytesRefl s.toByteArray.data.toList
+    | _ => rfl
+  have hSafSelf : safetyCompatible safety safety = true := by cases safety <;> rfl
+  refine ⟨?_, ?_, ?_⟩ <;>
+    simp [fnEntryCompatibleWithCallSite, hNotIntr, hAbiSelf, hSafSelf,
+      Trusted.Sequence.length, rigidTyListEq, rigidTyEq, mutabilityEq]
 
 /-- `D1`/`D2` **non-vacuity witnesses for Trusted conditional universal laws**: instantiates the
 hypotheses of `trusted_evalOperand_cast_deref_unsupported`, `trusted_evalOperand_move_pure_cast_deinit`,
@@ -2193,6 +2312,89 @@ theorem mr_checkPtrM_none_sized_prov_unsupported {M : Type} [Memory M] [MemoryOp
   rw [hSize, hE, pure_bind, hNull, hE, pure_bind, hAl, hE, pure_bind, hInh, hE, pure_bind]
   simp only [hPos, hProv, ite_false]
 
+/-- `D3` **Universal exact `checkPtr` / `CM.dereferenceable` characterization on `Mach`**:
+for every in-bounds, non-null, aligned, inhabited sized thin safe pointer (`&T`, `&mut T`, `Box<T>`)
+and every `mach : Mach`, `checkPtr ptr ptrTy (some mach)` returns `.ok ()` whenever
+`CM.dereferenceable mach.mem ptr.thin_pointer sz = .ok ()`, and returns exact UB
+`"Value::Ptr: non-dereferenceable safe pointer"` whenever `CM.dereferenceable` returns `.error (.ub m)`. -/
+theorem mr_checkPtr_dereferenceable_exact (ptr : Pointer Prov) (ptrTy : PtrType)
+    (pointee : PointeeInfo) (sz : Size) (al : Align) (mach : Mach)
+    (hSafe : PtrType.safe_pointee ptrTy = some pointee) (hLay : pointee.layout = .Sized sz al)
+    (hMeta : ptr.metadata = none) (hKind : PtrType.meta_kind ptrTy = .None)
+    (hAddr : inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hSize : inBounds sz.bytes .Signed x86_64.PTR_SIZE = true)
+    (hNull : (ptr.thin_pointer.addr != 0) = true) (hAl : Align.is_aligned al ptr.thin_pointer.addr = true)
+    (hInh : pointee.inhabited = true) :
+    (CM.dereferenceable mach.mem ptr.thin_pointer sz = .ok () →
+      checkPtr ptr ptrTy (some mach) = .ok ()) ∧
+    (∀ ubMsg, CM.dereferenceable mach.mem ptr.thin_pointer sz = .error (.ub ubMsg) →
+      checkPtr ptr ptrTy (some mach) = ub "Value::Ptr: non-dereferenceable safe pointer") := by
+  have hE : ∀ msg, ensureElseUb true msg = pure () := fun _ => rfl
+  have hMetaOk : checkPtrMetadata ptr.metadata (PtrType.meta_kind ptrTy) (some mach) = pure () := by
+    rw [hMeta, hKind]; rfl
+  have hCs : ∀ (vt : Ptr → Interp VTable),
+      LayoutStrategy.compute_size_and_align vt pointee.layout ptr.metadata = pure (sz, al) := by
+    intro vt; rw [hLay, hMeta]; rfl
+  constructor
+  · intro hOk
+    unfold checkPtr
+    rw [hAddr, hE, pure_bind, hMetaOk, pure_bind]
+    simp only [hSafe]
+    rw [hCs, pure_bind]
+    dsimp only
+    rw [hSize, hE, pure_bind, hNull, hE, pure_bind, hAl, hE, pure_bind, hInh, hE, pure_bind, hOk]
+    rfl
+  · intro ubMsg hUb
+    unfold checkPtr
+    rw [hAddr, hE, pure_bind, hMetaOk, pure_bind]
+    simp only [hSafe]
+    rw [hCs, pure_bind]
+    dsimp only
+    rw [hSize, hE, pure_bind, hNull, hE, pure_bind, hAl, hE, pure_bind, hInh, hE, pure_bind, hUb]
+
+/-- `D3` **Universal exact `checkPtrM` / `ConcurrentMemory.dereferenceable` characterization**
+(generic over `M`, instantiating to both `Mach` and `MachTB`): for every in-bounds, non-null,
+aligned, inhabited sized thin safe pointer and every machine `mach : Machine M`,
+`checkPtrM ptr ptrTy (some mach)` returns `.ok ()` whenever `ConcurrentMemory.dereferenceable`
+succeeds, and returns exact UB `"Value::Ptr: non-dereferenceable safe pointer"` whenever
+`ConcurrentMemory.dereferenceable` reports `.error (.ub ubMsg)`. -/
+theorem mr_checkPtrM_dereferenceable_exact {M : Type} [Memory M] [MemoryOps M]
+    (ptr : Pointer (Memory.Provenance M)) (ptrTy : PtrType)
+    (pointee : PointeeInfo) (sz : Size) (al : Align) (mach : Machine M)
+    (hSafe : PtrType.safe_pointee ptrTy = some pointee) (hLay : pointee.layout = .Sized sz al)
+    (hMeta : ptr.metadata = none) (hKind : PtrType.meta_kind ptrTy = .None)
+    (hAddr : inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hSize : inBounds sz.bytes .Signed x86_64.PTR_SIZE = true)
+    (hNull : (ptr.thin_pointer.addr != 0) = true) (hAl : Align.is_aligned al ptr.thin_pointer.addr = true)
+    (hInh : pointee.inhabited = true) :
+    (ConcurrentMemory.dereferenceable mach.mem ptr.thin_pointer sz = .ok () →
+      checkPtrM ptr ptrTy (some mach) = .ok ()) ∧
+    (∀ ubMsg, ConcurrentMemory.dereferenceable mach.mem ptr.thin_pointer sz = .error (.ub ubMsg) →
+      checkPtrM ptr ptrTy (some mach) = ub "Value::Ptr: non-dereferenceable safe pointer") := by
+  have hE : ∀ msg, ensureElseUb true msg = pure () := fun _ => rfl
+  have hMetaOk : checkPtrMetadataM ptr.metadata (PtrType.meta_kind ptrTy)
+      ((some mach).map (vtableFromPtrM ·)) = pure () := by
+    rw [hMeta, hKind]; rfl
+  have hCs : ∀ (vt : ThinPointer (Memory.Provenance M) → Interp VTable),
+      LayoutStrategy.compute_size_and_align vt pointee.layout ptr.metadata = pure (sz, al) := by
+    intro vt; rw [hLay, hMeta]; rfl
+  constructor
+  · intro hOk
+    unfold checkPtrM
+    rw [hAddr, hE, pure_bind, hMetaOk, pure_bind]
+    simp only [hSafe]
+    rw [hCs, pure_bind]
+    dsimp only
+    rw [hSize, hE, pure_bind, hNull, hE, pure_bind, hAl, hE, pure_bind, hInh, hE, pure_bind, hOk]
+    rfl
+  · intro ubMsg hUb
+    unfold checkPtrM
+    rw [hAddr, hE, pure_bind, hMetaOk, pure_bind]
+    simp only [hSafe]
+    rw [hCs, pure_bind]
+    dsimp only
+    rw [hSize, hE, pure_bind, hNull, hE, pure_bind, hAl, hE, pure_bind, hInh, hE, pure_bind, hUb]
+
 /-- `D3` **non-vacuity witnesses for `checkPtr` / `checkPtrM` universal laws (`Ref` and `Box`)**:
 jointly witnesses the hypotheses of `mr_checkPtr_sized_never_unsupported`,
 `mr_checkPtrM_sized_never_unsupported_bm_tbm`, `mr_checkPtrM_zst_always_ok`,
@@ -2263,6 +2465,8 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% @trusted_readProjectedValue_ocErase ∧
     type_of% @trusted_projectedValue_opaqueCast ∧
     type_of% @trusted_evalOperand_cast_deref_unsupported ∧
+    type_of% @trusted_evalOperand_copy_opaqueCast_eq ∧
+    type_of% @trusted_evalStmt_assign_pure_cast_eq ∧
     type_of% @trusted_eraseLeadingOpaqueCastDecls_laws ∧
     type_of% trusted_uninitFieldWriteShell_opaque_witness ∧
     type_of% @trusted_evalOperand_move_pure_cast_deinit ∧
@@ -2275,6 +2479,7 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% @trusted_restoreCallerProtectors_law ∧
     type_of% @trusted_fnEntryRetagPerm ∧
     type_of% @trusted_ocEraseRetags_retag_free ∧
+    type_of% @trusted_fnEntryCompatibleWithCallSite_transmute_boundary ∧
     type_of% trusted_d1_d2_nonvacuity_witnesses ∧
     type_of% @mr_ocEraseBody_cast_free ∧
     type_of% @mr_basic_retag_fnEntry_irrelevant ∧
@@ -2290,6 +2495,8 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% @mr_checkPtrM_null_always_ub ∧
     type_of% @mr_checkPtrM_unaligned_always_ub ∧
     type_of% @mr_checkPtrM_none_sized_prov_unsupported ∧
+    type_of% @mr_checkPtr_dereferenceable_exact ∧
+    type_of% @mr_checkPtrM_dereferenceable_exact ∧
     type_of% mr_checkPtrM_nonvacuity ∧
     type_of% @mr_checkValueM_ptr_eq_checkPtrM ∧
     type_of% mr_oc_exact_ub_diagnostics ∧
@@ -2298,27 +2505,31 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% mr_oc_dead_local_ub_non_masking ∧
     type_of% mr_oc_d2_rev_transmute_mode_sensitive ∧
     type_of% mr_oc_setDiscriminant_payload_agreement ∧
+    type_of% mr_oc_d3_zst_dangling_and_null ∧
     type_of% mr_checkPtr_some_vs_none_contrast ∧
     type_of% mr_checkPtrM_tb_some_vs_none_contrast :=
   ⟨@mr_translate_opaqueCast_fail_closed, @trusted_stripLeadingOpaqueCast_laws,
    @trusted_readProjectedValue_ocErase, @trusted_projectedValue_opaqueCast,
-   @trusted_evalOperand_cast_deref_unsupported, @trusted_eraseLeadingOpaqueCastDecls_laws,
+   @trusted_evalOperand_cast_deref_unsupported, @trusted_evalOperand_copy_opaqueCast_eq,
+   @trusted_evalStmt_assign_pure_cast_eq, @trusted_eraseLeadingOpaqueCastDecls_laws,
    trusted_uninitFieldWriteShell_opaque_witness, @trusted_evalOperand_move_pure_cast_deinit,
    @trusted_writePlaceValue_opaqueCast_laws, @trusted_evalStmt_deinit_opaqueCast,
    @trusted_evalStmt_setDiscriminant_opaqueCast, @trusted_evalTerminator_drop_opaqueCast,
    @trusted_evalFnEntryRetag_attach, @trusted_evalFnEntryRetag_ref_creates_protected_child,
    @trusted_restoreCallerProtectors_law, @trusted_fnEntryRetagPerm, @trusted_ocEraseRetags_retag_free,
+   @trusted_fnEntryCompatibleWithCallSite_transmute_boundary,
    trusted_d1_d2_nonvacuity_witnesses, @mr_ocEraseBody_cast_free,
    @mr_basic_retag_fnEntry_irrelevant, @mr_tb_retag_raw_noop,
    @mr_reborrowSettings_ref_protector, @mr_reborrowSettings_box_weak_protector,
    mr_reborrowSettings_nonvacuity, @mr_end_call_laws, @mr_cm_dereferenceable_ne_unsupported,
    @mr_checkPtr_sized_never_unsupported, @mr_checkPtrM_sized_never_unsupported_bm_tbm,
    @mr_checkPtrM_zst_always_ok, @mr_checkPtrM_null_always_ub, @mr_checkPtrM_unaligned_always_ub,
-   @mr_checkPtrM_none_sized_prov_unsupported, mr_checkPtrM_nonvacuity,
+   @mr_checkPtrM_none_sized_prov_unsupported, @mr_checkPtr_dereferenceable_exact,
+   @mr_checkPtrM_dereferenceable_exact, mr_checkPtrM_nonvacuity,
    @mr_checkValueM_ptr_eq_checkPtrM, mr_oc_exact_ub_diagnostics,
    mr_oc_minimize_lowering_contrasts, mr_oc_protected_drop_mode_sensitive,
    mr_oc_dead_local_ub_non_masking, mr_oc_d2_rev_transmute_mode_sensitive,
-   mr_oc_setDiscriminant_payload_agreement,
+   mr_oc_setDiscriminant_payload_agreement, mr_oc_d3_zst_dangling_and_null,
    mr_checkPtr_some_vs_none_contrast, mr_checkPtrM_tb_some_vs_none_contrast⟩
 
 section AxiomAudit
@@ -2343,6 +2554,16 @@ run_cmd do
       (ns ++ `mr_oc_dead_local_ub_non_masking, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_d2_rev_transmute_mode_sensitive, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mr_oc_d2_rev_transmute_mode_sensitive, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mr_oc_d3_zst_dangling_and_null, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `mr_oc_d3_zst_dangling_and_null, `MiniRustSpec.Interp.checkPtrM),
+      (ns ++ `trusted_evalOperand_copy_opaqueCast_eq, `Trusted.Rustc.V2026_06_01.MirSemantics.evalOperand),
+      (ns ++ `trusted_evalStmt_assign_pure_cast_eq, `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt),
+      (ns ++ `trusted_fnEntryCompatibleWithCallSite_transmute_boundary,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.fnEntryCompatibleWithCallSite),
+      (ns ++ `mr_checkPtr_dereferenceable_exact, `MiniRustSpec.Interp.checkPtr),
+      (ns ++ `mr_checkPtr_dereferenceable_exact, `MiniRustSpec.Interp.CM.dereferenceable),
+      (ns ++ `mr_checkPtrM_dereferenceable_exact, `MiniRustSpec.Interp.checkPtrM),
+      (ns ++ `mr_checkPtrM_dereferenceable_exact, `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable),
       (ns ++ `mr_end_call_laws, `MiniRustSpec.Interp.TreeBorrowsMemory.end_call),
       (ns ++ `mr_end_call_laws, `MiniRustSpec.Interp.TreeBorrowsMemory.release_protector),
       (ns ++ `mr_checkValueM_ptr_eq_checkPtrM, `MiniRustSpec.Interp.checkValueM),
@@ -2418,7 +2639,7 @@ run_cmd do
         throwError "{c} must be constructive (zero Classical.choice) but depends on Classical.choice"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 50 then
+  if theorems < 55 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit
