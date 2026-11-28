@@ -24,34 +24,40 @@ Exercises all four certificate-checked subsystems unified under
 1. **`Anneal.LinearArithIndexed` (`natCutIdxGate`, `intCutIdxGate`):**
    concrete `BoolCertCut.seal _ _ rfl` discharges covering row reuse and
    Chvatal-Gomory `.divCut` parity cuts, `firstAccepted` / `natCutPortfolio` /
-   `intCutPortfolio` / dual-backend selection, and oversized/forged rejections.
+   `intCutPortfolio` / dual-backend selection, oversized/forged rejections,
+   and total `gateVerdict` (`withFallback`) verdicts.
 2. **`Anneal.FarkasMirCert` (`farkasMirGate`):**
    concrete `BoolCertCut.seal _ _ rfl` discharges across `uintAddNoOverflow`,
    `uintSubNoUnderflowCertified`, `uintMulConstNoOverflow`, `sliceBounds`,
    `alignedStride`, `arrayToSliceCast`, and `natEntailmentAdequacy` (all four
-   `FarkasMirCert` constructors), plus `farkasMirPortfolio`, `withFallback`,
+   `FarkasMirCert` constructors), plus `farkasMirPortfolio`, `gateVerdict`,
    forged/oversized/mismatched rejections, and the `natCutIdxGate` ->
    `evalScalarBinOp` bridge.
 3. **`Anneal.CanonicalDiode` (`canonicalDiodeChunkGate` + `foldStreamPrefix`):**
    concrete `BoolCertCut` and streaming checks over
    `Anneal.CanonicalDiode.Canaries.diode` and a strict-parser diode proving
    canonical emission on valid streams, immediate halt with zero emission of
-   malformed or tampered chunks, and rejection of non-canonical/wrong-AST
-   producer outputs.
+   malformed or tampered chunks at the head AND mid-stream, rejection of
+   non-canonical/wrong-AST/replayed producer outputs, and the exact
+   `filterAll` characterization for adversarial producers.
 4. **`Anneal.Backend` + `Anneal.Mir.OverflowTrapRefinement`:**
    end-to-end `blockOptGate` `BoolCertCut` + `stepMirState` `u64` checked-to-
    unchecked add/sub refinement via `farkasMirGate`, `natCutIdxGate`, and
-   `CtxFact`, plus negative counterexamples (forged certs, `.symm` on
-   `.refines`, `.refines` under `.freeze`, `.fuzz`/`.sorryStub` candidates,
-   unsound overflow/underflow guard elision, `.diverged` distinctness, and
-   `-C panic=abort` vs `-C panic=unwind` separation).
+   `CtxFact`, certificate transport from ANY accepted `blockOptGate` witness
+   to `stepMirState`, plus negative counterexamples (forged certs, `.symm` on
+   `.refines`, `.refines` under `.freeze`, `.fuzz`/`.sorryStub` candidates
+   for which no certificate is ever accepted, unsound overflow/underflow
+   guard elision, `.diverged` distinctness, and `-C panic=abort` vs
+   `-C panic=unwind` separation).
 5. **Episode 1 Handoff Compatibility Pins:**
    exact `rfl` equalities between all four `Anneal.Hybrid` and
    `Anneal.SpecRealizability` realizability predicates, plus `#guard_msgs`
    negative elaboration checks confirming zero field defaults on
    `Anneal.Hybrid.EffectMask` and `Anneal.Hybrid.FnContract.effects`.
 6. **Exhaustive Axiom & `._unsafe_rec` Audit (`run_cmd` + `#print axioms`):**
-   sweeps every constant across all 9 new theory modules plus this test module.
+   sweeps every constant across all 9 new theory modules plus this test
+   module, pins each module's exact axiom set, and pins the exact axiom set of
+   every capstone.
 -/
 
 namespace Anneal.Mir.HybridBackendCertGateTests
@@ -188,6 +194,49 @@ theorem test_linearArithIndexed_portfolio_and_rejections :
    intCutPortfolio_sound (E := Unit) 8 intSubNegMulGoal
      [ .prodErr (), .candidate () intSubNegMulCert ] [] rfl⟩
 
+/-- `natCutDualGate` / `intCutDualGate` `BoolCertCut` discharges under BOTH
+witness tags, tag-for-tag agreement with the single-checker gates, and the
+failure direction of `natCutPortfolio_ok_iff_exists` /
+`intCutPortfolio_ok_iff_exists`. -/
+theorem test_linearArithIndexed_dualGate_and_portfolio_iff :
+    parityCutReqGoal.denote ∧
+    intSubNegMulGoal.denote ∧
+    Anneal.Hybrid.evalGate (E := Unit) (natCutDualGate 8) parityCutReqGoal
+        (.candidate () (.indexed, parityCutReqCert)) =
+      Anneal.Hybrid.evalGate (natCutIdxGate 8) parityCutReqGoal
+        (.candidate () parityCutReqCert) ∧
+    Anneal.Hybrid.evalGate (E := Unit) (intCutDualGate 8) intSubNegMulGoal
+        (.candidate () (.list, intSubNegMulCert)) =
+      Anneal.Hybrid.evalGate (Anneal.Hybrid.intCutGate 8) intSubNegMulGoal
+        (.candidate () intSubNegMulCert) ∧
+    -- Empty portfolios never succeed
+    ¬ (natCutPortfolio (E := Unit) 8 parityCutReqGoal [] [] = .ok ()) ∧
+    ¬ (intCutPortfolio (E := Unit) 8 intSubNegMulGoal [] [] = .ok ()) ∧
+    -- Oversized / forged / trapped / failed producers on both sides: the
+    -- portfolio reports the last fallback producer's rejection
+    natCutPortfolio (E := Unit) 4 natRowReuseGoal
+      [.candidate () natRowReuseCert, .trapped]
+      [.candidate () [.hyp 0], .prodErr ()] =
+      .error (.producerFailed ()) := by
+  have hNat : parityCutReqGoal.denote :=
+    natCutDualGate_cut_sound 8 parityCutReqGoal (.indexed, parityCutReqCert)
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+  have hInt : intSubNegMulGoal.denote :=
+    intCutDualGate_cut_sound 8 intSubNegMulGoal (.list, intSubNegMulCert)
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+  refine ⟨hNat, hInt,
+    (natCutDualGate_agrees 8 parityCutReqGoal parityCutReqCert).1,
+    (intCutDualGate_agrees 8 intSubNegMulGoal intSubNegMulCert).2,
+    ?_, ?_, rfl⟩
+  · intro hOk
+    cases (natCutPortfolio_ok_iff_exists 8 parityCutReqGoal [] []).1 hOk with
+    | inl h => have ⟨_, hMem, _⟩ := h; cases hMem
+    | inr h => have ⟨_, hMem, _⟩ := h; cases hMem
+  · intro hOk
+    cases (intCutPortfolio_ok_iff_exists 8 intSubNegMulGoal [] []).1 hOk with
+    | inl h => have ⟨_, hMem, _⟩ := h; cases hMem
+    | inr h => have ⟨_, hMem, _⟩ := h; cases hMem
+
 /-! ## 2. `FarkasMirCert` (`farkasMirGate`) -/
 
 def mirAddGoal : FarkasMirGoal :=
@@ -280,8 +329,8 @@ theorem test_farkasMirGate_boolCertCut_variants :
    farkasMirGate_cut_sound 16 mirEdgeGoal mirEdgeCert
      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)⟩
 
-/-- `farkasMirPortfolio`, `withFallback`, oversized / forged / mismatched
-rejections, and the `natCutIdxGate` -> `evalScalarBinOp` arithmetic bridge. -/
+/-- `farkasMirPortfolio`, oversized / forged / mismatched rejections, and the
+`natCutIdxGate` -> `evalScalarBinOp` arithmetic bridge. -/
 theorem test_farkasMirGate_portfolio_rejections_and_idx_bridge
     (a b : Nat) (locals : List LocalSlot) (mem : Memory)
     (ha : a ≤ 1000000) (hb : b ≤ 250000) :
@@ -299,11 +348,9 @@ theorem test_farkasMirGate_portfolio_rejections_and_idx_bridge
       [ .candidate () (.single [.hyp 0]),
         .trapped,
         .candidate () mirSubCert ] = .ok () ∧
-    -- `withFallback` yields fallback on total rejection
-    Anneal.Hybrid.withFallback mirAddGoal
-      (farkasMirPortfolio (E := Unit) 2 mirAddGoal
-        [.candidate () mirAddCert])
-      (fun _ => ()) = () ∧
+    -- An all-oversized portfolio reports the producer's rejection
+    farkasMirPortfolio (E := Unit) 2 mirAddGoal
+      [.candidate () mirAddCert] = .error (.witnessOversized 5 2) ∧
     -- Indexed-to-MIR bridge: `natCutIdxGate` discharges `evalScalarBinOp`
     evalScalarBinOp .addUnchecked
       ⟨a, uintBytes .u64⟩ ⟨4 * b, uintBytes .u64⟩ locals mem false =
@@ -320,6 +367,58 @@ theorem test_farkasMirGate_portfolio_rejections_and_idx_bridge
       (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
       [a, b] locals mem ha hb
   exact ⟨rfl, rfl, rfl, rfl, rfl, hIdxAdd.2.2.1, hIdxAdd.2.2.2⟩
+
+/-- Total `Bool` verdicts (`gateVerdict`, i.e. `withFallback` over
+`firstAccepted` on `verdictGate`): a `true` claim needs a gate-accepted
+witness, forged or oversized `true` claims fall back to `false`, and a `false`
+claim is accepted without consulting the checker. Unlike a `Unit`-valued
+fallback, the two results are distinguishable. -/
+theorem test_gateVerdict_withFallback_total_and_sound :
+    -- Valid `true` claim after a forged claim and a trap
+    gateVerdict (E := Unit) (natCutIdxGate 8) natRowReuseGoal
+      [ .candidate true [.hyp 0], .trapped,
+        .candidate true natRowReuseCert ] = true ∧
+    -- Forged-only `true` claims: fallback `false`
+    gateVerdict (E := Unit) (natCutIdxGate 8) natRowReuseGoal
+      [ .candidate true [.hyp 0], .prodErr () ] = false ∧
+    -- Oversized valid certificate: fallback `false`
+    gateVerdict (E := Unit) (natCutIdxGate 4) natRowReuseGoal
+      [ .candidate true natRowReuseCert ] = false ∧
+    -- No producers at all: fallback `false`
+    gateVerdict (E := Unit) (intCutIdxGate 8) intRowReuseGoal [] = false ∧
+    -- A `false` claim is accepted with an empty witness and ends the search
+    gateVerdict (E := Unit) (intCutIdxGate 8) intRowReuseGoal
+      [ .candidate false [], .candidate true intRowReuseCert ] = false ∧
+    -- `farkasMirGate`: valid, oversized, and payload-mismatched `true` claims
+    gateVerdict (E := Unit) (farkasMirGate 16) mirAddGoal
+      [ .candidate true mirAddCert ] = true ∧
+    gateVerdict (E := Unit) (farkasMirGate 2) mirAddGoal
+      [ .candidate true mirAddCert ] = false ∧
+    gateVerdict (E := Unit) (farkasMirGate 16) mirAddGoal
+      [ .candidate true (.pair [.hyp 0] [.hyp 1]) ] = false ∧
+    -- A `true` verdict is accepted exactly when the underlying gate accepts
+    Anneal.Hybrid.evalGate (E := Unit) (verdictGate (natCutIdxGate 8))
+      natRowReuseGoal (.candidate true natRowReuseCert) = .ok true ∧
+    natRowReuseGoal.denote ∧
+    mirAddGoal.denote := by
+  have hAllRej :
+      gateVerdict (E := Unit) (natCutIdxGate 8) natRowReuseGoal
+        [ .candidate true [.hyp 0], .prodErr () ] = false := by
+    refine gateVerdict_eq_false_of_all_rejected _ _ _ (fun r hMem b hEv => ?_)
+    cases hMem with
+    | head => cases hEv
+    | tail _ hTl =>
+      cases hTl with
+      | head => cases hEv
+      | tail _ hNil => cases hNil
+  exact ⟨rfl, hAllRej, rfl, rfl, rfl, rfl, rfl, rfl,
+    (verdictGate_true_ok_iff (natCutIdxGate 8) natRowReuseGoal
+      natRowReuseCert).2 rfl,
+    gateVerdict_sound (E := Unit) (natCutIdxGate 8) natRowReuseGoal
+      [ .candidate true [.hyp 0], .trapped,
+        .candidate true natRowReuseCert ] rfl,
+    gateVerdict_sound (E := Unit) (farkasMirGate 16) mirAddGoal
+      [ .candidate true mirAddCert ] rfl⟩
 
 /-! ## 3. `CanonicalDiode` (`canonicalDiodeChunkGate` + `foldStreamPrefix`) -/
 
@@ -369,9 +468,10 @@ theorem test_canonicalDiode_boolCertCut_and_valid_stream :
       [raw1, raw2, raw3]
   exact ⟨hCut1, hCut3, hStream, hValid⟩
 
-/-- Negative streaming tests: malformed input (`strictFrameDiode.filter raw2 =
-none`), tampered non-canonical output (`raw2`), and wrong-AST output (`raw3` for
-`raw2`) halt `foldStreamPrefix` immediately and are never emitted. -/
+/-- Negative streaming tests: malformed input
+(`strictFrameDiode.filter raw2 = none`), tampered non-canonical output
+(`raw2`), and wrong-AST output (`raw3` for `raw2`) halt `foldStreamPrefix`
+immediately and are never emitted. -/
 theorem test_canonicalDiode_malformed_and_tampered_rejections :
     -- Strict diode: valid prefix `[raw1]` emitted, halts at malformed `raw2`
     Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
@@ -402,8 +502,8 @@ theorem test_canonicalDiode_malformed_and_tampered_rejections :
     rw [hNone] at hDec
     nomatch hDec
   have hStrictNone :=
-    canonicalDiode_stream_halts_on_filter_none strictFrameDiode frameStream_lawful
-      boolListBeq boolListBeq_eq
+    canonicalDiode_stream_halts_on_filter_none strictFrameDiode
+      frameStream_lawful boolListBeq boolListBeq_eq
       (fun _ _ => .candidate (E := Unit) ((), raw1) ()) raw2 raw1 [raw1] rfl rfl
   have hWrongAst :
       Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
@@ -420,6 +520,62 @@ theorem test_canonicalDiode_malformed_and_tampered_rejections :
     have hNe : raw1 ≠ raw3 := by decide
     exact hNe h13
   exact ⟨rfl, hStrictNone, rfl, hWrongAst, hNotCanon⟩
+
+/-- Adversarial producer that answers every input chunk with the canonical
+chunk `raw1` (a replay of an earlier valid output). -/
+def replayRaw1Producer :
+    Unit → List Bool → Anneal.Hybrid.RawOutcome Unit (Unit × List Bool) Unit :=
+  fun _ _ => .candidate ((), raw1) ()
+
+/-- Mid-stream and whole-stream guarantees against an ADVERSARIAL producer.
+The replayed chunk `raw1` is canonical, so it passes `IsCanonicalImage`; it is
+accepted for inputs `raw1` and `raw2` (both filter to `raw1`) and rejected for
+`raw3`, where the stream halts with exactly the accepted prefix. The emitted
+chunks are `filterAll` of the consumed input prefix. -/
+theorem test_canonicalDiode_midstream_halt_and_prefix_characterization :
+    IsCanonicalImage diode raw1 ∧
+    -- Halt at position 2 with the accepted prefix kept and `raw1` not
+    -- appended a third time
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := IsCanonicalImage diode)
+      lenientDiodeGate replayRaw1Producer ()
+      ([raw1, raw2] ++ raw3 :: [raw1, raw1]) =
+      ([raw1, raw1], some .rejectedByChecker) ∧
+    -- Exact characterization: emitted = `filterAll` of the consumed prefix,
+    -- and the first unconsumed chunk is the one the gate rejected
+    (∃ consumed rest : List (List Bool),
+      [raw1, raw2, raw3, raw1, raw1] = consumed ++ rest ∧
+      diode.filterAll consumed = some [raw1, raw1] ∧
+      ∃ u rest', rest = u :: rest' ∧
+        Anneal.Hybrid.evalGate lenientDiodeGate ((), u)
+          (replayRaw1Producer () u) = .error .rejectedByChecker) ∧
+    -- Any accepted gate result is the filter image of ITS input
+    diode.filter raw2 = some raw1 := by
+  have hCanon : IsCanonicalImage diode raw1 :=
+    canonicalDiodeChunkGate_cut_sound diode frameStream_lawful
+      boolListBeq boolListBeq_eq raw1 raw1
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+  have hMid :=
+    canonicalDiode_stream_halts_on_tampered_midstream diode frameStream_lawful
+      boolListBeq boolListBeq_eq replayRaw1Producer
+      [raw1, raw2] [raw1, raw1] raw3 raw1 [raw1, raw1] rfl
+      (fun hEq => by
+        have hF : diode.filter raw3 = some raw3 := rfl
+        rw [hF] at hEq
+        injection hEq with h31
+        have hNe : raw3 ≠ raw1 := by decide
+        exact hNe h31)
+      rfl
+  have ⟨consumed, rest, hSplit, hAll, _, hSome⟩ :=
+    canonicalDiode_stream_prefix_eq_filterAll diode frameStream_lawful
+      boolListBeq boolListBeq_eq replayRaw1Producer
+      [raw1, raw2, raw3, raw1, raw1]
+  have hOkFilter :=
+    canonicalDiodeChunkGate_ok_filter diode frameStream_lawful
+      boolListBeq boolListBeq_eq raw2 (replayRaw1Producer () raw2)
+      ((), raw1) rfl
+  exact ⟨hCanon, hMid,
+    ⟨consumed, rest, hSplit, hAll, hSome .rejectedByChecker rfl⟩, hOkFilter⟩
 
 /-! ## 4. `Anneal.Backend` + `OverflowTrapRefinement` End-to-End & Negatives -/
 
@@ -445,7 +601,8 @@ theorem test_backend_overflowTrap_e2e_add_sub
       (classifyMirExecStateExact
         (runMirCall (mkUncheckedArithBody .u64 .add) 2
           (uintArgs2 .u64 a b))) ∧
-    (mirCallTree (mkUncheckedArithBody .u64 .add) (uintArgs2 .u64 a b)).toPartial ≤
+    (mirCallTree (mkUncheckedArithBody .u64 .add)
+        (uintArgs2 .u64 a b)).toPartial ≤
       (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
         (uintArgs2 .u64 a b)).toPartial ∧
     -- `u64` sub via `natCutIdxGate` + `blockOptGate` + `stepMirState`
@@ -464,7 +621,8 @@ theorem test_backend_overflowTrap_e2e_add_sub
       (classifyMirExecStateExact
         (runMirCall (mkUncheckedArithBody .u64 .sub) 2
           (uintArgs2 .u64 c d))) ∧
-    (mirCallTree (mkUncheckedArithBody .u64 .sub) (uintArgs2 .u64 c d)).toPartial ≤
+    (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 c d)).toPartial ≤
       (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
         (uintArgs2 .u64 c d)).toPartial := by
   have hAdd :=
@@ -567,6 +725,191 @@ theorem test_backend_and_trap_negative_counterexamples :
    (execOutcomeToMirClass?_diverged_distinct 0).1,
    (execOutcomeToMirClass?_diverged_distinct 0).2.2.2.2.2.2.2.2.1⟩
 
+/-- A second, non-canonical certificate for the `addNoOverflow` elision: a
+redundant leading `.refl` step before the `promoteAddNuw` rewrite. -/
+def u64AddAltSteps : List DagStep :=
+  [.refl 0, .biRule (.promoteAddNuw 0) [0, 1] 2 3]
+
+/-- Certificate transport: the real `stepMirState` refinement is derived from
+ANY accepted `blockOptGate` `BoolCertCut` (here a non-canonical certificate),
+for add and sub and for the unchecked and wrapping targets, including the
+fully chained two-gate capstones (`farkasMirGate` + `blockOptGate`). -/
+theorem test_backend_cert_transport_to_stepMirState
+    (a b : Nat) (ha : a ≤ 1000) (hb : b ≤ 2000)
+    (c d : Nat) (hc : c ≤ 1000) (hcd : d + 4 ≤ c) :
+    -- Both gates chained, non-canonical `blockOptGate` certificate
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 a b)))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2
+          (uintArgs2 .u64 a b))) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 a b)))
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2
+          (uintArgs2 .u64 a b))) ∧
+    -- Wrapping target: checked is refined by wrapping under the fact
+    MirExactOutcomeRefines
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 a b)))
+      (classifyMirExecStateExact
+        (runMirCall (mkWrappingArithBody .u64 .add) 2
+          (uintArgs2 .u64 a b))) ∧
+    -- Subtraction, both gates chained
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 c d)))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2
+          (uintArgs2 .u64 c d))) ∧
+    MirOutcomeRefines
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 c d)))
+      (classifyMirExecState .abort
+        (runMirCall (mkWrappingArithBody .u64 .sub) 2
+          (uintArgs2 .u64 c d))) := by
+  have hBig : 2000 < modPow2 (uintWidth .u64) := by decide
+  have haLt : a < modPow2 (uintWidth .u64) :=
+    Nat.lt_of_le_of_lt ha (Nat.lt_trans (by decide) hBig)
+  have hbLt : b < modPow2 (uintWidth .u64) := Nat.lt_of_le_of_lt hb hBig
+  have hcLt : c < modPow2 (uintWidth .u64) :=
+    Nat.lt_of_le_of_lt hc (Nat.lt_trans (by decide) hBig)
+  have hdLt : d < modPow2 (uintWidth .u64) :=
+    Nat.lt_of_le_of_lt (Nat.le_trans (Nat.le_add_right d 4) hcd) hcLt
+  have hAddEntry : SourceEntryPre u64CheckedAddSrc (env2 a b) :=
+    (sourceEntryPre_u64CheckedAdd_iff a b haLt hbLt).2
+      (Nat.lt_of_le_of_lt (Nat.add_le_add ha hb) (by decide))
+  have hSubEntry : SourceEntryPre u64CheckedSubSrc (env2 c d) :=
+    (sourceEntryPre_u64CheckedSub_iff c d hcLt hdLt).2
+      (Nat.le_trans (Nat.le_add_right d 4) hcd)
+  have hAdd :=
+    u64_add_farkas_and_blockOpt_cuts_to_stepMirState 8 2
+      [⟨.var 0, .cst 1000⟩, ⟨.var 1, .cst 2000⟩] (.var 0) (.var 1)
+      (.single [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1])
+      u64AddAltSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      [a, b] ha hb
+  have hAddWrap :=
+    u64_add_blockOptGate_cut_to_stepMirState_wrapping 2
+      u64CheckedAddToWrappingSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      a b haLt hbLt hAddEntry
+  have hSub :=
+    u64_sub_farkas_and_blockOpt_cuts_to_stepMirState 8 2
+      [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst 1000⟩]
+      (.var 0) (.var 1) mirSubCert u64CheckedSubToUncheckedSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      [c, d] hcd hc
+  have hSubWrap :=
+    u64_sub_blockOptGate_cut_to_stepMirState_wrapping 2
+      u64CheckedSubToWrappingSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      c d hcLt hdLt hSubEntry
+  exact ⟨hAdd.1, hAdd.2, hAddWrap.1, hSub.1, hSubWrap.2⟩
+
+/-- Undischarged-fact negatives. The SAME elision certificate that
+`blockOptGate` accepts for the `.proven` source is rejected once the fact is
+only `.fuzz` or `.sorryStub`; no certificate of any size is ever accepted
+there; and the `stepMirState` picture at the overflow / underflow witnesses
+shows the abort that elision would have erased. -/
+theorem test_backend_unproven_tier_elision_never_certified
+    (maxStepsPerNode : Nat) (steps : List DagStep) :
+    -- Differential: only the candidate's trust tier changes
+    Anneal.Hybrid.evalGate (E := Unit) (blockOptGate 2)
+      (u64CheckedAddSrcAt .proven)
+      (.candidate u64UncheckedAddOpt u64CheckedAddToUncheckedSteps) =
+      .ok u64UncheckedAddOpt ∧
+    Anneal.Hybrid.evalGate (E := Unit) (blockOptGate 2)
+      (u64CheckedAddSrcAt .fuzz)
+      (.candidate u64UncheckedAddOpt u64CheckedAddToUncheckedSteps) =
+      .error .rejectedByChecker ∧
+    Anneal.Hybrid.evalGate (E := Unit) (blockOptGate 2)
+      (u64CheckedAddSrcAt .sorryStub)
+      (.candidate u64UncheckedAddOpt u64CheckedAddToUncheckedSteps) =
+      .error .rejectedByChecker ∧
+    Anneal.Hybrid.evalGate (E := Unit) (blockOptGate 2)
+      (u64CheckedSubSrcAt .proven)
+      (.candidate u64WrappingSubOpt u64CheckedSubToWrappingSteps) =
+      .ok u64WrappingSubOpt ∧
+    Anneal.Hybrid.evalGate (E := Unit) (blockOptGate 2)
+      (u64CheckedSubSrcAt .fuzz)
+      (.candidate u64WrappingSubOpt u64CheckedSubToWrappingSteps) =
+      .error .rejectedByChecker ∧
+    Anneal.Hybrid.evalGate (E := Unit) (blockOptGate 2)
+      (u64CheckedSubSrcAt .sorryStub)
+      (.candidate u64WrappingSubOpt u64CheckedSubToWrappingSteps) =
+      .error .rejectedByChecker ∧
+    -- No certificate of ANY size, for ANY step list
+    Anneal.Hybrid.gateCheckBounded (blockOptGate maxStepsPerNode)
+      (u64CheckedAddSrcAt .fuzz, u64WrappingAddOpt, steps) = false ∧
+    Anneal.Hybrid.gateCheckBounded (blockOptGate maxStepsPerNode)
+      (u64CheckedAddSrcAt .sorryStub, u64UncheckedAddOpt, steps) = false ∧
+    Anneal.Hybrid.gateCheckBounded (blockOptGate maxStepsPerNode)
+      (u64CheckedSubSrcAt .sorryStub, u64WrappingSubOpt, steps) = false ∧
+    Anneal.Hybrid.gateCheckBounded (blockOptGate maxStepsPerNode)
+      (u64CheckedSubSrcAt .fuzz, u64UncheckedSubOpt, steps) = false ∧
+    -- `stepMirState` at the witnesses: checked aborts, wrapping returns
+    classifyMirExecStateExact
+      (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+        (uintArgs2 .u64 u64Max 1)) = .trap .abort ∧
+    classifyMirExecStateExact
+      (runMirCall (mkWrappingArithBody .u64 .add) 2
+        (uintArgs2 .u64 u64Max 1)) = .ret (execOutcomeToMirValue 0) ∧
+    classifyMirExecStateExact
+      (runMirCall (mkWrappingArithBody .u64 .sub) 2
+        (uintArgs2 .u64 0 1)) = .ret (execOutcomeToMirValue u64Max) :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl,
+   (neg_u64_add_unproven_elision_never_certified .fuzz
+     (fun h => nomatch h) maxStepsPerNode steps).1,
+   (neg_u64_add_unproven_elision_never_certified .sorryStub
+     (fun h => nomatch h) maxStepsPerNode steps).2,
+   (neg_u64_sub_unproven_elision_never_certified .sorryStub
+     (fun h => nomatch h) maxStepsPerNode steps).1,
+   (neg_u64_sub_unproven_elision_never_certified .fuzz
+     (fun h => nomatch h) maxStepsPerNode steps).2,
+   neg_u64_add_overflow_stepMirState_matrix.1,
+   neg_u64_add_overflow_stepMirState_matrix.2.1,
+   neg_u64_sub_underflow_stepMirState_matrix.2.1⟩
+
+/-- `SemRefinesUnder` preservation without any determinism assumption on the
+source semantics, instantiated at the certified `u64` add elision: every
+target outcome is a non-UB source-permitted outcome. -/
+theorem test_backend_relational_preservation (a b : Nat)
+    (ha : a < modPow2 (uintWidth .u64)) (hb : b < modPow2 (uintWidth .u64))
+    (hEntry : SourceEntryPre u64CheckedAddSrc (env2 a b))
+    (outTgt : ExecOutcome Nat Unit)
+    (hTgt : evalCompiledBlockUnit u64UncheckedAddOpt (env2 a b) outTgt) :
+    execOutcomeToMirClass? outTgt ≠ some .ub ∧
+    ∃ outSrc, evalSourceBlockUnit u64CheckedAddSrc (env2 a b) outSrc ∧
+      MirOptOutcomeRefines (execOutcomeToMirClass? outSrc)
+        (execOutcomeToMirClass? outTgt) := by
+  have hLt : a + b < modPow2 (uintWidth .u64) :=
+    (sourceEntryPre_u64CheckedAdd_iff a b ha hb).1 hEntry
+  have hNoUb :
+      ¬ evalSourceBlockUnit u64CheckedAddSrc (env2 a b) .faultUB := by
+    intro hUb
+    have hCls := congrArg execOutcomeToMirExactClass?
+      ((evalBlockWithGuards_iff_det _ _ _ _ _).1 hUb)
+    have hOk := runMirCall_checked_add_ok .u64 .abort a b hLt
+    dsimp only [PanicStrategy.toUnwindAction] at hOk
+    rw [execOutcomeToMirExactClass?_evalBlockDet,
+      u64CheckedAddSrc_corresponds_stepMirState a b ha hb, hOk] at hCls
+    nomatch hCls
+  have h :=
+    semRefinesUnder_preserves_mirOptRefines_relational
+      u64CheckedAdd_blockOptGate_to_unchecked hEntry hNoUb hTgt
+  have ⟨outSrc, hSrc, hRef, _⟩ := h.2.2
+  exact ⟨h.1, outSrc, hSrc, hRef⟩
+
 /-! ## 5. Episode 1 Handoff Compatibility Checks -/
 
 section Ep1Compat
@@ -594,6 +937,15 @@ theorem ep1_compat_dichotomyModuloObservation_rfl :
   rfl
 
 end Ep1Compat
+
+/-! Positive controls: with every non-defaulted field present both structures
+elaborate, so each failure below is caused by the omitted field alone. -/
+
+example : Anneal.Hybrid.EffectMask :=
+  { terminates := true, noUnwind := true, noAbort := true }
+
+example : Anneal.Hybrid.FnContract Nat Nat Unit :=
+  { effects := { terminates := true, noUnwind := true, noAbort := true } }
 
 /--
 error: Fields missing: `terminates`
@@ -635,6 +987,32 @@ Hint: Add missing fields:
 example : Anneal.Hybrid.FnContract Nat Nat Unit :=
   { safetyPre := fun _ => True, behaviorPre := fun _ => True }
 
+/-! `effects` is the ONLY `FnContract` field without a default: with the three
+postcondition fields supplied instead of the two preconditions, the report is
+again exactly `effects`. A partial `EffectMask` nested in a `FnContract`
+literal is rejected as well. -/
+
+/--
+error: Fields missing: `effects`
+
+Hint: Add missing fields:
+  ,̲ ̲e̲f̲f̲e̲c̲t̲s̲ ̲:̲=̲ ̲_̲
+-/
+#guard_msgs in
+example : Anneal.Hybrid.FnContract Nat Nat Unit :=
+  { postReturn := fun _ _ _ => True, postUnwind := fun _ _ => True,
+    postAbort := fun _ _ => True }
+
+/--
+error: Fields missing: `noAbort`
+
+Hint: Add missing fields:
+  ,̲ ̲n̲o̲A̲b̲o̲r̲t̲ ̲:̲=̲ ̲_̲
+-/
+#guard_msgs in
+example : Anneal.Hybrid.FnContract Nat Nat Unit :=
+  { effects := { terminates := true, noUnwind := true } }
+
 /-! ## 6. Exhaustive Programmatic Axiom & `._unsafe_rec` Sweep -/
 
 open Lean Elab Command in
@@ -643,145 +1021,198 @@ run_cmd do
   let unsafeRecSuffix : String := "_" ++ "unsafe_rec"
   let hasUnsafeRecName (n : Name) : Bool :=
     (n.toString.splitOn unsafeRecSuffix).length > 1
-  let checkNoUnsafeRecInInfo (mod : Name) (c : Name) (ci : ConstantInfo) :
-      CommandElabM Unit := do
+  let sameSet (xs ys : List Name) : Bool :=
+    xs.all ys.contains && ys.all xs.contains
+  let propextOnly : List Name := [``propext]
+  let constructive : List Name := [``propext, ``Quot.sound]
+  -- Audit ONE constant of any kind: no `unsafe_rec` companion in its name,
+  -- type, or body; not `unsafe`, `partial`, an axiom, or an opaque; and every
+  -- axiom it depends on is in `allowed`. Returns its kind (`1` theorem, `2`
+  -- definition, `0` other) and its axioms.
+  let auditConst (loc : String) (allowed : List Name) (c : Name)
+      (ci : ConstantInfo) : CommandElabM (Nat × List Name) := do
     if hasUnsafeRecName c then
-      throwError "audit: forbidden companion {c} in {mod}"
+      throwError "audit: forbidden companion {c} in {loc}"
     for u in ci.type.getUsedConstants do
       if hasUnsafeRecName u then
-        throwError "audit: type of {c} in {mod} uses {u}"
+        throwError "audit: type of {c} in {loc} uses {u}"
     if let some v := ci.value? then
       for u in v.getUsedConstants do
         if hasUnsafeRecName u then
-          throwError "audit: body of {c} in {mod} uses {u}"
-  let isPropextOnly (a : Name) : Bool :=
-    a == ``propext
-  let isConstructive (a : Name) : Bool :=
-    a == ``propext || a == ``Quot.sound
-  let auditModule (mod : Name) (propextOnly : Bool)
-      (minThms minDefs : Nat) : CommandElabM String := do
+          throwError "audit: body of {c} in {loc} uses {u}"
+    if ci.isUnsafe || ci.isPartial then
+      throwError "audit: unsafe or partial constant {c} in {loc}"
+    let kind : Nat ← match ci with
+      | .axiomInfo _ => throwError "audit: forbidden axiom {c} in {loc}"
+      | .opaqueInfo _ => throwError "audit: forbidden opaque {c} in {loc}"
+      | .thmInfo _ => pure 1
+      | .defnInfo _ => pure 2
+      | _ => pure 0
+    let axs := (← liftCoreM <| Lean.collectAxioms c).toList
+    for a in axs do
+      if hasUnsafeRecName a then
+        throwError "audit: {c} in {loc} references {a}"
+      unless allowed.contains a do
+        throwError "audit: {c} in {loc} uses axiom {a} (all={axs})"
+    return (kind, axs)
+  -- Audit EVERY constant of an imported module, enforce declaration floors
+  -- (exact counts when `frozen`), and pin the exact union of axioms the
+  -- module uses.
+  let auditModule (mod : Name) (frozen : Bool)
+      (allowed expected : List Name) (minThms minDefs : Nat) :
+      CommandElabM String := do
     let some idx := env.getModuleIdx? mod
       | throwError "audit: module {mod} is not imported"
     let mut nThm : Nat := 0
     let mut nDef : Nat := 0
     let mut nOther : Nat := 0
-    let mut usedAxioms : List Name := []
+    let mut used : List Name := []
     for c in env.header.moduleData[idx]!.constNames do
-      match env.find? c with
-      | some ci =>
-        checkNoUnsafeRecInInfo mod c ci
-        if ci.isUnsafe then
-          throwError "audit: unsafe constant {c} in {mod}"
-        match ci with
-        | .axiomInfo _ =>
-          throwError "audit: forbidden axiom {c} in {mod}"
-        | .opaqueInfo _ =>
-          throwError "audit: forbidden opaque {c} in {mod}"
-        | .thmInfo _ =>
-          let axs ← liftCoreM <| Lean.collectAxioms c
-          for a in axs do
-            if hasUnsafeRecName a then
-              throwError "audit: {c} in {mod} references {a}"
-            let ok := if propextOnly then isPropextOnly a else isConstructive a
-            unless ok do
-              throwError "audit: {c} in {mod} depends on disallowed axiom {a} (all={axs})"
-            unless usedAxioms.contains a do
-              usedAxioms := a :: usedAxioms
-          nThm := nThm + 1
-        | .defnInfo info =>
-          if info.safety != .safe then
-            throwError "audit: non-safe def {c} in {mod}"
-          let axs ← liftCoreM <| Lean.collectAxioms c
-          for a in axs do
-            if hasUnsafeRecName a then
-              throwError "audit: {c} in {mod} references {a}"
-            let ok := if propextOnly then isPropextOnly a else isConstructive a
-            unless ok do
-              throwError "audit: {c} in {mod} depends on disallowed axiom {a} (all={axs})"
-            unless usedAxioms.contains a do
-              usedAxioms := a :: usedAxioms
-          nDef := nDef + 1
-        | _ =>
-          nOther := nOther + 1
-      | none => pure ()
-    if nThm < minThms || nDef < minDefs then
-      throwError "audit: vacuous floor in {mod}: thms={nThm} (<{minThms}), defs={nDef} (<{minDefs})"
-    return s!"{mod}: {nThm} thms, {nDef} defs, {nOther} aux, axioms={usedAxioms}"
-  let r1 ← auditModule `Anneal.Hybrid true 115 260
-  let r2 ← auditModule `Anneal.Hybrid.Canaries true 60 65
-  let r3 ← auditModule `Anneal.Backend.Rules true 90 310
-  let r4 ← auditModule `Anneal.Backend.CtxFact true 50 145
-  let r5 ← auditModule `Anneal.Backend.CongruenceDagCtx true 45 100
-  let r6 ← auditModule `Anneal.Backend.PassRefines true 20 60
-  let r7 ← auditModule `Anneal.Backend true 0 0
-  let r8 ← auditModule `Anneal.Backend.Canaries true 30 60
-  let r9 ← auditModule `Anneal.HybridCertBridgesV2026 false 80 120
-  -- Sweep every constant defined in this test module
+      let some ci := env.find? c
+        | throwError "audit: {c} of {mod} is not in the environment"
+      let (kind, axs) ← auditConst mod.toString allowed c ci
+      for a in axs do
+        unless used.contains a do
+          used := a :: used
+      if kind == 1 then
+        nThm := nThm + 1
+      else if kind == 2 then
+        nDef := nDef + 1
+      else
+        nOther := nOther + 1
+    if nThm < minThms then
+      throwError "audit: floor in {mod}: {nThm} thms < {minThms}"
+    if nDef < minDefs then
+      throwError "audit: floor in {mod}: {nDef} defs < {minDefs}"
+    if frozen && (nThm != minThms || nDef != minDefs) then
+      throwError "audit: frozen {mod} drifted: thms={nThm}, defs={nDef}"
+    unless sameSet used expected do
+      throwError "audit: {mod} uses axioms {used}, expected {expected}"
+    return s!"{mod}: {nThm} thms, {nDef} defs, {nOther} aux, axioms={used}"
+  -- The eight Episode 1 modules and the verbatim `Backend.Canaries` port are
+  -- frozen: their theorem and definition counts are pinned exactly.
+  let r1 ← auditModule `Anneal.Hybrid true propextOnly propextOnly 120 269
+  let r2 ←
+    auditModule `Anneal.Hybrid.Canaries true propextOnly propextOnly 65 70
+  let r3 ←
+    auditModule `Anneal.Backend.Rules true propextOnly propextOnly 95 316
+  let r4 ←
+    auditModule `Anneal.Backend.CtxFact true propextOnly propextOnly 52 150
+  let r5 ←
+    auditModule `Anneal.Backend.CongruenceDagCtx true propextOnly
+      propextOnly 46 104
+  let r6 ←
+    auditModule `Anneal.Backend.PassRefines true propextOnly propextOnly
+      23 66
+  let r7 ← auditModule `Anneal.Backend true propextOnly [] 0 0
+  let r8 ←
+    auditModule `Anneal.Backend.Canaries true propextOnly propextOnly 30 64
+  let r9 ←
+    auditModule `Anneal.HybridCertBridgesV2026 false constructive
+      constructive 124 168
+  -- Sweep every constant defined so far in this test module
   let mut testThms : Nat := 0
   let mut testDefs : Nat := 0
-  let mut testAxioms : List Name := []
-  for (c, info) in env.constants.map₂.toList do
-    checkNoUnsafeRecInInfo `HybridBackendCertGateTests c info
-    if info.isUnsafe then
-      throwError "audit: unsafe constant {c} in test module"
-    match info with
-    | .axiomInfo _ =>
-      throwError "audit: forbidden axiom {c} in test module"
-    | .opaqueInfo _ =>
-      throwError "audit: forbidden opaque {c} in test module"
-    | .thmInfo _ =>
-      let axs ← liftCoreM <| Lean.collectAxioms c
-      for a in axs do
-        if hasUnsafeRecName a then
-          throwError "audit: test theorem {c} references {a}"
-        unless isConstructive a do
-          throwError "audit: test theorem {c} depends on disallowed axiom {a} (all={axs})"
-        unless testAxioms.contains a do
-          testAxioms := a :: testAxioms
+  let mut testUsed : List Name := []
+  for (c, ci) in env.constants.map₂.toList do
+    let (kind, axs) ← auditConst "the test module" constructive c ci
+    for a in axs do
+      unless testUsed.contains a do
+        testUsed := a :: testUsed
+    if kind == 1 then
       testThms := testThms + 1
-    | .defnInfo defn =>
-      if defn.safety != .safe then
-        throwError "audit: non-safe def {c} in test module"
-      let axs ← liftCoreM <| Lean.collectAxioms c
-      for a in axs do
-        if hasUnsafeRecName a then
-          throwError "audit: test def {c} references {a}"
-        unless isConstructive a do
-          throwError "audit: test def {c} depends on disallowed axiom {a} (all={axs})"
-        unless testAxioms.contains a do
-          testAxioms := a :: testAxioms
+    else if kind == 2 then
       testDefs := testDefs + 1
-    | _ => pure ()
-  if testThms < 12 || testDefs < 15 then
-    throwError "audit: vacuous test floor: thms={testThms}, defs={testDefs}"
-  logInfo m!"ALL 10 MODULES AUDITED CLEAN (0 Classical.choice, 0 sorryAx, 0 ofReduceBool, 0 unsafe_rec):
-  {r1}
-  {r2}
-  {r3}
-  {r4}
-  {r5}
-  {r6}
-  {r7}
-  {r8}
-  {r9}
-  test_module: {testThms} thms, {testDefs} defs, axioms={testAxioms}"
+  if testThms < 20 || testDefs < 33 then
+    throwError "audit: test floor: thms={testThms}, defs={testDefs}"
+  let rT :=
+    s!"test module: {testThms} thms, {testDefs} defs, axioms={testUsed}"
+  -- Pin the EXACT axiom set of every capstone, so a proof that starts to
+  -- depend on a new axiom fails here even while it stays within the bound.
+  let expectAxioms (expected : List Name) (cs : List Name) :
+      CommandElabM Unit := do
+    for c in cs do
+      let axs := (← liftCoreM <| Lean.collectAxioms c).toList
+      unless sameSet axs expected do
+        throwError "audit: {c} uses axioms {axs}, expected {expected}"
+  expectAxioms []
+    [ ``gateVerdict_sound,
+      ``canonicalDiodeChunkGate_cut_sound,
+      ``canonicalDiode_stream_all_emitted_canonical,
+      ``canonicalDiode_stream_faithful_eq_filterAll,
+      ``canonicalDiode_stream_halts_on_tampered_midstream,
+      ``canonicalDiode_stream_prefix_eq_filterAll ]
+  expectAxioms propextOnly
+    [ ``natCutIdxGate_cut_sound,
+      ``intCutIdxGate_cut_sound,
+      ``natCutDualGate_cut_sound,
+      ``natCutPortfolio_sound,
+      ``intCutPortfolio_sound,
+      ``farkasMirGate_cut_sound,
+      ``farkasMirPortfolio_sound,
+      ``natCutIdxGate_discharges_uint_add_no_overflow,
+      ``natCutIdxGate_discharges_uint_sub_no_underflow_certified,
+      ``semRefinesUnder_preserves_mirOptRefines,
+      ``semRefinesUnder_preserves_mirOptRefines_relational,
+      ``blockOptGate_cut_preserves_mirRefines,
+      ``blockOptGate_cut_transports_to_mirExecState,
+      ``blockOptGate_cut_transports_to_mirExecState_equiv,
+      ``u64_add_blockOptGate_cut_to_stepMirState,
+      ``u64_add_blockOptGate_cut_to_stepMirState_wrapping,
+      ``u64_sub_blockOptGate_cut_to_stepMirState,
+      ``u64_sub_blockOptGate_cut_to_stepMirState_wrapping,
+      ``u64_add_farkas_and_blockOpt_cuts_to_stepMirState,
+      ``u64_sub_farkas_and_blockOpt_cuts_to_stepMirState,
+      ``neg_u64_add_unproven_elision_never_certified,
+      ``neg_u64_sub_unproven_elision_never_certified,
+      ``neg_u64_add_overflow_stepMirState_matrix,
+      ``neg_u64_sub_underflow_stepMirState_matrix,
+      ``neg_aborted_strategy_separation,
+      ``abstractCost_boolCertCut_shrink,
+      ``neg1_symmOnDirRefine_rejected,
+      ``neg5_fuzzAndSorryCandidatesRejectedByGate,
+      ``neg7_unconditionalGuardElision_unsound,
+      ``neg10_reversedDropSubNuw_rejected ]
+  -- `Quot.sound` enters only through `ITree.toPartial` statements
+  expectAxioms constructive
+    [ ``u64_add_ctxFact_to_stepMirState_bridge,
+      ``u64_sub_ctxFact_to_stepMirState_bridge,
+      ``u64_add_farkasMirGate_to_stepMirState_bridge,
+      ``u64_sub_farkasMirGate_to_stepMirState_bridge,
+      ``u64_add_natCutIdxGate_to_stepMirState_bridge,
+      ``u64_sub_natCutIdxGate_to_stepMirState_bridge,
+      ``neg_u64_add_undischarged_guard_elision_unsound,
+      ``neg_u64_sub_undischarged_guard_elision_unsound ]
+  let report :=
+    "\n  ".intercalate [r1, r2, r3, r4, r5, r6, r7, r8, r9, rT]
+  logInfo m!"ALL 10 MODULES AUDITED CLEAN:\n  {report}"
 
-#print axioms Anneal.HybridCertBridgesV2026.natCutIdxGate_cut_sound
-#print axioms Anneal.HybridCertBridgesV2026.intCutIdxGate_cut_sound
-#print axioms Anneal.HybridCertBridgesV2026.natCutPortfolio_sound
-#print axioms Anneal.HybridCertBridgesV2026.farkasMirGate_cut_sound
-#print axioms Anneal.HybridCertBridgesV2026.natCutIdxGate_discharges_uint_add_no_overflow
-#print axioms Anneal.HybridCertBridgesV2026.canonicalDiode_stream_all_emitted_canonical
-#print axioms Anneal.HybridCertBridgesV2026.canonicalDiode_stream_faithful_eq_filterAll
-#print axioms Anneal.HybridCertBridgesV2026.blockOptGate_cut_preserves_mirRefines
-#print axioms Anneal.HybridCertBridgesV2026.u64_add_farkasMirGate_to_stepMirState_bridge
-#print axioms Anneal.HybridCertBridgesV2026.u64_sub_natCutIdxGate_to_stepMirState_bridge
-#print axioms Anneal.HybridCertBridgesV2026.neg_u64_add_undischarged_guard_elision_unsound
-#print axioms Anneal.HybridCertBridgesV2026.neg_aborted_strategy_separation
-#print axioms Anneal.Backend.Canaries.abstractCost_boolCertCut_shrink
-#print axioms Anneal.Mir.HybridBackendCertGateTests.test_linearArithIndexed_boolCertCut_discharges
-#print axioms Anneal.Mir.HybridBackendCertGateTests.test_farkasMirGate_boolCertCut_variants
-#print axioms Anneal.Mir.HybridBackendCertGateTests.test_canonicalDiode_boolCertCut_and_valid_stream
-#print axioms Anneal.Mir.HybridBackendCertGateTests.test_backend_overflowTrap_e2e_add_sub
+#print axioms natCutIdxGate_cut_sound
+#print axioms intCutIdxGate_cut_sound
+#print axioms natCutPortfolio_sound
+#print axioms gateVerdict_sound
+#print axioms farkasMirGate_cut_sound
+#print axioms natCutIdxGate_discharges_uint_add_no_overflow
+#print axioms canonicalDiode_stream_all_emitted_canonical
+#print axioms canonicalDiode_stream_faithful_eq_filterAll
+#print axioms canonicalDiode_stream_prefix_eq_filterAll
+#print axioms blockOptGate_cut_preserves_mirRefines
+#print axioms blockOptGate_cut_transports_to_mirExecState_equiv
+#print axioms u64_add_farkas_and_blockOpt_cuts_to_stepMirState
+#print axioms u64_sub_farkas_and_blockOpt_cuts_to_stepMirState
+#print axioms u64_add_farkasMirGate_to_stepMirState_bridge
+#print axioms u64_sub_natCutIdxGate_to_stepMirState_bridge
+#print axioms neg_u64_add_undischarged_guard_elision_unsound
+#print axioms neg_u64_add_unproven_elision_never_certified
+#print axioms neg_aborted_strategy_separation
+#print axioms abstractCost_boolCertCut_shrink
+#print axioms test_linearArithIndexed_boolCertCut_discharges
+#print axioms test_farkasMirGate_boolCertCut_variants
+#print axioms test_gateVerdict_withFallback_total_and_sound
+#print axioms test_canonicalDiode_boolCertCut_and_valid_stream
+#print axioms test_canonicalDiode_midstream_halt_and_prefix_characterization
+#print axioms test_backend_overflowTrap_e2e_add_sub
+#print axioms test_backend_cert_transport_to_stepMirState
+#print axioms test_backend_unproven_tier_elision_never_certified
 
 end Anneal.Mir.HybridBackendCertGateTests
