@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -62,12 +63,15 @@ ROOT_MANIFEST_REPO_REQUIRED = (
 )
 OLEAN_RESULT_KEYS = frozenset({
     "auditor", "schema", "scope", "modules", "loadedModules", "artifactPartsChecked",
+    "oleanFilesValidated", "privateNamesAudited", "moduleConstantsAxiomSwept", "opaqueTheoremReadinessFlags",
     "auditedDeclarations", "reachableDeclarations", "codegenCompanions", "irDeclarationsChecked",
     "intrinsicTagsChecked", "kernelTagConfirmations", "constructiveModulesChecked",
     "specStrengthChecksPassed", "axioms", "localTestAxioms",
     "kernelConfirmedNativeAxioms", "provisionalNativeAxioms", "replayedDeclarations", "replay",
     "importMicros", "elapsedMicros"})
-OLEAN_COUNT_KEYS = ("loadedModules", "artifactPartsChecked", "auditedDeclarations", "reachableDeclarations",
+OLEAN_COUNT_KEYS = ("loadedModules", "artifactPartsChecked", "oleanFilesValidated", "privateNamesAudited",
+                    "moduleConstantsAxiomSwept", "opaqueTheoremReadinessFlags",
+                    "auditedDeclarations", "reachableDeclarations",
                     "codegenCompanions", "irDeclarationsChecked", "intrinsicTagsChecked",
                     "kernelTagConfirmations", "constructiveModulesChecked", "specStrengthChecksPassed",
                     "localTestAxioms", "replayedDeclarations", "importMicros", "elapsedMicros")
@@ -689,6 +693,107 @@ def _canonical_regular(path: Path) -> bool:
         return False
 
 
+def _canonical_dir(path: Path) -> bool:
+    """True iff `path` is an absolute, canonical, non-symlinked directory."""
+    if not path.is_absolute():
+        return False
+    try:
+        st = path.lstat()
+        return stat.S_ISDIR(st.st_mode) and os.path.realpath(str(path)) == str(path)
+    except OSError:
+        return False
+
+
+def _path_within_root(root: Path, target: Path) -> bool:
+    """Canonical component-boundary containment check (blocks `/tmp/root_evil` vs `/tmp/root` and symlinks)."""
+    r, t = os.path.realpath(str(root)), os.path.realpath(str(target))
+    try:
+        return os.path.commonpath([r, t]) == r
+    except ValueError:
+        return False
+
+
+_OLEAN_MAGIC = b"olean"
+_OLEAN_LEAN_VER = b"4.34.1" + b"\x00" * 27
+_OLEAN_GITHASH = b"5045d0056413266e57c625dcd7c365b10e377c52"
+_OLEAN_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _check_no_toolchain_shadow(art_root: Path, phase: str) -> None:
+    """Refuse artifact roots that shadow `Init`/`Std`/`Lean` `.olean*` files or contain symlinks under them."""
+    for root_name in ("Init", "Std", "Lean"):
+        for ext in PARTS[:3]:
+            cand = art_root / f"{root_name}.{ext}"
+            if cand.exists() or cand.is_symlink():
+                raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact root shadows toolchain file: {cand}")
+        sub = art_root / root_name
+        if sub.is_symlink():
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact root has symlinked toolchain dir: {sub}")
+        if sub.is_dir():
+            for directory, dirs, files in os.walk(sub, followlinks=False):
+                for name in sorted(dirs + files):
+                    p = Path(directory) / name
+                    if p.is_symlink():
+                        raise Failure(1, phase, f"[moduleProvenanceSpoofed] symlink under shadowed toolchain dir: {p}")
+                    if any(name.endswith("." + ext) for ext in PARTS[:3]):
+                        raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact root shadows toolchain artifact: {p}")
+
+
+def _validate_olean_parts(module: str, olean_parts: list[str], phase: str) -> None:
+    """Pre-`importModules` binary header & compacted-region bounds check (leanprover/lean4#16737)."""
+    if len(olean_parts) not in (1, 3):
+        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: expected 1 or 3 olean parts, got {len(olean_parts)}")
+    parents: list[tuple[int, int, int]] = []
+    for raw in olean_parts:
+        p = Path(raw)
+        if not _canonical_regular(p):
+            raise Failure(1, phase, f"[moduleProvenanceSpoofed] {module}: non-canonical olean part {p}")
+        try:
+            with p.open("rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                if size < 96 or size > _OLEAN_MAX_BYTES:
+                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: {p} size {size} outside [96, 256 MiB]")
+                hdr = f.read(96)
+                if len(hdr) != 96 or hdr[:5] != _OLEAN_MAGIC or hdr[5] != 2 or (hdr[6] & ~1) != 0:
+                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid header magic/version/flags in {p}")
+                if hdr[7:40] != _OLEAN_LEAN_VER or hdr[40:80] != _OLEAN_GITHASH:
+                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: unpinned Lean version/githash in {p}")
+                base_addr, root_ptr = struct.unpack_from("<QQ", hdr, 80)
+                if base_addr == 0 or (base_addr & 7) != 0 or base_addr + size >= (1 << 64):
+                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid/overflowing baseAddr in {p}")
+                if any(not (base_addr + size <= pb or pb + ps <= base_addr) for pb, ps, _ in parents):
+                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: overlapping compacted-region layer in {p}")
+                if base_addr + 96 <= root_ptr <= base_addr + size - 8:
+                    if (root_ptr & 7) != 0:
+                        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: unaligned rootPtr in {p}")
+                    off = root_ptr - base_addr
+                    f.seek(off)
+                    obj_hdr = f.read(8)
+                    if len(obj_hdr) != 8:
+                        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: truncated root object in {p}")
+                    rc, cs_sz, other, tag = struct.unpack("<iHBB", obj_hdr)
+                    min_sz = 8 + 8 * other
+                    obj_sz = cs_sz if cs_sz > 0 else min_sz
+                    if rc != 0 or tag > 243 or (cs_sz != 0 and cs_sz < min_sz) or off + obj_sz > size:
+                        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root object header in {p}")
+                    child_raw = f.read(8 * other)
+                    if len(child_raw) != 8 * other:
+                        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: truncated root children in {p}")
+                    for child in struct.unpack(f"<{other}Q", child_raw):
+                        if child & 1:
+                            continue
+                        in_own = (child & 7) == 0 and (base_addr + 96 <= child <= base_addr + size - 8)
+                        in_par = (child & 7) == 0 and any(pb + 96 <= child <= pb + ps - 8 for pb, ps, _ in parents)
+                        if not (in_own or in_par):
+                            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: out-of-bounds root child ptr in {p}")
+                else:
+                    if not parents or size != 96 or not any(root_ptr == pr for _, _, pr in parents):
+                        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid out-of-region rootPtr in {p}")
+                parents.append((base_addr, size, root_ptr))
+        except OSError as error:
+            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: cannot read {p}: {error}") from error
+
+
 class Checker:
     def __init__(
         self,
@@ -955,6 +1060,10 @@ class Checker:
                 # Never satisfy an OleanEnvAuditor audit from cache if any artifact or source path
                 # is non-canonical, splits base directories, mismatches its module path, swaps
                 # olean/IR groups, or omits an on-disk companion: let the auditor run and reject it.
+                approved_roots = [Path(r) for r in fields.get("approvedBuildRoots", [])]
+                if any(not _canonical_dir(r) for r in approved_roots):
+                    return None
+                checked_roots: set[str] = set()
                 for mod, groups in self.artifacts.items():
                     if not isinstance(groups, list) or len(groups) != 2:
                         return None
@@ -977,11 +1086,29 @@ class Checker:
                         cand = Path(f"{base}.{ext}")
                         if str(cand) not in listed and (cand.exists() or cand.is_symlink()):
                             return None
+                    try:
+                        _validate_olean_parts(mod, olean_parts, mode)
+                    except Failure:
+                        return None
+                    if mod not in self.foundation:
+                        art_root = Path(olean_parts[0][:-len(rel_suffix)] or "/")
+                        if not _canonical_dir(art_root):
+                            return None
+                        if approved_roots and any(not any(_path_within_root(r, Path(p)) for r in approved_roots)
+                                                  for p in olean_parts + ir_parts):
+                            return None
+                        if str(art_root) not in checked_roots:
+                            try:
+                                _check_no_toolchain_shadow(art_root, mode)
+                            except Failure:
+                                return None
+                            checked_roots.add(str(art_root))
                 for _, p in fields.get("sources", []):
                     if not _canonical_regular(Path(p)):
                         return None
-                # Staged source paths differ per run; key them by module and content instead.
-                fields = {**fields, "sources": [(m, digest(Path(p))) for m, p in fields.get("sources", [])]}
+                # Staged source/stage build-root paths differ per run; containment was just verified above.
+                fields = {**fields, "sources": [(m, digest(Path(p))) for m, p in fields.get("sources", [])],
+                          **({"approvedBuildRoots": bool(approved_roots)} if "approvedBuildRoots" in fields else {})}
                 inspector_sha = {"trustedBoundary": inspector_sha,
                                  "oleanEnvAuditor": getattr(self, "olean_auditor_hash", None)}
                 artifact_hashes = [
@@ -1102,8 +1229,15 @@ class Checker:
                 return False
             available[part] = str(dest)
             self.expected_artifacts[str(dest)] = expected_sha
+        olean_parts = [available[p] for p in PARTS[:3] if p in available]
+        try:
+            if not _path_within_root(self.stage, output):
+                return False
+            _validate_olean_parts(module, olean_parts, "compile")
+        except Failure:
+            return False
         self.artifacts[module] = [
-            [available[p] for p in PARTS[:3] if p in available],
+            olean_parts,
             [available[p] for p in PARTS[3:] if p in available],
         ]
         return True
@@ -1140,6 +1274,11 @@ class Checker:
 
     def inspect(self, mode: str, **fields) -> dict:
         self.phase = mode
+        if any(k.startswith(("LEAN_PATH", "LEAN_SYSROOT")) for k in self.environment):
+            raise Failure(2, mode, "hostile LEAN_PATH/LEAN_SYSROOT leaked into child environment")
+        if mode.startswith("inductive-replay") or mode in ("audit", "downstream-audit"):
+            for mod, groups in sorted(self.artifacts.items()):
+                _validate_olean_parts(mod, groups[0], mode)
         cache_key = self._inspect_cache_key(mode, fields)
         if cache_key is not None and self.cache_dir is not None:
             cache_file = self.cache_dir / "inspect" / f"{mode}-{cache_key}.json"
@@ -1266,6 +1405,8 @@ class Checker:
                     and result["replay"] is True
                     and result["modules"] == sorted(fields["modules"])
                     and all(type(result[k]) is int and result[k] >= 0 for k in OLEAN_COUNT_KEYS)
+                    and result["oleanFilesValidated"] >= len(fields["modules"])
+                    and (fields.get("checkOpaqueTheoremReadiness", False) or result["opaqueTheoremReadinessFlags"] == 0)
                     and result["auditedDeclarations"] >= result["replayedDeclarations"]
                     and result["constructiveModulesChecked"] == len(fields.get("constructiveModules", []))
                     and result["specStrengthChecksPassed"] == len(fields.get("specStrengthChecks", []))
@@ -1307,7 +1448,8 @@ class Checker:
         toolchain roots cannot be requested here."""
         allowed = {"roots", "modules", "artifacts", "graph", "localAxiomModules", "claimModules",
                    "statementForbidden", "statementUnfold", "sources", "scope",
-                   "allowClassicalChoice", "constructiveModules", "specStrengthChecks"}
+                   "allowClassicalChoice", "constructiveModules", "specStrengthChecks",
+                   "approvedBuildRoots", "checkOpaqueTheoremReadiness"}
         phase = "olean-audit"
         require(isinstance(request, dict) and set(request) <= allowed
                 and {"roots", "modules", "artifacts"} <= set(request), phase, "malformed --audit-olean request")
@@ -1318,6 +1460,15 @@ class Checker:
                     f"malformed --audit-olean field {key}")
         allow_classical = request.get("allowClassicalChoice", True)
         require(type(allow_classical) is bool, phase, "malformed --audit-olean field allowClassicalChoice")
+        check_opaque_thm = request.get("checkOpaqueTheoremReadiness", False)
+        require(type(check_opaque_thm) is bool, phase, "malformed --audit-olean field checkOpaqueTheoremReadiness")
+        raw_build_roots = request.get("approvedBuildRoots", [])
+        require(isinstance(raw_build_roots, list) and all(isinstance(r, str) and os.path.isabs(r) for r in raw_build_roots),
+                phase, "malformed --audit-olean field approvedBuildRoots")
+        approved_roots = [Path(r) for r in raw_build_roots]
+        for r in approved_roots:
+            if not _canonical_dir(r):
+                raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical approvedBuildRoots entry: {r}")
         constructive_mods = request.get("constructiveModules", [])
         require(len(constructive_mods) == len(set(constructive_mods)), phase,
                 "malformed --audit-olean field constructiveModules")
@@ -1423,23 +1574,45 @@ class Checker:
         saved_expected = dict(self.expected_artifacts)
         saved_graph = dict(self.graph)
         caller_hashes: dict[str, str] = {}
+        checked_roots: set[str] = set()
         try:
             for entry in artifacts:
                 require(isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str) and bool(entry[0])
                         and entry[0] not in self.artifacts and isinstance(entry[1], list) and len(entry[1]) == 2
                         and all(isinstance(g, list) and all(isinstance(p, str) and os.path.isabs(p) for p in g)
                                 for g in entry[1]), phase, "malformed --audit-olean artifact entry")
+                mod, (olean_parts, ir_parts) = entry[0], entry[1]
                 for group in entry[1]:
                     for path in group:
                         regular(Path(path), phase)
                         if not _canonical_regular(Path(path)):
                             raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical artifact path: {path}")
+                        if approved_roots and not any(_path_within_root(r, Path(path)) for r in approved_roots):
+                            raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact path escapes approvedBuildRoots: {path}")
                         h = digest(Path(path))
                         self.expected_artifacts[path] = h
                         caller_hashes[path] = h
-                self.artifacts[entry[0]] = [list(entry[1][0]), list(entry[1][1])]
+                if olean_parts:
+                    rel_suffix = "/" + mod.replace(".", "/") + ".olean"
+                    if olean_parts[0].endswith(rel_suffix):
+                        art_root = Path(olean_parts[0][:-len(rel_suffix)] or "/")
+                        if not _canonical_dir(art_root):
+                            raise Failure(1, phase, f"[moduleProvenanceSpoofed] non-canonical artifact root: {art_root}")
+                        for p in olean_parts + ir_parts:
+                            if not _path_within_root(art_root, Path(p)):
+                                raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact parts are not canonical companions of root {art_root}: {p}")
+                        if str(art_root) not in checked_roots:
+                            _check_no_toolchain_shadow(art_root, phase)
+                            checked_roots.add(str(art_root))
+                    if len(olean_parts) in (1, 3):
+                        _validate_olean_parts(mod, olean_parts, phase)
+                self.artifacts[mod] = [list(olean_parts), list(ir_parts)]
             if merged_graph is not None:
                 self.graph = merged_graph
+            effective_build_roots = (
+                list(dict.fromkeys([*raw_build_roots, *(str(d) for d in (self.stage / "lib", self.stage / "downstream-lib") if d.is_dir())]))
+                if approved_roots else []
+            )
             verdict = self.olean_audit(
                 "olean-audit", scope=scope, roots=[*request["roots"], *compiled_own],
                 modules=[*request["modules"], *compiled_own],
@@ -1451,7 +1624,9 @@ class Checker:
                 claimModules=request.get("claimModules", []),
                 statementForbidden=request.get("statementForbidden", []),
                 statementUnfold=request.get("statementUnfold", []),
-                sources=[tuple(s) for s in sources])
+                sources=[tuple(s) for s in sources],
+                approvedBuildRoots=effective_build_roots,
+                checkOpaqueTheoremReadiness=check_opaque_thm)
             for path, expected in (*caller_hashes.items(), *source_hashes.items()):
                 regular(Path(path), "freshness")
                 if digest(Path(path)) != expected:
@@ -1568,11 +1743,15 @@ class Checker:
                         raise Failure(2, "foundation", f"unexpected companion part: {relative}")
                     continue
                 regular(installed, "foundation")
+                if not _canonical_regular(installed) or not _path_within_root(self.prefix / "lib/lean", installed):
+                    raise Failure(1, "foundation", f"[moduleProvenanceSpoofed] sysroot artifact escapes lib/lean: {installed}")
                 if digest(installed) != expected:
                     raise Failure(2, "foundation", f"artifact digest mismatch: {relative}")
                 copied = self.stage / "foundation" / relative
                 copied.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(installed, copied)
+                if not _path_within_root(self.stage / "foundation", copied):
+                    raise Failure(2, "foundation", f"staged foundation artifact escapes stage: {copied}")
                 if digest(copied) != expected:
                     raise Failure(2, "foundation", f"artifact changed while copying: {relative}")
                 available[part] = str(copied)
@@ -1581,6 +1760,7 @@ class Checker:
                                       [available[p] for p in PARTS[3:] if p in available]]
             if not self.artifacts[module][0]:
                 raise Failure(2, "foundation", f"missing olean for {module}")
+            _validate_olean_parts(module, self.artifacts[module][0], "foundation")
         self.graph = dict(self.lock["graph"])
         if self.inspect("foundation").get("graph") != self.graph:
             raise Failure(1, "foundation", "locked compiled foundation DAG differs")
@@ -1716,8 +1896,11 @@ class Checker:
                     self.expected_artifacts[str(artifact)] = digest(artifact)
             if "olean" not in available:
                 raise Failure(2, "compile", f"compiler omitted output for {module}")
+            if not _path_within_root(self.stage / "downstream-lib", output):
+                raise Failure(2, "compile", f"compiled output escapes downstream-lib: {output}")
             self.artifacts[module] = [[available[p] for p in PARTS[:3] if p in available],
                                       [available[p] for p in PARTS[3:] if p in available]]
+            _validate_olean_parts(module, self.artifacts[module][0], "compile")
             self.graph[module] = edge_list
             self._store_cached_module(cache_key, available)
         if not self.fast:
@@ -1794,7 +1977,8 @@ class Checker:
             statementForbidden=[m for m, _, _, r in targets if r == "theory"],
             statementUnfold=[m for m, _, _, r in targets if r in ("claim", "examples", "test")],
             sources=[*((n, str(self.source_copy / p)) for n, p in self.modules.items()),
-                     *((m, str(copies[m])) for m in downstream_modules)])
+                     *((m, str(copies[m])) for m in downstream_modules)],
+            approvedBuildRoots=[str(d) for d in (self.stage / "lib", self.stage / "downstream-lib") if d.is_dir()])
         result["inductiveReplay"] = self.inspect(
             "inductive-replay-downstream", targets=downstream_modules,
             roots=self.foundation + list(self.modules) + downstream_modules)
@@ -1884,8 +2068,11 @@ class Checker:
                     self.expected_artifacts[str(path)] = digest(path)
             if "olean" not in available:
                 raise Failure(2, "compile", f"compiler omitted output for {module}")
+            if not _path_within_root(self.stage / "lib", output):
+                raise Failure(2, "compile", f"compiled output escapes lib: {output}")
             self.artifacts[module] = [[available[p] for p in PARTS[:3] if p in available],
                                       [available[p] for p in PARTS[3:] if p in available]]
+            _validate_olean_parts(module, self.artifacts[module][0], "compile")
             self._store_cached_module(cache_key, available)
         if not self.fast:
             self.freshness()
@@ -1894,7 +2081,8 @@ class Checker:
             raise Failure(2, "audit", "incomplete final audit evidence")
         report["oleanAudit"] = self.olean_audit(
             "olean-audit", scope="trusted", roots=list(self.modules), modules=list(self.modules),
-            sources=[(n, str(self.source_copy / p)) for n, p in self.modules.items()])
+            sources=[(n, str(self.source_copy / p)) for n, p in self.modules.items()],
+            approvedBuildRoots=[str(self.stage / "lib")] if (self.stage / "lib").is_dir() else [])
         report["inductiveReplay"] = self.inspect(
             "inductive-replay-trusted", targets=list(self.modules),
             roots=self.foundation + list(self.modules))
