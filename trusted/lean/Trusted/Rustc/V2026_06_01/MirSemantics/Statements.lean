@@ -12342,7 +12342,8 @@ def decodeScalarLayoutBytesTarget
     (layouts : LayoutTable)
     (sl : ScalarLayout)
     (allowUninit : Bool)
-    (bytes : List AbstractByte) :
+    (bytes : List AbstractByte)
+    (enforceValidRange : Bool := true) :
     Option Value :=
   match layouts.isLittleEndian with
   | false => .none
@@ -12366,11 +12367,11 @@ def decodeScalarLayoutBytesTarget
             match sl with
             | .union pk =>
               match allBytesSameProv bytes, decodeScalarBytes bytes false with
-              | .some (.some (a, _)), .some (sv, _) =>
-                match pk with
-                | .pointer _ =>
+              | .some (.some (a, t)), .some (sv, _) =>
+                match Nat.beq a t, pk with
+                | true, .pointer _ =>
                   .some (.ptr { allocId := a, offsetBytes := sv.bits } expectedSz)
-                | _ => .none
+                | _, _ => .none
               | .some .none, .some (sv, _) =>
                 .some (.scalar sv)
               | _, _ => .none
@@ -12378,21 +12379,24 @@ def decodeScalarLayoutBytesTarget
               match pk with
               | .pointer _ =>
                 match allBytesSameProv bytes, decodeScalarBytes bytes false with
-                | .some (.some (a, _)), .some (sv, _) =>
-                  match
-                    Bool.and (Nat.beq a 0) (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := sv.bits }))
-                  with
+                | .some (.some (a, t)), .some (sv, _) =>
+                  match Nat.beq a t with
+                  | false => .none
                   | true =>
-                    match wrappingRangeContains validRange sv.bits with
-                    | true => .some (.ptr { allocId := 0, offsetBytes := sv.bits } expectedSz)
-                    | false => .none
-                  | false =>
-                    match validRangeCoversAllNonNull expectedSz validRange with
-                    | true => .some (.ptr { allocId := a, offsetBytes := sv.bits } expectedSz)
-                    | false => .none
+                    match
+                      Bool.and (Nat.beq a 0) (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := sv.bits }))
+                    with
+                    | true =>
+                      match Bool.or (Bool.not enforceValidRange) (wrappingRangeContains validRange sv.bits) with
+                      | true => .some (.scalar sv)
+                      | false => .none
+                    | false =>
+                      match validRangeCoversAllNonNull expectedSz validRange with
+                      | true => .some (.ptr { allocId := a, offsetBytes := sv.bits } expectedSz)
+                      | false => .none
                 | .some .none, .some (sv, _) =>
-                  match wrappingRangeContains validRange sv.bits with
-                  | true => .some (.ptr { allocId := 0, offsetBytes := sv.bits } expectedSz)
+                  match Bool.or (Bool.not enforceValidRange) (wrappingRangeContains validRange sv.bits) with
+                  | true => .some (.scalar sv)
                   | false => .none
                 | _, _ => .none
               | _ =>
@@ -12401,12 +12405,15 @@ def decodeScalarLayoutBytesTarget
                 | false =>
                   match decodeScalarBytes bytes false with
                   | .some (sv, _) =>
-                    match wrappingRangeContains validRange sv.bits with
-                    | false => .none
+                    match enforceValidRange with
+                    | false => .some (.scalar sv)
                     | true =>
-                      match charShapedSurrogate pk validRange sv.bits with
-                      | true => .none
-                      | false => .some (.scalar sv)
+                      match wrappingRangeContains validRange sv.bits with
+                      | false => .none
+                      | true =>
+                        match charShapedSurrogate pk validRange sv.bits with
+                        | true => .none
+                        | false => .some (.scalar sv)
                   | .none => .none
 
 /--
@@ -12491,9 +12498,9 @@ def decodeValueAtLayoutIdx
     (mem : Memory)
     (layouts : LayoutTable)
     (allowPartialUninit : Bool) :
-    Nat → LayoutIdx → List AbstractByte → Option Value
-  | .zero, _, _ => .none
-  | .succ fuel', lIdx, bytes =>
+    Nat → LayoutIdx → List AbstractByte → (enforceValidRange : Bool := true) → Option Value
+  | .zero, _, _, _ => .none
+  | .succ fuel', lIdx, bytes, enforceValidRange =>
     match layouts.isLittleEndian with
     | false => .none
     | true =>
@@ -12517,7 +12524,7 @@ def decodeValueAtLayoutIdx
               | false =>
                 match l.backendRepr with
                 | .scalar s0 =>
-                  decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit bytes
+                  decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit bytes enforceValidRange
                 | _ =>
                   match allBytesUninit bytes, allowPartialUninit with
                   | true, true => .some .uninit
@@ -12538,7 +12545,7 @@ def decodeValueAtLayoutIdx
                   match
                     decodeFieldsAtLayoutIdxs
                       (fun fIdx bs =>
-                        decodeValueAtLayoutIdx mem layouts allowPartialUninit fuel' fIdx bs)
+                        decodeValueAtLayoutIdx mem layouts allowPartialUninit fuel' fIdx bs enforceValidRange)
                       layouts
                       bytes
                       offsets
@@ -12553,7 +12560,7 @@ def decodeValueAtLayoutIdx
                     | .some sz0 =>
                       match sliceAbstractBytes bytes off0.bytes sz0 with
                       | .some sl0 =>
-                        match decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit sl0 with
+                        match decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit sl0 enforceValidRange with
                         | .some v0 => .some (.aggregate varIdx (v0 :: .nil))
                         | .none => .none
                       | .none => .none
@@ -12569,8 +12576,8 @@ def decodeValueAtLayoutIdx
                       with
                       | .some sl0, .some sl1 =>
                         match
-                          decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit sl0,
-                          decodeScalarLayoutBytesTarget mem layouts s1 allowPartialUninit sl1
+                          decodeScalarLayoutBytesTarget mem layouts s0 allowPartialUninit sl0 enforceValidRange,
+                          decodeScalarLayoutBytesTarget mem layouts s1 allowPartialUninit sl1 enforceValidRange
                         with
                         | .some vFirst, .some vSecond =>
                           match swapped with
@@ -12597,7 +12604,7 @@ def decodeValueAtLayoutIdx
                         match
                           decodeArrayElemsAtLayoutIdx
                             (fun bs =>
-                              decodeValueAtLayoutIdx mem layouts allowPartialUninit fuel' elemLIdx bs)
+                              decodeValueAtLayoutIdx mem layouts allowPartialUninit fuel' elemLIdx bs enforceValidRange)
                             bytes
                             elemFl.size.bytes
                             stride.bytes
@@ -12631,7 +12638,7 @@ def decodeValueAtLayoutIdx
                     let vals :=
                       decodeUnionFieldsAtLayoutIdxs
                         (fun fIdx bs =>
-                          decodeValueAtLayoutIdx mem layouts true fuel' fIdx bs)
+                          decodeValueAtLayoutIdx mem layouts true fuel' fIdx bs true)
                         layouts
                         bytes
                         (fHead :: fTail)
@@ -12647,7 +12654,7 @@ def decodeValueAtLayoutIdx
                 | .nil =>
                   match l.backendRepr with
                   | .scalar s0 =>
-                    match decodeScalarLayoutBytesTarget mem layouts s0 true bytes with
+                    match decodeScalarLayoutBytesTarget mem layouts s0 true bytes true with
                     | .some v => .some v
                     | .none => rawOverlayFallback ()
                   | _ => rawOverlayFallback ()
@@ -12729,21 +12736,21 @@ def decodeThinPtrBytes
       | false => .none
     | false =>
       match allBytesSameProv bytes, decodeScalarBytes bytes false with
-      | .some (.some (a, _)), .some (sv, _) =>
-        match
-          Bool.and requireNonNull
-            (Bool.and (Nat.beq a 0)
-              (Bool.and (Nat.beq sv.bits 0)
-                (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := 0 }))))
-        with
-        | true => .none
-        | false => .some (.ptr { allocId := a, offsetBytes := sv.bits } ptrBytes)
+      | .some (.some (a, t)), .some (sv, _) =>
+        match Nat.beq a t with
+        | false => .none
+        | true =>
+          match
+            Bool.and requireNonNull
+              (Bool.and (Nat.beq a 0)
+                (Bool.and (Nat.beq sv.bits 0)
+                  (Bool.not (isBackedPtr mem { allocId := 0, offsetBytes := 0 }))))
+          with
+          | true => .none
+          | false => .some (.ptr { allocId := a, offsetBytes := sv.bits } ptrBytes)
       | .some .none, .some (sv, _) =>
         match requireNonNull with
-        | true =>
-          match Nat.beq sv.bits 0 with
-          | true => .none
-          | false => .some (.ptr { allocId := 0, offsetBytes := sv.bits } ptrBytes)
+        | true => .none
         | false => .some (.scalar sv)
       | _, _ => .none
 
@@ -13055,7 +13062,7 @@ def decodePartialUninitValue
           | .none => .none
         | .adt _ _ | .closure _ _ =>
           match resolveConsistentLayout? localDecls layouts ty with
-          | .some (lIdx, _) => decodeValueAtLayoutIdx mem layouts true (.succ fuel') lIdx bytes
+          | .some (lIdx, _) => decodeValueAtLayoutIdx mem layouts true (.succ fuel') lIdx bytes false
           | .none => .none
         | _ => .none
 

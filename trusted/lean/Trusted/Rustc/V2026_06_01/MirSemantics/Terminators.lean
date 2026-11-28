@@ -4462,6 +4462,7 @@ def writeBytesAction
                                           dstPlaceTy
                                           fillBytes
                                           .strictUcg630Ub
+                                          true
                                       with
                                       | .some fillVal =>
                                         .store dstPlace dstEntry.targetLocal dstPtr.tag fillVal

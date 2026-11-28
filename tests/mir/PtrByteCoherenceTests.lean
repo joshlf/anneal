@@ -35,6 +35,7 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (PtrByteFrag AbstractByte Value Lo
   decodeRawAbstractByteVals? overlayRawAbstractByteVals
   globalAllocSliceToAbstractBytes
   decodePtrBytesNoForge decodeScalarLayoutBytesNoForge decodeTypedValueFromBytes
+  decodeUntypedStorageBytes unionDirectSlotValidForFieldTy readProjectedValueUnionAware
   validateValueForTy? evalConstValue evalGlobalDerefRead evalSliceFatPtrDerefRead
   evalOperand evalByteCast evalRvalue
   evalStmt evalCopySingleDirect evalCopyUnionBytes evalForeignFrameCopySingleDirect
@@ -62,6 +63,7 @@ export Trusted.Rustc.V2026_08_01.MirSemantics (PtrByteFrag AbstractByte Value Lo
   decodeRawAbstractByteVals? overlayRawAbstractByteVals
   globalAllocSliceToAbstractBytes
   decodePtrBytesNoForge decodeScalarLayoutBytesNoForge decodeTypedValueFromBytes
+  decodeUntypedStorageBytes unionDirectSlotValidForFieldTy readProjectedValueUnionAware
   validateValueForTy? evalConstValue evalGlobalDerefRead evalSliceFatPtrDerefRead
   evalOperand evalByteCast evalRvalue
   evalStmt evalCopySingleDirect evalCopyUnionBytes evalForeignFrameCopySingleDirect
@@ -3654,6 +3656,454 @@ theorem b3_evalCopyMemory_ptr_byte_permutations_v06_v08 :
       some (.ptr 7 0x10 8) := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-! ## §4f. `[adv ep1-A3]` Adversarial Regressions & `lean-miri` Correspondence Gap Postmortem
+
+### `lean-miri` Correspondence Gap Postmortem (`mir-correspondence-postmortem`)
+Why `LeanMiriSpec` did not catch the four classes of TCB soundness / `Kani#5205` defects uncovered
+in Pass A3:
+1. **Union field read punning bypass on `.ref` / `.fnPtr` (`readProjectedValueUnionAware`)**:
+   `SimLM2_4` (`union_punning_field_read`) exercises scalar-to-scalar union field reads (`u32`/`u64`,
+   where `ScalarLayout` matches `RigidTy`), and did not exercise union punning from an integer or
+   byte-permuted pointer into a `.ref` or `.fnPtr` field (whose `TypeLayout` shares
+   `ScalarLayout.initialized (.pointer 0) ⟨1, MAX⟩` with `NonNull<T>`). `decodeUnionBytesWithCountOpt`
+   decoded non-zero plain/byte-swapped bytes into `.scalar ⟨addr, ptrBytes⟩`, and
+   `readProjectedValueUnionAware` returned cached `directFvOpt` directly without checking
+   `unionDirectSlotValidForFieldTy`.
+2. **`evalCopyMemory` provenance-free reference / `fnPtr` forgery (`decodeThinPtrBytes`)**:
+   `CoreMemPtrIntrinsicsLM` bridges typed `copy_nonoverlapping` on scalar and intact-pointer slices
+   and did not exercise untyped `evalCopyMemory` writing provenance-free non-zero integer bytes
+   (`0x1000u64`) into a `&T` or `fn()` destination, or copying a pointer with a distinct retagged
+   borrow tag (`frag.tag ≠ frag.allocId`). Prior to A3, `decodeThinPtrBytes` forged
+   `Value.ptr { allocId := 0, offsetBytes := sv.bits }` on `requireNonNull = true` when
+   `allBytesSameProv` was `.some .none`, and collapsed `frag.tag ≠ frag.allocId` onto `allocId`.
+3. **`evalCopyMemory` scalar-wrapper pointer forgery & write-time `Kani#5205` rejection
+   (`decodeScalarLayoutBytesTarget` / `decodeValueAtLayoutIdx`)**:
+   `decodeScalarLayoutBytesTarget` forged `Value.ptr ⟨0, sv.bits⟩` from provenance-free bytes on
+   `ScalarLayout.initialized (.pointer _)` (e.g. `PtrWrap(*const u8)`), causing subsequent
+   `transmute::<PtrWrap, u64>` to fail `.ub` under `.strictUcg630Ub`, and enforced
+   `wrappingRangeContains` / `charShapedSurrogate` at untyped `evalCopyMemory` write time on
+   non-union ADTs (`Unaligned<bool>`, `CharWrap(char)`) instead of deferring bit-validity UB to
+   typed reads (`Kani#5205`).
+4. **`writeBytesAction` on `&T` / `fn()` (`Terminators.lean`)**:
+   `CoreMemPtrIntrinsicsLM` tested `write_bytes` on integer/array/struct destinations and did not
+   exercise `write_bytes(&mut r, b, 1)` on `r : &T` or `r : fn()`. Passing default
+   `preservePartialPtrFrags = false` to `decodeUntypedStorageBytes` rejected untyped `write_bytes`
+   with `.fault .unsupported` at write time instead of storing the raw-byte carrier and faulting
+   `.ub` on typed read (`Kani#5205`). -/
+
+section A3Fixtures06
+
+open V06
+
+/-- `union IntOrRef { i: u64, r: &'static u8 }` at idx 16 (`fieldLayouts = [4, 6]`). -/
+def a3IntOrRefUnionL_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [4, 6] }
+
+/-- `union PtrOrRefFn { p: *const u8, r: &'static u8, f: fn(u32) -> u32 }` at idx 17. -/
+def a3PtrOrRefFnUnionL_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 3, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [5, 6, 6] }
+
+/-- `#[repr(transparent)] struct PtrWrap(*const u8)` at idx 18 (`fieldLayouts = [5]`). -/
+def a3PtrWrapL_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [5] }
+
+/-- `#[repr(transparent)] struct CharWrapField(char)` at idx 19 (`fieldLayouts = [3]`). -/
+def a3CharWrapFieldL_06 : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 0x10FFFF⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [3] }
+
+def a3Layouts64_06 : LayoutTable :=
+  { layouts64_06 with
+    entries := layouts64_06.entries ++
+      [a3IntOrRefUnionL_06, a3PtrOrRefFnUnionL_06, a3PtrWrapL_06, a3CharWrapFieldL_06] }
+
+def a3TyIntOrRef_06 : Ty := { kind := .adt "IntOrRef" [], layoutIdx := 16 }
+def a3TyPtrOrRefFn_06 : Ty := { kind := .adt "PtrOrRefFn" [], layoutIdx := 17 }
+def a3TyPtrWrap_06 : Ty := { kind := .adt "PtrWrap" [], layoutIdx := 18 }
+def a3TyCharWrapField_06 : Ty := { kind := .adt "CharWrapField" [], layoutIdx := 19 }
+def a3TyU32_06 : Ty := { kind := .uint .u32, layoutIdx := 0 }
+
+def a3Step1_06 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot)
+    (sOff dOff n : Nat) : Option (List LocalSlot × Memory) :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory (mkState06 l a2TwoPairMem_06) l decls a3Layouts64_06
+      ⟨10, sOff⟩ ⟨11, dOff⟩ n with
+  | .ok res => some res
+  | _ => none
+
+def a3Copy1Slot_06 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot)
+    (sOff dOff n : Nat) : Option LocalSlot :=
+  match a3Step1_06 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (_ :: dst' :: _, _) => some dst'
+  | _ => none
+
+def a3Copy1Read_06 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot)
+    (sOff dOff n : Nat) : Option ValSummary :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  match a3Step1_06 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (l', _) =>
+    match evalOperand l' (.copy ⟨1, []⟩) [] [] a3Layouts64_06 [] decls with
+    | .ok v _ => some (valSummaryVal06 v)
+    | .ub => some .none
+    | .unsupported => none
+  | none => none
+
+def a3Copy1CastU64_06 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot)
+    (sOff dOff n : Nat) : Option ValSummary :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  match a3Step1_06 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (l', m') =>
+    match evalByteCast l' (.copy ⟨1, []⟩) tyU64_06 m' decls a3Layouts64_06 with
+    | .ok v _ _ => some (valSummaryVal06 v)
+    | .ub => some .none
+    | .unsupported => none
+  | none => none
+
+end A3Fixtures06
+
+section A3Fixtures08
+
+open V08
+
+def a3IntOrRefUnionL_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [4, 6] }
+
+def a3PtrOrRefFnUnionL_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 3, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [5, 6, 6] }
+
+def a3PtrWrapL_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [5] }
+
+def a3CharWrapFieldL_08 : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.int 32 false) ⟨0, 0x10FFFF⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [3] }
+
+def a3Layouts64_08 : LayoutTable :=
+  { layouts64_08 with
+    entries := layouts64_08.entries ++
+      [a3IntOrRefUnionL_08, a3PtrOrRefFnUnionL_08, a3PtrWrapL_08, a3CharWrapFieldL_08] }
+
+def a3TyIntOrRef_08 : Ty := { kind := .adt "IntOrRef" [], layoutIdx := 16 }
+def a3TyPtrOrRefFn_08 : Ty := { kind := .adt "PtrOrRefFn" [], layoutIdx := 17 }
+def a3TyPtrWrap_08 : Ty := { kind := .adt "PtrWrap" [], layoutIdx := 18 }
+def a3TyCharWrapField_08 : Ty := { kind := .adt "CharWrapField" [], layoutIdx := 19 }
+def a3TyU32_08 : Ty := { kind := .uint .u32, layoutIdx := 0 }
+
+def a3Step1_08 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot)
+    (sOff dOff n : Nat) : Option (List LocalSlot × Memory) :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory (mkState08 l a2TwoPairMem_08) l decls a3Layouts64_08
+      ⟨10, sOff⟩ ⟨11, dOff⟩ n with
+  | .ok res => some res
+  | _ => none
+
+def a3Copy1Slot_08 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot)
+    (sOff dOff n : Nat) : Option LocalSlot :=
+  match a3Step1_08 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (_ :: dst' :: _, _) => some dst'
+  | _ => none
+
+def a3Copy1Read_08 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot)
+    (sOff dOff n : Nat) : Option ValSummary :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  match a3Step1_08 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (l', _) =>
+    match evalOperand l' (.copy ⟨1, []⟩) [] [] a3Layouts64_08 [] decls with
+    | .ok v _ => some (valSummaryVal08 v)
+    | .ub => some .none
+    | .unsupported => none
+  | none => none
+
+def a3Copy1CastU64_08 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot)
+    (sOff dOff n : Nat) : Option ValSummary :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  match a3Step1_08 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (l', m') =>
+    match evalByteCast l' (.copy ⟨1, []⟩) tyU64_08 m' decls a3Layouts64_08 with
+    | .ok v _ _ => some (valSummaryVal08 v)
+    | .ub => some .none
+    | .unsupported => none
+  | none => none
+
+end A3Fixtures08
+
+/-- A3.1 (Union `.ref` / `.fnPtr` punning rejection, `V2026_06_01` & `V2026_08_01`):
+`transmute::<u64, IntOrRef>(0x1000)` succeeds and reads `.i` (`u64`) cleanly, while reading `.r`
+(`&u8`) faults `.ub` (`unionDirectSlotValidForFieldTy = false`); a byte-swapped pointer image in
+`PtrOrRefFn` strips provenance on `.p` (`*const u8 -> .scalar ⟨0x1000, 8⟩`) and faults `.ub` on
+`.r` (`&u8`) and `.f` (`fn(u32) -> u32`), whereas intact `ptr64Bytes` reads `.r` as `.ptr`; and
+`unionDirectSlotValidForFieldTy` permits non-null zero-length `&[]` while rejecting non-empty
+provenance-free `&[u8]` and vtable-provenance-free `&dyn T`. -/
+theorem a3_union_ref_and_fnptr_punning_reject_v06_v08 :
+    -- V2026_06_01
+    (let declsInt06 : List V06.LocalDecl := [
+       { mutability := .not, ty := tyU64_06, debugName := none },
+       { mutability := .not, ty := a3TyIntOrRef_06, debugName := none },
+       { mutability := .not, ty := a3TyPtrOrRefFn_06, debugName := none }
+     ]
+     V06.unionDirectSlotValidForFieldTy tyRefSliceU8_06.kind
+       (.aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨0, 8⟩]) = true ∧
+     V06.unionDirectSlotValidForFieldTy tyRefSliceU8_06.kind
+       (.aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨3, 8⟩]) = false ∧
+     V06.unionDirectSlotValidForFieldTy tyRefDyn_06.kind
+       (.aggregate 0 [.ptr ptr64_06 8, .scalar ⟨0x80, 8⟩]) = false ∧
+     (match V06.evalByteCast [.init (.scalar ⟨0x1000, 8⟩), .uninit, .uninit]
+          (.copy ⟨0, []⟩) a3TyIntOrRef_06 V06.emptyMemory declsInt06 a3Layouts64_06,
+          V06.decodeUntypedStorageBytes V06.defaultCodecFuel a3Layouts64_06
+            a3TyPtrOrRefFn_06 (swap01_06 ptr64Bytes_06) .strictUcg630Ub true,
+          V06.decodeUntypedStorageBytes V06.defaultCodecFuel a3Layouts64_06
+            a3TyPtrOrRefFn_06 ptr64Bytes_06 .strictUcg630Ub true with
+      | .ok uInt _ _, some uSwap, some uOk =>
+        V06.readProjectedValueUnionAware [] declsInt06 a3Layouts64_06 uInt a3TyIntOrRef_06
+          [.field 0 tyU64_06] = .ok (.scalar ⟨0x1000, 8⟩) ∧
+        V06.readProjectedValueUnionAware [] declsInt06 a3Layouts64_06 uInt a3TyIntOrRef_06
+          [.field 1 tyRefU8_06] = .ub ∧
+        V06.evalOperand [.uninit, .init uInt, .init uSwap] (.copy ⟨1, [.field 1 tyRefU8_06]⟩)
+          [] [] a3Layouts64_06 [] declsInt06 = .ub ∧
+        V06.evalOperand [.uninit, .init uInt, .init uSwap] (.copy ⟨2, [.field 0 tyRawPtrU8_06]⟩)
+          [] [] a3Layouts64_06 [] declsInt06 =
+          .ok (.scalar ⟨0x1000, 8⟩) [.uninit, .init uInt, .init uSwap] ∧
+        V06.evalOperand [.uninit, .init uInt, .init uSwap] (.copy ⟨2, [.field 1 tyRefU8_06]⟩)
+          [] [] a3Layouts64_06 [] declsInt06 = .ub ∧
+        V06.evalOperand [.uninit, .init uInt, .init uSwap] (.copy ⟨2, [.field 2 tyFnPtr_06]⟩)
+          [] [] a3Layouts64_06 [] declsInt06 = .ub ∧
+        V06.evalOperand [.uninit, .uninit, .init uOk] (.copy ⟨2, [.field 1 tyRefU8_06]⟩)
+          [] [] a3Layouts64_06 [] declsInt06 =
+          .ok (.ptr ptr64_06 8) [.uninit, .uninit, .init uOk]
+      | _, _, _ => False)) ∧
+    -- V2026_08_01
+    (let declsInt08 : List V08.LocalDecl := [
+       { mutability := .not, ty := tyU64_08, debugName := none },
+       { mutability := .not, ty := a3TyIntOrRef_08, debugName := none },
+       { mutability := .not, ty := a3TyPtrOrRefFn_08, debugName := none }
+     ]
+     V08.unionDirectSlotValidForFieldTy tyRefSliceU8_08.kind
+       (.aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨0, 8⟩]) = true ∧
+     V08.unionDirectSlotValidForFieldTy tyRefSliceU8_08.kind
+       (.aggregate 0 [.scalar ⟨1, 8⟩, .scalar ⟨3, 8⟩]) = false ∧
+     V08.unionDirectSlotValidForFieldTy tyRefDyn_08.kind
+       (.aggregate 0 [.ptr ptr64_08 8, .scalar ⟨0x80, 8⟩]) = false ∧
+     (match V08.evalByteCast [.init (.scalar ⟨0x1000, 8⟩), .uninit, .uninit]
+          (.copy ⟨0, []⟩) a3TyIntOrRef_08 V08.emptyMemory declsInt08 a3Layouts64_08,
+          V08.decodeUntypedStorageBytes V08.defaultCodecFuel a3Layouts64_08
+            a3TyPtrOrRefFn_08 (swap01_08 ptr64Bytes_08) .strictUcg630Ub true,
+          V08.decodeUntypedStorageBytes V08.defaultCodecFuel a3Layouts64_08
+            a3TyPtrOrRefFn_08 ptr64Bytes_08 .strictUcg630Ub true with
+      | .ok uInt _ _, some uSwap, some uOk =>
+        V08.readProjectedValueUnionAware [] declsInt08 a3Layouts64_08 uInt a3TyIntOrRef_08
+          [.field 0 tyU64_08] = .ok (.scalar ⟨0x1000, 8⟩) ∧
+        V08.readProjectedValueUnionAware [] declsInt08 a3Layouts64_08 uInt a3TyIntOrRef_08
+          [.field 1 tyRefU8_08] = .ub ∧
+        V08.evalOperand [.uninit, .init uInt, .init uSwap] (.copy ⟨1, [.field 1 tyRefU8_08]⟩)
+          [] [] a3Layouts64_08 [] declsInt08 = .ub ∧
+        V08.evalOperand [.uninit, .init uInt, .init uSwap] (.copy ⟨2, [.field 0 tyRawPtrU8_08]⟩)
+          [] [] a3Layouts64_08 [] declsInt08 =
+          .ok (.scalar ⟨0x1000, 8⟩) [.uninit, .init uInt, .init uSwap] ∧
+        V08.evalOperand [.uninit, .init uInt, .init uSwap] (.copy ⟨2, [.field 1 tyRefU8_08]⟩)
+          [] [] a3Layouts64_08 [] declsInt08 = .ub ∧
+        V08.evalOperand [.uninit, .init uInt, .init uSwap] (.copy ⟨2, [.field 2 tyFnPtr_08]⟩)
+          [] [] a3Layouts64_08 [] declsInt08 = .ub ∧
+        V08.evalOperand [.uninit, .uninit, .init uOk] (.copy ⟨2, [.field 1 tyRefU8_08]⟩)
+          [] [] a3Layouts64_08 [] declsInt08 =
+          .ok (.ptr ptr64_08 8) [.uninit, .uninit, .init uOk]
+      | _, _, _ => False)) := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+/-- A3.2 (`evalCopyMemory` `0x1000u64 -> &u8` / `fn()` no-forge & `frag.tag ≠ frag.allocId`
+preservation, `V2026_06_01` & `V2026_08_01`): copying `0x1000u64` into `&u8` or `fn(u32) -> u32`
+succeeds at untyped write time via the raw-byte carrier (never forging `Value.ptr ⟨0, 0x1000⟩`)
+and faults `.ub` at typed read time; copying a pointer with distinct borrow tag `(7, 99)` preserves
+the `(7, 99)` raw-byte carrier in storage and materializes `.ptr ⟨7, 0x10⟩` on read. -/
+theorem a3_evalCopyMemory_ref_noforge_and_distinct_tag_v06_v08 :
+    let plainCarrier06 : V06.LocalSlot :=
+      .init (.aggregate 0 (V06.encodeRawAbstractByteVals (V06.encodeLittleEndianBytes 0x1000 8 none)))
+    let tag99Slot06 : V06.LocalSlot :=
+      .init (.aggregate 0 (V06.encodeRawAbstractByteVals (V06.encodeLittleEndianBytes 0x10 8 (some (7, 99)))))
+    let plainCarrier08 : V08.LocalSlot :=
+      .init (.aggregate 0 (V08.encodeRawAbstractByteVals (V08.encodeLittleEndianBytes 0x1000 8 none)))
+    let tag99Slot08 : V08.LocalSlot :=
+      .init (.aggregate 0 (V08.encodeRawAbstractByteVals (V08.encodeLittleEndianBytes 0x10 8 (some (7, 99)))))
+    a3Copy1Slot_06 tyU64_06 tyRefU8_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some plainCarrier06 ∧
+    a3Copy1Read_06 tyU64_06 tyRefU8_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 = some .none ∧
+    a3Copy1Slot_06 tyU64_06 tyFnPtr_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some plainCarrier06 ∧
+    a3Copy1Read_06 tyU64_06 tyFnPtr_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 = some .none ∧
+    a3Copy1Slot_06 tyArr8U8_06 tyRawPtrU8_06 tag99Slot06 .uninit 0 0 8 = some tag99Slot06 ∧
+    a3Copy1Read_06 tyArr8U8_06 tyRawPtrU8_06 tag99Slot06 .uninit 0 0 8 = some (.ptr 7 0x10 8) ∧
+    a3Copy1Read_06 tyArr8U8_06 tyRefU8_06 tag99Slot06 .uninit 0 0 8 = some (.ptr 7 0x10 8) ∧
+    a3Copy1Slot_08 tyU64_08 tyRefU8_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some plainCarrier08 ∧
+    a3Copy1Read_08 tyU64_08 tyRefU8_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 = some .none ∧
+    a3Copy1Slot_08 tyU64_08 tyFnPtr_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some plainCarrier08 ∧
+    a3Copy1Read_08 tyU64_08 tyFnPtr_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 = some .none ∧
+    a3Copy1Slot_08 tyArr8U8_08 tyRawPtrU8_08 tag99Slot08 .uninit 0 0 8 = some tag99Slot08 ∧
+    a3Copy1Read_08 tyArr8U8_08 tyRawPtrU8_08 tag99Slot08 .uninit 0 0 8 = some (.ptr 7 0x10 8) ∧
+    a3Copy1Read_08 tyArr8U8_08 tyRefU8_08 tag99Slot08 .uninit 0 0 8 = some (.ptr 7 0x10 8) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- A3.3 (`evalCopyMemory` on `Unaligned<bool>`, `CharWrapField(char)`, `CharWrap(char)`, &
+`PtrWrap(*const u8)`, `V2026_06_01` & `V2026_08_01`): untyped `evalCopyMemory` of `2u8` into
+`Unaligned<bool>` and `0xD800` into `CharWrapField` / `CharWrap` succeeds at write time and faults
+`.ub` on typed read (`Kani#5205`), while `0x1000u64 -> PtrWrap(*const u8)` stores `.scalar` (never
+forging `.ptr`) so `transmute::<PtrWrap, u64>` succeeds under `.strictUcg630Ub`. -/
+theorem a3_evalCopyMemory_adt_kani5205_and_ptrwrap_v06_v08 :
+    a3Copy1Slot_06 tyU8_06 tyUnalignedBool_06 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1 =
+      some (.init (.aggregate 0 [.scalar ⟨2, 1⟩])) ∧
+    a3Copy1Read_06 tyU8_06 tyUnalignedBool_06 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1 = some .none ∧
+    a3Copy1Slot_06 a3TyU32_06 a3TyCharWrapField_06 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 =
+      some (.init (.aggregate 0 [.scalar ⟨0xD800, 4⟩])) ∧
+    a3Copy1Read_06 a3TyU32_06 a3TyCharWrapField_06 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 =
+      some .none ∧
+    a3Copy1Slot_06 a3TyU32_06 a1TyCharWrap_06 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 =
+      some (.init (.scalar ⟨0xD800, 4⟩)) ∧
+    a3Copy1Read_06 a3TyU32_06 a1TyCharWrap_06 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 =
+      some .none ∧
+    a3Copy1Slot_06 tyU64_06 a3TyPtrWrap_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some (.init (.aggregate 0 [.scalar ⟨0x1000, 8⟩])) ∧
+    a3Copy1CastU64_06 tyU64_06 a3TyPtrWrap_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some (.scalar 0x1000 8) ∧
+    a3Copy1Slot_08 tyU8_08 tyUnalignedBool_08 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1 =
+      some (.init (.aggregate 0 [.scalar ⟨2, 1⟩])) ∧
+    a3Copy1Read_08 tyU8_08 tyUnalignedBool_08 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1 = some .none ∧
+    a3Copy1Slot_08 a3TyU32_08 a3TyCharWrapField_08 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 =
+      some (.init (.aggregate 0 [.scalar ⟨0xD800, 4⟩])) ∧
+    a3Copy1Read_08 a3TyU32_08 a3TyCharWrapField_08 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 =
+      some .none ∧
+    a3Copy1Slot_08 a3TyU32_08 a1TyCharWrap_08 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 =
+      some (.init (.scalar ⟨0xD800, 4⟩)) ∧
+    a3Copy1Read_08 a3TyU32_08 a1TyCharWrap_08 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 =
+      some .none ∧
+    a3Copy1Slot_08 tyU64_08 a3TyPtrWrap_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some (.init (.aggregate 0 [.scalar ⟨0x1000, 8⟩])) ∧
+    a3Copy1CastU64_08 tyU64_08 a3TyPtrWrap_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some (.scalar 0x1000 8) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- A3.4 (`writeBytesAction` on `&u8` and `fn()`, `V2026_06_01` & `V2026_08_01`): `write_bytes`
+writing `0x00` or `0x01` onto `*mut &u8` and `*mut fn(u32) -> u32` stores the raw-byte carrier at
+write time (`Kani#5205`, no spurious `.fault .unsupported`) and faults `.ub` when read as `&u8` /
+`fn(u32) -> u32`. -/
+theorem a3_write_bytes_ref_and_fnptr_carrier_v06_v08 :
+    -- V2026_06_01
+    (let decls06 : List V06.LocalDecl := [
+       { mutability := .mut, ty := tyRefU8_06, debugName := none },
+       { mutability := .mut, ty := tyFnPtr_06, debugName := none }
+     ]
+     let bRef06 : V06.BorrowEntry := { tag := 90, targetLocal := 0, targetProjection := [], perm := .active }
+     let bFn06 : V06.BorrowEntry := { tag := 91, targetLocal := 1, targetProjection := [], perm := .active }
+     let zeroCarrier06 : V06.Value :=
+       .aggregate 0 (V06.encodeRawAbstractByteVals (List.replicate 8 (V06.mkInitByte 0)))
+     let oneCarrier06 : V06.Value :=
+       .aggregate 0 (V06.encodeRawAbstractByteVals (List.replicate 8 (V06.mkInitByte 1)))
+     let wbRefZero06 := V06.writeBytesAction [bRef06, bFn06] 0
+       { defPath := "core::ptr::write_bytes", typeArgs := [tyRefU8_06.kind] } decls06 a3Layouts64_06 []
+       [.ptr ⟨90, 0⟩ 8, .scalar ⟨0, 1⟩, .scalar ⟨1, 8⟩]
+     let wbFnOne06 := V06.writeBytesAction [bRef06, bFn06] 0
+       { defPath := "core::ptr::write_bytes", typeArgs := [tyFnPtr_06.kind] } decls06 a3Layouts64_06 []
+       [.ptr ⟨91, 0⟩ 8, .scalar ⟨1, 1⟩, .scalar ⟨1, 8⟩]
+     (match wbRefZero06, wbFnOne06 with
+      | .store ⟨0, []⟩ 0 90 v0, .store ⟨1, []⟩ 1 91 v1 =>
+        v0 = zeroCarrier06 ∧ v1 = oneCarrier06 ∧
+        V06.evalOperand [.init v0, .init v1] (.copy ⟨0, []⟩) [] [] a3Layouts64_06 [] decls06 = .ub ∧
+        V06.evalOperand [.init v0, .init v1] (.copy ⟨1, []⟩) [] [] a3Layouts64_06 [] decls06 = .ub
+      | _, _ => False)) ∧
+    -- V2026_08_01
+    (let decls08 : List V08.LocalDecl := [
+       { mutability := .mut, ty := tyRefU8_08, debugName := none },
+       { mutability := .mut, ty := tyFnPtr_08, debugName := none }
+     ]
+     let bRef08 : V08.BorrowEntry := { tag := 90, targetLocal := 0, targetProjection := [], perm := .active }
+     let bFn08 : V08.BorrowEntry := { tag := 91, targetLocal := 1, targetProjection := [], perm := .active }
+     let zeroCarrier08 : V08.Value :=
+       .aggregate 0 (V08.encodeRawAbstractByteVals (List.replicate 8 (V08.mkInitByte 0)))
+     let oneCarrier08 : V08.Value :=
+       .aggregate 0 (V08.encodeRawAbstractByteVals (List.replicate 8 (V08.mkInitByte 1)))
+     let wbRefZero08 := V08.writeBytesAction [bRef08, bFn08] 0
+       { defPath := "core::ptr::write_bytes", typeArgs := [tyRefU8_08.kind] } decls08 a3Layouts64_08 []
+       [.ptr ⟨90, 0⟩ 8, .scalar ⟨0, 1⟩, .scalar ⟨1, 8⟩]
+     let wbFnOne08 := V08.writeBytesAction [bRef08, bFn08] 0
+       { defPath := "core::ptr::write_bytes", typeArgs := [tyFnPtr_08.kind] } decls08 a3Layouts64_08 []
+       [.ptr ⟨91, 0⟩ 8, .scalar ⟨1, 1⟩, .scalar ⟨1, 8⟩]
+     (match wbRefZero08, wbFnOne08 with
+      | .store ⟨0, []⟩ 0 90 v0, .store ⟨1, []⟩ 1 91 v1 =>
+        v0 = zeroCarrier08 ∧ v1 = oneCarrier08 ∧
+        V08.evalOperand [.init v0, .init v1] (.copy ⟨0, []⟩) [] [] a3Layouts64_08 [] decls08 = .ub ∧
+        V08.evalOperand [.init v0, .init v1] (.copy ⟨1, []⟩) [] [] a3Layouts64_08 [] decls08 = .ub
+      | _, _ => False)) := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+/-- A3.5 (`V2026_06_01 == V2026_08_01` lockstep parity across all Pass A3 scenarios). -/
+theorem a3_lockstep_parity :
+    let pr06 : Trusted.Rustc.V2026_06_01.MirSemantics.ProjReadResult → ValSummary
+      | .ok v => valSummaryVal06 v
+      | _ => .none
+    let pr08 : Trusted.Rustc.V2026_08_01.MirSemantics.ProjReadResult → ValSummary
+      | .ok v => valSummaryVal08 v
+      | _ => .none
+    let uSwap06 : V06.Value := .aggregate 0 [.scalar ⟨0x1000, 8⟩, .scalar ⟨0x1000, 8⟩, .scalar ⟨0x1000, 8⟩]
+    let uSwap08 : V08.Value := .aggregate 0 [.scalar ⟨0x1000, 8⟩, .scalar ⟨0x1000, 8⟩, .scalar ⟨0x1000, 8⟩]
+    let v06 : List (Option ValSummary) := [
+      some (pr06 (V06.readProjectedValueUnionAware [] [] a3Layouts64_06 uSwap06 a3TyPtrOrRefFn_06 [.field 0 tyRawPtrU8_06])),
+      some (pr06 (V06.readProjectedValueUnionAware [] [] a3Layouts64_06 uSwap06 a3TyPtrOrRefFn_06 [.field 1 tyRefU8_06])),
+      some (pr06 (V06.readProjectedValueUnionAware [] [] a3Layouts64_06 uSwap06 a3TyPtrOrRefFn_06 [.field 2 tyFnPtr_06])),
+      a3Copy1Read_06 tyU64_06 tyRefU8_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8,
+      a3Copy1Read_06 tyU8_06 tyUnalignedBool_06 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1,
+      a3Copy1Read_06 a3TyU32_06 a3TyCharWrapField_06 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4,
+      a3Copy1CastU64_06 tyU64_06 a3TyPtrWrap_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8
+    ]
+    let v08 : List (Option ValSummary) := [
+      some (pr08 (V08.readProjectedValueUnionAware [] [] a3Layouts64_08 uSwap08 a3TyPtrOrRefFn_08 [.field 0 tyRawPtrU8_08])),
+      some (pr08 (V08.readProjectedValueUnionAware [] [] a3Layouts64_08 uSwap08 a3TyPtrOrRefFn_08 [.field 1 tyRefU8_08])),
+      some (pr08 (V08.readProjectedValueUnionAware [] [] a3Layouts64_08 uSwap08 a3TyPtrOrRefFn_08 [.field 2 tyFnPtr_08])),
+      a3Copy1Read_08 tyU64_08 tyRefU8_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8,
+      a3Copy1Read_08 tyU8_08 tyUnalignedBool_08 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1,
+      a3Copy1Read_08 a3TyU32_08 a3TyCharWrapField_08 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4,
+      a3Copy1CastU64_08 tyU64_08 a3TyPtrWrap_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8
+    ]
+    v06 = v08 ∧
+    v06 = [some (.scalar 0x1000 8), some .none, some .none, some .none, some .none, some .none, some (.scalar 0x1000 8)] := by
+  exact ⟨rfl, rfl⟩
+
 /-! ## §5. Mechanical Local Axiom, Reachability, & Non-Triviality Audit -/
 
 open Lean Elab Command in
@@ -3729,6 +4179,8 @@ run_cmd do
     ``Trusted.Rustc.V2026_06_01.MirSemantics.globalRelocsOverlapRange,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.isPtrCopyKind,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.materializeReadPtrValue,
+    ``Trusted.Rustc.V2026_06_01.MirSemantics.unionDirectSlotValidForFieldTy,
+    ``Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv?,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge,
@@ -3751,7 +4203,9 @@ run_cmd do
     ``Trusted.Rustc.V2026_08_01.MirSemantics.evalCopyMemory,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.globalRelocsOverlapRange,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.isPtrCopyKind,
-    ``Trusted.Rustc.V2026_08_01.MirSemantics.materializeReadPtrValue
+    ``Trusted.Rustc.V2026_08_01.MirSemantics.materializeReadPtrValue,
+    ``Trusted.Rustc.V2026_08_01.MirSemantics.unionDirectSlotValidForFieldTy,
+    ``Trusted.Rustc.V2026_08_01.MirSemantics.readProjectedValueUnionAware
   ]
   for req in requiredConsts do
     unless reached.contains req do

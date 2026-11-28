@@ -8282,6 +8282,15 @@ handling:
   transmutes and union reads never fabricate provenance;
 - ADT fields are decoded by their `fieldLayouts` (generic arguments are not
   field types).
+- Known `TypeLayout` schema limitation (`VariantsShape.multiple`): `TypeLayout`
+  (`Layout.lean`) records `variants : List FieldsShape` without per-variant
+  `LayoutIdx` lists or `TagEncoding::Niche` metadata, so pointer-payload vs
+  integer-payload variants of a multi-variant enum cannot be distinguished from
+  `TypeLayout` alone. Consequently, `.multiple` conservatively rejects any
+  provenance-bearing byte buffer under `.strictUcg630Ub` (failing closed rather
+  than stripping pointer provenance into an integer variant via
+  `decodeFieldsBySpan`; niche/tagged enums with explicit `RichAdtSpec` metadata
+  decode per-variant pointer payloads via `decodeRichValueFromBytes`).
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -9900,10 +9909,56 @@ def wrapFullWidthInitChain?
   | _, _, _ => .none
 
 /--
+Check whether a cached runtime slot value `fv` in a `FieldsShape.union`
+aggregate may be returned directly when reading the union field at static type
+`rFieldKind`, or must be re-decoded from the union's storage bytes at the full
+`rFieldTy`:
+- `TypeLayout.fieldLayouts` decodes union slots without `RigidTy` (distinguishing
+  only `ScalarLayout`, which `NonNull<T>` shares with `&T` and `fn()`), so a
+  provenance-free or byte-permuted pointer image (`UCG#558`) can populate a
+  union slot with `Value.scalar`.
+- Reading a `.ref` or `.fnPtr` union field requires coherent pointer provenance
+  (except non-null zero-length slice/`str` references `&[]` / `""`), so any
+  cached `.scalar` (or `.scalar`-backed wide `&dyn` / non-empty `&[T]`) slot is
+  not trusted directly and falls through to `decodeTypedValueFromBytes` at
+  `rFieldTy`.
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Reading a union field reads the bits of the union at the field's type. ...
+> Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def unionDirectSlotValidForFieldTy (rFieldKind : RigidTy) (fv : Value) : Bool :=
+  match fv with
+  | .scalar _ =>
+    match rFieldKind with
+    | .ref _ _ => false
+    | .fnPtr _ _ _ _ => false
+    | _ => true
+  | .aggregate 0 (dVal :: mVal :: .nil) =>
+    match rFieldKind with
+    | .ref _ (.dynamic _) =>
+      match dVal, mVal with
+      | .ptr _ _, .ptr _ _ => true
+      | _, _ => false
+    | .ref _ (.slice _) | .ref _ .str =>
+      match dVal, mVal with
+      | .ptr _ _, .scalar _ => true
+      | .scalar addrSc, .scalar lenSc =>
+        Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq addrSc.bits 0))
+      | _, _ => false
+    | _ => true
+  | _ => true
+
+/--
 Read a deref-free projection chain `proj` on `v` of static type `baseTy` with
 union byte-reinterpretation semantics:
 - Reading a union `.field idx fieldTy` whose runtime slot holds a non-`.unit`
-  value returns/projects that value directly.
+  value compatible with `fieldTy` (`unionDirectSlotValidForFieldTy`)
+  returns/projects that value directly.
 - Reading a union `.field idx fieldTy` whose runtime slot is `.unit` (or beyond
   `length fields` while `< unionFieldCount`) encodes the union's initialized
   storage bytes via `encodeByLayoutIdxAux`, slices `[subOff .. subOff + sizeof)`
@@ -9991,7 +10046,10 @@ def readProjectedValueUnionAware
             | .tuple .nil => .some .unit
             | .fnDef _ _ => .some .unit
             | _ => .none
-          | .some fv => .some fv
+          | .some fv =>
+            match unionDirectSlotValidForFieldTy rFieldTy.kind fv with
+            | true => .some fv
+            | false => .none
           | .none => .none
         -- A union value whose slots (or raw-byte overlay) disagree on some
         -- initialized byte does not determine a storage image (e.g. after a

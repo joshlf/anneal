@@ -1768,7 +1768,13 @@ theorem evalOperand_unionFieldRead_spec
       dsimp only
       rw [hble_j]; simp only []
       rw [hget, hcons]
-      rfl
+      dsimp only [unionDirectSlotValidForFieldTy]
+      cases isUnresolvedLayoutIdx body.layouts f0Ty.layoutIdx <;> dsimp only
+      · rcases hprim0 with hk | hk | ⟨_, hk⟩ | ⟨_, hk⟩ <;> (rw [hk]; rfl)
+      · cases get? tl.fieldLayouts f <;> dsimp only
+        · have hrk := resolveTyWithLocalDecls_kind_eq body.localDecls body.layouts f0Ty
+          rcases hprim0 with hk | hk | ⟨_, hk⟩ | ⟨_, hk⟩ <;> (rw [hrk, hk]; rfl)
+        · rcases hprim0 with hk | hk | ⟨_, hk⟩ | ⟨_, hk⟩ <;> (rw [hk]; rfl)
     have hval_ok : validateValueForTy? body.layouts (some rPt) (.scalar sc) = true := by
       cases sc with | mk bits szB =>
       exact validateValueForTy?_primScalar body.layouts hprim0 hvb0 hsz0

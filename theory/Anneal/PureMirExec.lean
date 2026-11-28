@@ -554,18 +554,20 @@ theorem validateWideMetaBytes_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂
   simp only [validateNonNullPtrBytes_congr h, bytesHaveRealProvenance_congr h]
 
 theorem decodeScalarLayoutBytesTarget_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
-    (layouts : LayoutTable) (sl : ScalarLayout) (allowUninit : Bool) (bs : List AbstractByte) :
-    decodeScalarLayoutBytesTarget m₁ layouts sl allowUninit bs =
-      decodeScalarLayoutBytesTarget m₂ layouts sl allowUninit bs := by
+    (layouts : LayoutTable) (sl : ScalarLayout) (allowUninit : Bool) (bs : List AbstractByte)
+    (enforceValidRange : Bool) :
+    decodeScalarLayoutBytesTarget m₁ layouts sl allowUninit bs enforceValidRange =
+      decodeScalarLayoutBytesTarget m₂ layouts sl allowUninit bs enforceValidRange := by
   unfold decodeScalarLayoutBytesTarget
   simp only [isBackedPtr_congr h, bytesHaveRealProvenance_congr h]
 
 theorem decodeValueAtLayoutIdx_congr {m₁ m₂ : Memory} (h : MemBGFEq m₁ m₂)
     (layouts : LayoutTable) (allowPartialUninit : Bool)
-    (fuel : Nat) (lIdx : LayoutIdx) (bs : List AbstractByte) :
-    decodeValueAtLayoutIdx m₁ layouts allowPartialUninit fuel lIdx bs =
-      decodeValueAtLayoutIdx m₂ layouts allowPartialUninit fuel lIdx bs := by
-  induction fuel generalizing allowPartialUninit lIdx bs with
+    (fuel : Nat) (lIdx : LayoutIdx) (bs : List AbstractByte)
+    (enforceValidRange : Bool) :
+    decodeValueAtLayoutIdx m₁ layouts allowPartialUninit fuel lIdx bs enforceValidRange =
+      decodeValueAtLayoutIdx m₂ layouts allowPartialUninit fuel lIdx bs enforceValidRange := by
+  induction fuel generalizing allowPartialUninit lIdx bs enforceValidRange with
   | zero => rfl
   | succ fuel' ih =>
     unfold decodeValueAtLayoutIdx
