@@ -102,6 +102,9 @@ private theorem word64_eq_mod_u64 (n : Nat) :
     word64 n = n % modPow2 (uintWidth .u64) :=
   rfl
 
+private theorem word64_idem (n : Nat) : word64 (word64 n) = word64 n :=
+  Nat.mod_eq_of_lt (Nat.mod_lt n u64Mod_pos)
+
 /-! ## Pillar 1: `Anneal.LinearArithIndexed` Gates & Portfolios -/
 
 /-- `Anneal.LinearArithIndexed` tree-indexed natural-number cut certificates
@@ -631,6 +634,24 @@ theorem gateVerdict_eq_false_of_all_rejected {X W E : Type} {P : X → Prop}
       (firstAccepted_ok_iff_exists (verdictGate g) x rs).1 ⟨b, hFirst⟩
     exact False.elim (hAll r hMem b' hEv)
 
+/-- Total `Bool` verdict over interleaved indexed and list-backed `NatCutGoal`
+producers (`natCutDualGate`). -/
+theorem natCutDualGate_verdict_sound {E : Type} (maxSteps : Nat)
+    (goal : NatCutGoal)
+    (rs : List (RawOutcome E Bool (CutCheckerKind × List CutStep)))
+    (hTrue : gateVerdict (natCutDualGate maxSteps) goal rs = true) :
+    goal.denote :=
+  gateVerdict_sound (natCutDualGate maxSteps) goal rs hTrue
+
+/-- Total `Bool` verdict over interleaved indexed and list-backed `IntCutGoal`
+producers (`intCutDualGate`). -/
+theorem intCutDualGate_verdict_sound {E : Type} (maxSteps : Nat)
+    (goal : IntCutGoal)
+    (rs : List (RawOutcome E Bool (CutCheckerKind × List CutStep)))
+    (hTrue : gateVerdict (intCutDualGate maxSteps) goal rs = true) :
+    goal.denote :=
+  gateVerdict_sound (intCutDualGate maxSteps) goal rs hTrue
+
 /-! ## Pillar 2: `Anneal.FarkasMirCert` Unified Gate & Indexed-to-MIR Bridge -/
 
 /-- Computable total `CutStep` count across all four `FarkasMirCert` variants
@@ -816,6 +837,46 @@ theorem farkasMirBoundedEdgeGate_accept_imp_farkasMirGate (maxSteps : Nat)
   rw [Nat.ble_eq_true_of_le
     (Nat.le_trans (farkasMirCertSize_le_weight cert) hW), bool_and_right hOk]
   rfl
+
+/-- Strictness lifted to `evalGate`: any producer outcome accepted by
+`farkasMirBoundedEdgeGate` is accepted by `farkasMirGate` under the same cap.
+-/
+theorem farkasMirBoundedEdgeGate_eval_ok_imp_farkasMirGate {E : Type}
+    (maxSteps : Nat) (goal : FarkasMirGoal)
+    (r : RawOutcome E Unit FarkasMirCert)
+    (hOk : evalGate (farkasMirBoundedEdgeGate maxSteps) goal r = .ok ()) :
+    evalGate (farkasMirGate maxSteps) goal r = .ok () := by
+  cases r with
+  | trapped => cases hOk
+  | prodErr _ => cases hOk
+  | candidate y cert =>
+    cases y
+    have h := (evalGate_candidate_ok_iff (farkasMirBoundedEdgeGate maxSteps)
+      goal () cert ()).1 hOk
+    have hChk : gateCheckBounded (farkasMirBoundedEdgeGate maxSteps)
+        (goal, (), cert) = true := by
+      dsimp only [gateCheckBounded]
+      rw [Nat.ble_eq_true_of_le h.2.1, h.2.2]
+      rfl
+    have hMir := farkasMirBoundedEdgeGate_accept_imp_farkasMirGate maxSteps
+      goal cert hChk
+    exact (evalGate_candidate_ok_iff (farkasMirGate maxSteps) goal () cert ()).2
+      ⟨rfl, Nat.le_of_ble_eq_true (bool_and_left hMir), bool_and_right hMir⟩
+
+/-- Strictness lifted to `gateVerdict`: whenever the bounded-edge portfolio
+returns `true`, the exact-size `farkasMirGate` portfolio also returns `true`.
+-/
+theorem farkasMirBoundedEdgeGate_verdict_imp_farkasMirGate {E : Type}
+    (maxSteps : Nat) (goal : FarkasMirGoal)
+    (rs : List (RawOutcome E Bool FarkasMirCert))
+    (hTrue : gateVerdict (farkasMirBoundedEdgeGate maxSteps) goal rs = true) :
+    gateVerdict (farkasMirGate maxSteps) goal rs = true := by
+  have ⟨r, hMem, w, hEq, hChk⟩ :=
+    (gateVerdict_eq_true_iff_exists (farkasMirBoundedEdgeGate maxSteps) goal
+      rs).1 hTrue
+  exact (gateVerdict_eq_true_iff_exists (farkasMirGate maxSteps) goal rs).2
+    ⟨r, hMem, w, hEq,
+      farkasMirBoundedEdgeGate_accept_imp_farkasMirGate maxSteps goal w hChk⟩
 
 /-- `firstAccepted` portfolio selection over candidate `FarkasMirCert`
 producers. -/
@@ -1842,6 +1903,95 @@ theorem neg_execOutcomeToMirExactClass?_not_injective_unranged :
      injection h with hV _
      exact absurd hV (Nat.ne_of_lt u64Mod_pos)),
    (fun h => Nat.lt_irrefl _ h)⟩
+
+/-- The strategy-erased (`PanicStrategy.abort`) outcome bridge is also
+injective on `u64`-ranged outcomes, because `ExecOutcome` has only `.aborted`
+(never `.panic`). -/
+theorem execOutcomeToMirClass?_injective_on_u64
+    {o₁ o₂ : ExecOutcome Nat Unit}
+    (h₁ : ExecOutcomeInU64 o₁) (h₂ : ExecOutcomeInU64 o₂)
+    (hEq : execOutcomeToMirClass? o₁ = execOutcomeToMirClass? o₂) :
+    o₁ = o₂ := by
+  cases o₁ with
+  | returned v₁ m₁ =>
+    cases m₁
+    cases o₂ with
+    | returned v₂ m₂ =>
+      cases m₂
+      have hV : execOutcomeToMirValue v₁ = execOutcomeToMirValue v₂ := by
+        injection hEq with hRet
+        injection hRet
+      rw [execOutcomeToMirValue_inj_on_u64 h₁ h₂ hV]
+    | aborted m₂ => cases m₂; nomatch hEq
+    | faultUB => nomatch hEq
+    | diverged => nomatch hEq
+  | aborted m₁ =>
+    cases m₁
+    cases o₂ with
+    | returned v₂ m₂ => cases m₂; nomatch hEq
+    | aborted m₂ => cases m₂; rfl
+    | faultUB => nomatch hEq
+    | diverged => nomatch hEq
+  | faultUB =>
+    cases o₂ with
+    | returned v₂ m₂ => cases m₂; nomatch hEq
+    | aborted m₂ => cases m₂; nomatch hEq
+    | faultUB => rfl
+    | diverged => nomatch hEq
+  | diverged =>
+    cases o₂ with
+    | returned v₂ m₂ => cases m₂; nomatch hEq
+    | aborted m₂ => cases m₂; nomatch hEq
+    | faultUB => nomatch hEq
+    | diverged => rfl
+
+/-- Refinement reflection for the strategy-erased bridge on `u64`-ranged
+outcomes: `MirOptOutcomeRefines` holds iff the spec is UB or equal to impl. -/
+theorem mirOptOutcomeRefines_exec_iff_on_u64
+    {o₁ o₂ : ExecOutcome Nat Unit}
+    (h₁ : ExecOutcomeInU64 o₁) (h₂ : ExecOutcomeInU64 o₂) :
+    MirOptOutcomeRefines (execOutcomeToMirClass? o₁)
+        (execOutcomeToMirClass? o₂) ↔
+      (o₁ = .faultUB ∨ o₁ = o₂) := by
+  constructor
+  · intro hRef
+    cases o₁ with
+    | faultUB => exact Or.inl rfl
+    | returned v₁ m₁ =>
+      cases m₁
+      cases o₂ with
+      | returned v₂ m₂ =>
+        cases m₂
+        have hV : execOutcomeToMirValue v₁ = execOutcomeToMirValue v₂ := hRef
+        exact Or.inr (by rw [execOutcomeToMirValue_inj_on_u64 h₁ h₂ hV])
+      | aborted m₂ => cases m₂; exact False.elim hRef
+      | faultUB => exact False.elim hRef
+      | diverged => exact False.elim hRef
+    | aborted m₁ =>
+      cases m₁
+      cases o₂ with
+      | returned v₂ m₂ => cases m₂; exact False.elim hRef
+      | aborted m₂ => cases m₂; exact Or.inr rfl
+      | faultUB => exact False.elim hRef
+      | diverged => exact False.elim hRef
+    | diverged =>
+      cases o₂ with
+      | returned v₂ m₂ => cases m₂; exact False.elim hRef
+      | aborted m₂ => cases m₂; exact False.elim hRef
+      | faultUB => exact False.elim hRef
+      | diverged => exact Or.inr rfl
+  · intro h
+    cases h with
+    | inl hUb =>
+      rw [hUb]
+      cases o₂ with
+      | returned v₂ m₂ => cases m₂; exact True.intro
+      | aborted m₂ => cases m₂; exact True.intro
+      | faultUB => exact True.intro
+      | diverged => exact True.intro
+    | inr hEq =>
+      rw [hEq]
+      exact mirOptOutcomeRefines_refl _
 
 /-- Relational preservation with NO determinism assumption on `semSrc`: under
 `SemRefinesUnder`, on an input satisfying `EntryPre` where `semSrc` cannot
@@ -3556,6 +3706,76 @@ theorem u64_addNuw_to_addWrap_asymmetric_ub_transport (a b : Nat)
   intro h
   exact False.elim h
 
+/-- Unchecked (`subNuw`) source block with no guards and no contextual facts,
+used to exercise genuinely asymmetric `.ub ⊑ .ret` certificate transport via
+`.dirRule .dropSubNuw`. -/
+def u64UncheckedSubSrc : SourceBlockUnit :=
+  { guards := []
+    arena := u64CheckedSubArena
+    srcRetId := 3
+    candidates := [] }
+
+/-- Genuinely asymmetric `.ub ⊑ .ret` certificate transport for subtraction
+through `blockOptGate`: dropping `nuw` (`.dirRule .dropSubNuw`) refines
+`mkUncheckedArithBody .u64 .sub` to `mkWrappingArithBody .u64 .sub` for ALL
+`u64`-ranged `a, b` (in `MirExactOutcomeRefines`, `MirOutcomeRefines`, and
+Layer 1A `ITree.toPartial`), and at `(0, 1)` the source faults `.ub` while the
+target returns `u64Max` so the converse strictly fails. -/
+theorem u64_subNuw_to_subWrap_asymmetric_ub_transport (a b : Nat)
+    (ha : a < modPow2 (uintWidth .u64)) (hb : b < modPow2 (uintWidth .u64)) :
+    MirExactOutcomeRefines
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2 (uintArgs2 .u64 a b)))
+      (classifyMirExecStateExact
+        (runMirCall (mkWrappingArithBody .u64 .sub) 2 (uintArgs2 .u64 a b))) ∧
+    MirOutcomeRefines
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2 (uintArgs2 .u64 a b)))
+      (classifyMirExecState .abort
+        (runMirCall (mkWrappingArithBody .u64 .sub) 2 (uintArgs2 .u64 a b))) ∧
+    (mirCallTree (mkWrappingArithBody .u64 .sub)
+        (uintArgs2 .u64 a b)).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 a b)).toPartial ∧
+    ¬ MirExactOutcomeRefines
+        (classifyMirExecStateExact
+          (runMirCall (mkWrappingArithBody .u64 .sub) 2
+            (uintArgs2 .u64 0 1)))
+        (classifyMirExecStateExact
+          (runMirCall (mkUncheckedArithBody .u64 .sub) 2
+            (uintArgs2 .u64 0 1))) := by
+  have hCut :
+      Anneal.Framework.StepWp.BoolCertCut
+        (gateCheckBounded (blockOptGate 2))
+        (u64UncheckedSubSrc, u64WrappingSubOpt,
+          [.dirRule .dropSubNuw [0, 1] 3 2]) :=
+    Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl
+  have hEntry : SourceEntryPre u64UncheckedSubSrc (env2 a b) :=
+    fun _ _ h => nomatch h
+  have hTr :=
+    blockOptGate_cut_transports_to_mirExecState 2
+      u64UncheckedSubSrc u64WrappingSubOpt [.dirRule .dropSubNuw [0, 1] 3 2]
+      hCut (env2 a b) hEntry
+      (u64UncheckedSubOpt_corresponds_stepMirState a b ha hb)
+      (u64WrappingSubOpt_corresponds_stepMirState a b ha hb)
+  have hPartial :=
+    blockOptGate_cut_transports_to_mirCallTree_toPartial 2
+      u64UncheckedSubSrc u64WrappingSubOpt [.dirRule .dropSubNuw [0, 1] 3 2]
+      hCut (env2 a b) hEntry
+      (u64UncheckedSubOpt_corresponds_stepMirState a b ha hb)
+      (u64WrappingSubOpt_corresponds_stepMirState a b ha hb)
+      (fun _ _ _ _ hS hT =>
+        (canonMem_unchecked_sub a b ha hS).trans
+          (canonMem_wrapping_sub a b ha hb hT).symm)
+  have h0Lt : 0 < modPow2 (uintWidth .u64) := u64Mod_pos
+  have h1Lt : 1 < modPow2 (uintWidth .u64) := Nat.le_of_ble_eq_true rfl
+  have hMirU := runMirCall_unchecked_sub_ub .u64 0 1 (Nat.le_of_ble_eq_true rfl)
+  have hMirW := runMirCall_wrapping_sub .u64 0 1 h0Lt h1Lt
+  refine ⟨hTr.1, hTr.2, hPartial, ?_⟩
+  rw [hMirW, hMirU]
+  intro h
+  exact False.elim h
+
 /-- Fully chained capstone for `u64` addition through BOTH gates: a
 `farkasMirGate` `BoolCertCut` discharges the `CtxFact` entry precondition, and
 ANY `blockOptGate` `BoolCertCut` then transports the guard elision to the real
@@ -3794,6 +4014,264 @@ theorem u64_sub_blockOptGate_cut_to_stepMirState_env (maxStepsPerNode : Nat)
       (fun _ _ _ _ hS hT =>
         (canonMem_checked_sub _ _ h0 h1 hS).trans
           (canonMem_unchecked_sub _ _ h0 hT).symm)
+  exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩
+
+/-- `u64CheckedAddArena` reduces inputs via `word64`, so EVERY unrestricted
+`env : Nat → Nat` evaluates identically to
+`env2 (word64 (env 0)) (word64 (env 1))`. -/
+theorem u64CheckedAddArena_evalArena_any_env (env : Nat → Nat) :
+    evalArena env u64CheckedAddArena =
+      evalArena (env2 (word64 (env 0)) (word64 (env 1)))
+        u64CheckedAddArena := by
+  let env' : Nat → Nat := env2 (word64 (env 0)) (word64 (env 1))
+  have h0 : word64 (env' 0) = word64 (env 0) := word64_idem (env 0)
+  have h1 : word64 (env' 1) = word64 (env 1) := word64_idem (env 1)
+  change
+    [ .val (word64 (env 0)),
+      .val (word64 (env 1)),
+      evalSsaOp (fun _ => 0) .addWrap
+        [.val (word64 (env 0)), .val (word64 (env 1))],
+      evalSsaOp (fun _ => 0) .addNuw
+        [.val (word64 (env 0)), .val (word64 (env 1))] ] =
+    [ .val (word64 (env' 0)),
+      .val (word64 (env' 1)),
+      evalSsaOp (fun _ => 0) .addWrap
+        [.val (word64 (env' 0)), .val (word64 (env' 1))],
+      evalSsaOp (fun _ => 0) .addNuw
+        [.val (word64 (env' 0)), .val (word64 (env' 1))] ]
+  rw [h0, h1]
+
+/-- `u64CheckedSubArena` reduces inputs via `word64`, so EVERY unrestricted
+`env : Nat → Nat` evaluates identically to
+`env2 (word64 (env 0)) (word64 (env 1))`. -/
+theorem u64CheckedSubArena_evalArena_any_env (env : Nat → Nat) :
+    evalArena env u64CheckedSubArena =
+      evalArena (env2 (word64 (env 0)) (word64 (env 1)))
+        u64CheckedSubArena := by
+  let env' : Nat → Nat := env2 (word64 (env 0)) (word64 (env 1))
+  have h0 : word64 (env' 0) = word64 (env 0) := word64_idem (env 0)
+  have h1 : word64 (env' 1) = word64 (env 1) := word64_idem (env 1)
+  change
+    [ .val (word64 (env 0)),
+      .val (word64 (env 1)),
+      evalSsaOp (fun _ => 0) .subWrap
+        [.val (word64 (env 0)), .val (word64 (env 1))],
+      evalSsaOp (fun _ => 0) .subNuw
+        [.val (word64 (env 0)), .val (word64 (env 1))] ] =
+    [ .val (word64 (env' 0)),
+      .val (word64 (env' 1)),
+      evalSsaOp (fun _ => 0) .subWrap
+        [.val (word64 (env' 0)), .val (word64 (env' 1))],
+      evalSsaOp (fun _ => 0) .subNuw
+        [.val (word64 (env' 0)), .val (word64 (env' 1))] ]
+  rw [h0, h1]
+
+theorem sourceEntryPre_u64CheckedAdd_any_env_iff (env : Nat → Nat) :
+    SourceEntryPre u64CheckedAddSrc env ↔
+      SourceEntryPre u64CheckedAddSrc
+        (env2 (word64 (env 0)) (word64 (env 1))) := by
+  dsimp only [SourceEntryPre, EntryFactsHold, u64CheckedAddSrc]
+  rw [u64CheckedAddArena_evalArena_any_env env]
+
+theorem sourceEntryPre_u64CheckedSub_any_env_iff (env : Nat → Nat) :
+    SourceEntryPre u64CheckedSubSrc env ↔
+      SourceEntryPre u64CheckedSubSrc
+        (env2 (word64 (env 0)) (word64 (env 1))) := by
+  dsimp only [SourceEntryPre, EntryFactsHold, u64CheckedSubSrc]
+  rw [u64CheckedSubArena_evalArena_any_env env]
+
+/-- Unrestricted every-environment transport for `u64` checked-to-unchecked
+addition (NO `env 0, env 1 < 2^64` range hypotheses): ANY accepted
+`blockOptGate` certificate transports to `stepMirState` and bidirectional
+`ITree.toPartial` equivalence on `word64 (env 0), word64 (env 1)`. -/
+theorem u64_add_blockOptGate_cut_to_stepMirState_any_env
+    (maxStepsPerNode : Nat) (steps : List DagStep)
+    (hCut : Anneal.Framework.StepWp.BoolCertCut
+      (gateCheckBounded (blockOptGate maxStepsPerNode))
+      (u64CheckedAddSrc, u64UncheckedAddOpt, steps))
+    (env : Nat → Nat) (hEntry : SourceEntryPre u64CheckedAddSrc env) :
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1))))) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))))
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1))))) ∧
+    (mirCallTree (mkUncheckedArithBody .u64 .add)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ∧
+    (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .add)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial :=
+  u64_add_blockOptGate_cut_to_stepMirState_env maxStepsPerNode steps hCut
+    (env2 (word64 (env 0)) (word64 (env 1)))
+    (Nat.mod_lt (env 0) u64Mod_pos) (Nat.mod_lt (env 1) u64Mod_pos)
+    ((sourceEntryPre_u64CheckedAdd_any_env_iff env).1 hEntry)
+
+/-- Unrestricted every-environment transport for `u64` checked-to-wrapping
+addition (NO range hypotheses): full `stepMirState` and bidirectional
+`ITree.toPartial` equivalence for ANY accepted `blockOptGate` certificate. -/
+theorem u64_add_blockOptGate_cut_to_stepMirState_wrapping_any_env
+    (maxStepsPerNode : Nat) (steps : List DagStep)
+    (hCut : Anneal.Framework.StepWp.BoolCertCut
+      (gateCheckBounded (blockOptGate maxStepsPerNode))
+      (u64CheckedAddSrc, u64WrappingAddOpt, steps))
+    (env : Nat → Nat) (hEntry : SourceEntryPre u64CheckedAddSrc env) :
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))))
+      (classifyMirExecStateExact
+        (runMirCall (mkWrappingArithBody .u64 .add) 2
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1))))) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))))
+      (classifyMirExecState .abort
+        (runMirCall (mkWrappingArithBody .u64 .add) 2
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1))))) ∧
+    (mirCallTree (mkWrappingArithBody .u64 .add)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ∧
+    (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ≤
+      (mirCallTree (mkWrappingArithBody .u64 .add)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial := by
+  have h0 : word64 (env 0) < modPow2 (uintWidth .u64) :=
+    Nat.mod_lt (env 0) u64Mod_pos
+  have h1 : word64 (env 1) < modPow2 (uintWidth .u64) :=
+    Nat.mod_lt (env 1) u64Mod_pos
+  have hEntry2 := (sourceEntryPre_u64CheckedAdd_any_env_iff env).1 hEntry
+  have hLt : word64 (env 0) + word64 (env 1) < modPow2 (uintWidth .u64) :=
+    (sourceEntryPre_u64CheckedAdd_iff _ _ h0 h1).1 hEntry2
+  have hOk := runMirCall_checked_add_ok .u64 .abort (word64 (env 0))
+    (word64 (env 1)) hLt
+  dsimp only [PanicStrategy.toUnwindAction] at hOk
+  have hDef :
+      classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))) ≠ .ub := by
+    rw [hOk]
+    intro h
+    nomatch h
+  have hEq := u64_add_blockOptGate_cut_to_stepMirState_wrapping maxStepsPerNode
+    steps hCut (word64 (env 0)) (word64 (env 1)) h0 h1 hEntry2
+  have hTree :=
+    blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
+      maxStepsPerNode u64CheckedAddSrc u64WrappingAddOpt steps hCut
+      (env2 (word64 (env 0)) (word64 (env 1))) hEntry2
+      (u64CheckedAddSrc_corresponds_stepMirState _ _ h0 h1)
+      (u64WrappingAddOpt_corresponds_stepMirState _ _ h0 h1) hDef
+      (fun _ _ _ _ hS hT =>
+        (canonMem_checked_add _ _ hS).trans
+          (canonMem_wrapping_add _ _ hT).symm)
+  exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩
+
+/-- Unrestricted every-environment transport for `u64` checked-to-unchecked
+subtraction (NO range hypotheses). -/
+theorem u64_sub_blockOptGate_cut_to_stepMirState_any_env
+    (maxStepsPerNode : Nat) (steps : List DagStep)
+    (hCut : Anneal.Framework.StepWp.BoolCertCut
+      (gateCheckBounded (blockOptGate maxStepsPerNode))
+      (u64CheckedSubSrc, u64UncheckedSubOpt, steps))
+    (env : Nat → Nat) (hEntry : SourceEntryPre u64CheckedSubSrc env) :
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1))))) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))))
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1))))) ∧
+    (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ∧
+    (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial :=
+  u64_sub_blockOptGate_cut_to_stepMirState_env maxStepsPerNode steps hCut
+    (env2 (word64 (env 0)) (word64 (env 1)))
+    (Nat.mod_lt (env 0) u64Mod_pos) (Nat.mod_lt (env 1) u64Mod_pos)
+    ((sourceEntryPre_u64CheckedSub_any_env_iff env).1 hEntry)
+
+/-- Unrestricted every-environment transport for `u64` checked-to-wrapping
+subtraction (NO range hypotheses): full `stepMirState` and bidirectional
+`ITree.toPartial` equivalence for ANY accepted `blockOptGate` certificate. -/
+theorem u64_sub_blockOptGate_cut_to_stepMirState_wrapping_any_env
+    (maxStepsPerNode : Nat) (steps : List DagStep)
+    (hCut : Anneal.Framework.StepWp.BoolCertCut
+      (gateCheckBounded (blockOptGate maxStepsPerNode))
+      (u64CheckedSubSrc, u64WrappingSubOpt, steps))
+    (env : Nat → Nat) (hEntry : SourceEntryPre u64CheckedSubSrc env) :
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))))
+      (classifyMirExecStateExact
+        (runMirCall (mkWrappingArithBody .u64 .sub) 2
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1))))) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))))
+      (classifyMirExecState .abort
+        (runMirCall (mkWrappingArithBody .u64 .sub) 2
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1))))) ∧
+    (mirCallTree (mkWrappingArithBody .u64 .sub)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ∧
+    (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial ≤
+      (mirCallTree (mkWrappingArithBody .u64 .sub)
+        (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))).toPartial := by
+  have h0 : word64 (env 0) < modPow2 (uintWidth .u64) :=
+    Nat.mod_lt (env 0) u64Mod_pos
+  have h1 : word64 (env 1) < modPow2 (uintWidth .u64) :=
+    Nat.mod_lt (env 1) u64Mod_pos
+  have hEntry2 := (sourceEntryPre_u64CheckedSub_any_env_iff env).1 hEntry
+  have hLe : word64 (env 1) ≤ word64 (env 0) :=
+    (sourceEntryPre_u64CheckedSub_iff _ _ h0 h1).1 hEntry2
+  have hOk := runMirCall_checked_sub_ok .u64 .abort (word64 (env 0))
+    (word64 (env 1)) h0 h1 hLe
+  dsimp only [PanicStrategy.toUnwindAction] at hOk
+  have hDef :
+      classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (word64 (env 0)) (word64 (env 1)))) ≠ .ub := by
+    rw [hOk]
+    intro h
+    nomatch h
+  have hEq := u64_sub_blockOptGate_cut_to_stepMirState_wrapping maxStepsPerNode
+    steps hCut (word64 (env 0)) (word64 (env 1)) h0 h1 hEntry2
+  have hTree :=
+    blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
+      maxStepsPerNode u64CheckedSubSrc u64WrappingSubOpt steps hCut
+      (env2 (word64 (env 0)) (word64 (env 1))) hEntry2
+      (u64CheckedSubSrc_corresponds_stepMirState _ _ h0 h1)
+      (u64WrappingSubOpt_corresponds_stepMirState _ _ h0 h1) hDef
+      (fun _ _ _ _ hS hT =>
+        (canonMem_checked_sub _ _ h0 h1 hS).trans
+          (canonMem_wrapping_sub _ _ h0 h1 hT).symm)
   exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩
 
 /-! ### 4.4 Negative Counterexamples (Undischarged Elision & Strategy Split) -/

@@ -424,14 +424,33 @@ theorem test_farkasMir_edge_weight_bounds (goal : FarkasMirGoal) :
     Anneal.Hybrid.gateCheckBounded (farkasMirBoundedEdgeGate 3)
       (mirEdgeGoal, (), mirEdgeCert) = false ∧
     Anneal.Hybrid.gateCheckBounded (farkasMirGate 3)
-      (mirEdgeGoal, (), mirEdgeCert) = true :=
+      (mirEdgeGoal, (), mirEdgeCert) = true ∧
+    -- Strictness lifted to `evalGate` and total `gateVerdict`
+    Anneal.Hybrid.evalGate (E := Unit) (farkasMirGate 4) mirEdgeGoal
+      (.candidate () mirEdgeCert) = .ok () ∧
+    gateVerdict (E := Unit) (farkasMirGate 4) mirEdgeGoal
+      [ .candidate false (.edge []), .candidate true mirEdgeCert ] = true ∧
+    -- Total `gateVerdict` over dual-backend (`natCutDualGate` /
+    -- `intCutDualGate`)
+    parityCutReqGoal.denote ∧
+    intSubNegMulGoal.denote :=
   ⟨(farkasMirCert_empty_edge_size_and_weight 64).1,
    (farkasMirCert_empty_edge_size_and_weight 64).2,
    farkasMirBoundedEdgeGate_rejects_long_edge 63 goal
      (List.replicate 64 []) (Nat.le_of_ble_eq_true rfl),
    farkasMirBoundedEdgeGate_accept_imp_farkasMirGate 4 mirEdgeGoal
      mirEdgeCert rfl,
-   rfl, rfl⟩
+   rfl, rfl,
+   farkasMirBoundedEdgeGate_eval_ok_imp_farkasMirGate 4 mirEdgeGoal
+     (.candidate () mirEdgeCert) rfl,
+   farkasMirBoundedEdgeGate_verdict_imp_farkasMirGate 4 mirEdgeGoal
+     [ .candidate false (.edge []), .candidate true mirEdgeCert ] rfl,
+   natCutDualGate_verdict_sound (E := Unit) 8 parityCutReqGoal
+     [ .candidate false (.indexed, []),
+       .candidate true (.list, parityCutReqCert) ] rfl,
+   intCutDualGate_verdict_sound (E := Unit) 8 intSubNegMulGoal
+     [ .candidate false (.list, []),
+       .candidate true (.indexed, intSubNegMulCert) ] rfl⟩
 
 /-- Total sabotage-resistant `Bool` verdicts (`gateVerdict`, i.e.
 `withFallback` over `firstAccepted` on `verdictGate`): a `true` claim needs a
@@ -959,8 +978,26 @@ theorem test_backend_asymmetric_ub_transport
             (uintArgs2 .u64 u64Max 1))) ∧
     (∃ outSrc, evalSourceBlockUnit u64UncheckedAddSrc (env2 u64Max 1) outSrc ∧
       MirOptOutcomeRefines (execOutcomeToMirClass? outSrc)
-        (execOutcomeToMirClass? (.returned 0 ()))) := by
+        (execOutcomeToMirClass? (.returned 0 ()))) ∧
+    -- Symmetric subtraction asymmetric `.ub ⊑ .ret` transport (`dropSubNuw`)
+    MirExactOutcomeRefines
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2 (uintArgs2 .u64 a b)))
+      (classifyMirExecStateExact
+        (runMirCall (mkWrappingArithBody .u64 .sub) 2 (uintArgs2 .u64 a b))) ∧
+    (mirCallTree (mkWrappingArithBody .u64 .sub)
+        (uintArgs2 .u64 a b)).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 a b)).toPartial ∧
+    ¬ MirExactOutcomeRefines
+        (classifyMirExecStateExact
+          (runMirCall (mkWrappingArithBody .u64 .sub) 2
+            (uintArgs2 .u64 0 1)))
+        (classifyMirExecStateExact
+          (runMirCall (mkUncheckedArithBody .u64 .sub) 2
+            (uintArgs2 .u64 0 1))) := by
   have hTr := u64_addNuw_to_addWrap_asymmetric_ub_transport a b ha hb
+  have hSubTr := u64_subNuw_to_subWrap_asymmetric_ub_transport a b ha hb
   have hCut :
       Anneal.Framework.StepWp.BoolCertCut
         (Anneal.Hybrid.gateCheckBounded (blockOptGate 2))
@@ -982,7 +1019,8 @@ theorem test_backend_asymmetric_ub_transport
     semRefinesUnder_preserves_mirOptRefines_asymmetric hSem
       (fun _ _ h => nomatch h) (Or.inl hSrcUb) hTgtRet
   have ⟨outSrc, hS, hR, _⟩ := hAsym
-  exact ⟨hTr.1, hTr.2.2.1, hTr.2.2.2, outSrc, hS, hR⟩
+  exact ⟨hTr.1, hTr.2.2.1, hTr.2.2.2, ⟨outSrc, hS, hR⟩,
+    hSubTr.1, hSubTr.2.2.1, hSubTr.2.2.2⟩
 
 /-- The outcome bridge is faithful exactly on `u64`-ranged outcomes: it is
 injective there, refinement between bridged outcomes means "the spec is UB
@@ -997,12 +1035,18 @@ theorem test_backend_outcome_bridge_faithful :
     (∀ v : Nat, v < modPow2 (uintWidth .u64) →
       execOutcomeToMirExactClass? (.returned v ()) =
         execOutcomeToMirExactClass? (.returned 7 ()) → v = 7) ∧
+    (∀ v : Nat, v < modPow2 (uintWidth .u64) →
+      execOutcomeToMirClass? (.returned v ()) =
+        execOutcomeToMirClass? (.returned 7 ()) → v = 7) ∧
+    ¬ MirOptOutcomeRefines (execOutcomeToMirClass? (.aborted ()))
+        (execOutcomeToMirClass? (.returned 0 ())) ∧
     execOutcomeToMirExactClass? (.returned 0 ()) =
       execOutcomeToMirExactClass? (.returned u64Mod ()) := by
   have h0 : 0 < modPow2 (uintWidth .u64) := by decide
   have h1 : 1 < modPow2 (uintWidth .u64) := by decide
   have h7 : 7 < modPow2 (uintWidth .u64) := by decide
   refine ⟨fun hRef => ?_, fun hRef => ?_, ?_, fun v hv hEq => ?_,
+    fun v hv hEq => ?_, fun hRef => ?_,
     neg_execOutcomeToMirExactClass?_not_injective_unranged.1⟩
   · cases (mirOptExactOutcomeRefines_exec_iff_on_u64
         (o₁ := .aborted ()) (o₂ := .returned 0 ()) True.intro h0).1 hRef with
@@ -1017,18 +1061,30 @@ theorem test_backend_outcome_bridge_faithful :
   · have hOut := execOutcomeToMirExactClass?_injective_on_u64
       (o₁ := .returned v ()) (o₂ := .returned 7 ()) hv h7 hEq
     injection hOut
+  · have hOut := execOutcomeToMirClass?_injective_on_u64
+      (o₁ := .returned v ()) (o₂ := .returned 7 ()) hv h7 hEq
+    injection hOut
+  · cases (mirOptOutcomeRefines_exec_iff_on_u64
+        (o₁ := .aborted ()) (o₂ := .returned 0 ()) True.intro h0).1 hRef with
+    | inl h => nomatch h
+    | inr h => nomatch h
 
 /-- An environment that is NOT of the form `env2 a b`: variable `2` is `13`,
 not `0`. -/
 def affineEnv : Nat → Nat := fun i => 5 * i + 3
 
-/-- Certificate transport at EVERY `u64`-ranged Backend environment, for a
-non-canonical certificate: `SemRefinesUnder` quantifies over all
-`env : Nat → Nat`, and so does the transported `stepMirState` and
-`ITree.toPartial` equivalence, here at `affineEnv` (inputs `3` and `8`). -/
+/-- An out-of-range environment whose `0` and `1` coordinates exceed `2^64`
+(`wrappedEnv 0 = 2^64 + 3`, `wrappedEnv 1 = 2 * 2^64 + 8`). -/
+def wrappedEnv : Nat → Nat := fun i => (i + 1) * u64Mod + 5 * i + 3
+
+/-- Certificate transport at EVERY Backend environment (both `u64`-ranged
+`affineEnv` AND out-of-range `wrappedEnv` with NO range hypotheses), for
+non-canonical certificates and both unchecked and wrapping targets. -/
 theorem test_backend_every_environment_transport :
     affineEnv 2 ≠ env2 (affineEnv 0) (affineEnv 1) 2 ∧
+    u64Mod ≤ wrappedEnv 0 ∧
     SourceEntryPre u64CheckedAddSrc affineEnv ∧
+    SourceEntryPre u64CheckedAddSrc wrappedEnv ∧
     MirExactOutcomeEquiv
       (classifyMirExecStateExact
         (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
@@ -1040,23 +1096,55 @@ theorem test_backend_every_environment_transport :
         (uintArgs2 .u64 3 8)).toPartial ≤
       (mirCallTree (mkUncheckedArithBody .u64 .add)
         (uintArgs2 .u64 3 8)).toPartial ∧
-    -- Subtraction at the swapped environment (inputs `8` and `3`)
+    -- Out-of-range `wrappedEnv`: unchecked + wrapping `ITree.toPartial` equiv
+    (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 (word64 (wrappedEnv 0))
+          (word64 (wrappedEnv 1)))).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .add)
+        (uintArgs2 .u64 (word64 (wrappedEnv 0))
+          (word64 (wrappedEnv 1)))).toPartial ∧
+    (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 (word64 (wrappedEnv 0))
+          (word64 (wrappedEnv 1)))).toPartial ≤
+      (mirCallTree (mkWrappingArithBody .u64 .add)
+        (uintArgs2 .u64 (word64 (wrappedEnv 0))
+          (word64 (wrappedEnv 1)))).toPartial ∧
+    -- Subtraction at swapped environments (in-range + out-of-range wrapping)
     MirOutcomeEquiv
       (classifyMirExecState .abort
         (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
           (uintArgs2 .u64 8 3)))
       (classifyMirExecState .abort
         (runMirCall (mkUncheckedArithBody .u64 .sub) 2
-          (uintArgs2 .u64 8 3))) := by
+          (uintArgs2 .u64 8 3))) ∧
+    (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 (word64 (wrappedEnv 1))
+          (word64 (wrappedEnv 0)))).toPartial ≤
+      (mirCallTree (mkWrappingArithBody .u64 .sub)
+        (uintArgs2 .u64 (word64 (wrappedEnv 1))
+          (word64 (wrappedEnv 0)))).toPartial := by
   have h3 : 3 < modPow2 (uintWidth .u64) := by decide
   have h8 : 8 < modPow2 (uintWidth .u64) := by decide
   have hAddEntry : SourceEntryPre u64CheckedAddSrc affineEnv :=
     (sourceEntryPre_u64CheckedAdd_env_iff affineEnv).2
       ((sourceEntryPre_u64CheckedAdd_iff 3 8 h3 h8).2 (by decide))
+  have hWrapAddEntry : SourceEntryPre u64CheckedAddSrc wrappedEnv :=
+    (sourceEntryPre_u64CheckedAdd_any_env_iff wrappedEnv).2
+      ((sourceEntryPre_u64CheckedAdd_iff _ _ (by decide) (by decide)).2
+        (by decide))
   have hAdd :=
     u64_add_blockOptGate_cut_to_stepMirState_env 2 u64AddAltSteps
       (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
       affineEnv h3 h8 hAddEntry
+  have hWrapAdd :=
+    u64_add_blockOptGate_cut_to_stepMirState_any_env 2 u64AddAltSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      wrappedEnv hWrapAddEntry
+  have hWrapAddW :=
+    u64_add_blockOptGate_cut_to_stepMirState_wrapping_any_env 2
+      u64CheckedAddToWrappingSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      wrappedEnv hWrapAddEntry
   have hSubEntry :
       SourceEntryPre u64CheckedSubSrc (fun i => affineEnv (1 - i)) :=
     (sourceEntryPre_u64CheckedSub_env_iff _).2
@@ -1066,7 +1154,18 @@ theorem test_backend_every_environment_transport :
       u64CheckedSubToUncheckedSteps
       (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
       (fun i => affineEnv (1 - i)) h8 h3 hSubEntry
-  exact ⟨by decide, hAddEntry, hAdd.1, hAdd.2.2.2, hSub.2.1⟩
+  have hWrapSubEntry :
+      SourceEntryPre u64CheckedSubSrc (fun i => wrappedEnv (1 - i)) :=
+    (sourceEntryPre_u64CheckedSub_any_env_iff _).2
+      ((sourceEntryPre_u64CheckedSub_iff _ _ (by decide) (by decide)).2
+        (by decide))
+  have hWrapSubW :=
+    u64_sub_blockOptGate_cut_to_stepMirState_wrapping_any_env 2
+      u64CheckedSubToWrappingSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      (fun i => wrappedEnv (1 - i)) hWrapSubEntry
+  exact ⟨by decide, by decide, hAddEntry, hWrapAddEntry, hAdd.1, hAdd.2.2.2,
+    hWrapAdd.2.2.2, hWrapAddW.2.2.2, hSub.2.1, hWrapSubW.2.2.2⟩
 
 /-- Undischarged-fact negatives. The SAME elision certificate that
 `blockOptGate` accepts for the `.proven` source is rejected once the fact is
@@ -1361,11 +1460,11 @@ run_cmd do
     auditModule `Anneal.Backend.Canaries true propextOnly propextOnly 30 64
   let r9 ←
     auditModule `Anneal.HybridCertBridgesV2026 false constructive
-      constructive 161 212
+      constructive 176 213
   -- Enforce an EXACT duplicate-free `Quot.sound` allowlist on
   -- `Anneal.HybridCertBridgesV2026`: every non-allowlisted constant must be
-  -- `<= [propext]`, and every allowlisted constant must genuinely use
-  -- `Quot.sound` (via `ITree.toPartial`).
+  -- `<= [propext]` (only exact allowlisted theorems and their direct
+  -- compiler-generated `match_*` auxiliaries may use `Quot.sound`).
   let quotAllowed : List Name :=
     [ ``blockOptGate_cut_transports_to_mirCallTree_toPartial,
       ``blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv,
@@ -1376,10 +1475,19 @@ run_cmd do
       ``u64_add_natCutIdxGate_to_stepMirState_bridge,
       ``u64_sub_natCutIdxGate_to_stepMirState_bridge,
       ``u64_addNuw_to_addWrap_asymmetric_ub_transport,
+      ``u64_subNuw_to_subWrap_asymmetric_ub_transport,
       ``u64_add_blockOptGate_cut_to_stepMirState_env,
       ``u64_sub_blockOptGate_cut_to_stepMirState_env,
+      ``u64_add_blockOptGate_cut_to_stepMirState_any_env,
+      ``u64_add_blockOptGate_cut_to_stepMirState_wrapping_any_env,
+      ``u64_sub_blockOptGate_cut_to_stepMirState_any_env,
+      ``u64_sub_blockOptGate_cut_to_stepMirState_wrapping_any_env,
       ``neg_u64_add_undischarged_guard_elision_unsound,
       ``neg_u64_sub_undischarged_guard_elision_unsound ]
+  let isMatchAuxOf (q c : Name) : Bool :=
+    match c with
+    | .str p s => p == q && s.startsWith "match_"
+    | _ => false
   let mut seenAllow : List Name := []
   for q in quotAllowed do
     if seenAllow.contains q then
@@ -1389,21 +1497,26 @@ run_cmd do
     | throwError "audit: Anneal.HybridCertBridgesV2026 not imported"
   let brConsts := env.header.moduleData[idxBr]!.constNames.toList
   let mut quotActual : List Name := []
+  let mut quotMatchHelpers : Nat := 0
   for c in brConsts do
     let axs := (← liftCoreM <| Lean.collectAxioms c).toList
     if axs.contains ``Quot.sound then
-      unless quotAllowed.any (fun q => q.isPrefixOf c) do
+      if quotAllowed.contains c then
+        quotActual := c :: quotActual
+      else if quotAllowed.any (fun q => isMatchAuxOf q c) then
+        quotMatchHelpers := quotMatchHelpers + 1
+      else
         throwError "audit: unexpected Quot.sound in {c} (axs={axs})"
-      quotActual := c :: quotActual
   for q in quotAllowed do
     unless quotActual.contains q do
       throwError "audit: stale Quot.sound allowlist entry {q}"
   -- Transitive `unsafe_rec` audit. A companion `c._unsafe_rec` is a sibling of
   -- `c` and never one of its dependencies, so following `getUsedConstants`
   -- alone can never reach one. For every `Anneal.*` constant reachable from
-  -- the 9 theory modules and this test module, the companion is looked up by
-  -- name. The 10 audited modules must have none. The pre-existing base
-  -- modules they build on do have some; that set is pinned exactly, so a new
+  -- the 9 theory modules and this test module (plus every local constant in
+  -- `env.constants.map₂`), the companion is looked up by name. The 10 audited
+  -- modules must have none. The pre-existing base modules they build on do
+  -- have some; that set is pinned exactly (duplicate-free), so a new
   -- well-founded dependency is reported instead of silently accepted.
   let theoryMods : List Name :=
     [ `Anneal.Hybrid, `Anneal.Hybrid.Canaries, `Anneal.Backend.Rules,
@@ -1417,6 +1530,8 @@ run_cmd do
     for c in env.header.moduleData[idx]!.constNames do
       work := c :: work
   for (c, _) in env.constants.map₂.toList do
+    if env.contains (Name.str c unsafeRecSuffix) then
+      throwError "audit: test constant {c} has a companion"
     work := c :: work
   let mut visited : NameSet := {}
   let mut annealTransitive : Nat := 0
@@ -1460,14 +1575,37 @@ run_cmd do
       ``Anneal.FarkasMirCert.evalIntLinExprSInt,
       ``Anneal.FarkasMirCert.listLookup?,
       ``Anneal.Mir.OverflowTrapRefinement.runMirSteps ]
+  let mut seenBase : List Name := []
+  for b in expectedBaseCompanions do
+    if seenBase.contains b then
+      throwError "audit: duplicate expectedBaseCompanions entry {b}"
+    seenBase := b :: seenBase
   unless sameSet baseCompanions expectedBaseCompanions do
     throwError "audit: base constants with companions: {baseCompanions}"
-  -- Sweep every constant defined so far in this test module
+  -- Sweep every constant defined so far in this test module, enforcing an
+  -- exact duplicate-free `Quot.sound` allowlist on the test module as well.
+  let testQuotAllowed : List Name :=
+    [ ``test_backend_overflowTrap_e2e_add_sub,
+      ``test_backend_blockOptGate_mirRefines_and_alt_bridges,
+      ``test_backend_and_trap_negative_counterexamples,
+      ``test_backend_asymmetric_ub_transport,
+      ``test_backend_every_environment_transport ]
+  let mut seenTestQuot : List Name := []
+  for tq in testQuotAllowed do
+    if seenTestQuot.contains tq then
+      throwError "audit: duplicate testQuotAllowed entry {tq}"
+    seenTestQuot := tq :: seenTestQuot
   let mut testThms : Nat := 0
   let mut testDefs : Nat := 0
   let mut testUsed : List Name := []
+  let mut testQuotActual : List Name := []
   for (c, ci) in env.constants.map₂.toList do
     let (kind, axs) ← auditConst "the test module" constructive c ci
+    if axs.contains ``Quot.sound then
+      if testQuotAllowed.contains c then
+        testQuotActual := c :: testQuotActual
+      else if !testQuotAllowed.any (fun q => isMatchAuxOf q c) then
+        throwError "audit: unexpected Quot.sound in test {c} (axs={axs})"
     for a in axs do
       unless testUsed.contains a do
         testUsed := a :: testUsed
@@ -1475,11 +1613,15 @@ run_cmd do
       testThms := testThms + 1
     else if kind == 2 then
       testDefs := testDefs + 1
-  if testThms < 25 || testDefs < 40 then
+  for tq in testQuotAllowed do
+    unless testQuotActual.contains tq do
+      throwError "audit: stale testQuotAllowed entry {tq}"
+  if testThms < 25 || testDefs < 41 then
     throwError "audit: test floor: thms={testThms}, defs={testDefs}"
   let rT :=
     s!"test module: {testThms} thms, {testDefs} defs, axioms={testUsed}, " ++
-    s!"quotAllowed={quotAllowed.length}, " ++
+    s!"quotAllowed={quotAllowed.length}+{quotMatchHelpers}m, " ++
+    s!"testQuot={testQuotAllowed.length}, " ++
     s!"annealTransitive={annealTransitive}, " ++
     s!"baseCompanions={baseCompanions.length}"
   -- Pin the EXACT axiom set of every capstone, so a proof that starts to
@@ -1509,18 +1651,28 @@ run_cmd do
     [ ``natCutIdxGate_cut_sound,
       ``intCutIdxGate_cut_sound,
       ``natCutDualGate_cut_sound,
+      ``natCutDualGate_verdict_sound,
+      ``intCutDualGate_verdict_sound,
       ``natCutPortfolio_sound,
       ``intCutPortfolio_sound,
       ``farkasMirGate_cut_sound,
       ``farkasMirBoundedEdgeGate_cut_sound,
       ``farkasMirBoundedEdgeGate_rejects_long_edge,
       ``farkasMirBoundedEdgeGate_accept_imp_farkasMirGate,
+      ``farkasMirBoundedEdgeGate_eval_ok_imp_farkasMirGate,
+      ``farkasMirBoundedEdgeGate_verdict_imp_farkasMirGate,
       ``neg_farkasMir_empty_edge_bomb_bounded,
       ``farkasMirPortfolio_sound,
       ``natCutIdxGate_discharges_uint_add_no_overflow,
       ``natCutIdxGate_discharges_uint_sub_no_underflow_certified,
       ``execOutcomeToMirExactClass?_injective_on_u64,
       ``mirOptExactOutcomeRefines_exec_iff_on_u64,
+      ``execOutcomeToMirClass?_injective_on_u64,
+      ``mirOptOutcomeRefines_exec_iff_on_u64,
+      ``u64CheckedAddArena_evalArena_any_env,
+      ``u64CheckedSubArena_evalArena_any_env,
+      ``sourceEntryPre_u64CheckedAdd_any_env_iff,
+      ``sourceEntryPre_u64CheckedSub_any_env_iff,
       ``semRefinesUnder_preserves_mirOptRefines,
       ``semRefinesUnder_preserves_mirOptRefines_relational,
       ``semRefinesUnder_preserves_mirOptRefines_asymmetric,
@@ -1577,8 +1729,13 @@ run_cmd do
 #print axioms u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState
 #print axioms u64_sub_natCutIdx_and_blockOpt_cuts_to_stepMirState
 #print axioms u64_addNuw_to_addWrap_asymmetric_ub_transport
+#print axioms u64_subNuw_to_subWrap_asymmetric_ub_transport
 #print axioms u64_add_blockOptGate_cut_to_stepMirState_env
 #print axioms u64_sub_blockOptGate_cut_to_stepMirState_env
+#print axioms u64_add_blockOptGate_cut_to_stepMirState_any_env
+#print axioms u64_add_blockOptGate_cut_to_stepMirState_wrapping_any_env
+#print axioms u64_sub_blockOptGate_cut_to_stepMirState_any_env
+#print axioms u64_sub_blockOptGate_cut_to_stepMirState_wrapping_any_env
 #print axioms u64_add_farkasMirGate_to_stepMirState_bridge
 #print axioms u64_sub_natCutIdxGate_to_stepMirState_bridge
 #print axioms neg_u64_add_undischarged_guard_elision_unsound
