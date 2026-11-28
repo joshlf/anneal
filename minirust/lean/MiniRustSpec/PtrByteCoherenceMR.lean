@@ -11,7 +11,9 @@ those terms.
 import Lean
 import MiniRustSpec.Interp
 import Trusted.Rustc.V2026_06_01.MirSemantics.Places
+import Trusted.Rustc.V2026_06_01.MirSemantics.Statements
 import Trusted.Rustc.V2026_08_01.MirSemantics.Places
+import Trusted.Rustc.V2026_08_01.MirSemantics.Statements
 
 /-!
 # Episode 2 Dual-Authority Correspondence (`MiniRustSpec` Authority):
@@ -82,10 +84,13 @@ position of the byte inside its pointer.
   transmute strips provenance), so a slice length read from pointer bytes is
   accepted; `Trusted` pins `Ptr2IntTransmutePolicy.strictUcg630Ub` and rejects
   provenance-bearing slice / `str` metadata.
-* `DIV-MR-CHAR` (`w_kani5205_char`): MiniRust has no `char` type (`Type` is
-  `Int`, `Bool`, `Ptr`, `Tuple`, `Array`, `Union`, `Enum`, `Slice`,
-  `TraitObject`); the closest MiniRust type `Type::Int(u32)` accepts `0xD800`,
-  while `Trusted` rejects it at typed `char`.
+* `DIV-MR-CHAR` (`w_kani5205_char`, `kani5205_char_divergence`) vs. **exact `Type::Enum`
+  correspondence** (`minirustCharType`, `kani5205_char_correspondence_M`): MiniRust has no
+  primitive `Type::Char` constructor (so `Type::Int(u32)` accepts all `c < 2^32`, including
+  surrogates `0xD800 ..= 0xDFFF`); however, MiniRust's standard `Type::Enum` + `Discriminator::Branch`
+  encoding of Rust `char` (`[0, 0xD800) ∪ [0xE000, 0x110000)` with fallback `.Invalid`) matches
+  `Trusted` `validateValueForTy?` and `decodeTypedValueFromBytes` biconditionally across **every**
+  `c < 2^32` and both `BasicMemory` and `TreeBorrowsMemory` (`kani5205_char_correspondence_M`).
 * `DIV-MR-DYN-VTABLE` (`w_wide_dyn`): at the representation level MiniRust
   decodes an incoherent vtable pointer to a provenance-free pointer and rejects
   it only in `check_value` through `Machine::vtable_from_ptr`; `Trusted` has no
@@ -690,6 +695,159 @@ theorem minirust_u32_accepts_all (c : Nat) (hc : c < 2 ^ 32) :
   rw [ite_of_neg hlen, mapM_data_init]
   show Except.ok (some (Gen.Value.Int ((Interp.leValue (Interp.leBytes c 4) : Nat) : Int))) = _
   rw [leValue_leBytes, Nat.mod_eq_of_lt (by omega)]
+
+/-- Memory-polymorphic `AbstractByte.dataM` over plain initialized bytes. -/
+theorem mapM_dataM_init {M : Type} [Gen.Memory M] : ∀ (l : List UInt8),
+    (l.map (fun b => (Gen.AbstractByte.Init b none : Gen.AbstractByte (Gen.Memory.Provenance M)))).mapM
+      Interp.AbstractByte.dataM = some l
+  | [] => rfl
+  | b :: rest => by
+      rw [List.map_cons, List.mapM_cons, mapM_dataM_init rest]
+      rfl
+
+/-- Memory-polymorphic MiniRust `Type.decodeM (.Int u32)` accepts every 32-bit pattern across both
+`BasicMemory` and `TreeBorrowsMemory`. -/
+theorem minirust_u32_decodeM {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (c : Nat) (hc : c < 2 ^ 32) :
+    Interp.Type.decodeM (M := M) (.Int ⟨.Unsigned, ⟨4⟩⟩)
+      ((Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none)) = .ok (some (.Int c)) := by
+  rw [Interp.Type.decodeM]
+  unfold Interp.Type.decodeIntM
+  dsimp only
+  have hlen : ¬ (((Interp.leBytes c 4).map (fun b =>
+      (Gen.AbstractByte.Init b none : Gen.AbstractByte (Gen.Memory.Provenance M)))).length ≠
+      (⟨4⟩ : LibSpecr.Size).bytes) := by
+    rw [List.length_map, leBytes_length]
+    exact fun h => h rfl
+  rw [ite_of_neg hlen, mapM_dataM_init]
+  show Except.ok (some (Gen.Value.Int ((Interp.leValue (Interp.leBytes c 4) : Nat) : Int))) = _
+  rw [leValue_leBytes, Nat.mod_eq_of_lt (by omega)]
+
+/-- General 2-range `u32` `Type::Enum` + `Discriminator::Branch` type parameterized by symbolic
+interval endpoints `[lo1, hi1)` and `[lo2, hi2)` (keeping endpoint numerals opaque to well-founded
+equation-lemma kernel reduction). -/
+def minirustTwoRangeU32Enum (lo1 hi1 lo2 hi2 : Int) : Gen.«Type» :=
+  .Enum
+    ⟨[(0, ⟨.Int ⟨.Unsigned, ⟨4⟩⟩, ⟨[]⟩⟩), (1, ⟨.Int ⟨.Unsigned, ⟨4⟩⟩, ⟨[]⟩⟩)]⟩
+    ⟨.Unsigned, ⟨4⟩⟩
+    (.Branch ⟨0⟩ ⟨.Unsigned, ⟨4⟩⟩ .Invalid
+      ⟨[((lo1, hi1), .Known 0), ((lo2, hi2), .Known 1)]⟩)
+    ⟨4⟩ ⟨4⟩
+
+/-- **MiniRust `Type::Enum` + `Discriminator::Branch` encoding of Rust `char`.**
+MiniRust models Rust `char` (whose validity invariant is `[0, 0xD800) ∪ [0xE000, 0x110000)`) via
+a 2-range `Discriminator::Branch` over the 4-byte unsigned word at offset `0` with fallback
+`.Invalid`. -/
+def minirustCharType : Gen.«Type» :=
+  minirustTwoRangeU32Enum 0 0xD800 0xE000 0x110000
+
+/-- Syntactic helper on symbolic endpoints `[lo1, hi1) ∪ [lo2, hi2)` and symbolic 4-byte stream
+`bs`: avoids ever reducing large concrete numerals inside well-founded `Type.decodeM` /
+`decodeDiscriminantM` kernel checks. -/
+theorem minirust_twoRangeU32Enum_decodeM_of_u32 {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (lo1 hi1 lo2 hi2 : Int)
+    (bs : List (Gen.AbstractByte (Gen.Memory.Provenance M))) (c : Int)
+    (hlen : bs.length = 4)
+    (hu32 : Interp.Type.decodeIntM (M := M) ⟨.Unsigned, ⟨4⟩⟩ bs = .ok (some (.Int c))) :
+    Interp.Type.decodeM (M := M) (minirustTwoRangeU32Enum lo1 hi1 lo2 hi2) bs =
+      if lo1 ≤ c ∧ c < hi1 then .ok (some (.Variant 0 (.Int c)))
+      else if lo2 ≤ c ∧ c < hi2 then .ok (some (.Variant 1 (.Int c)))
+      else .ok none := by
+  have hsub : Interp.subsliceWithLength bs ((0 : Nat) : Int) ((4 : Nat) : Int) = .ok bs := by
+    unfold Interp.subsliceWithLength
+    have hcond : (0 : Int) ≤ (0 : Nat) ∧ (0 : Int) ≤ (4 : Nat) ∧ ((0 : Nat) : Int) + (4 : Nat) ≤ bs.length := by
+      omega
+    rw [ite_of_pos hcond]
+    change Except.ok ((bs.drop 0).take 4) = Except.ok bs
+    rw [List.drop_zero, List.take_of_length_le (by omega)]
+  have hdecU32 : Interp.Type.decodeM (M := M) (.Int ⟨.Unsigned, ⟨4⟩⟩) bs = .ok (some (.Int c)) := by
+    rw [Interp.Type.decodeM]; exact hu32
+  unfold minirustTwoRangeU32Enum
+  rw [Interp.Type.decodeM]
+  simp only [hlen, ne_eq, not_true_eq_false, ↓reduceIte, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+  rw [Interp.decodeDiscriminantM]
+  simp only [hsub, hu32, bind, Bind.bind, Except.bind]
+  rw [Interp.decodeDiscriminantChildrenM]
+  by_cases h1 : lo1 ≤ c ∧ c < hi1
+  · rw [ite_of_pos h1, ite_of_pos h1]
+    rw [Interp.decodeDiscriminantM]
+    dsimp only [bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    rw [Interp.Type.decodeVariantM, ite_of_pos rfl, hdecU32]
+  · rw [ite_of_neg h1, ite_of_neg h1]
+    rw [Interp.decodeDiscriminantChildrenM]
+    by_cases h2 : lo2 ≤ c ∧ c < hi2
+    · rw [ite_of_pos h2, ite_of_pos h2]
+      rw [Interp.decodeDiscriminantM]
+      dsimp only [bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+      rw [Interp.Type.decodeVariantM, ite_of_neg (by decide : ¬ ((0 : Int) = 1)),
+        Interp.Type.decodeVariantM, ite_of_pos rfl, hdecU32]
+    · rw [ite_of_neg h2, ite_of_neg h2]
+      rw [Interp.decodeDiscriminantChildrenM, Interp.decodeDiscriminantM]
+      rfl
+
+/-- Exact closed form of memory-polymorphic MiniRust `Type.decodeM minirustCharType` on every
+32-bit little-endian pattern `c < 2^32` across both `BasicMemory` and `TreeBorrowsMemory`. -/
+theorem minirust_char_decodeM_eq {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (c : Nat) (hc : c < 2 ^ 32) :
+    Interp.Type.decodeM (M := M) minirustCharType
+      ((Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none)) =
+      if c < 0xD800 then .ok (some (.Variant 0 (.Int c)))
+      else if 0xE000 ≤ c ∧ c ≤ 0x10FFFF then .ok (some (.Variant 1 (.Int c)))
+      else .ok none := by
+  have h := minirust_twoRangeU32Enum_decodeM_of_u32 (M := M) 0 0xD800 0xE000 0x110000
+    ((Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none)) (c : Int)
+    (by simp [leBytes_length]) (by
+      have hu := minirust_u32_decodeM (M := M) c hc
+      rw [Interp.Type.decodeM] at hu
+      exact hu)
+  change Interp.Type.decodeM (M := M) (minirustTwoRangeU32Enum 0 0xD800 0xE000 0x110000) _ = _
+  rw [h]
+  by_cases h1 : c < 0xD800
+  · have h1' : (0 : Int) ≤ (c : Int) ∧ (c : Int) < 0xD800 := by omega
+    simp only [h1, h1', and_self, ↓reduceIte]
+  · have h1' : ¬ ((0 : Int) ≤ (c : Int) ∧ (c : Int) < 0xD800) := by omega
+    by_cases h2 : 0xE000 ≤ c ∧ c ≤ 0x10FFFF
+    · have h2' : (0xE000 : Int) ≤ (c : Int) ∧ (c : Int) < 0x110000 := by omega
+      simp only [h1, h1', h2, h2', and_self, ↓reduceIte]
+    · have h2' : ¬ ((0xE000 : Int) ≤ (c : Int) ∧ (c : Int) < 0x110000) := by omega
+      simp only [h1, h1', h2, h2', ↓reduceIte]
+
+/-- Universal biconditional characterizing MiniRust `minirustCharType` validity across all
+`c < 2^32` and both `BasicMemory` and `TreeBorrowsMemory`. -/
+theorem minirust_char_decodeM_iff {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (c : Nat) (hc : c < 2 ^ 32) :
+    (∃ v, Interp.Type.decodeM (M := M) minirustCharType
+        ((Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none)) = .ok (some v)) ↔
+      (c < 0xD800 ∨ (0xE000 ≤ c ∧ c ≤ 0x10FFFF)) := by
+  rw [minirust_char_decodeM_eq (M := M) c hc]
+  by_cases h1 : c < 0xD800
+  · simp [h1]
+  · by_cases h2 : 0xE000 ≤ c ∧ c ≤ 0x10FFFF
+    · simp [h1, h2]
+    · simp [h1, h2]
+
+/-- MiniRust `Type.decodeM minirustCharType` rejects any 4-byte stream starting with `.Uninit`. -/
+theorem minirust_char_uninit_decodeM {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (b1 b2 b3 : Gen.AbstractByte (Gen.Memory.Provenance M)) :
+    Interp.Type.decodeM (M := M) minirustCharType [.Uninit, b1, b2, b3] = .ok none := by
+  unfold minirustCharType minirustTwoRangeU32Enum
+  rw [Interp.Type.decodeM]
+  have hsub : Interp.subsliceWithLength
+      ([Gen.AbstractByte.Uninit, b1, b2, b3] : List (Gen.AbstractByte (Gen.Memory.Provenance M)))
+      ((0 : Nat) : Int) ((4 : Nat) : Int) =
+      .ok [.Uninit, b1, b2, b3] := by
+    unfold Interp.subsliceWithLength
+    have hcond : (0 : Int) ≤ (0 : Nat) ∧ (0 : Int) ≤ (4 : Nat) ∧
+        ((0 : Nat) : Int) + (4 : Nat) ≤ ([Gen.AbstractByte.Uninit, b1, b2, b3] : List (Gen.AbstractByte (Gen.Memory.Provenance M))).length := by
+      simp
+    rw [ite_of_pos hcond]; rfl
+  have hint : Interp.Type.decodeIntM (M := M) ⟨.Unsigned, ⟨4⟩⟩ [.Uninit, b1, b2, b3] = .ok none := by
+    unfold Interp.Type.decodeIntM; rfl
+  simp only [List.length_cons, List.length_nil, ne_eq, not_true_eq_false, ↓reduceIte,
+    bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+  rw [Interp.decodeDiscriminantM]
+  simp only [hsub, bind, Bind.bind, Except.bind, hint]
+  rfl
 
 end Shared
 
@@ -2728,6 +2886,388 @@ theorem kani5205_char_divergence_instance :
         .ok (some (.Int 0xD800))) ∧
     isValidCharCode 0xD800 = false ∧ isValidCharCode 0x41 = true :=
   ⟨kani5205_char_divergence 0xD800 (by decide), rfl, rfl⟩
+
+/-- Decoding LE bits of `encodePlainLittleEndianBytes c n` yields `c % 256 ^ n`. -/
+theorem decodeLittleEndianBits_encodePlain :
+    ∀ (n c : Nat), decodeLittleEndianBits (encodePlainLittleEndianBytes c n) = some (c % 256 ^ n)
+  | 0, c => by
+      show some 0 = some (c % 256 ^ 0)
+      rw [Nat.pow_zero, Nat.mod_one]
+  | n + 1, c => by
+      show (match decodeLittleEndianBits (encodePlainLittleEndianBytes (c / 256) n) with
+        | some hi => some (Nat.add (UInt8.ofNat c).toBitVec.toNat (Nat.mul 256 hi))
+        | none => none) = some (c % 256 ^ (n + 1))
+      rw [decodeLittleEndianBits_encodePlain n (c / 256)]
+      show some ((UInt8.ofNat c).toNat + 256 * (c / 256 % 256 ^ n)) = some (c % 256 ^ (n + 1))
+      rw [u8_ofNat_toNat, Nat.pow_succ, Nat.mul_comm (256 ^ n) 256, Nat.mod_mul]
+
+/-- **Universal `Kani#5205` `char` correspondence across BOTH `BasicMemory` and `TreeBorrowsMemory`
+via MiniRust's `Type::Enum` + `Discriminator::Branch` encoding (`minirustCharType`).**
+For every 32-bit pattern `c < 2^32`, any `layouts`, any `tyChar` with `tyChar.kind = .char`, and
+any `M ∈ {BasicMemory, TreeBorrowsMemory}`:
+1. Untyped byte storage (`decodeUntypedStorageBytes`) succeeds for EVERY `c` (including all 2048
+   surrogates `0xD800..=0xDFFF` and `> 0x10FFFF`, matching MiniRust `Type::Int(u32)` / `Type::Union`).
+2. `Trusted.validateValueForTy?` and `Trusted.decodeTypedValueFromBytes` accept `c` **iff**
+   MiniRust `Type.decodeM (M := M) minirustCharType` accepts the projected bytes! -/
+theorem kani5205_char_correspondence_M {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (layouts : LayoutTable) (tyChar : Ty) (hty : tyChar.kind = .char)
+    (c : Nat) (hc : c < 2 ^ 32) :
+    let bs := encodePlainLittleEndianBytes c 4
+    decodeUntypedStorageBytes defaultCodecFuel layouts tyChar bs = some (.scalar ⟨c, 4⟩) ∧
+    ((decodeTypedValueFromBytes defaultCodecFuel layouts tyChar bs).isSome = true ↔
+      ∃ v, Interp.Type.decodeM (M := M) minirustCharType (projBytes pv bs) = .ok (some v)) ∧
+    (validateValueForTy? layouts (some tyChar) (.scalar ⟨c, 4⟩) = true ↔
+      ∃ v, Interp.Type.decodeM (M := M) minirustCharType (projBytes pv bs) = .ok (some v)) := by
+  intro bs
+  obtain ⟨kind, lidx⟩ := tyChar
+  dsimp only at hty
+  subst hty
+  have hp : projBytes pv bs =
+      (Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none) :=
+    (proj_plain_bytes (M := M) pv 4 c 0).trans (encodePtrBytesM_none_eq_map _ 0)
+  have hbits : decodeLittleEndianBits bs = some c := by
+    have h := decodeLittleEndianBits_encodePlain 4 c
+    rw [Nat.mod_eq_of_lt (by omega : c < 256 ^ 4)] at h
+    exact h
+  have hlen : length bs = 4 := rfl
+  have hnoprov : abstractBytesHaveProv bs = false := rfl
+  have hunt : decodeUntypedStorageBytes defaultCodecFuel layouts { kind := .char, layoutIdx := lidx } bs =
+      some (.scalar ⟨c, 4⟩) := by
+    show (match Nat.beq (length bs) 4, policyRejectsProv .strictUcg630Ub bs with
+      | true, false => match decodeLittleEndianBits bs with
+        | some bits => some (Value.scalar ⟨bits, 4⟩)
+        | none => none
+      | _, _ => none) = some (.scalar ⟨c, 4⟩)
+    have hpol : policyRejectsProv .strictUcg630Ub bs = false := by
+      unfold policyRejectsProv; exact hnoprov
+    rw [hlen, hpol, hbits]
+  have hsc : decodeScalarBytes bs false = some ({ bits := c, sizeBytes := 4 }, none) := by
+    unfold decodeScalarBytes decodeLittleEndianBytes
+    rw [hlen, hbits]
+  have hvalid_iff : isValidCharCode c = true ↔ (c < 0xD800 ∨ (0xE000 ≤ c ∧ c ≤ 0x10FFFF)) := by
+    unfold isValidCharCode
+    constructor
+    · intro h
+      simp only [Bool.or_eq_true, Bool.and_eq_true, Bool.not_eq_true'] at h
+      rcases h with h1 | ⟨h2, h3⟩
+      · left
+        cases hc1 : Nat.ble 55296 c with
+        | true => rw [hc1] at h1; cases h1
+        | false =>
+          by_cases hlt : c < 55296
+          · exact hlt
+          · have : 55296 ≤ c := by omega
+            have := Nat.ble_eq.mpr this
+            rw [this] at hc1; cases hc1
+      · right; rw [Nat.ble_eq] at h2 h3; exact ⟨h2, h3⟩
+    · intro h
+      simp only [Bool.or_eq_true, Bool.and_eq_true, Bool.not_eq_true']
+      rcases h with h1 | ⟨h2, h3⟩
+      · left
+        cases hc1 : Nat.ble 55296 c with
+        | false => rfl
+        | true => have := Nat.ble_eq.mp hc1; omega
+      · right; exact ⟨Nat.ble_eq.mpr h2, Nat.ble_eq.mpr h3⟩
+  have hdec : decodeTypedValueFromBytes defaultCodecFuel layouts { kind := .char, layoutIdx := lidx } bs =
+      if isValidCharCode c then some (.scalar ⟨c, 4⟩) else none := by
+    show (match abstractBytesHaveProv bs with
+      | true => none
+      | false =>
+        match Nat.beq (length bs) 4 with
+        | false => none
+        | true =>
+          match decodeScalarBytes bs false with
+          | some (sv, _) =>
+            match isValidCharCode sv.bits with
+            | true => some (Value.scalar sv)
+            | false => none
+          | none => none) = _
+    rw [hnoprov, hlen, hsc]
+    dsimp only
+    cases isValidCharCode c <;> rfl
+  have hval : validateValueForTy? layouts (some { kind := .char, layoutIdx := lidx }) (.scalar ⟨c, 4⟩) =
+      isValidCharCode c := by
+    show Bool.and (Nat.beq 4 4) (isValidCharCode c) = isValidCharCode c
+    rfl
+  rw [hp, minirust_char_decodeM_iff (M := M) c hc, hdec, hval]
+  refine ⟨hunt, ?_, hvalid_iff⟩
+  cases h : isValidCharCode c with
+  | true => simp [hvalid_iff.mp h]
+  | false =>
+    constructor
+    · intro hf; cases hf
+    · intro hok; exact absurd (hvalid_iff.mpr hok) (by rw [h]; decide)
+
+/-- Non-vacuous boundary instantiations of `kani5205_char_correspondence_M` across `BM` and `TBM`
+(valid ASCII `0x41`, BMP edge `0xD7FF`, surrogates `0xD800`/`0xDFFF`, post-surrogate `0xE000`,
+max Unicode `0x10FFFF`, out-of-range `0x110000`, plus `.Uninit`). -/
+theorem w_kani5205_char_enum_instance :
+    Interp.Type.decodeM (M := Interp.BM) minirustCharType
+        (projBytes bmProv (encodePlainLittleEndianBytes 0x41 4)) = .ok (some (.Variant 0 (.Int 0x41))) ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0xD7FF 4)) = .ok (some (.Variant 0 (.Int 0xD7FF))) ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0xD800 4)) = .ok none ∧
+    Interp.Type.decodeM (M := Interp.BM) minirustCharType
+        (projBytes bmProv (encodePlainLittleEndianBytes 0xDFFF 4)) = .ok none ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0xE000 4)) = .ok (some (.Variant 1 (.Int 0xE000))) ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0x10FFFF 4)) = .ok (some (.Variant 1 (.Int 0x10FFFF))) ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0x110000 4)) = .ok none ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType [.Uninit, .Init 0 none, .Init 0 none, .Init 0 none] = .ok none ∧
+    (decodeUntypedStorageBytes defaultCodecFuel wLayouts wTyChar (encodePlainLittleEndianBytes 0xD800 4) =
+        some (.scalar ⟨0xD800, 4⟩) ∧
+      ((decodeTypedValueFromBytes defaultCodecFuel wLayouts wTyChar (encodePlainLittleEndianBytes 0xD800 4)).isSome = true ↔
+        ∃ v, Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+          (projBytes tbProv (encodePlainLittleEndianBytes 0xD800 4)) = .ok (some v)) ∧
+      (validateValueForTy? wLayouts (some wTyChar) (.scalar ⟨0xD800, 4⟩) = true ↔
+        ∃ v, Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+          (projBytes tbProv (encodePlainLittleEndianBytes 0xD800 4)) = .ok (some v))) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, minirust_char_uninit_decodeM _ _ _,
+    kani5205_char_correspondence_M (M := Interp.TBM) tbProv wLayouts wTyChar rfl 0xD800 (by decide)⟩
+  · rw [(proj_plain_bytes (M := Interp.BM) bmProv 4 0x41 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.BM) 0x41 (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0xD7FF 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0xD7FF (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0xD800 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0xD800 (by decide)
+  · rw [(proj_plain_bytes (M := Interp.BM) bmProv 4 0xDFFF 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.BM) 0xDFFF (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0xE000 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0xE000 (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0x10FFFF 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0x10FFFF (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0x110000 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0x110000 (by decide)
+
+/-- Little-endian optional byte list for a `CapturedAllocation` (no uninit bytes). -/
+def leOptBytes (u : Nat) : Nat → List (Option UInt8)
+  | 0 => []
+  | n + 1 => some (UInt8.ofNat u) :: leOptBytes (u / 256) n
+
+/-- **Universal `body.globals` relocation correspondence (`Trusted` ↔ `MiniRustSpec.Interp`,
+64-bit, BOTH `BasicMemory` and `TreeBorrowsMemory`).**
+For any global `CapturedAllocation` holding an 8-byte pointer relocation `(0, targetPtr)` with LE
+bytes of any `addr < 2^64`, `globalAllocSliceToAbstractBytes` equals `encodePtrBytes`, projects to
+MiniRust `encodePtrM`, decodes identically in `Trusted.evalGlobalDerefRead` (raw `*const u8` &
+`&u8`) and `MiniRustSpec.Interp.decodePtrM`, and faults with `.ub` on a typed `u64` dereference
+read under `.strictUcg630Ub` (`W5`). -/
+theorem globalAlloc_reloc_correspondence_M {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (gId : Nat) (al : Align) (mutbl : Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 8, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 8 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs ∧
+    Interp.encodePtrM (M := M) ⟨(addr : Int), some (pv targetPtr.allocId targetPtr.tag)⟩ =
+      .ok (projBytes pv bs) ∧
+    Interp.decodePtrM (M := M) (projBytes pv bs) =
+      .ok (some ⟨(addr : Int), some (pv targetPtr.allocId targetPtr.tag)⟩) ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub := by
+  intro alloc bs
+  have hbits8 :
+      Nat.add (UInt8.ofNat addr).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0))))))))))))))) = addr := by
+    have h := decodeLittleEndianBits_encodePlain 8 addr
+    rw [Nat.mod_eq_of_lt (by omega : addr < 256 ^ 8)] at h
+    injection h with h
+  have horig : readGlobalRelocOrigOffset (leOptBytes addr 8) 0 8 targetPtr = normPtrByteOffset 8 addr := by
+    unfold readGlobalRelocOrigOffset
+    show (match some (Nat.add (UInt8.ofNat addr).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0)))))))))))))))) with
+      | some bits => normPtrByteOffset 8 bits
+      | none => normPtrByteOffset 8 targetPtr.offsetBytes) = normPtrByteOffset 8 addr
+    rw [hbits8]
+  have hslice : globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs := by
+    unfold globalAllocSliceToAbstractBytes
+    dsimp only [alloc, bs, encodePtrBytes, encodePtrBytesAux]
+    simp only [globalAllocBytesAux, leOptBytes, lookupRelocEntry, get?, Nat.ble, Nat.blt,
+      Nat.add, Nat.sub, Bool.and, Bool.not]
+    have horig' : readGlobalRelocOrigOffset
+        [some (UInt8.ofNat addr), some (UInt8.ofNat (addr / 256)),
+         some (UInt8.ofNat (addr / 256 / 256)), some (UInt8.ofNat (addr / 256 / 256 / 256)),
+         some (UInt8.ofNat (addr / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256 / 256))] 0 8 targetPtr =
+        normPtrByteOffset 8 addr := horig
+    rw [horig']; rfl
+  have henc := encodePtrM_proj (M := M) pv addr targetPtr.allocId targetPtr.tag haddr
+  have hdecM := decodePtrM_proj_encodePtrBytes (M := M) pv addr targetPtr.allocId targetPtr.tag haddr
+  have hthin : ∀ isRef, decodePtrBytesNoForge isRef (.uint .u8) 8 bs =
+      some (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) := by
+    intro isRef
+    have h := (decodePtrBytesNoForge_thin isRef (.uint .u8) 8 bs rfl).trans
+      (thinDecode_encodePtrBytes isRef addr 8 targetPtr.allocId targetPtr.tag (by decide))
+    rw [Nat.mod_eq_of_lt (by omega : addr < 256 ^ 8)] at h
+    exact h
+  have hraw : evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] := by
+    unfold evalGlobalDerefRead
+    simp only [wLayouts, wTyRawPtrU8, layoutPointerBytes, intCastTargetBytes, hslice]
+    change (match decodePtrBytesNoForge false (.uint .u8) 8 bs with
+      | some decodedVal =>
+        match readProjectedValue [] decodedVal [] with
+        | .ok fieldVal => PlaceReadResult.ok fieldVal []
+        | .ub => .ub | .unsupported => .unsupported
+      | none => .ub) = _
+    rw [hthin false]; rfl
+  have href : evalGlobalDerefRead [] alloc 0 8 [] wLayouts
+      (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] := by
+    unfold evalGlobalDerefRead
+    simp only [wLayouts, layoutPointerBytes, intCastTargetBytes, hslice]
+    change (match decodePtrBytesNoForge true (.uint .u8) 8 bs with
+      | some decodedVal =>
+        match readProjectedValue [] decodedVal [] with
+        | .ok fieldVal => PlaceReadResult.ok fieldVal []
+        | .ub => .ub | .unsupported => .unsupported
+      | none => .ub) = _
+    rw [hthin true]; rfl
+  have hu64 : evalGlobalDerefRead [] alloc 0 8 [] wLayouts
+      (some { kind := .uint .u64, layoutIdx := 0 }) = .ub := rfl
+  exact ⟨hslice, henc, hdecM, hraw, href, hu64⟩
+
+def wPtrL : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+def wArr8U8L : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨1⟩ 8, variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+def wCopyLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [wUnitL, wU8L, wBoolL, wCharL, wU32L, wPtrL, wArr8U8L] }
+def wTyRawPtrC : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 5 }
+def wTyRefC : Ty := { kind := .ref .not (.uint .u8), layoutIdx := 5 }
+def wTyArr8U8C : Ty := { kind := .array (.uint .u8) 8, layoutIdx := 6 }
+def wCopyMem : Memory :=
+  { emptyMemory with
+    borrows := [
+      { tag := 10, targetLocal := 0, targetProjection := [], perm := .frozen, rangeOffset := 0, rangeLen := 8 },
+      { tag := 11, targetLocal := 1, targetProjection := [], perm := .active, rangeOffset := 0, rangeLen := 8 }
+    ] }
+def wCopyStep (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) (sOff dOff n : Nat) :
+    Option LocalSlot :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory { frame := { blockIdx := 0, stmtIdx := 0, locals := l }, memory := wCopyMem }
+      l decls wCopyLayouts ⟨10, sOff⟩ ⟨11, dOff⟩ n with
+  | .ok (_ :: dst' :: _, _) => some dst'
+  | _ => none
+def wCopyRead (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) (sOff dOff n : Nat) :
+    Option (Option Value) :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory { frame := { blockIdx := 0, stmtIdx := 0, locals := l }, memory := wCopyMem }
+      l decls wCopyLayouts ⟨10, sOff⟩ ⟨11, dOff⟩ n with
+  | .ok (l', _) =>
+    match evalOperand l' (.copy ⟨1, []⟩) [] [] wCopyLayouts [] decls with
+    | .ok v _ => some (some v)
+    | .ub => some none
+    | .unsupported => none
+  | _ => none
+
+/-- **End-to-end `body.globals` misaligned relocation & `evalCopyMemory` correspondence witness
+(`Trusted` ↔ `MiniRustSpec.Interp`).**
+1. Misaligned `[p, p]` global relocation read at offset `4`: BOTH `Trusted.evalGlobalDerefRead`
+   (raw -> `.scalar`, ref -> `.ub`) AND `MiniRust` `decodePtrM` strip provenance.
+2. End-to-end `Trusted.evalCopyMemory`:
+   - intact 8B copy retains `.ptr ⟨7, 0x1000⟩ 8` in `Trusted` and `some (tbProv 7 7)` in `MiniRust`;
+   - 4+4 swapped halves strip provenance in BOTH `Trusted` and `MiniRust`;
+   - 1+7 `p` / `p+256` splice via two `evalCopyMemory` calls strips in `Trusted` (raw -> `.scalar
+     ⟨0x1100, 8⟩`, ref -> `.ub`) while `MiniRust` retains `some (tbProv 7 7)` (`DIV-MR-OFFSET-SPLICE`). -/
+theorem w_mr_global_reloc_and_copyMemory :
+    let p : ProvenancePtr := { allocId := 7, offsetBytes := 0x1000 }
+    let p256 : ProvenancePtr := { allocId := 7, offsetBytes := 0x1100 }
+    let adjAlloc : CapturedAllocation :=
+      { allocId := 50, bytes := leOptBytes 0x1000 8 ++ leOptBytes 0x1000 8,
+        relocations := [(0, p), (8, p)], align := ⟨8⟩, mutability := .not }
+    (∃ misBytes, globalAllocSliceToAbstractBytes adjAlloc 4 8 8 = some misBytes ∧
+      evalGlobalDerefRead [] adjAlloc 4 8 [] wLayouts (some wTyRawPtrU8) =
+        .ok (.scalar ⟨0x100000000000, 8⟩) [] ∧
+      evalGlobalDerefRead [] adjAlloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv misBytes) = .ok (some ⟨0x100000000000, none⟩)) ∧
+    (∃ vIntact bsIntact,
+      wCopyRead wTyRawPtrC wTyRefC (.init (.ptr p 8)) .uninit 0 0 8 = some (some (.ptr ⟨7, 0x1000⟩ 8)) ∧
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p 8)) .uninit 0 0 8 = some (.init vIntact) ∧
+      encodeUntypedValueToBytes defaultCodecFuel vIntact = some bsIntact ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv bsIntact) = .ok (some ⟨0x1000, some (tbProv 7 7)⟩)) ∧
+    (∃ s1 vSwap bsSwap,
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p 8)) .uninit 0 4 4 = some s1 ∧
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p 8)) s1 4 0 4 = some (.init vSwap) ∧
+      wCopyRead wTyArr8U8C wTyRawPtrC (.init vSwap) .uninit 0 0 8 = some (some (.scalar ⟨0x100000000000, 8⟩)) ∧
+      wCopyRead wTyArr8U8C wTyRefC (.init vSwap) .uninit 0 0 8 = some none ∧
+      encodeUntypedValueToBytes defaultCodecFuel vSwap = some bsSwap ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv bsSwap) = .ok (some ⟨0x100000000000, none⟩)) ∧
+    (∃ s1 vSplice bsSplice,
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p 8)) .uninit 0 0 1 = some s1 ∧
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p256 8)) s1 1 1 7 = some (.init vSplice) ∧
+      wCopyRead wTyArr8U8C wTyRawPtrC (.init vSplice) .uninit 0 0 8 = some (some (.scalar ⟨0x1100, 8⟩)) ∧
+      wCopyRead wTyArr8U8C wTyRefC (.init vSplice) .uninit 0 0 8 = some none ∧
+      encodeUntypedValueToBytes defaultCodecFuel vSplice = some bsSplice ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv bsSplice) = .ok (some ⟨0x1100, some (tbProv 7 7)⟩)) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · refine ⟨_, rfl, rfl, rfl, rfl⟩
+  · refine ⟨_, _, rfl, rfl, rfl, rfl⟩
+  · refine ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · refine ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Non-vacuous instantiations of `globalAlloc_reloc_correspondence_M` across both `BM` and `TBM`. -/
+theorem ep2_b2_mr_non_vacuity_instances :
+    let p : ProvenancePtr := { allocId := 7, offsetBytes := 0x1000 }
+    let alloc : CapturedAllocation :=
+      { allocId := 50, bytes := leOptBytes 0x1000 8, relocations := [(0, p)],
+        align := ⟨8⟩, mutability := .not }
+    (globalAllocSliceToAbstractBytes alloc 0 8 8 = some (encodePtrBytes 0x1000 8 7 7) ∧
+      Interp.encodePtrM (M := Interp.TBM) ⟨0x1000, some (tbProv 7 7)⟩ =
+        .ok (projBytes tbProv (encodePtrBytes 0x1000 8 7 7)) ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv (encodePtrBytes 0x1000 8 7 7)) =
+        .ok (some ⟨0x1000, some (tbProv 7 7)⟩) ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some wTyRawPtrU8) = .ok (.ptr ⟨7, 0x1000⟩ 8) [] ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+        .ok (.ptr ⟨7, 0x1000⟩ 8) [] ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub) ∧
+    (globalAllocSliceToAbstractBytes alloc 0 8 8 = some (encodePtrBytes 0x1000 8 7 7) ∧
+      Interp.encodePtrM (M := Interp.BM) ⟨0x1000, some (bmProv 7 7)⟩ =
+        .ok (projBytes bmProv (encodePtrBytes 0x1000 8 7 7)) ∧
+      Interp.decodePtrM (M := Interp.BM) (projBytes bmProv (encodePtrBytes 0x1000 8 7 7)) =
+        .ok (some ⟨0x1000, some (bmProv 7 7)⟩) ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some wTyRawPtrU8) = .ok (.ptr ⟨7, 0x1000⟩ 8) [] ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+        .ok (.ptr ⟨7, 0x1000⟩ 8) [] ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub) :=
+  ⟨globalAlloc_reloc_correspondence_M (M := Interp.TBM) tbProv 50 ⟨8⟩ .not { allocId := 7, offsetBytes := 0x1000 } 0x1000 (by decide),
+   globalAlloc_reloc_correspondence_M (M := Interp.BM) bmProv 50 ⟨8⟩ .not { allocId := 7, offsetBytes := 0x1000 } 0x1000 (by decide)⟩
 
 end Witnesses
 
@@ -4769,6 +5309,388 @@ theorem kani5205_char_divergence_instance :
     isValidCharCode 0xD800 = false ∧ isValidCharCode 0x41 = true :=
   ⟨kani5205_char_divergence 0xD800 (by decide), rfl, rfl⟩
 
+/-- Decoding LE bits of `encodePlainLittleEndianBytes c n` yields `c % 256 ^ n`. -/
+theorem decodeLittleEndianBits_encodePlain :
+    ∀ (n c : Nat), decodeLittleEndianBits (encodePlainLittleEndianBytes c n) = some (c % 256 ^ n)
+  | 0, c => by
+      show some 0 = some (c % 256 ^ 0)
+      rw [Nat.pow_zero, Nat.mod_one]
+  | n + 1, c => by
+      show (match decodeLittleEndianBits (encodePlainLittleEndianBytes (c / 256) n) with
+        | some hi => some (Nat.add (UInt8.ofNat c).toBitVec.toNat (Nat.mul 256 hi))
+        | none => none) = some (c % 256 ^ (n + 1))
+      rw [decodeLittleEndianBits_encodePlain n (c / 256)]
+      show some ((UInt8.ofNat c).toNat + 256 * (c / 256 % 256 ^ n)) = some (c % 256 ^ (n + 1))
+      rw [u8_ofNat_toNat, Nat.pow_succ, Nat.mul_comm (256 ^ n) 256, Nat.mod_mul]
+
+/-- **Universal `Kani#5205` `char` correspondence across BOTH `BasicMemory` and `TreeBorrowsMemory`
+via MiniRust's `Type::Enum` + `Discriminator::Branch` encoding (`minirustCharType`).**
+For every 32-bit pattern `c < 2^32`, any `layouts`, any `tyChar` with `tyChar.kind = .char`, and
+any `M ∈ {BasicMemory, TreeBorrowsMemory}`:
+1. Untyped byte storage (`decodeUntypedStorageBytes`) succeeds for EVERY `c` (including all 2048
+   surrogates `0xD800..=0xDFFF` and `> 0x10FFFF`, matching MiniRust `Type::Int(u32)` / `Type::Union`).
+2. `Trusted.validateValueForTy?` and `Trusted.decodeTypedValueFromBytes` accept `c` **iff**
+   MiniRust `Type.decodeM (M := M) minirustCharType` accepts the projected bytes! -/
+theorem kani5205_char_correspondence_M {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (layouts : LayoutTable) (tyChar : Ty) (hty : tyChar.kind = .char)
+    (c : Nat) (hc : c < 2 ^ 32) :
+    let bs := encodePlainLittleEndianBytes c 4
+    decodeUntypedStorageBytes defaultCodecFuel layouts tyChar bs = some (.scalar ⟨c, 4⟩) ∧
+    ((decodeTypedValueFromBytes defaultCodecFuel layouts tyChar bs).isSome = true ↔
+      ∃ v, Interp.Type.decodeM (M := M) minirustCharType (projBytes pv bs) = .ok (some v)) ∧
+    (validateValueForTy? layouts (some tyChar) (.scalar ⟨c, 4⟩) = true ↔
+      ∃ v, Interp.Type.decodeM (M := M) minirustCharType (projBytes pv bs) = .ok (some v)) := by
+  intro bs
+  obtain ⟨kind, lidx⟩ := tyChar
+  dsimp only at hty
+  subst hty
+  have hp : projBytes pv bs =
+      (Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none) :=
+    (proj_plain_bytes (M := M) pv 4 c 0).trans (encodePtrBytesM_none_eq_map _ 0)
+  have hbits : decodeLittleEndianBits bs = some c := by
+    have h := decodeLittleEndianBits_encodePlain 4 c
+    rw [Nat.mod_eq_of_lt (by omega : c < 256 ^ 4)] at h
+    exact h
+  have hlen : length bs = 4 := rfl
+  have hnoprov : abstractBytesHaveProv bs = false := rfl
+  have hunt : decodeUntypedStorageBytes defaultCodecFuel layouts { kind := .char, layoutIdx := lidx } bs =
+      some (.scalar ⟨c, 4⟩) := by
+    show (match Nat.beq (length bs) 4, policyRejectsProv .strictUcg630Ub bs with
+      | true, false => match decodeLittleEndianBits bs with
+        | some bits => some (Value.scalar ⟨bits, 4⟩)
+        | none => none
+      | _, _ => none) = some (.scalar ⟨c, 4⟩)
+    have hpol : policyRejectsProv .strictUcg630Ub bs = false := by
+      unfold policyRejectsProv; exact hnoprov
+    rw [hlen, hpol, hbits]
+  have hsc : decodeScalarBytes bs false = some ({ bits := c, sizeBytes := 4 }, none) := by
+    unfold decodeScalarBytes decodeLittleEndianBytes
+    rw [hlen, hbits]
+  have hvalid_iff : isValidCharCode c = true ↔ (c < 0xD800 ∨ (0xE000 ≤ c ∧ c ≤ 0x10FFFF)) := by
+    unfold isValidCharCode
+    constructor
+    · intro h
+      simp only [Bool.or_eq_true, Bool.and_eq_true, Bool.not_eq_true'] at h
+      rcases h with h1 | ⟨h2, h3⟩
+      · left
+        cases hc1 : Nat.ble 55296 c with
+        | true => rw [hc1] at h1; cases h1
+        | false =>
+          by_cases hlt : c < 55296
+          · exact hlt
+          · have : 55296 ≤ c := by omega
+            have := Nat.ble_eq.mpr this
+            rw [this] at hc1; cases hc1
+      · right; rw [Nat.ble_eq] at h2 h3; exact ⟨h2, h3⟩
+    · intro h
+      simp only [Bool.or_eq_true, Bool.and_eq_true, Bool.not_eq_true']
+      rcases h with h1 | ⟨h2, h3⟩
+      · left
+        cases hc1 : Nat.ble 55296 c with
+        | false => rfl
+        | true => have := Nat.ble_eq.mp hc1; omega
+      · right; exact ⟨Nat.ble_eq.mpr h2, Nat.ble_eq.mpr h3⟩
+  have hdec : decodeTypedValueFromBytes defaultCodecFuel layouts { kind := .char, layoutIdx := lidx } bs =
+      if isValidCharCode c then some (.scalar ⟨c, 4⟩) else none := by
+    show (match abstractBytesHaveProv bs with
+      | true => none
+      | false =>
+        match Nat.beq (length bs) 4 with
+        | false => none
+        | true =>
+          match decodeScalarBytes bs false with
+          | some (sv, _) =>
+            match isValidCharCode sv.bits with
+            | true => some (Value.scalar sv)
+            | false => none
+          | none => none) = _
+    rw [hnoprov, hlen, hsc]
+    dsimp only
+    cases isValidCharCode c <;> rfl
+  have hval : validateValueForTy? layouts (some { kind := .char, layoutIdx := lidx }) (.scalar ⟨c, 4⟩) =
+      isValidCharCode c := by
+    show Bool.and (Nat.beq 4 4) (isValidCharCode c) = isValidCharCode c
+    rfl
+  rw [hp, minirust_char_decodeM_iff (M := M) c hc, hdec, hval]
+  refine ⟨hunt, ?_, hvalid_iff⟩
+  cases h : isValidCharCode c with
+  | true => simp [hvalid_iff.mp h]
+  | false =>
+    constructor
+    · intro hf; cases hf
+    · intro hok; exact absurd (hvalid_iff.mpr hok) (by rw [h]; decide)
+
+/-- Non-vacuous boundary instantiations of `kani5205_char_correspondence_M` across `BM` and `TBM`
+(valid ASCII `0x41`, BMP edge `0xD7FF`, surrogates `0xD800`/`0xDFFF`, post-surrogate `0xE000`,
+max Unicode `0x10FFFF`, out-of-range `0x110000`, plus `.Uninit`). -/
+theorem w_kani5205_char_enum_instance :
+    Interp.Type.decodeM (M := Interp.BM) minirustCharType
+        (projBytes bmProv (encodePlainLittleEndianBytes 0x41 4)) = .ok (some (.Variant 0 (.Int 0x41))) ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0xD7FF 4)) = .ok (some (.Variant 0 (.Int 0xD7FF))) ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0xD800 4)) = .ok none ∧
+    Interp.Type.decodeM (M := Interp.BM) minirustCharType
+        (projBytes bmProv (encodePlainLittleEndianBytes 0xDFFF 4)) = .ok none ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0xE000 4)) = .ok (some (.Variant 1 (.Int 0xE000))) ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0x10FFFF 4)) = .ok (some (.Variant 1 (.Int 0x10FFFF))) ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (projBytes tbProv (encodePlainLittleEndianBytes 0x110000 4)) = .ok none ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType [.Uninit, .Init 0 none, .Init 0 none, .Init 0 none] = .ok none ∧
+    (decodeUntypedStorageBytes defaultCodecFuel wLayouts wTyChar (encodePlainLittleEndianBytes 0xD800 4) =
+        some (.scalar ⟨0xD800, 4⟩) ∧
+      ((decodeTypedValueFromBytes defaultCodecFuel wLayouts wTyChar (encodePlainLittleEndianBytes 0xD800 4)).isSome = true ↔
+        ∃ v, Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+          (projBytes tbProv (encodePlainLittleEndianBytes 0xD800 4)) = .ok (some v)) ∧
+      (validateValueForTy? wLayouts (some wTyChar) (.scalar ⟨0xD800, 4⟩) = true ↔
+        ∃ v, Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+          (projBytes tbProv (encodePlainLittleEndianBytes 0xD800 4)) = .ok (some v))) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, minirust_char_uninit_decodeM _ _ _,
+    kani5205_char_correspondence_M (M := Interp.TBM) tbProv wLayouts wTyChar rfl 0xD800 (by decide)⟩
+  · rw [(proj_plain_bytes (M := Interp.BM) bmProv 4 0x41 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.BM) 0x41 (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0xD7FF 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0xD7FF (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0xD800 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0xD800 (by decide)
+  · rw [(proj_plain_bytes (M := Interp.BM) bmProv 4 0xDFFF 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.BM) 0xDFFF (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0xE000 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0xE000 (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0x10FFFF 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0x10FFFF (by decide)
+  · rw [(proj_plain_bytes (M := Interp.TBM) tbProv 4 0x110000 0).trans (encodePtrBytesM_none_eq_map _ 0)]
+    exact minirust_char_decodeM_eq (M := Interp.TBM) 0x110000 (by decide)
+
+/-- Little-endian optional byte list for a `CapturedAllocation` (no uninit bytes). -/
+def leOptBytes (u : Nat) : Nat → List (Option UInt8)
+  | 0 => []
+  | n + 1 => some (UInt8.ofNat u) :: leOptBytes (u / 256) n
+
+/-- **Universal `body.globals` relocation correspondence (`Trusted` ↔ `MiniRustSpec.Interp`,
+64-bit, BOTH `BasicMemory` and `TreeBorrowsMemory`).**
+For any global `CapturedAllocation` holding an 8-byte pointer relocation `(0, targetPtr)` with LE
+bytes of any `addr < 2^64`, `globalAllocSliceToAbstractBytes` equals `encodePtrBytes`, projects to
+MiniRust `encodePtrM`, decodes identically in `Trusted.evalGlobalDerefRead` (raw `*const u8` &
+`&u8`) and `MiniRustSpec.Interp.decodePtrM`, and faults with `.ub` on a typed `u64` dereference
+read under `.strictUcg630Ub` (`W5`). -/
+theorem globalAlloc_reloc_correspondence_M {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (gId : Nat) (al : Align) (mutbl : Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 8, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 8 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs ∧
+    Interp.encodePtrM (M := M) ⟨(addr : Int), some (pv targetPtr.allocId targetPtr.tag)⟩ =
+      .ok (projBytes pv bs) ∧
+    Interp.decodePtrM (M := M) (projBytes pv bs) =
+      .ok (some ⟨(addr : Int), some (pv targetPtr.allocId targetPtr.tag)⟩) ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub := by
+  intro alloc bs
+  have hbits8 :
+      Nat.add (UInt8.ofNat addr).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0))))))))))))))) = addr := by
+    have h := decodeLittleEndianBits_encodePlain 8 addr
+    rw [Nat.mod_eq_of_lt (by omega : addr < 256 ^ 8)] at h
+    injection h with h
+  have horig : readGlobalRelocOrigOffset (leOptBytes addr 8) 0 8 targetPtr = normPtrByteOffset 8 addr := by
+    unfold readGlobalRelocOrigOffset
+    show (match some (Nat.add (UInt8.ofNat addr).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0)))))))))))))))) with
+      | some bits => normPtrByteOffset 8 bits
+      | none => normPtrByteOffset 8 targetPtr.offsetBytes) = normPtrByteOffset 8 addr
+    rw [hbits8]
+  have hslice : globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs := by
+    unfold globalAllocSliceToAbstractBytes
+    dsimp only [alloc, bs, encodePtrBytes, encodePtrBytesAux]
+    simp only [globalAllocBytesAux, leOptBytes, lookupRelocEntry, get?, Nat.ble, Nat.blt,
+      Nat.add, Nat.sub, Bool.and, Bool.not]
+    have horig' : readGlobalRelocOrigOffset
+        [some (UInt8.ofNat addr), some (UInt8.ofNat (addr / 256)),
+         some (UInt8.ofNat (addr / 256 / 256)), some (UInt8.ofNat (addr / 256 / 256 / 256)),
+         some (UInt8.ofNat (addr / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (addr / 256 / 256 / 256 / 256 / 256 / 256 / 256))] 0 8 targetPtr =
+        normPtrByteOffset 8 addr := horig
+    rw [horig']; rfl
+  have henc := encodePtrM_proj (M := M) pv addr targetPtr.allocId targetPtr.tag haddr
+  have hdecM := decodePtrM_proj_encodePtrBytes (M := M) pv addr targetPtr.allocId targetPtr.tag haddr
+  have hthin : ∀ isRef, decodePtrBytesNoForge isRef (.uint .u8) 8 bs =
+      some (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) := by
+    intro isRef
+    have h := (decodePtrBytesNoForge_thin isRef (.uint .u8) 8 bs rfl).trans
+      (thinDecode_encodePtrBytes isRef addr 8 targetPtr.allocId targetPtr.tag (by decide))
+    rw [Nat.mod_eq_of_lt (by omega : addr < 256 ^ 8)] at h
+    exact h
+  have hraw : evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] := by
+    unfold evalGlobalDerefRead
+    simp only [wLayouts, wTyRawPtrU8, layoutPointerBytes, intCastTargetBytes, hslice]
+    change (match decodePtrBytesNoForge false (.uint .u8) 8 bs with
+      | some decodedVal =>
+        match readProjectedValue [] decodedVal [] with
+        | .ok fieldVal => PlaceReadResult.ok fieldVal []
+        | .ub => .ub | .unsupported => .unsupported
+      | none => .ub) = _
+    rw [hthin false]; rfl
+  have href : evalGlobalDerefRead [] alloc 0 8 [] wLayouts
+      (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] := by
+    unfold evalGlobalDerefRead
+    simp only [wLayouts, layoutPointerBytes, intCastTargetBytes, hslice]
+    change (match decodePtrBytesNoForge true (.uint .u8) 8 bs with
+      | some decodedVal =>
+        match readProjectedValue [] decodedVal [] with
+        | .ok fieldVal => PlaceReadResult.ok fieldVal []
+        | .ub => .ub | .unsupported => .unsupported
+      | none => .ub) = _
+    rw [hthin true]; rfl
+  have hu64 : evalGlobalDerefRead [] alloc 0 8 [] wLayouts
+      (some { kind := .uint .u64, layoutIdx := 0 }) = .ub := rfl
+  exact ⟨hslice, henc, hdecM, hraw, href, hu64⟩
+
+def wPtrL : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+def wArr8U8L : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨1⟩ 8, variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+def wCopyLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [wUnitL, wU8L, wBoolL, wCharL, wU32L, wPtrL, wArr8U8L] }
+def wTyRawPtrC : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 5 }
+def wTyRefC : Ty := { kind := .ref .not (.uint .u8), layoutIdx := 5 }
+def wTyArr8U8C : Ty := { kind := .array (.uint .u8) 8, layoutIdx := 6 }
+def wCopyMem : Memory :=
+  { emptyMemory with
+    borrows := [
+      { tag := 10, targetLocal := 0, targetProjection := [], perm := .frozen, rangeOffset := 0, rangeLen := 8 },
+      { tag := 11, targetLocal := 1, targetProjection := [], perm := .active, rangeOffset := 0, rangeLen := 8 }
+    ] }
+def wCopyStep (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) (sOff dOff n : Nat) :
+    Option LocalSlot :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory { frame := { blockIdx := 0, stmtIdx := 0, locals := l }, memory := wCopyMem }
+      l decls wCopyLayouts ⟨10, sOff⟩ ⟨11, dOff⟩ n with
+  | .ok (_ :: dst' :: _, _) => some dst'
+  | _ => none
+def wCopyRead (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) (sOff dOff n : Nat) :
+    Option (Option Value) :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory { frame := { blockIdx := 0, stmtIdx := 0, locals := l }, memory := wCopyMem }
+      l decls wCopyLayouts ⟨10, sOff⟩ ⟨11, dOff⟩ n with
+  | .ok (l', _) =>
+    match evalOperand l' (.copy ⟨1, []⟩) [] [] wCopyLayouts [] decls with
+    | .ok v _ => some (some v)
+    | .ub => some none
+    | .unsupported => none
+  | _ => none
+
+/-- **End-to-end `body.globals` misaligned relocation & `evalCopyMemory` correspondence witness
+(`Trusted` ↔ `MiniRustSpec.Interp`).**
+1. Misaligned `[p, p]` global relocation read at offset `4`: BOTH `Trusted.evalGlobalDerefRead`
+   (raw -> `.scalar`, ref -> `.ub`) AND `MiniRust` `decodePtrM` strip provenance.
+2. End-to-end `Trusted.evalCopyMemory`:
+   - intact 8B copy retains `.ptr ⟨7, 0x1000⟩ 8` in `Trusted` and `some (tbProv 7 7)` in `MiniRust`;
+   - 4+4 swapped halves strip provenance in BOTH `Trusted` and `MiniRust`;
+   - 1+7 `p` / `p+256` splice via two `evalCopyMemory` calls strips in `Trusted` (raw -> `.scalar
+     ⟨0x1100, 8⟩`, ref -> `.ub`) while `MiniRust` retains `some (tbProv 7 7)` (`DIV-MR-OFFSET-SPLICE`). -/
+theorem w_mr_global_reloc_and_copyMemory :
+    let p : ProvenancePtr := { allocId := 7, offsetBytes := 0x1000 }
+    let p256 : ProvenancePtr := { allocId := 7, offsetBytes := 0x1100 }
+    let adjAlloc : CapturedAllocation :=
+      { allocId := 50, bytes := leOptBytes 0x1000 8 ++ leOptBytes 0x1000 8,
+        relocations := [(0, p), (8, p)], align := ⟨8⟩, mutability := .not }
+    (∃ misBytes, globalAllocSliceToAbstractBytes adjAlloc 4 8 8 = some misBytes ∧
+      evalGlobalDerefRead [] adjAlloc 4 8 [] wLayouts (some wTyRawPtrU8) =
+        .ok (.scalar ⟨0x100000000000, 8⟩) [] ∧
+      evalGlobalDerefRead [] adjAlloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv misBytes) = .ok (some ⟨0x100000000000, none⟩)) ∧
+    (∃ vIntact bsIntact,
+      wCopyRead wTyRawPtrC wTyRefC (.init (.ptr p 8)) .uninit 0 0 8 = some (some (.ptr ⟨7, 0x1000⟩ 8)) ∧
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p 8)) .uninit 0 0 8 = some (.init vIntact) ∧
+      encodeUntypedValueToBytes defaultCodecFuel vIntact = some bsIntact ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv bsIntact) = .ok (some ⟨0x1000, some (tbProv 7 7)⟩)) ∧
+    (∃ s1 vSwap bsSwap,
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p 8)) .uninit 0 4 4 = some s1 ∧
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p 8)) s1 4 0 4 = some (.init vSwap) ∧
+      wCopyRead wTyArr8U8C wTyRawPtrC (.init vSwap) .uninit 0 0 8 = some (some (.scalar ⟨0x100000000000, 8⟩)) ∧
+      wCopyRead wTyArr8U8C wTyRefC (.init vSwap) .uninit 0 0 8 = some none ∧
+      encodeUntypedValueToBytes defaultCodecFuel vSwap = some bsSwap ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv bsSwap) = .ok (some ⟨0x100000000000, none⟩)) ∧
+    (∃ s1 vSplice bsSplice,
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p 8)) .uninit 0 0 1 = some s1 ∧
+      wCopyStep wTyRawPtrC wTyArr8U8C (.init (.ptr p256 8)) s1 1 1 7 = some (.init vSplice) ∧
+      wCopyRead wTyArr8U8C wTyRawPtrC (.init vSplice) .uninit 0 0 8 = some (some (.scalar ⟨0x1100, 8⟩)) ∧
+      wCopyRead wTyArr8U8C wTyRefC (.init vSplice) .uninit 0 0 8 = some none ∧
+      encodeUntypedValueToBytes defaultCodecFuel vSplice = some bsSplice ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv bsSplice) = .ok (some ⟨0x1100, some (tbProv 7 7)⟩)) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · refine ⟨_, rfl, rfl, rfl, rfl⟩
+  · refine ⟨_, _, rfl, rfl, rfl, rfl⟩
+  · refine ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · refine ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Non-vacuous instantiations of `globalAlloc_reloc_correspondence_M` across both `BM` and `TBM`. -/
+theorem ep2_b2_mr_non_vacuity_instances :
+    let p : ProvenancePtr := { allocId := 7, offsetBytes := 0x1000 }
+    let alloc : CapturedAllocation :=
+      { allocId := 50, bytes := leOptBytes 0x1000 8, relocations := [(0, p)],
+        align := ⟨8⟩, mutability := .not }
+    (globalAllocSliceToAbstractBytes alloc 0 8 8 = some (encodePtrBytes 0x1000 8 7 7) ∧
+      Interp.encodePtrM (M := Interp.TBM) ⟨0x1000, some (tbProv 7 7)⟩ =
+        .ok (projBytes tbProv (encodePtrBytes 0x1000 8 7 7)) ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv (encodePtrBytes 0x1000 8 7 7)) =
+        .ok (some ⟨0x1000, some (tbProv 7 7)⟩) ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some wTyRawPtrU8) = .ok (.ptr ⟨7, 0x1000⟩ 8) [] ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+        .ok (.ptr ⟨7, 0x1000⟩ 8) [] ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub) ∧
+    (globalAllocSliceToAbstractBytes alloc 0 8 8 = some (encodePtrBytes 0x1000 8 7 7) ∧
+      Interp.encodePtrM (M := Interp.BM) ⟨0x1000, some (bmProv 7 7)⟩ =
+        .ok (projBytes bmProv (encodePtrBytes 0x1000 8 7 7)) ∧
+      Interp.decodePtrM (M := Interp.BM) (projBytes bmProv (encodePtrBytes 0x1000 8 7 7)) =
+        .ok (some ⟨0x1000, some (bmProv 7 7)⟩) ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some wTyRawPtrU8) = .ok (.ptr ⟨7, 0x1000⟩ 8) [] ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+        .ok (.ptr ⟨7, 0x1000⟩ 8) [] ∧
+      evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub) :=
+  ⟨globalAlloc_reloc_correspondence_M (M := Interp.TBM) tbProv 50 ⟨8⟩ .not { allocId := 7, offsetBytes := 0x1000 } 0x1000 (by decide),
+   globalAlloc_reloc_correspondence_M (M := Interp.BM) bmProv 50 ⟨8⟩ .not { allocId := 7, offsetBytes := 0x1000 } 0x1000 (by decide)⟩
+
 end Witnesses
 
 end V08
@@ -5033,17 +5955,21 @@ elab "#assert_ptr_byte_coherence_mr_audit" : command => do
     "minirust_bool_invalid", "minirust_u8_valid", "kani5205_bool_correspondence_M",
     "w_roundtrip", "w_ucg558_w1", "w_mixed_missing_uninit", "w_offset_splice_p_p4",
     "w_offset_splice_p_p256", "w_basic_memory_tag_blind", "w_wide_slice",
-    "w_wide_swapped_halves", "w_wide_dyn", "w_kani5205_bool", "w_kani5205_char", "kani5205_char_divergence", "kani5205_char_divergence_instance",
+    "w_wide_swapped_halves", "w_wide_dyn", "w_kani5205_bool", "w_kani5205_char",
+    "kani5205_char_divergence", "kani5205_char_divergence_instance",
+    "kani5205_char_correspondence_M", "w_kani5205_char_enum_instance",
+    "globalAlloc_reloc_correspondence_M", "w_mr_global_reloc_and_copyMemory",
     "w_kani5205_unaligned_and_maybeuninit",
     "coherent_decode_agreement_instance", "encode_roundtrip_instance",
     "rawCarrier_ptr_roundtrip_instance", "strip_laws_instance", "offset_splice_instance",
-    "wide_and_bool_instance", "ep2_b1_mr_non_vacuity_instances" ]
+    "wide_and_bool_instance", "ep2_b1_mr_non_vacuity_instances", "ep2_b2_mr_non_vacuity_instances" ]
   let shared : List Lean.Name := [
     ``mrProvM_eq_some_iff, ``decodePtrProvenanceM_eq_some_iff, ``decodePtrM_eq,
     ``decodePtr_eq_M, ``decodePtrProvenance_eq_M, ``encodePtr_eq_M, ``encodePtrBytes_eq_M,
     ``endianness_encode_ptr, ``encodeWidePtrM_slice_eq, ``encodeWidePtrM_dyn_eq,
     ``decodeWidePtrM_slice_eq, ``decodeWidePtrM_dyn_eq, ``minirust_bool_decodeM_iff,
-    ``minirust_u8_decodeM, ``minirust_bool_uninit_decodeM,
+    ``minirust_u8_decodeM, ``minirust_bool_uninit_decodeM, ``minirust_u32_decodeM,
+    ``minirust_char_decodeM_eq, ``minirust_char_decodeM_iff, ``minirust_char_uninit_decodeM,
     ``tbProv_inj, ``bmProv_eq_iff, ``coherent_parity, ``encode_parity,
     ``thinDecode_parity, ``lockstep_parity, ``w_lockstep_parity, ``lockstep_parity_instance ]
   let mut headline : Nat := 0
