@@ -44,6 +44,17 @@ witnesses over unmodified `Trusted.Rustc.V2026_06_01.MirSemantics`.
   cast-erased image to `okScalar 5`.
 * `outOfRange` (`idx ≥ 22`): all three authorities fail closed (`.unsupported`).
 
+**Companions, phase boundary, and shared-runner locks** (beyond the matrix):
+* §7b pins exact 3-way raw-observer agreement on the 14 companion cells
+  (`ocCase6PayloadMir`, `ocCase7ProtectedDropMir`, `ocCase9DeadLocalMir`,
+  `ocCase9InvalidBoolMir`, `ocCase13RevTransmuteMir`, `ocCase17DanglingZstMir`,
+  `ocCase18ZstNullMir`) with the single Trusted no-forge boundary
+  `zstDangling`, plus the type-switch erasure boundary.
+* §7c pins the `D1` static phase boundary on MiniRust (real `translatePlace`)
+  and LeanMiri (parameterized phase observer) against runtime execution.
+* §7d exports the universal copy laws through which the cross-root bridge
+  locks the shared Trusted runner of `section Fixtures` for EVERY body.
+
 **100% Constructive purity (`[propext, Quot.sound]`)**: every single declaration
 in this module — codecs, corpus combinators, bundle witnesses, lifted domain
 theorems, driver identities, and capstones — depends strictly on `[propext,
@@ -1165,7 +1176,9 @@ theorem dual_d2_machine_termination_contrast :
 `mrOcObserve` executes programs with
 `MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM`. Projected to `Stop`, it is
 definitionally the unmodified `MiniRustSpec.Interp.stepsM` iteration (covering
-both `BM` and `TBM`, hence `stepsTB` on `MachTB`), 100% choice-free. -/
+both `BM` and `TBM`, hence `stepsTB` on `MachTB`), 100% choice-free; on `Mach`
+it is moreover MiniRust's own `steps` relative to the upstream `stepM = step`
+specialization law (`steps_eq_runToStopM_bm_of`). -/
 
 section MiniRustDriver
 open MiniRustSpec MiniRustSpec.Gen MiniRustSpec.LibSpecr MiniRustSpec.Interp
@@ -1192,7 +1205,412 @@ theorem stepsTB_eq_runToStopM (fuel : Nat) (m : MachTB) :
       stopProj (MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM fuel m) :=
   stepsM_eq_runToStopM fuel m
 
+/-- **`Mach` driver identity, relative to the upstream specialization law.**
+On `Mach` the observer's driver is MiniRust's own `steps`, GIVEN that the
+polymorphic `stepM` specializes to `step` on `BasicMemory`. That law is the
+pre-existing upstream lemma `MiniRustSpec.Correspondence.stepM_bm_eq`, which is
+NOT choice-free; it is taken as a hypothesis here so this module stays 100%
+constructive with zero allowlist entries, and is discharged unconditionally in
+the test bridge (`bm_driver_is_minirust_steps`). -/
+theorem steps_eq_runToStopM_bm_of
+    (h : ∀ m : Mach, stepM (M := BM) m = step m) (fuel : Nat) (m : Mach) :
+    steps fuel m =
+      stopProj
+        (MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM (M := BM) fuel m) := by
+  induction fuel generalizing m with
+  | zero => rfl
+  | succ n ih =>
+    unfold steps MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM
+    rw [h]
+    cases step m with
+    | ok m' => exact ih m'
+    | error s => rfl
+
 end MiniRustDriver
+
+/-! ## §7b. Companion Fixtures: Exact 3-Way Raw-Observer Agreement
+
+The Episode 1 companions live outside the frozen 22-case matrix. Their Trusted
+(`stepMirFn`) and MiniRust (`stepM` / `checkPtrM`) observations are executed
+here directly by the kernel, and the LeanMiri side is any companion observer
+whose cells satisfy `OcFpLmCompanionCells` (closed in the cross-root bridge over
+the real vendored-Miri companion harnesses). -/
+
+/-- The Episode 1 companion fixtures (outside the frozen 22-case matrix). -/
+inductive OcFpCompanion : Type where
+  /-- `ocCase6PayloadMir`: `SetDiscriminant` payload read (`D1`). -/
+  | payload
+  /-- `ocCase7ProtectedDropMir`: drop under an active protector (`D1`). -/
+  | protectedDrop
+  /-- `ocCase9DeadLocalMir`: dead-local read through the cast (`D1`). -/
+  | deadLocal
+  /-- `ocCase9InvalidBoolMir`: invalid-`bool` type-switching cast (`D1`). -/
+  | invalidBool
+  /-- `ocCase13RevTransmuteMir`: reverse fn-ptr transmutation (`D2`). -/
+  | revTransmute
+  /-- `ocCase17DanglingZstMir`: dangling provenance-less `&()` (`D3`). -/
+  | zstDangling
+  /-- `ocCase18ZstNullMir`: null `&()` (`D3`). -/
+  | zstNull
+  deriving DecidableEq, Repr
+
+/-- Authority 0 on a companion: unmodified Trusted `stepMirFn` on its
+`CapturedMir` (`tb = false` runs the no-borrow-tracker image `ocEraseRetags`,
+matching the convention of `mrOcTrustedObserve`). -/
+def trustedCompanion (tb : Bool) : OcFpCompanion → MrOcFpObs
+  | .payload => mrOcTrustedObsOf .scalar (ocRunTrustedRaw ocCase6PayloadMir [])
+  | .protectedDrop =>
+    mrOcTrustedObsOf .scalar
+      (ocRunTrustedRaw
+        (if tb then ocCase7ProtectedDropMir
+         else ocEraseRetags ocCase7ProtectedDropMir) [])
+  | .deadLocal =>
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw ocCase9DeadLocalMir [])
+  | .invalidBool =>
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw ocCase9InvalidBoolMir [])
+  | .revTransmute =>
+    mrOcTrustedObsOf .pair
+      (ocRunTrustedRaw ocCase13RevTransmuteMir
+        [if tb then ocCase13Callee else ocEraseRetags ocCase13Callee])
+  | .zstDangling =>
+    mrOcTrustedObsOf .ptrValid (ocRunTrustedRaw ocCase17DanglingZstMir [])
+  | .zstNull =>
+    mrOcTrustedObsOf .ptrValid (ocRunTrustedRaw ocCase18ZstNullMir [])
+
+/-- Authority 1 on a companion: unmodified MiniRust on `Mach` / `MachTB`. -/
+def mrCompanion (tb : Bool) : OcFpCompanion → MrOcFpObs
+  | .payload => ocRun tb [] ocMrProg6Payload
+  | .protectedDrop => ocRun tb [] ocMrProg7ProtectedDrop
+  | .deadLocal => ocRun tb [] ocMrProg9DeadLocal
+  | .invalidBool => ocRun tb [] ocMrProg9InvalidBool
+  | .revTransmute => ocRun tb [] ocMrProg13RevTransmute
+  | .zstDangling => ocRun tb ocMrZstPtrTys ocMrProg17
+  | .zstNull => ocRun tb ocMrZstPtrTys ocMrProg18
+
+/-- Frozen MiniRust = LeanMiri companion table. -/
+def ocCompanionExpected (tb : Bool) : OcFpCompanion → MrOcFpObs
+  | .payload => .okScalar 7
+  | .protectedDrop => if tb then .ub else .okScalar 7
+  | .deadLocal => .ub
+  | .invalidBool => .ub
+  | .revTransmute => if tb then .ub else .okRetagPair 5 5
+  | .zstDangling => .okPtrValid
+  | .zstNull => .ub
+
+/-- Frozen Trusted companion table: identical except the conservative no-forge
+boundary `zstDangling` (Trusted rejects provenance-less reference transmutes
+with `.ub`, while MiniRust and LeanMiri accept the dangling ZST pointer). -/
+def ocCompanionTrustedExpected (tb : Bool) (c : OcFpCompanion) : MrOcFpObs :=
+  if c = .zstDangling then .ub else ocCompanionExpected tb c
+
+/-- Kernel-executed Trusted companion table (`stepMirFn` on all 14 cells). -/
+theorem trustedCompanion_table (tb : Bool) (c : OcFpCompanion) :
+    trustedCompanion tb c = ocCompanionTrustedExpected tb c := by
+  cases tb <;> cases c <;> decide +kernel
+
+/-- Kernel-executed MiniRust companion table (`stepM` / `checkPtrM` on all 14
+cells). -/
+theorem mrCompanion_table (tb : Bool) (c : OcFpCompanion) :
+    mrCompanion tb c = ocCompanionExpected tb c := by
+  cases tb <;> cases c <;> decide +kernel
+
+/-- 14-cell certificate of a LeanMiri companion observer `obs` presented
+through the observation translation `f` (the cross-root bridge instantiates
+`f := lmToMr` and `obs` by the real vendored-Miri companion harnesses). -/
+def OcFpLmCompanionCells {Obs : Type} (f : Obs → MrOcFpObs)
+    (obs : Bool → OcFpCompanion → Obs) : Prop :=
+  ∀ tb c, f (obs tb c) = ocCompanionExpected tb c
+
+/-- **Exact 3-way raw-observer agreement on every companion cell.** A
+certified LeanMiri companion observer equals raw MiniRust on all 14 cells,
+equals raw Trusted iff the companion is not the conservative no-forge boundary
+`zstDangling`, full 3-way agreement holds iff `c ≠ .zstDangling`, and no cell
+is verdict-less or fail-closed on any authority (so nothing agrees vacuously
+through `phaseBoundary` / `specPanic` / `unsupported`). -/
+theorem dual_companion_three_way {Obs : Type} (f : Obs → MrOcFpObs)
+    (obs : Bool → OcFpCompanion → Obs) (hC : OcFpLmCompanionCells f obs)
+    (tb : Bool) (c : OcFpCompanion) :
+    f (obs tb c) = mrCompanion tb c ∧
+    (f (obs tb c) = trustedCompanion tb c ↔ c ≠ .zstDangling) ∧
+    ((trustedCompanion tb c = mrCompanion tb c ∧
+        mrCompanion tb c = f (obs tb c)) ↔ c ≠ .zstDangling) ∧
+    ocVerdictOf (f (obs tb c)) ≠ none ∧
+    ocVerdictOf (f (obs tb c)) ≠ some .unsupported ∧
+    ocVerdictOf (trustedCompanion tb c) ≠ none ∧
+    ocVerdictOf (trustedCompanion tb c) ≠ some .unsupported := by
+  rw [hC tb c, mrCompanion_table tb c, trustedCompanion_table tb c]
+  cases tb <;> cases c <;> decide
+
+/-- **Exact companion mode sensitivity on all three authorities**: `basic` and
+`treeBorrows` disagree on a companion iff it is the protected drop
+(`ocCase7ProtectedDropMir`) or the reverse fn-ptr transmutation
+(`ocCase13RevTransmuteMir`). -/
+theorem dual_companion_mode_sensitivity {Obs : Type} (f : Obs → MrOcFpObs)
+    (obs : Bool → OcFpCompanion → Obs) (hC : OcFpLmCompanionCells f obs)
+    (c : OcFpCompanion) :
+    (trustedCompanion false c ≠ trustedCompanion true c ↔
+      (c = .protectedDrop ∨ c = .revTransmute)) ∧
+    (mrCompanion false c ≠ mrCompanion true c ↔
+      (c = .protectedDrop ∨ c = .revTransmute)) ∧
+    (f (obs false c) ≠ f (obs true c) ↔
+      (c = .protectedDrop ∨ c = .revTransmute)) := by
+  rw [hC false c, hC true c, mrCompanion_table false c, mrCompanion_table true c,
+    trustedCompanion_table false c, trustedCompanion_table true c]
+  cases c <;> decide
+
+/-- **Type-switch erasure boundary on all three authorities**
+(`ocCase9InvalidBoolMir`, `move (_1 as bool)` with `_1 : u8 = 2`). The cast
+fixture is `.ub` on Trusted, MiniRust, and LeanMiri, whereas the cast-ERASED
+image returns the invalid byte `2` without UB both on Trusted `stepMirFn` and on
+any LeanMiri erased-image observation `erased` with `f erased = .okScalar 2`
+(vendored `Step.step` in the bridge): erasing a type-switching cast would mask
+the UB, so cast erasure is faithful only for type-preserving casts. -/
+theorem dual_type_switch_erasure_boundary {Obs : Type} (f : Obs → MrOcFpObs)
+    (obs : Bool → OcFpCompanion → Obs) (hC : OcFpLmCompanionCells f obs)
+    (erased : Obs) (hE : f erased = .okScalar 2) (tb : Bool) :
+    mrOcTrustedObsOf .scalar
+        (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []) = f erased ∧
+    f erased ≠ f (obs tb .invalidBool) ∧
+    trustedCompanion tb .invalidBool = .ub ∧
+    mrCompanion tb .invalidBool = .ub ∧
+    f (obs tb .invalidBool) = .ub := by
+  rw [hE, hC tb .invalidBool, mrCompanion_table tb .invalidBool,
+    trustedCompanion_table tb .invalidBool]
+  cases tb <;> refine ⟨?_, ?_, rfl, rfl, rfl⟩ <;> decide +kernel
+
+/-! ## §7c. `D1` Static Phase Boundary on MiniRust and LeanMiri
+
+`ProjectionElem.opaqueCast` exists only before `MirPhase::Runtime`. Trusted
+executes it value-transparently, whereas BOTH reference authorities reject
+every cast-bearing place statically and execute the cast-erased image. -/
+
+/-- **MiniRust static phase observer**: a fixture is rejected at the phase
+boundary when it addresses at least one cast-bearing place and EVERY such
+place fails closed in the real `MiniRustSpec.Correspondence.translatePlace`
+(upstream `minimize` has no `OpaqueCast` lowering). Mirrors LeanMiri's
+`lmOcPhaseObserve` (`.unsupported` when no place carries a cast). -/
+def mrOcPhaseObserve (idx : Nat) : MrOcFpObs :=
+  match ocCaseFixture? idx with
+  | none => .unsupported
+  | some (body, _) =>
+    match (ocBodyPlaces body).filter ocPlaceHasCast with
+    | [] => .unsupported
+    | ps =>
+      if ps.all (fun p =>
+          (MiniRustSpec.Correspondence.translatePlace body.localDecls p).isNone)
+      then .phaseBoundary else .unsupported
+
+/-- Frozen phase table: `phaseBoundary` on `D1` (`0..9`); the `D2` / `D3`
+fixtures carry no cast. -/
+def ocPhaseExpected : List MrOcFpObs :=
+  [.phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary,
+   .phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary,
+   .phaseBoundary, .phaseBoundary,
+   .unsupported, .unsupported, .unsupported, .unsupported, .unsupported,
+   .unsupported, .unsupported, .unsupported, .unsupported, .unsupported,
+   .unsupported, .unsupported]
+
+/-- Kernel-executed MiniRust phase table over the real `translatePlace`. -/
+theorem mrOcPhaseObserve_table :
+    (List.range mrOcCaseCount).map mrOcPhaseObserve = ocPhaseExpected := by
+  decide +kernel
+
+/-- The frozen phase table is `phaseBoundary` (and hence verdict-less) exactly
+on the `D1` cases. -/
+theorem ocPhaseExpected_cell (idx : Nat) (hi : idx < mrOcCaseCount) :
+    (ocPhaseExpected.getD idx .unsupported = .phaseBoundary ↔
+      ocDomainOf idx = .d1) ∧
+    (ocVerdictOf (ocPhaseExpected.getD idx .unsupported) = none ↔
+      ocDomainOf idx = .d1) := by
+  revert hi
+  revert idx
+  decide +kernel
+
+/-- 22-cell certificate of a LeanMiri static phase observer `phase` presented
+through `f` (the bridge instantiates `phase := lmOcPhaseObserve`, built on the
+real vendored `Miri.Interpreter.project` and `PlaceDynamic.project`). -/
+def lmPhaseCheckOf {Obs : Type} (f : Obs → MrOcFpObs) (phase : Nat → Obs) :
+    Bool :=
+  (List.range mrOcCaseCount).all fun idx =>
+    decide (f (phase idx) = ocPhaseExpected.getD idx .unsupported)
+
+/-- **`D1` static phase boundary on MiniRust and LeanMiri vs runtime
+execution on all three authorities.** For every in-range case: the LeanMiri
+phase observation equals the MiniRust phase observation; both are
+`phaseBoundary` (no runtime verdict) iff the case lies in `D1`; and yet NO
+runtime observer of any authority ever reports `phaseBoundary` (Trusted
+dispatches the cast value-transparently, MiniRust and LeanMiri run the
+cast-erased image). -/
+theorem dual_d1_phase_boundary (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) (f : A.Obs → MrOcFpObs)
+    (hf : ∀ o, A.toVerdict o = ocVerdictOf (f o)) (phase : Nat → A.Obs)
+    (hP : lmPhaseCheckOf f phase = true) (tb : Bool) (idx : Nat)
+    (hi : idx < mrOcCaseCount) :
+    f (phase idx) = mrOcPhaseObserve idx ∧
+    (mrOcPhaseObserve idx = .phaseBoundary ↔ ocDomainOf idx = .d1) ∧
+    (A.toVerdict (phase idx) = none ↔ ocDomainOf idx = .d1) ∧
+    f (A.observe tb idx) ≠ .phaseBoundary ∧
+    mrOcObserve tb idx ≠ .phaseBoundary ∧
+    mrOcTrustedObserve tb idx ≠ .phaseBoundary := by
+  have hL : f (phase idx) = ocPhaseExpected.getD idx .unsupported :=
+    of_decide_eq_true (List.all_eq_true.mp hP idx (List.mem_range.mpr hi))
+  have hM : mrOcPhaseObserve idx = ocPhaseExpected.getD idx .unsupported := by
+    rw [← mrOcPhaseObserve_table, range_map_getD hi]
+  have hCell := ocPhaseExpected_cell idx hi
+  have hObs := observer_level_three_way A hA f hf tb idx hi
+  have hNoPanic := dual_no_specPanic_all_cells A hA tb idx hi
+  have hMrNe : mrOcObserve tb idx ≠ .phaseBoundary := fun h =>
+    hNoPanic.2.1 (congrArg ocVerdictOf h)
+  have hTrNe : mrOcTrustedObserve tb idx ≠ .phaseBoundary := fun h =>
+    hNoPanic.1 (congrArg ocVerdictOf h)
+  refine ⟨hL.trans hM.symm, ?_, ?_, hObs.1 ▸ hMrNe, hMrNe, hTrNe⟩
+  · rw [hM]; exact hCell.1
+  · rw [hf, hL]; exact hCell.2
+
+/-! ## §7d. Verbatim-Copy Locks for the Shared Trusted Runner
+
+`section Fixtures` of `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR` is shared
+verbatim with `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM`. Its 93 plain
+definitions are locked by `Eq.refl` in the cross-root bridge. The four runner
+declarations mention the per-namespace outcome inductives: the bridge relates
+the two inductives (`OcTrustedOutcome`, `OcTrustedRun`) by constructor
+bijections and locks the two functions (`ocTrustedStep`, `ocRunTrustedRaw`)
+UNIVERSALLY (for every body, run state, and callee list) through the generic
+copy laws below, instantiated with the LeanMiri-side copy using `Eq.refl`
+hypotheses only. -/
+
+section RunnerLock
+open Trusted.Rustc.V2026_06_01 Trusted.Rustc.V2026_06_01.MirAst
+
+/-- The `.running` transition of the shared `ocTrustedStep`, abstracted over
+the run / outcome representation (same `match` text as `ocTrustedStep`, so
+both the MiniRust-side and the LeanMiri-side copies unfold to it by
+`Eq.refl`). -/
+def ocStepG {R O : Type} (running : MirSemantics.MachineState → R)
+    (done : O → R) (ret : MirSemantics.Value → O) (ub unsupported : O)
+    (body : CapturedMir) (s : MirSemantics.MachineState) : R :=
+  match MirSemantics.stepMirFn body s with
+  | .tau (.running s') => running s'
+  | .tau (.halted (.normal r)) => done (ret r.1)
+  | .tau (.faulted .ub) => done ub
+  | .vis (.inr (.inl (.emit _))) cont =>
+    match cont PUnit.unit with
+    | .running s' => running s'
+    | _ => done unsupported
+  | .ret (.normal r) => done (ret r.1)
+  | .vis (.inl (.fail .ub)) _ => done ub
+  | _ => done unsupported
+
+/-- The MiniRust-side `ocTrustedStep` is definitionally the generic step. -/
+theorem ocTrustedStep_running_eq (body : CapturedMir)
+    (s : MirSemantics.MachineState) :
+    ocTrustedStep body (.running s) =
+      ocStepG OcTrustedRun.running OcTrustedRun.done OcTrustedOutcome.ret
+        OcTrustedOutcome.ub OcTrustedOutcome.unsupported body s := rfl
+
+/-- The generic step is natural in constructor-preserving maps. -/
+theorem ocStepG_natural {R O R' O' : Type}
+    (running : MirSemantics.MachineState → R) (done : O → R)
+    (ret : MirSemantics.Value → O) (ub unsupported : O)
+    (running' : MirSemantics.MachineState → R') (done' : O' → R')
+    (ret' : MirSemantics.Value → O') (ub' unsupported' : O')
+    (g : R → R') (f : O → O')
+    (hr : ∀ s, g (running s) = running' s)
+    (hd : ∀ o, g (done o) = done' (f o))
+    (hret : ∀ v, f (ret v) = ret' v) (hub : f ub = ub')
+    (hun : f unsupported = unsupported')
+    (body : CapturedMir) (s : MirSemantics.MachineState) :
+    g (ocStepG running done ret ub unsupported body s) =
+      ocStepG running' done' ret' ub' unsupported' body s := by
+  unfold ocStepG
+  split
+  all_goals first
+    | exact hr _
+    | rw [hd, hret]
+    | rw [hd, hub]
+    | rw [hd, hun]
+    | (split <;> first | exact hr _ | rw [hd, hun])
+
+/-- `Nat.repeat` is natural in step-commuting maps. -/
+theorem repeat_natural {R R' : Type} (g : R → R') (step : R → R)
+    (step' : R' → R') (h : ∀ r, g (step r) = step' (g r)) :
+    ∀ (n : Nat) (r : R), g (Nat.repeat step n r) = Nat.repeat step' n (g r)
+  | 0, _ => rfl
+  | n + 1, r => by
+    show g (step (Nat.repeat step n r)) = step' (Nat.repeat step' n (g r))
+    rw [h, repeat_natural g step step' h n r]
+
+/-- **Universal runner lock.** Any foreign copy `(R', O', step', runRaw')` of
+the shared bounded Trusted runner whose constructors correspond under
+`g : OcTrustedRun → R'` / `f : OcTrustedOutcome → O'` and whose definitions
+unfold to the same text (hypotheses discharged by `Eq.refl` in the bridge)
+simulates the MiniRust-side runner in lockstep on EVERY body and run state,
+and returns the corresponding raw outcome on EVERY body and callee list. -/
+theorem ocRunner_copy_lock {R' O' : Type}
+    (running' : MirSemantics.MachineState → R') (done' : O' → R')
+    (ret' : MirSemantics.Value → O') (ub' unsupported' outOfFuel' : O')
+    (g : OcTrustedRun → R') (f : OcTrustedOutcome → O')
+    (step' : CapturedMir → R' → R') (finish' : R' → O')
+    (runRaw' : CapturedMir → List CapturedMir → O')
+    (hgRun : ∀ s, g (.running s) = running' s)
+    (hgDone : ∀ o, g (.done o) = done' (f o))
+    (hfRet : ∀ v, f (.ret v) = ret' v) (hfUb : f .ub = ub')
+    (hfUns : f .unsupported = unsupported')
+    (hfFuel : f .outOfFuel = outOfFuel')
+    (hStepRun : ∀ body s, step' body (running' s) =
+      ocStepG running' done' ret' ub' unsupported' body s)
+    (hStepDone : ∀ body o, step' body (done' o) = done' o)
+    (hFinDone : ∀ o, finish' (done' o) = o)
+    (hFinRun : ∀ s, finish' (running' s) = outOfFuel')
+    (hRaw : ∀ body callees, runRaw' body callees =
+      finish' (Nat.repeat (step' body) ocTrustedFuel
+        (running'
+          (MirSemantics.initMachineStateWithCallees body [] callees)))) :
+    (∀ body r, g (ocTrustedStep body r) = step' body (g r)) ∧
+    (∀ body callees, f (ocRunTrustedRaw body callees) = runRaw' body callees) := by
+  have hStep : ∀ body r, g (ocTrustedStep body r) = step' body (g r) := by
+    intro body r
+    cases r with
+    | done o =>
+      show g (.done o) = step' body (g (.done o))
+      rw [hgDone, hStepDone]
+    | running s =>
+      rw [ocTrustedStep_running_eq, hgRun, hStepRun]
+      exact ocStepG_natural _ _ _ _ _ _ _ _ _ _ g f hgRun hgDone hfRet hfUb
+        hfUns body s
+  refine ⟨hStep, ?_⟩
+  intro body callees
+  rw [hRaw]
+  have hRep := repeat_natural g (ocTrustedStep body) (step' body) (hStep body)
+    ocTrustedFuel
+    (.running (MirSemantics.initMachineStateWithCallees body [] callees))
+  rw [hgRun] at hRep
+  rw [← hRep]
+  unfold ocRunTrustedRaw
+  cases Nat.repeat (ocTrustedStep body) ocTrustedFuel
+      (.running (MirSemantics.initMachineStateWithCallees body [] callees)) with
+  | done o => show f o = finish' (g (.done o)); rw [hgDone, hFinDone]
+  | running s =>
+    show f .outOfFuel = finish' (g (.running s))
+    rw [hgRun, hFinRun, hfFuel]
+
+end RunnerLock
+
+/-- **Universal `ocCombine` lock.** Any foreign copy `combine'` of the shared
+half-combiner over an observation type `L` in bijection with `MrOcFpObs`
+commutes with the translation `g` on EVERY pair of observations. -/
+theorem ocCombine_copy_lock {L : Type} [DecidableEq L] (g : L → MrOcFpObs)
+    (g' : MrOcFpObs → L) (hrt : ∀ o, g' (g o) = o) (uns : L)
+    (hu : g uns = .unsupported) (combine' : L → L → L)
+    (hc : ∀ a b, combine' a b = if a = b then a else uns) (a b : L) :
+    g (combine' a b) = ocCombine (g a) (g b) := by
+  rw [hc]
+  unfold ocCombine
+  by_cases h : a = b
+  · subst h; rw [ite_eq_left rfl, ite_eq_left rfl]
+  · have hne : g a ≠ g b := fun e =>
+      h ((hrt a).symm.trans ((congrArg g' e).trans (hrt b)))
+    rw [ite_eq_right h, ite_eq_right hne, hu]
 
 /-! ## §8. Non-Vacuity of the LeanMiri Hypotheses (Root-Side Witness) -/
 
@@ -1252,6 +1670,33 @@ theorem rootBacked_observer_level (tb : Bool) (idx : Nat) :
   observer_level_exact_all_nat rootBackedLmAuthority
     rootBackedLmAuthority_tableCheck rootBackedLmAuthority_failClosed
     (fun o => o) (fun _ => rfl) tb idx
+
+/-- Root-side companion observer built from the REAL Trusted and MiniRust
+companion observers (MiniRust on the `zstDangling` no-forge boundary, Trusted
+elsewhere); it solely witnesses non-vacuity of `OcFpLmCompanionCells`. -/
+def rootBackedCompanion (tb : Bool) (c : OcFpCompanion) : MrOcFpObs :=
+  if c = .zstDangling then mrCompanion tb c else trustedCompanion tb c
+
+theorem rootBackedCompanion_cells :
+    OcFpLmCompanionCells (fun o => o) rootBackedCompanion := by
+  intro tb c
+  show (if c = .zstDangling then mrCompanion tb c else trustedCompanion tb c) = _
+  rw [mrCompanion_table tb c, trustedCompanion_table tb c]
+  cases tb <;> cases c <;> decide
+
+/-- The REAL MiniRust phase observer passes the LeanMiri phase certificate
+(non-vacuity of `lmPhaseCheckOf`). -/
+theorem rootBackedPhase_check :
+    lmPhaseCheckOf (fun o => o) mrOcPhaseObserve = true := by
+  decide +kernel
+
+/-- Trusted `stepMirFn` on the cast-ERASED invalid-`bool` companion returns
+the invalid byte `2` (the erased-image witness of
+`dual_type_switch_erasure_boundary`). -/
+theorem rootBackedErased_eq :
+    mrOcTrustedObsOf .scalar
+      (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []) = .okScalar 2 := by
+  decide +kernel
 
 /-! ## §9. Capstones -/
 
@@ -1345,6 +1790,51 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous :
   ep2_opaquecast_fnentry_dual_authority_capstone rootBackedLmAuthority
     rootBackedLmAuthority_tableCheck rootBackedLmAuthority_failClosed
 
+/-- **Episode 2 companion and phase-boundary capstone (100% constructive)**:
+for EVERY certified LeanMiri authority `A` whose translation factors through
+`f`, every companion observer `obs` passing the 14-cell companion certificate,
+every erased-image observation `erased` of the invalid-`bool` companion, and
+every static phase observer `phase` passing the 22-cell phase certificate:
+1. exact 3-way raw-observer agreement on all 14 companion cells, with the
+   single documented Trusted no-forge boundary (`zstDangling`);
+2. exact companion mode sensitivity (protected drop, reverse transmutation);
+3. the type-switch erasure boundary (`ocCase9InvalidBoolMir`);
+4. the `D1` static phase boundary on MiniRust and LeanMiri vs runtime
+   execution on all three authorities;
+5. the universal MiniRust translation fail-closed law for `.opaqueCast`. -/
+theorem ep2_opaquecast_fnentry_companion_phase_capstone (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) (f : A.Obs → MrOcFpObs)
+    (hf : ∀ o, A.toVerdict o = ocVerdictOf (f o))
+    (obs : Bool → OcFpCompanion → A.Obs) (hC : OcFpLmCompanionCells f obs)
+    (erased : A.Obs) (hE : f erased = .okScalar 2)
+    (phase : Nat → A.Obs) (hP : lmPhaseCheckOf f phase = true) :
+    (∀ tb c, type_of% (dual_companion_three_way f obs hC tb c)) ∧
+    (∀ c, type_of% (dual_companion_mode_sensitivity f obs hC c)) ∧
+    (∀ tb, type_of% (dual_type_switch_erasure_boundary f obs hC erased hE tb)) ∧
+    (∀ tb idx (hi : idx < mrOcCaseCount),
+      type_of% (dual_d1_phase_boundary A hA f hf phase hP tb idx hi)) ∧
+    type_of% @mr_translate_opaqueCast_fail_closed :=
+  ⟨dual_companion_three_way f obs hC, dual_companion_mode_sensitivity f obs hC,
+   dual_type_switch_erasure_boundary f obs hC erased hE,
+   dual_d1_phase_boundary A hA f hf phase hP,
+   @mr_translate_opaqueCast_fail_closed⟩
+
+/-- The companion and phase-boundary capstone is non-vacuous: all of its
+hypotheses are inhabited by the REAL root-side Trusted / MiniRust observers. -/
+theorem ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous :
+    type_of% (ep2_opaquecast_fnentry_companion_phase_capstone
+      rootBackedLmAuthority rootBackedLmAuthority_tableCheck
+      (fun o => o) (fun _ => rfl) rootBackedCompanion rootBackedCompanion_cells
+      (mrOcTrustedObsOf .scalar
+        (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []))
+      rootBackedErased_eq mrOcPhaseObserve rootBackedPhase_check) :=
+  ep2_opaquecast_fnentry_companion_phase_capstone
+    rootBackedLmAuthority rootBackedLmAuthority_tableCheck
+    (fun o => o) (fun _ => rfl) rootBackedCompanion rootBackedCompanion_cells
+    (mrOcTrustedObsOf .scalar
+      (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []))
+    rootBackedErased_eq mrOcPhaseObserve rootBackedPhase_check
+
 /-! ## §10. Import-Isolation, 100% Constructive Purity, Reachability & Audit -/
 
 section AxiomAudit
@@ -1401,11 +1891,26 @@ run_cmd do
       ns ++ `dual_d3_dereferenceable_and_zst_boundary,
       ns ++ `ocTerminatesCleanly, ns ++ `dual_d2_machine_termination_contrast,
       ns ++ `stopProj, ns ++ `stepsM_eq_runToStopM,
-      ns ++ `stepsTB_eq_runToStopM,
+      ns ++ `stepsTB_eq_runToStopM, ns ++ `steps_eq_runToStopM_bm_of,
       ns ++ `rootBackedLmAuthority, ns ++ `rootBackedLmAuthority_tableCheck,
       ns ++ `rootBackedLmAuthority_failClosed, ns ++ `rootBacked_observer_level,
+      ns ++ `trustedCompanion, ns ++ `mrCompanion, ns ++ `ocCompanionExpected,
+      ns ++ `ocCompanionTrustedExpected, ns ++ `trustedCompanion_table,
+      ns ++ `mrCompanion_table, ns ++ `OcFpLmCompanionCells,
+      ns ++ `dual_companion_three_way, ns ++ `dual_companion_mode_sensitivity,
+      ns ++ `dual_type_switch_erasure_boundary,
+      ns ++ `mrOcPhaseObserve, ns ++ `ocPhaseExpected,
+      ns ++ `mrOcPhaseObserve_table, ns ++ `ocPhaseExpected_cell,
+      ns ++ `lmPhaseCheckOf, ns ++ `dual_d1_phase_boundary,
+      ns ++ `ocStepG, ns ++ `ocTrustedStep_running_eq, ns ++ `ocStepG_natural,
+      ns ++ `repeat_natural, ns ++ `ocRunner_copy_lock,
+      ns ++ `ocCombine_copy_lock,
+      ns ++ `rootBackedCompanion, ns ++ `rootBackedCompanion_cells,
+      ns ++ `rootBackedPhase_check, ns ++ `rootBackedErased_eq,
       ns ++ `ep2_opaquecast_fnentry_dual_authority_capstone,
-      ns ++ `ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous ]
+      ns ++ `ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous,
+      ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone,
+      ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous ]
   for c in spotlightDecls do
     unless env.contains c do throwError "constructive audit: {c} missing"
     for a in ← liftCoreM <| Lean.collectAxioms c do
@@ -1418,7 +1923,7 @@ run_cmd do
         unless a == ``propext || a == ``Quot.sound do
           throwError "exhaustive constructive audit failure: {c} depends on {a}"
       exhaustiveChoiceFree := exhaustiveChoiceFree + 1
-  if exhaustiveChoiceFree < 280 then
+  if exhaustiveChoiceFree < 400 then
     throwError "exhaustive constructive audit vacuous: only {exhaustiveChoiceFree} decls checked"
   -- Auditor self-tests: Classical.em, sorryAx, and Lean.ofReduceBool are caught.
   if (← liftCoreM <| Lean.collectAxioms ``Classical.em).all
@@ -1469,7 +1974,54 @@ run_cmd do
           `MiniRustSpec.Interp.ReborrowSettings.new,
           `MiniRustSpec.Interp.TreeBorrowsMemory.retag_ptr,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ep1_minirust_opaquecast_fnentry_capstone,
-          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ep1_minirust_opaquecast_fnentry_universal_capstone ]) ]
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ep1_minirust_opaquecast_fnentry_universal_capstone ]),
+      -- Every per-domain bundle reaches the same real interpreters.
+      (ns ++ `domainBundleOf,
+        [ `Anneal.DualCorrespondenceBundle.DualCorrespondenceBundle,
+          `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `Trusted.Rustc.V2026_06_01.MirSemantics.stripLeadingOpaqueCast,
+          `Trusted.Rustc.V2026_06_01.MirSemantics.eraseLeadingOpaqueCastDecls,
+          `Trusted.Rustc.V2026_06_01.MirSemantics.evalFnEntryRetag,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedObserve,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve,
+          `MiniRustSpec.Interp.stepM,
+          `MiniRustSpec.Interp.checkPtrM,
+          `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable,
+          `MiniRustSpec.Interp.TreeBorrowsMemory.retag_ptr ]),
+      -- Companion observers and their 3-way theorem run the real engines.
+      (ns ++ `trustedCompanion,
+        [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `Trusted.Rustc.V2026_06_01.MirSemantics.evalFnEntryRetag,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase6PayloadMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase7ProtectedDropMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase9DeadLocalMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase9InvalidBoolMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase13RevTransmuteMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase17DanglingZstMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase18ZstNullMir ]),
+      (ns ++ `mrCompanion,
+        [ `MiniRustSpec.Interp.stepM,
+          `MiniRustSpec.Interp.checkPtrM,
+          `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable,
+          `MiniRustSpec.Interp.TreeBorrowsMemory.retag_ptr ]),
+      (ns ++ `mrOcPhaseObserve,
+        [ `MiniRustSpec.Correspondence.translatePlace,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCaseFixture?,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocBodyPlaces,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocPlaceHasCast ]),
+      (ns ++ `ocRunner_copy_lock,
+        [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocTrustedStep,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocRunTrustedRaw,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocTrustedFuel ]),
+      (ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone,
+        [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `MiniRustSpec.Interp.stepM,
+          `MiniRustSpec.Interp.checkPtrM,
+          `MiniRustSpec.Correspondence.translatePlace,
+          `MiniRustSpec.Correspondence.translateStatement,
+          ns ++ `trustedCompanion, ns ++ `mrCompanion,
+          ns ++ `mrOcPhaseObserve ]) ]
   for (root, rs) in reqs do
     let seen := reachFrom root
     for r in rs do
@@ -1486,7 +2038,7 @@ run_cmd do
         throwError "{c} depends on non-standard axiom {a}"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 50 then
+  if theorems < 100 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
   logInfo m!"oc/fp DualSpec audit: {exhaustiveChoiceFree} decls ({theorems} theorems) 100% constructive in [propext, Quot.sound], zero Classical.choice"
 

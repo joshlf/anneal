@@ -39,15 +39,25 @@ import MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
    bundles, all lifted theorems, observer-level (raw `MrOcFpObs`) 3-way
    agreement, 3-engine companion & UB root-cause alignment, and the Episode 2
    cross-root capstone. It also:
-   - locks ALL 97 shared `section Fixtures` declarations (93 identically-typed
-     defs locked by `Eq.refl` + `mrOcCaseCount = lmOcCaseCount` by `Eq.refl`,
-     plus constructor bijections and table/step locks for the 4 runner decls
-     `OcTrustedOutcome`, `OcTrustedRun`, `ocTrustedStep`, `ocRunTrustedRaw`);
+   - locks ALL 97 shared `section Fixtures` declarations: 93 identically-typed
+     defs by `Eq.refl` (+ `mrOcCaseCount = lmOcCaseCount`), the two runner
+     inductives (`OcTrustedOutcome`, `OcTrustedRun`) by constructor bijections,
+     and `ocTrustedStep` / `ocRunTrustedRaw` UNIVERSALLY (every body, run
+     state, and callee list) through `ocRunner_copy_lock`, whose 11 copy
+     hypotheses are discharged by `Eq.refl`; the only other shared top-level
+     name (`ocCombine`) is locked universally through `lmToMr`, and an
+     EXHAUSTIVE audit rejects any shared MR/LM declaration without a lock;
+   - closes exact 3-way raw-observer agreement on all 14 companion cells
+     (`dual_companion_three_way`), the type-switch erasure boundary, and the
+     `D1` static phase boundary (`dual_d1_phase_boundary`) over the REAL
+     vendored-Miri companion harnesses and `lmOcPhaseObserve`;
    - proves translation fidelity (`lmOcToVerdict = ocVerdictOf ∘ lmToMr`,
      `lmToMr`/`mrToLm` 7-constructor bijection) and locks `ocLmExpected*` to
      `lmOcExpected*.map lmToMr` by `Eq.refl`;
-   - verifies EVERY forged control is REJECTED by the kernel while its paired
-     honest twin is ACCEPTED (`twins = rejected`);
+   - verifies EVERY forged control is REJECTED BY THE KERNEL (the rejection
+     message must be a `(kernel)` type mismatch, never an elaboration or
+     name-resolution accident) while its paired honest twin is ACCEPTED
+     (`twins = rejected`);
    - verifies transitive reachability across Trusted, MiniRust, and vendored
      Miri.
 3. **§3 Constructive purity, axiom audit, and auditor self-tests**: exhaustive
@@ -67,6 +77,17 @@ open Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec
 open MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
 
 /-! ## §1. Root-Lake Concrete Canaries -/
+
+/-- Close an equality goal by kernel definitional reduction (`Eq.refl`, zero
+`Lean.ofReduceBool`); used where the compared type has no `DecidableEq`. -/
+local elab "kernel_rfl" : tactic => do
+  let mvarId ← Lean.Elab.Tactic.getMainGoal
+  let tgt ← Lean.MVarId.getType' mvarId
+  let some (ty, lhs, _) := tgt.eq?
+    | Lean.Meta.throwTacticEx `kernel_rfl mvarId "expected equality goal"
+  let u ← Lean.Meta.getLevel ty
+  mvarId.assign (Lean.mkApp2 (Lean.mkConst ``Eq.refl [u]) ty lhs)
+  Lean.Elab.Tactic.replaceMainGoal []
 
 /-- Codec round-trip on every constructor, tightness, exact `ValidRep`
 characterization, distinct tags, and malformed-wire rejection. -/
@@ -117,10 +138,12 @@ theorem d1_opaqueCast_canaries :
     ocClassOf 8 = .castDerefBoundary := by
   decide +kernel
 
-/-- `D1` companions and type-switch erasure boundary: `SetDiscriminant` payload
-(`ocCase6PayloadMir`), mode-sensitive protected drop (`ocCase7ProtectedDropMir`),
-dead-local UB (`ocCase9DeadLocalMir`), invalid-`bool` UB + type-switch erasure
-boundary (`ocCase9InvalidBoolMir`), and upstream `minimize` contrasts. -/
+/-- `D1` companions and type-switch erasure boundary (lifted Episode 1
+theorems): `SetDiscriminant` payload (`ocCase6PayloadMir`), mode-sensitive
+protected drop (`ocCase7ProtectedDropMir`), dead-local UB
+(`ocCase9DeadLocalMir`), invalid-`bool` UB + type-switch erasure boundary
+(`ocCase9InvalidBoolMir`), and upstream `minimize` contrasts. The same facts
+are re-executed directly by the kernel in `companion_direct_canaries`. -/
 theorem d1_companion_and_type_switch_canaries :
     type_of% mr_oc_setDiscriminant_payload_agreement ∧
     type_of% mr_oc_protected_drop_mode_sensitive ∧
@@ -134,6 +157,67 @@ theorem d1_companion_and_type_switch_canaries :
    mr_oc_invalid_bool_ub_non_masking,
    mr_oc_type_switch_erasure_boundary,
    mr_oc_minimize_lowering_contrasts⟩
+
+/-- **Companions (direct kernel execution, independent of every Episode 1
+theorem)**: real Trusted `stepMirFn` and real MiniRust `stepM` / `checkPtrM` on
+all 7 companion fixtures in both modes.
+* `payload` (`ocCase6PayloadMir`): `7` everywhere;
+* `protectedDrop` (`ocCase7ProtectedDropMir`): `7` in `basic`, UB under Tree
+  Borrows;
+* `deadLocal` (`ocCase9DeadLocalMir`) and `invalidBool`
+  (`ocCase9InvalidBoolMir`): UB everywhere, while Trusted on the cast-ERASED
+  invalid-`bool` image returns the invalid byte `2` (type-switch erasure
+  boundary);
+* `revTransmute` (`ocCase13RevTransmuteMir`): `(5, 5)` in `basic`, UB under
+  Tree Borrows;
+* `zstDangling` (`ocCase17DanglingZstMir`): MiniRust accepts, Trusted rejects
+  conservatively (the single companion boundary);
+* `zstNull` (`ocCase18ZstNullMir`): UB everywhere. -/
+theorem companion_direct_canaries :
+    trustedCompanion false .payload = .okScalar 7 ∧
+    trustedCompanion true .payload = .okScalar 7 ∧
+    mrCompanion false .payload = .okScalar 7 ∧
+    mrCompanion true .payload = .okScalar 7 ∧
+    trustedCompanion false .protectedDrop = .okScalar 7 ∧
+    trustedCompanion true .protectedDrop = .ub ∧
+    mrCompanion false .protectedDrop = .okScalar 7 ∧
+    mrCompanion true .protectedDrop = .ub ∧
+    trustedCompanion false .deadLocal = .ub ∧
+    mrCompanion true .deadLocal = .ub ∧
+    trustedCompanion false .invalidBool = .ub ∧
+    mrCompanion false .invalidBool = .ub ∧
+    mrCompanion true .invalidBool = .ub ∧
+    mrOcTrustedObsOf .scalar
+      (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []) = .okScalar 2 ∧
+    trustedCompanion false .revTransmute = .okRetagPair 5 5 ∧
+    trustedCompanion true .revTransmute = .ub ∧
+    mrCompanion false .revTransmute = .okRetagPair 5 5 ∧
+    mrCompanion true .revTransmute = .ub ∧
+    trustedCompanion false .zstDangling = .ub ∧
+    mrCompanion false .zstDangling = .okPtrValid ∧
+    mrCompanion true .zstDangling = .okPtrValid ∧
+    trustedCompanion true .zstNull = .ub ∧
+    mrCompanion false .zstNull = .ub ∧
+    mrCompanion true .zstNull = .ub ∧
+    trustedCompanion false .protectedDrop ≠ trustedCompanion true .protectedDrop ∧
+    mrCompanion false .revTransmute ≠ mrCompanion true .revTransmute := by
+  decide +kernel
+
+/-- **`D1` static phase boundary (direct kernel execution)**: the real
+`MiniRustSpec.Correspondence.translatePlace` fails closed on every cast-bearing
+place of every `D1` fixture (`0..9` are `phaseBoundary`), no `D2` / `D3` fixture
+carries a cast, out-of-range indices fail closed, and yet the runtime
+observers execute the same `D1` cases (flip guard `phase 0 ≠ runtime 0`). -/
+theorem d1_phase_boundary_canaries :
+    (List.range 22).map mrOcPhaseObserve = ocPhaseExpected ∧
+    mrOcPhaseObserve 0 = .phaseBoundary ∧ mrOcPhaseObserve 8 = .phaseBoundary ∧
+    mrOcPhaseObserve 9 = .phaseBoundary ∧ mrOcPhaseObserve 10 = .unsupported ∧
+    mrOcPhaseObserve 21 = .unsupported ∧ mrOcPhaseObserve 22 = .unsupported ∧
+    mrOcPhaseObserve 0 ≠ mrOcObserve false 0 ∧
+    mrOcPhaseObserve 0 ≠ mrOcTrustedObserve false 0 ∧
+    lmPhaseCheckOf (fun o => o) mrOcPhaseObserve = true ∧
+    lmPhaseCheckOf (fun o => o) (mrOcObserve false) = false := by
+  decide +kernel
 
 /-- `D2` (direct kernel execution): callee-only `rust#166253` (`10`) succeeds
 in BOTH modes (`okRetagPair 5 5`), pre-`#166253` caller-retag (`11`) and
@@ -167,8 +251,10 @@ theorem d2_fnentry_protector_canaries :
     mrVerdict true 10 ≠ mrVerdict true 11 := by
   decide +kernel
 
-/-- `D2` companions: reverse-transmutation mode sensitivity, Trusted indirect
-fn-ptr transmute boundary, and machine-level `steps`/`stepsTB` contrast. -/
+/-- `D2` companions (lifted Episode 1 theorems): reverse-transmutation mode
+sensitivity, Trusted indirect fn-ptr transmute boundary, and machine-level
+`steps`/`stepsTB` contrast; re-executed directly by the kernel in
+`d2_indirect_fnptr_direct_canaries`. -/
 theorem d2_indirect_and_rev_transmute_canaries :
     type_of% mr_oc_d2_rev_transmute_mode_sensitive ∧
     type_of% trusted_d2_indirect_fnptr_calls ∧
@@ -176,6 +262,58 @@ theorem d2_indirect_and_rev_transmute_canaries :
   ⟨mr_oc_d2_rev_transmute_mode_sensitive,
    trusted_d2_indirect_fnptr_calls,
    dual_d2_machine_termination_contrast⟩
+
+/-- **`D2` indirect / transmuted fn-ptr boundary (direct kernel execution of
+real Trusted `stepMirFn`)**: an exact-signature indirect call of the
+callee-only `fn(*mut u8, *mut u8)` returns `(5, 5)`; the `&mut u8`-retagging
+callee is UB under Tree Borrows and `(5, 5)` on its no-borrow-tracker image;
+the fn-ptr `transmute` itself succeeds in both directions, whereas CALLING the
+transmuted pointer is UB in both directions (Trusted compares call-site
+signatures syntactically), while MiniRust's transmuted call of case `10`
+succeeds in both modes; and the unmodified MiniRust step drivers terminate
+cleanly on the callee-only program in both modes but not on case `11` under
+Tree Borrows. -/
+theorem d2_indirect_fnptr_direct_canaries :
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw
+      (ocIndirectMain "oc::case10_callee" ocFnRawSigTy ocFnRawSigTy)
+      [ocCase10Callee]) = .okRetagPair 5 5 ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw
+      (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRefSigTy)
+      [ocCase11Callee]) = .ub ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw
+      (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRefSigTy)
+      [ocEraseRetags ocCase11Callee]) = .okRetagPair 5 5 ∧
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw
+      (ocIndirectTransmuteOnly "oc::case10_callee" ocFnRawSigTy ocFnRefSigTy)
+      [ocCase10Callee]) = .okScalar 1 ∧
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw
+      (ocIndirectTransmuteOnly "oc::case11_callee" ocFnRefSigTy ocFnRawSigTy)
+      [ocCase11Callee]) = .okScalar 1 ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw
+      (ocIndirectMain "oc::case10_callee" ocFnRawSigTy ocFnRefSigTy)
+      [ocCase10Callee]) = .ub ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw
+      (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRawSigTy)
+      [ocEraseRetags ocCase11Callee]) = .ub ∧
+    mrOcObserve false 10 = .okRetagPair 5 5 ∧
+    mrOcObserve true 10 = .okRetagPair 5 5 ∧
+    ocTerminatesCleanly false ocMrProg10 = true ∧
+    ocTerminatesCleanly true ocMrProg10 = true ∧
+    ocTerminatesCleanly false ocMrProg11 = true ∧
+    ocTerminatesCleanly true ocMrProg11 = false := by
+  decide +kernel
+
+/-- **`Mach` driver identity (universal, unconditional)**: on `BasicMemory`
+the driver behind `mrOcObserve false` is MiniRust's own `steps`, for EVERY
+fuel and machine. Discharges the hypothesis of the constructive
+`steps_eq_runToStopM_bm_of` with the upstream specialization lemma
+`MiniRustSpec.Correspondence.stepM_bm_eq` (the single place where its
+`Classical.choice` enters, kept out of the 100% constructive `DualSpec`). -/
+theorem bm_driver_is_minirust_steps (fuel : Nat) (m : MiniRustSpec.Interp.Mach) :
+    MiniRustSpec.Interp.steps fuel m =
+      stopProj (MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM
+        (M := MiniRustSpec.Interp.BM) fuel m) :=
+  steps_eq_runToStopM_bm_of MiniRustSpec.Correspondence.stepM_bm_eq fuel m
 
 /-- `D3` (direct kernel execution): valid `&u32` (`16`) and ZST `&()` (`17`)
 return `okPtrValid`; null (`18`), unaligned (`19`), OOB (`20`), and freed (`21`)
@@ -197,7 +335,8 @@ theorem d3_safe_ptr_dereferenceable_canaries :
   decide +kernel
 
 /-- `D3` `some mach` vs `none` `CM.dereferenceable` separation on `Mach` and
-`MachTB` plus ZST dangling/null companions. -/
+`MachTB` plus ZST dangling/null companions (lifted Episode 1 theorems);
+re-executed directly by the kernel in `d3_some_vs_none_direct_canaries`. -/
 theorem d3_some_vs_none_and_zst_canaries :
     type_of% mr_checkPtr_some_vs_none_contrast ∧
     type_of% mr_checkPtrM_tb_some_vs_none_contrast ∧
@@ -206,9 +345,52 @@ theorem d3_some_vs_none_and_zst_canaries :
    mr_checkPtrM_tb_some_vs_none_contrast,
    mr_oc_d3_zst_dangling_and_null⟩
 
-/-- Fail-closed out-of-range cells (`22`, `1000`) on Trusted and MiniRust, and
-the exact class layout: 21 `threeWay`, `[8]` `castDerefBoundary`, and
-`{11, 13, 14}` mode-sensitive. -/
+section D3Direct
+open MiniRustSpec MiniRustSpec.Gen MiniRustSpec.LibSpecr MiniRustSpec.Interp
+open MiniRustSpec.CrossFrameRefAndPanicMR MiniRustSpec.WideDstAndMaybeUninitMR
+
+/-- **`D3` exact `some mach` vs `none` separation (direct kernel execution of
+real `checkPtr` on `Mach` and `checkPtrM` on `MachTB`)**:
+* valid `&u32` (`16`): `.ok ()` WITH the machine, `Stop.unsupported` without;
+* out-of-bounds (`20`) and freed (`21`): exact `CM.dereferenceable`
+  `Stop.ub` WITH the machine, `Stop.unsupported` without;
+* null (`18`) and unaligned (`19`): `Stop.ub` both ways (never
+  `Stop.unsupported`);
+* ZST `&()` (`17`): `.ok ()` both ways. -/
+theorem d3_some_vs_none_direct_canaries :
+    ocCheckPtrContrast ocMrProg16 (.Ref .Immutable u32Pointee) =
+      some (.ok (),
+        unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") ∧
+    ocCheckPtrContrast ocMrProg17 (.Ref .Immutable ocMrUnitPointee) =
+      some (.ok (), .ok ()) ∧
+    ocCheckPtrContrast ocMrProg18 (.Ref .Immutable u32Pointee) =
+      some (ub "Value::Ptr: null safe pointer",
+        ub "Value::Ptr: null safe pointer") ∧
+    ocCheckPtrContrast ocMrProg19 (.Box u32Pointee) =
+      some (ub "Value::Ptr: unaligned safe pointer",
+        ub "Value::Ptr: unaligned safe pointer") ∧
+    ocCheckPtrContrast ocMrProg20 (.Ref .Immutable u32Pointee) =
+      some (ub "Value::Ptr: non-dereferenceable safe pointer",
+        unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") ∧
+    ocCheckPtrContrast ocMrProg21 (.Box u32Pointee) =
+      some (ub "Value::Ptr: non-dereferenceable safe pointer",
+        unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") ∧
+    ocCheckPtrMContrastTB ocMrProg16 (.Ref .Immutable u32Pointee) =
+      some (.ok (),
+        unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") ∧
+    ocCheckPtrMContrastTB ocMrProg20 (.Ref .Immutable u32Pointee) =
+      some (ub "Value::Ptr: non-dereferenceable safe pointer",
+        unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") ∧
+    ocCheckPtrMContrastTB ocMrProg21 (.Box u32Pointee) =
+      some (ub "Value::Ptr: non-dereferenceable safe pointer",
+        unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+end D3Direct
+
+/-- Fail-closed out-of-range cells (`22`, `1000`) on Trusted and MiniRust
+(direct kernel execution), and the exact class layout: 21 `threeWay`, `[8]`
+`castDerefBoundary`, and `{11, 13, 14}` mode-sensitive. -/
 theorem out_of_range_and_class_canaries :
     trustedVerdict false 22 = some .unsupported ∧
     mrVerdict true 22 = some .unsupported ∧
@@ -218,14 +400,11 @@ theorem out_of_range_and_class_canaries :
     ((List.range 22).filter (fun i => ocClassOf i == .castDerefBoundary)) = [8] ∧
     ((List.range 22).filter ocCaseModeSensitive) = [11, 13, 14] ∧
     ocClassOf 22 = .outOfRange := by
-  refine ⟨trustedVerdict_out_of_range false 22 (by decide),
-    mrVerdict_out_of_range true 22 (by decide),
-    trustedVerdict_out_of_range true 1000 (by decide),
-    mrVerdict_out_of_range false 1000 (by decide),
-    by decide, by decide, by decide, by decide⟩
+  decide +kernel
 
-/-- Root-side instantiation of the capstone at the real-observer-backed
-authority (non-vacuity of all capstone hypotheses). -/
+/-- Root-side instantiation of BOTH capstones at the real-observer-backed
+authority, companion observer, and MiniRust phase observer (non-vacuity of all
+capstone hypotheses). -/
 theorem root_capstone_instantiation :
     lmTableCheckOf rootBackedLmAuthority = true ∧
     (∀ sel, lmCheckOf sel rootBackedLmAuthority = true) ∧
@@ -233,15 +412,23 @@ theorem root_capstone_instantiation :
       rootBackedLmAuthority_tableCheck) ∧
     type_of% (projectFault rootBackedLmAuthority
       rootBackedLmAuthority_tableCheck) ∧
-    type_of% ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous :=
+    type_of% ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous ∧
+    OcFpLmCompanionCells (fun o => o) rootBackedCompanion ∧
+    lmPhaseCheckOf (fun o => o) mrOcPhaseObserve = true ∧
+    type_of% ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous :=
   ⟨rootBackedLmAuthority_tableCheck,
    fun sel => lmCheckOf_of_table sel _ rootBackedLmAuthority_tableCheck,
    projectPositive _ rootBackedLmAuthority_tableCheck,
    projectFault _ rootBackedLmAuthority_tableCheck,
-   ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous⟩
+   ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous,
+   rootBackedCompanion_cells, rootBackedPhase_check,
+   ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous⟩
 
 /-! ## §2. Cross-Root 3-Way Kernel Closure (`MiniRustSpec` + `LeanMiriSpec` + `Anneal`) -/
 
+-- The bridge is one long `do` block: raise only the ELABORATOR's recursion
+-- limit for it (every declaration it adds is still checked by the kernel).
+set_option maxRecDepth 8192 in
 open Lean Elab Command Meta in
 run_cmd do
   let opts := (← getOptions).setBool `Elab.async false
@@ -574,12 +761,13 @@ run_cmd do
 
     -- 4. Definitional `Eq.refl` fixture locks over EVERY identically-typed
     -- shared definition in `section Fixtures` (all 93 defs: case count, span,
-    -- builders, layouts, types, constants, all 34 `CapturedMir` fixtures,
+    -- builders, layouts, types, constants, all 35 `CapturedMir` fixtures,
     -- cast-erasure/place-extraction/retag-erasure helpers, `ocCaseFixture?`,
     -- and `ocTrustedFuel`) PLUS `mrOcCaseCount = lmOcCaseCount` (94 `Eq.refl`
-    -- locks), PLUS constructor bijections and step/run locks for the 4 runner
-    -- declarations (`OcTrustedOutcome`, `OcTrustedRun`, `ocTrustedStep`,
-    -- `ocRunTrustedRaw`) covering all 97 `section Fixtures` declarations!
+    -- locks), PLUS constructor bijections for the two runner inductives
+    -- (`OcTrustedOutcome`, `OcTrustedRun`) and UNIVERSAL lockstep / raw-run
+    -- locks for `ocTrustedStep` and `ocRunTrustedRaw`, covering all 97
+    -- `section Fixtures` declarations (checked exhaustively below).
     let fixtureNames : List Name :=
       [ `ocFixtureCaseCount, `ocSpan, `ocSt, `ocBb, `ocDecl, `ocLoc,
         `ocU8Layout, `ocU32Layout, `ocUnitLayout, `ocPtrLayout, `ocPairLayout,
@@ -630,8 +818,8 @@ run_cmd do
       throwError "cross-root: expected 94 Eq.refl fixture locks, got {eqLockCount}"
     -- Lock the remaining 4 `section Fixtures` declarations
     -- (`OcTrustedOutcome`, `OcTrustedRun`, `ocTrustedStep`, `ocRunTrustedRaw`):
-    -- constructor bijections for both inductives + exact lockstep `Eq.refl`
-    -- check of `ocRunTrustedRaw` and `ocTrustedStep` across all fixtures.
+    -- constructor bijections for both inductives + universal lockstep and
+    -- raw-run locks of `ocTrustedStep` / `ocRunTrustedRaw` for EVERY body.
     let outCtors : List Name := [`ret, `ub, `unsupported, `outOfFuel]
     let mrOutToLmName := ns ++ `mrOutToLm
     let _ ← addDef mrOutToLmName
@@ -712,41 +900,219 @@ run_cmd do
       |>.push (ns ++ `fixtureLock ++ `OcTrustedRun_lm_mr)
     lockNames := lockNames.push (ns ++ `fixtureLock ++ `OcTrustedRun_mr_lm)
       |>.push (ns ++ `fixtureLock ++ `OcTrustedRun_lm_mr)
-    -- `ocTrustedStep` lockstep simulation on a concrete body & `ocRunTrustedRaw`
-    -- lock across case 0 and case 10 (by `Eq.refl`).
-    let initSt0 :=
-      mkApp3 (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.initMachineStateWithCallees)
-        (mkConst (mrNs ++ `ocCase0Mir))
-        (mkApp (mkConst ``List.nil [0])
-          (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.Value))
-        (mkApp (mkConst ``List.nil [0])
-          (mkConst `Trusted.Rustc.V2026_06_01.MirAst.CapturedMir))
-    let stepLhs := mkApp mrRunToLm
-      (mkApp2 (mkConst (mrNs ++ `ocTrustedStep)) (mkConst (mrNs ++ `ocCase0Mir))
-        (mkApp (mkConst (mrNs ++ `OcTrustedRun.running)) initSt0))
-    let stepRhs := mkApp2 (mkConst (lmNs ++ `ocTrustedStep))
-      (mkConst (lmNs ++ `ocCase0Mir))
-      (mkApp (mkConst (lmNs ++ `OcTrustedRun.running)) initSt0)
+    -- UNIVERSAL locks of `ocTrustedStep` and `ocRunTrustedRaw` (EVERY body,
+    -- run state, and callee list): instantiate `ocRunner_copy_lock` with the
+    -- LeanMiri-side copy of the runner, discharging all 11 copy hypotheses by
+    -- `Eq.refl` (kernel unfolding of the verbatim-shared definitions), and
+    -- check both conjuncts against explicitly constructed `∀` statements.
+    let lmOutC (c : Name) : Expr := mkConst (lmNs ++ `OcTrustedOutcome ++ c)
+    let lmRunC (c : Name) : Expr := mkConst (lmNs ++ `OcTrustedRun ++ c)
+    let finishLm : Expr :=
+      mkLambda `r .default lmRunTy <|
+        mkAppN (mkConst (lmNs ++ `OcTrustedRun.rec) [1])
+          #[mkLambda `x .default lmRunTy lmOutTy,
+            mkLambda `s .default stTy (lmOutC `outOfFuel),
+            mkLambda `o .default lmOutTy (.bvar 0), .bvar 0]
+    let dischargeRefl (head : Expr) (n : Nat) : MetaM Expr := do
+      let mut e := head
+      for _ in List.range n do
+        let ty ← whnf (← inferType e)
+        let .forallE _ dom _ _ := ty
+          | throwError "cross-root: expected a hypothesis binder in {ty}"
+        let pf ← forallTelescope dom fun xs body => do
+          let some (α, lhs, _) := body.eq?
+            | throwError "cross-root: expected an equality hypothesis: {body}"
+          mkLambdaFVars xs (mkRefl α lhs)
+        e := mkApp e pf
+      return e
+    let runnerHead (ubC : Expr) : Expr :=
+      mkAppN (mkConst (bNs ++ `ocRunner_copy_lock))
+        #[lmRunTy, lmOutTy, lmRunC `running, lmRunC `done, lmOutC `ret, ubC,
+          lmOutC `unsupported, lmOutC `outOfFuel, mrRunToLm, mrOutToLm,
+          mkConst (lmNs ++ `ocTrustedStep), finishLm,
+          mkConst (lmNs ++ `ocRunTrustedRaw)]
+    let runnerPf ← MetaM.run' <| dischargeRefl (runnerHead (lmOutC `ub)) 11
+    let runnerUnivName := ns ++ `fixtureLock ++ `runner_universal
+    addThmInfer runnerUnivName runnerPf
+    added := added.push runnerUnivName
+    let capMirTy0 := mkConst `Trusted.Rustc.V2026_06_01.MirAst.CapturedMir
+    let (stepLockTy, runLockTy) ← MetaM.run' do
+      let stepTy ← withLocalDeclD `body capMirTy0 fun body =>
+        withLocalDeclD `r mrRunTy fun r =>
+          mkForallFVars #[body, r] <| mkEq lmRunTy
+            (mkApp mrRunToLm (mkApp2 (mkConst (mrNs ++ `ocTrustedStep)) body r))
+            (mkApp2 (mkConst (lmNs ++ `ocTrustedStep)) body (mkApp mrRunToLm r))
+      let runTy ← withLocalDeclD `body capMirTy0 fun body =>
+        withLocalDeclD `callees (mkApp (mkConst ``List [0]) capMirTy0) fun cs =>
+          mkForallFVars #[body, cs] <| mkEq lmOutTy
+            (mkApp mrOutToLm
+              (mkApp2 (mkConst (mrNs ++ `ocRunTrustedRaw)) body cs))
+            (mkApp2 (mkConst (lmNs ++ `ocRunTrustedRaw)) body cs)
+      return (stepTy, runTy)
     let stepLockName := ns ++ `fixtureLock ++ `ocTrustedStep
-    addThm stepLockName (mkEq lmRunTy stepLhs stepRhs) (mkRefl lmRunTy stepLhs)
+    addThm stepLockName stepLockTy
+      (← MetaM.run' <| mkAppM ``And.left #[mkConst runnerUnivName])
     added := added.push stepLockName
     lockNames := lockNames.push stepLockName
-    let nilMir := mkApp (mkConst ``List.nil [0])
-      (mkConst `Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
-    let runLhs := mkApp mrOutToLm
-      (mkApp2 (mkConst (mrNs ++ `ocRunTrustedRaw))
-        (mkConst (mrNs ++ `ocCase0Mir)) nilMir)
-    let runRhs := mkApp2 (mkConst (lmNs ++ `ocRunTrustedRaw))
-      (mkConst (lmNs ++ `ocCase0Mir)) nilMir
     let runLockName := ns ++ `fixtureLock ++ `ocRunTrustedRaw
-    addThm runLockName (mkEq lmOutTy runLhs runRhs) (mkRefl lmOutTy runLhs)
+    addThm runLockName runLockTy
+      (← MetaM.run' <| mkAppM ``And.right #[mkConst runnerUnivName])
     added := added.push runLockName
     lockNames := lockNames.push runLockName
-    let _ := (mrRunTy, mrOutTy)
-    let runnerLockCount : Nat := 4 -- OcTrustedOutcome, OcTrustedRun, ocTrustedStep, ocRunTrustedRaw
+    let _ := mrOutTy
+    let nilMir := mkApp (mkConst ``List.nil [0]) capMirTy0
+    -- `ocCombine` is the only other top-level name shared by both namespaces
+    -- (declared outside `section Fixtures`, over the per-namespace observation
+    -- type): lock it universally through `lmToMr` via `ocCombine_copy_lock`.
+    let combineLockName := ns ++ `fixtureLock ++ `ocCombine
+    addThmInfer combineLockName <|
+      mkAppN (mkConst (bNs ++ `ocCombine_copy_lock))
+        #[lmObsTy, mkConst (lmNs ++ `instDecidableEqLmOcFpObs), lmToMr, mrToLm,
+          mkConst (ns ++ `mrToLm_lmToMr), lmObsC `unsupported,
+          mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `unsupported)),
+          mkConst (lmNs ++ `ocCombine),
+          mkLambda `a .default lmObsTy <| mkLambda `b .default lmObsTy <|
+            mkRefl lmObsTy
+              (mkApp2 (mkConst (lmNs ++ `ocCombine)) (.bvar 1) (.bvar 0))]
+    added := added.push combineLockName
+    lockNames := lockNames.push combineLockName
+    let runnerLockCount : Nat := 4 -- 2 inductive bijections + 2 universal locks
     let totalFixtureLockCount : Nat := eqLockCount + runnerLockCount
     unless totalFixtureLockCount = 98 do
       throwError "cross-root: expected 98 total fixture locks (97 section Fixtures + caseCount), got {totalFixtureLockCount}"
+    -- EXHAUSTIVE shared-name audit: EVERY top-level declaration name that the
+    -- MiniRust and LeanMiri modules both declare (the 97 `section Fixtures`
+    -- declarations plus `ocCombine`) must be covered by one of the locks
+    -- above, so a shared fixture can never be added without a lock.
+    let lockedShared : NameSet :=
+      (fixtureNames ++ [`OcTrustedOutcome, `OcTrustedRun, `ocTrustedStep,
+        `ocRunTrustedRaw, `ocCombine]).foldl (fun s n => s.insert n) {}
+    let envNow ← getEnv
+    let some mrModIdx := envNow.getModuleIdx? mrNs
+      | throwError "cross-root: module {mrNs} not loaded"
+    let mut sharedTopLevel : Nat := 0
+    for c in envNow.header.moduleData[mrModIdx.toNat]!.constNames do
+      if mrNs.isPrefixOf c then
+        let suffix := c.replacePrefix mrNs .anonymous
+        if suffix.getNumParts == 1 && envNow.contains (lmNs ++ suffix) then
+          unless lockedShared.contains suffix do
+            throwError "cross-root: shared MR/LM declaration {suffix} has no lock"
+          sharedTopLevel := sharedTopLevel + 1
+    unless sharedTopLevel = 98 && lockedShared.size = 98 do
+      throwError "cross-root: expected 98 shared top-level MR/LM names (97 section Fixtures + ocCombine), got {sharedTopLevel} (locked {lockedShared.size})"
+
+    -- 4a. Companion fixtures and `D1` static phase boundary over the REAL
+    -- vendored-Miri harnesses. Every LeanMiri companion cell is read off the
+    -- statement of its kernel-checked Episode 1 theorem (the harness
+    -- expression on the left of each conjunct), assembled into the companion
+    -- observer `lmCompanionObserve`, and certified through `lmToMr`.
+    let conjuncts (thm : Name) : MetaM (Array (Expr × Expr)) := do
+      let mut out : Array (Expr × Expr) := #[]
+      let mut ty ← inferType (mkConst thm)
+      let mut pf := mkConst thm
+      let mut fuel : Nat := 64
+      while fuel > 0 do
+        fuel := fuel - 1
+        match ty.and? with
+        | some (a, b) =>
+          out := out.push (a, mkApp3 (mkConst ``And.left) a b pf)
+          pf := mkApp3 (mkConst ``And.right) a b pf
+          ty := b
+        | none =>
+          out := out.push (ty, pf)
+          fuel := 0
+      return out
+    let compNs := bNs ++ `OcFpCompanion
+    let compTy := mkConst compNs
+    let compCtors : List Name :=
+      [`payload, `protectedDrop, `deadLocal, `invalidBool, `revTransmute,
+       `zstDangling, `zstNull]
+    -- `(basic cell, Tree Borrows cell)` of each companion, in constructor
+    -- order, plus the erased-image cell of the invalid-`bool` companion.
+    let (cells, erasedCell) ← MetaM.run' do
+      let pay ← conjuncts (lmNs ++ `lm_oc_setDiscriminant_payload_agreement)
+      let pd ← conjuncts (lmNs ++ `lm_oc_protected_drop_mode_sensitive)
+      let dl ← conjuncts (lmNs ++ `lm_oc_dead_local_ub_non_masking)
+      let ts ← conjuncts (lmNs ++ `lm_oc_type_switch_erasure_boundary)
+      let rt ← conjuncts (lmNs ++ `lm_oc_d2_rev_transmute_mode_sensitive)
+      let z ← conjuncts (lmNs ++ `lm_oc_d3_zst_dangling_and_null)
+      unless pay.size = 2 && pd.size = 4 && dl.size = 2 && ts.size = 5 &&
+          rt.size = 4 && z.size = 6 do
+        throwError "cross-root: unexpected LeanMiri companion theorem shapes"
+      return (#[(pay[0]!, pay[0]!), (pd[0]!, pd[1]!), (dl[0]!, dl[0]!),
+                (ts[3]!, ts[4]!), (rt[2]!, rt[3]!), (z[1]!, z[2]!),
+                (z[4]!, z[5]!)], ts[2]!)
+    let lhsOf (p : Expr × Expr) : CoreM Expr := do
+      let some (_, l, _) := p.1.eq?
+        | throwError "cross-root: companion cell is not an equality: {p.1}"
+      return l
+    let mut obsMinors : Array Expr := #[]
+    for (cf, ct) in cells do
+      obsMinors := obsMinors.push <|
+        mkAppN (mkConst ``Bool.rec [1])
+          #[mkLambda `b .default boolTy lmObsTy, ← lhsOf cf, ← lhsOf ct, .bvar 1]
+    let compObsName := ns ++ `lmCompanionObserve
+    let _ ← addDef compObsName <|
+      mkLambda `tb .default boolTy <| mkLambda `c .default compTy <|
+        mkAppN (mkConst (compNs ++ `rec) [1])
+          (#[mkLambda `x .default compTy lmObsTy] ++ obsMinors ++ #[.bvar 0])
+    added := added.push compObsName
+    let compObs := mkConst compObsName
+    let cellsPf ← MetaM.run' do
+      withLocalDeclD `tb boolTy fun tb => withLocalDeclD `c compTy fun c => do
+        let goal (tbE cE : Expr) : Expr :=
+          mkEq mrObsTy0 (mkApp lmToMr (mkApp2 compObs tbE cE))
+            (mkApp2 (mkConst (bNs ++ `ocCompanionExpected)) tbE cE)
+        let mut minors : Array Expr := #[]
+        for (ctor, (cf, ct)) in compCtors.zip cells.toList do
+          let cE := mkConst (compNs ++ ctor)
+          let motiveB ← withLocalDeclD `b boolTy fun b =>
+            mkLambdaFVars #[b] (goal b cE)
+          let pF ← mkAppM ``congrArg #[lmToMr, cf.2]
+          let pT ← mkAppM ``congrArg #[lmToMr, ct.2]
+          minors := minors.push
+            (mkAppN (mkConst ``Bool.rec [0]) #[motiveB, pF, pT, tb])
+        let motiveC ← withLocalDeclD `x compTy fun x =>
+          mkLambdaFVars #[x] (goal tb x)
+        mkLambdaFVars #[tb, c]
+          (mkAppN (mkConst (compNs ++ `rec) [0]) (#[motiveC] ++ minors ++ #[c]))
+    let compCellsName := ns ++ `lmCompanion_cells
+    addThm compCellsName
+      (mkApp3 (mkConst (bNs ++ `OcFpLmCompanionCells)) lmObsTy lmToMr compObs)
+      cellsPf
+    added := added.push compCellsName
+    let hC := mkConst compCellsName
+    for thmName in [`dual_companion_three_way,
+                    `dual_companion_mode_sensitivity] do
+      addThmInfer (ns ++ thmName)
+        (mkApp4 (mkConst (bNs ++ thmName)) lmObsTy lmToMr compObs hC)
+      added := added.push (ns ++ thmName)
+    let erasedLhs ← lhsOf erasedCell
+    let hErased ← MetaM.run' <| mkAppM ``congrArg #[lmToMr, erasedCell.2]
+    addThmInfer (ns ++ `dual_type_switch_erasure_boundary)
+      (mkApp6 (mkConst (bNs ++ `dual_type_switch_erasure_boundary)) lmObsTy
+        lmToMr compObs hC erasedLhs hErased)
+    added := added.push (ns ++ `dual_type_switch_erasure_boundary)
+    -- LeanMiri static phase observer (`Miri.Interpreter.project` AND
+    -- `PlaceDynamic.project` on every cast place): 22-cell certificate by
+    -- direct kernel evaluation.
+    let lmPhaseObs := mkConst (lmNs ++ `lmOcPhaseObserve)
+    let phaseCheck (phase : Expr) : Expr :=
+      mkApp3 (mkConst (bNs ++ `lmPhaseCheckOf)) lmObsTy lmToMr phase
+    let phaseCheckName := ns ++ `lmPhase_check
+    addThm phaseCheckName (eqTrue (phaseCheck lmPhaseObs)) reflTrue
+    added := added.push phaseCheckName
+    let fidelityC := mkConst (ns ++ `translation_fidelity)
+    addThmInfer (ns ++ `dual_d1_phase_boundary)
+      (mkApp6 (mkConst (bNs ++ `dual_d1_phase_boundary)) authC hA lmToMr
+        fidelityC lmPhaseObs (mkConst phaseCheckName))
+    added := added.push (ns ++ `dual_d1_phase_boundary)
+    let compCapName := ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone
+    addThmInfer compCapName <|
+      mkAppN (mkConst (bNs ++ `ep2_opaquecast_fnentry_companion_phase_capstone))
+        #[authC, hA, lmToMr, fidelityC, compObs, hC, erasedLhs, hErased,
+          lmPhaseObs, mkConst phaseCheckName]
+    added := added.push compCapName
 
     -- 4b. Observer-level 3-way agreement over raw `lmOcObserve` + unified
     -- cross-root 3-engine capstone.
@@ -781,7 +1147,11 @@ run_cmd do
           mkConst (lmNs ++ `ep1_lean_miri_opaquecast_fnentry_capstone),
           mkConst (lmNs ++ `lmOcObserve_table),
           mkConst (lmNs ++ `lmOcObserve_mode_sensitivity),
-          mkConst (lmNs ++ `lmOc_trusted_agreement) ] ++
+          mkConst (lmNs ++ `lmOc_trusted_agreement),
+          mkConst compCapName,
+          mkConst compCellsName,
+          mkConst phaseCheckName,
+          mkConst runnerUnivName ] ++
         (lockNames.toList.map mkConst)
       let rec conj : List Expr → MetaM Expr
         | [] => return mkConst ``True.intro
@@ -792,11 +1162,14 @@ run_cmd do
     added := added.push crossName
 
     -- 5. Negative forgery controls on scratch environment copies: EVERY forged
-    -- declaration MUST be rejected by the kernel AND paired with an accepted
-    -- honest twin (`twins = rejected`).
+    -- declaration MUST be rejected BY THE KERNEL (its error message must be a
+    -- `(kernel)` type mismatch) AND paired with an accepted honest twin
+    -- (`twins = rejected`).
     let saved ← getEnv
-    let accepts (d : Declaration) : CoreM Bool := do
-      let r ← try addDecl d; pure true catch _ => pure false
+    -- `none` when the kernel accepts `d`; otherwise the rejection message.
+    let rejection (d : Declaration) : CoreM (Option String) := do
+      let r ← try addDecl d; pure none
+        catch ex => pure (some (← ex.toMessageData.toString))
       setEnv saved
       return r
     let invObserve ← MetaM.run' <|
@@ -928,8 +1301,9 @@ run_cmd do
         ("forged DualCorrespondenceBundle from mode-inverted LM authority",
           defD (ns ++ `forged.bundleModeInverted) ocBundleTy
             (mkApp2 (mkConst (bNs ++ `bundleOf)) invAuth reflTrue),
+          -- Same-shaped twin: the kernel re-evaluates the 44-cell certificate.
           defD (ns ++ `honest.bundleFromUnrolled) ocBundleTy
-            (mkApp2 (mkConst (bNs ++ `bundleOf)) authUC (mkConst tblUName))),
+            (mkApp2 (mkConst (bNs ++ `bundleOf)) authUC reflTrue)),
         ("swapped fixture lock (ocCase0Mir = ocCase5Mir)",
           thmD (ns ++ `forged.swappedFixture)
             (mkEq capMirTy (mkConst (mrNs ++ `ocCase0Mir))
@@ -1152,15 +1526,140 @@ run_cmd do
           thmD (ns ++ `honest.lmOutOfRangeUns)
             (mkEq lmObsTy (lmObsU false 22) (lmObsC `unsupported))
             (mkRefl lmObsTy (lmObsU false 22))) ]
+    -- Companion, phase-boundary, shared-runner, and remaining matrix controls.
+    let compC (c : Name) : Expr := mkConst (compNs ++ c)
+    let trComp (tb : Bool) (c : Name) : Expr :=
+      mkApp2 (mkConst (bNs ++ `trustedCompanion)) (toExpr tb) (compC c)
+    let mrComp (tb : Bool) (c : Name) : Expr :=
+      mkApp2 (mkConst (bNs ++ `mrCompanion)) (toExpr tb) (compC c)
+    -- LeanMiri companion harness on its kernel-evaluable loop-unrolled twin.
+    let lmTwinRun (twin : Name) (tb : Bool) : Expr :=
+      mkApp lmToMr (mkApp (mkConst (lmNs ++ `lmOcRun))
+        (mkApp (mkConst (lmNs ++ twin)) (toExpr tb)))
+    let mrPhase (i : Nat) : Expr :=
+      mkApp (mkConst (bNs ++ `mrOcPhaseObserve)) (mkNatLit i)
+    let selOf (d : Name) : Expr :=
+      mkApp2 (mkConst ``Option.some [0]) (mkConst domNs) (mkConst (domNs ++ d))
+    let domCheck (d : Name) (a : Expr) : Expr :=
+      mkApp2 (mkConst (bNs ++ `lmCheckOf)) (selOf d) a
+    let layoutTy ← MetaM.run' <| inferType (mkConst (mrNs ++ `ocU8Layout))
+    let runnerTy ← MetaM.run' <| inferType runnerPf
+    let forgedRunnerPf ← MetaM.run' <|
+      dischargeRefl (runnerHead (lmOutC `unsupported)) 11
+    let forgedRunnerTy ← MetaM.run' <| inferType forgedRunnerPf
+    let lmCombine12 := mkApp lmToMr
+      (mkApp2 (mkConst (lmNs ++ `ocCombine)) (lmSc 1) (lmSc 2))
+    let eqCtl (what : String) (tag : Name) (ty lhs bad good : Expr) :
+        String × Declaration × Declaration :=
+      (what, thmD (ns ++ `forged ++ tag) (mkEq ty lhs bad) (mkRefl ty lhs),
+        thmD (ns ++ `honest ++ tag) (mkEq ty lhs good) (mkRefl ty lhs))
+    let forgedMore : List (String × Declaration × Declaration) :=
+      [ ("forged universal runner lock (ub/unsupported-swapped outcome constructors)",
+          thmD (ns ++ `forged.runnerUniversal) forgedRunnerTy forgedRunnerPf,
+          thmD (ns ++ `honest.runnerUniversal) runnerTy runnerPf),
+        eqCtl "forged outcome bijection (mrOutToLm ub = unsupported)"
+          `outcomeBijection lmOutTy
+          (mkApp mrOutToLm (mkConst (mrNs ++ `OcTrustedOutcome.ub)))
+          (lmOutC `unsupported) (lmOutC `ub),
+        eqCtl "forged ocCombine lock (disagreeing halves combine to the first half)"
+          `combineDisagree mrObsTy0 lmCombine12 (mrSc 1) (mrC `unsupported),
+        ("swapped layout fixture lock (ocU8Layout = ocU32Layout)",
+          thmD (ns ++ `forged.swappedLayout)
+            (mkEq layoutTy (mkConst (mrNs ++ `ocU8Layout))
+              (mkConst (lmNs ++ `ocU32Layout)))
+            (mkRefl layoutTy (mkConst (mrNs ++ `ocU8Layout))),
+          thmD (ns ++ `honest.layoutU32)
+            (mkEq layoutTy (mkConst (mrNs ++ `ocU32Layout))
+              (mkConst (lmNs ++ `ocU32Layout)))
+            (mkRefl layoutTy (mkConst (mrNs ++ `ocU32Layout)))),
+        eqCtl "forged case count (mrOcCaseCount = 23)" `caseCount natTy
+          (mkConst (mrNs ++ `mrOcCaseCount)) (mkNatLit 23)
+          (mkConst (lmNs ++ `lmOcCaseCount)),
+        ("forged case 13 mode invariance (Trusted basic = treeBorrows)",
+          thmD (ns ++ `forged.case13TrInv)
+            (mkEq mrObsTy (trObs false 13) (trObs true 13))
+            (mkRefl mrObsTy (trObs false 13)),
+          thmD (ns ++ `honest.case13TrTbUb)
+            (mkEq mrObsTy (trObs true 13) (mrC `ub))
+            (mkRefl mrObsTy (trObs true 13))),
+        ("forged case 14 mode invariance (MiniRust basic = treeBorrows)",
+          thmD (ns ++ `forged.case14MrInv)
+            (mkEq mrObsTy (mrObs false 14) (mrObs true 14))
+            (mkRefl mrObsTy (mrObs false 14)),
+          thmD (ns ++ `honest.case14MrTbUb)
+            (mkEq mrObsTy (mrObs true 14) (mrC `ub))
+            (mkRefl mrObsTy (mrObs true 14))),
+        ("forged D2 per-domain side certificate from the mode-inverted LM authority",
+          thmD (ns ++ `forged.d2ModeInverted) (eqTrue (domCheck `d2 invAuth)) reflTrue,
+          -- `D1` is mode-insensitive, so the SAME inversion is harmless there.
+          thmD (ns ++ `honest.d1ModeInverted) (eqTrue (domCheck `d1 invAuth)) reflTrue),
+        eqCtl "forged companion: Trusted protected drop succeeds under Tree Borrows"
+          `compTrProtectedDrop mrObsTy0 (trComp true `protectedDrop) (mrSc 7) (mrC `ub),
+        eqCtl "forged companion: MiniRust protected drop succeeds under Tree Borrows"
+          `compMrProtectedDrop mrObsTy0 (mrComp true `protectedDrop) (mrSc 7) (mrC `ub),
+        eqCtl "forged companion: LeanMiri protected drop succeeds under Tree Borrows"
+          `compLmProtectedDrop mrObsTy0 (lmTwinRun `lmOcProtectedDropU true)
+          (mrSc 7) (mrC `ub),
+        eqCtl "forged companion: Trusted reverse transmute succeeds under Tree Borrows"
+          `compTrRevTransmute mrObsTy0 (trComp true `revTransmute) (mrPair 5 5) (mrC `ub),
+        eqCtl "forged companion: MiniRust reverse transmute succeeds under Tree Borrows"
+          `compMrRevTransmute mrObsTy0 (mrComp true `revTransmute) (mrPair 5 5) (mrC `ub),
+        eqCtl "forged companion: LeanMiri reverse transmute succeeds under Tree Borrows"
+          `compLmRevTransmute mrObsTy0 (lmTwinRun `lmOcD2RevTransmuteU true)
+          (mrPair 5 5) (mrC `ub),
+        eqCtl "forged companion: Trusted masks the invalid bool through the cast"
+          `compTrInvalidBool mrObsTy0 (trComp false `invalidBool) (mrSc 2) (mrC `ub),
+        eqCtl "forged companion: MiniRust masks the invalid bool"
+          `compMrInvalidBool mrObsTy0 (mrComp true `invalidBool) (mrSc 2) (mrC `ub),
+        eqCtl "forged companion: LeanMiri type-switched read masks the invalid bool"
+          `compLmInvalidBool mrObsTy0 (lmTwinRun `lmOcInvalidBoolReadU false)
+          (mrSc 2) (mrC `ub),
+        eqCtl "forged companion: Trusted accepts the dangling ZST (no boundary)"
+          `compTrZstDangling mrObsTy0 (trComp false `zstDangling)
+          (mrC `okPtrValid) (mrC `ub),
+        eqCtl "forged companion: MiniRust rejects the dangling ZST"
+          `compMrZstDangling mrObsTy0 (mrComp false `zstDangling)
+          (mrC `ub) (mrC `okPtrValid),
+        eqCtl "forged companion: MiniRust accepts the null ZST"
+          `compMrZstNull mrObsTy0 (mrComp true `zstNull) (mrC `okPtrValid) (mrC `ub),
+        eqCtl "forged phase boundary: cast-free D2 case 10 rejected statically"
+          `phaseD2 mrObsTy0 (mrPhase 10) (mrC `phaseBoundary) (mrC `unsupported),
+        eqCtl "forged phase boundary: MiniRust translates the cast places of case 8"
+          `phaseCase8 mrObsTy0 (mrPhase 8) (mrC `unsupported) (mrC `phaseBoundary),
+        ("forged LM phase certificate from the RUNTIME observer",
+          thmD (ns ++ `forged.phaseFromRuntime)
+            (eqTrue (phaseCheck (mkApp lmObserveU (toExpr false)))) reflTrue,
+          thmD (ns ++ `honest.phaseFromRuntimeFalse)
+            (eqFalse (phaseCheck (mkApp lmObserveU (toExpr false)))) reflFalse) ] ++
+      ([18, 19, 20, 21].map fun i =>
+        eqCtl s!"forged D3 case {i}: Trusted accepts the invalid safe pointer"
+          (Name.mkSimple s!"d3TrAccepts{i}") mrObsTy (trObs false i)
+          (mrC `okPtrValid) (mrC `ub)) ++
+      ([18, 19, 20, 21].map fun i =>
+        eqCtl s!"forged D3 case {i}: MiniRust accepts the invalid safe pointer"
+          (Name.mkSimple s!"d3MrAccepts{i}") mrObsTy (mrObs true i)
+          (mrC `okPtrValid) (mrC `ub))
     let mut rejected : Nat := 0
     let mut twins : Nat := 0
-    for (what, d, h) in forged do
-      if ← accepts d then
+    for (what, d, h) in forged ++ forgedMore do
+      match ← rejection d with
+      | none =>
         throwError "cross-root negative control FAILED: kernel accepted {what}"
+      | some msg =>
+        -- Only `(kernel) declaration type mismatch` / `(kernel) application
+        -- type mismatch` count: never a name-resolution, elaboration, or
+        -- resource (`deep recursion`) failure.
+        unless msg.startsWith "(kernel)" &&
+            (msg.splitOn "type mismatch").length > 1 do
+          throwError "cross-root negative control VACUOUS: {what} was not rejected by a kernel type mismatch: {msg}"
       rejected := rejected + 1
-      unless ← accepts h do
-        throwError "cross-root negative control VACUOUS: honest twin of {what} was rejected"
+      if let some msg ← rejection h then
+        throwError "cross-root negative control VACUOUS: honest twin of {what} was rejected: {msg}"
       twins := twins + 1
+    -- Harness self-test: an accepted declaration reports no rejection.
+    if let some msg ← rejection (thmD (ns ++ `honest.selfTest)
+        (mkEq natTy (mkNatLit 2) (mkNatLit 2)) (mkRefl natTy (mkNatLit 2))) then
+      throwError "cross-root control harness self-test failed: {msg}"
 
     -- 6. Axiom / non-triviality audit of every added declaration & LM theorems.
     let env ← getEnv
@@ -1236,54 +1735,93 @@ run_cmd do
           for d in ci.getUsedConstantsAsSet do
             if !seen.contains d then todo := todo.push d
       return seen
+    let trustedCore : List Name :=
+      [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.stripLeadingOpaqueCast,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.eraseLeadingOpaqueCastDecls,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.evalFnEntryRetag ]
+    -- Everything the REAL observers of a closed bundle execute (reached
+    -- through the bundle witness itself, not through a conjoined capstone).
+    let bundleCore : List Name := trustedCore ++
+      [ `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedObserve,
+        `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve,
+        `MiniRustSpec.Interp.stepM,
+        `MiniRustSpec.Interp.checkPtrM,
+        `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable,
+        `MiniRustSpec.Interp.TreeBorrowsMemory.retag_ptr,
+        `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserve,
+        `Miri.Interpreter.Step.step,
+        `Miri.Interpreter.project,
+        `Miri.Interpreter.Call.initStackFrame,
+        `Miri.TreeBorrows.RetagPipeline.retagPointerValue,
+        `Miri.Interpreter.ValidityMachine.checkPointerAccess,
+        `Miri.Interpreter.ValidityMachine.checkPointerAlign,
+        `Miri.Memory.Validity.checkScalar ]
+    -- Companion observer: the real vendored-Miri companion harnesses.
+    let companionReach : List Name :=
+      [ `Miri.Interpreter.Step.step,
+        `Miri.TreeBorrows.RetagPipeline.retagPointerValue,
+        `Miri.Interpreter.ValidityMachine.checkPointerAccess,
+        `Miri.Interpreter.ValidityMachine.checkPointerAlign,
+        `Miri.Memory.Validity.checkScalar,
+        `Miri.Memory.Validity.checkPrimitive ]
+    -- Phase certificate: BOTH vendored projection engines.
+    let phaseReach : List Name :=
+      [ `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcPhaseObserve,
+        `Miri.Interpreter.project,
+        `Miri.Interpreter.PlaceDynamic.project ]
+    -- Every vendored-Miri entry point named by the Episode 2 brief.
+    let miriAll : List Name :=
+      [ `Miri.Interpreter.Step.step,
+        `Miri.Interpreter.project,
+        `Miri.Interpreter.PlaceDynamic.project,
+        `Miri.Interpreter.Call.initStackFrame,
+        `Miri.TreeBorrows.RetagPipeline.retagPointerValue,
+        `Miri.Interpreter.ValidityMachine.checkPointerAccess,
+        `Miri.Interpreter.ValidityMachine.checkPointerAlign,
+        `Miri.Memory.Validity.checkScalar,
+        `Miri.Memory.Validity.checkPrimitive,
+        `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserve,
+        `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcPhaseObserve ]
+    -- Closed companion / phase capstone: all three engines.
+    let compCapReach : List Name := trustedCore ++ miriAll ++
+      [ `MiniRustSpec.Interp.stepM,
+        `MiniRustSpec.Interp.checkPtrM,
+        `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable,
+        `MiniRustSpec.Correspondence.translatePlace,
+        `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.trustedCompanion,
+        `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.mrCompanion,
+        `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.mrOcPhaseObserve ]
+    -- Universal runner lock: both copies of the shared Trusted runner.
+    let runnerReach : List Name :=
+      [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+        `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocTrustedStep,
+        `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocRunTrustedRaw,
+        `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.ocTrustedStep,
+        `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.ocRunTrustedRaw ]
+    let crossReach : List Name := trustedCore ++ miriAll ++
+      [ `MiniRustSpec.Interp.stepM,
+        `MiniRustSpec.Interp.steps,
+        `MiniRustSpec.Interp.stepsTB,
+        `MiniRustSpec.Interp.checkPtr,
+        `MiniRustSpec.Interp.checkPtrM,
+        `MiniRustSpec.Interp.CM.dereferenceable,
+        `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable,
+        `MiniRustSpec.Correspondence.translatePlace,
+        `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.ep1_lean_miri_opaquecast_fnentry_capstone ]
+    let twinU : List Name :=
+      [ `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserveU ]
     let reqs : List (Name × List Name) :=
-      [ (unifiedName,
-          [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
-            `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedObserve,
-            `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve,
-            `MiniRustSpec.Interp.stepM,
-            `MiniRustSpec.Interp.checkPtrM,
-            `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable,
-            `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserve,
-            `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserveU,
-            `Miri.Interpreter.Step.step,
-            `Miri.TreeBorrows.RetagPipeline.retagPointerValue,
-            `Miri.Interpreter.ValidityMachine.checkPointerAccess,
-            `Miri.Interpreter.ValidityMachine.checkPointerAlign,
-            `Miri.Memory.Validity.checkScalar ]),
-        (directBundle,
-          [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
-            `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedObserve,
-            `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve,
-            `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserve,
-            `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserveU,
-            `Miri.Interpreter.Step.step,
-            `Miri.TreeBorrows.RetagPipeline.retagPointerValue,
-            `Miri.Interpreter.ValidityMachine.checkPointerAccess,
-            `Miri.Interpreter.ValidityMachine.checkPointerAlign ]),
-        (crossName,
-          [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
-            `Trusted.Rustc.V2026_06_01.MirSemantics.stripLeadingOpaqueCast,
-            `Trusted.Rustc.V2026_06_01.MirSemantics.eraseLeadingOpaqueCastDecls,
-            `Trusted.Rustc.V2026_06_01.MirSemantics.evalFnEntryRetag,
-            `MiniRustSpec.Interp.stepM,
-            `MiniRustSpec.Interp.steps,
-            `MiniRustSpec.Interp.stepsTB,
-            `MiniRustSpec.Interp.checkPtr,
-            `MiniRustSpec.Interp.checkPtrM,
-            `MiniRustSpec.Interp.CM.dereferenceable,
-            `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable,
-            `Miri.Interpreter.Step.step,
-            `Miri.Interpreter.project,
-            `Miri.Interpreter.PlaceDynamic.project,
-            `Miri.Interpreter.Call.initStackFrame,
-            `Miri.TreeBorrows.RetagPipeline.retagPointerValue,
-            `Miri.Interpreter.ValidityMachine.checkPointerAccess,
-            `Miri.Interpreter.ValidityMachine.checkPointerAlign,
-            `Miri.Memory.Validity.checkScalar,
-            `Miri.Memory.Validity.checkPrimitive,
-            `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserve,
-            `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.ep1_lean_miri_opaquecast_fnentry_capstone ]) ]
+      [ (unifiedName, bundleCore ++ twinU),
+        (directBundle, bundleCore ++ twinU),
+        (ns ++ `domainBundle ++ `d1, bundleCore),
+        (ns ++ `domainBundle ++ `d2, bundleCore),
+        (ns ++ `domainBundle ++ `d3, bundleCore),
+        (compObsName, companionReach),
+        (phaseCheckName, phaseReach),
+        (compCapName, compCapReach),
+        (runnerUnivName, runnerReach),
+        (crossName, crossReach) ]
     let mut reachChecked : Nat := 0
     for (root, rs) in reqs do
       let seen := reachFrom root
@@ -1293,20 +1831,33 @@ run_cmd do
         unless seen.contains r do
           throwError "cross-root reachability failure: {root} does not reach {r}"
         reachChecked := reachChecked + 1
-    return (added.size, bundleCount, eqLockCount, totalFixtureLockCount,
+    -- The vendored projection engines live in the modules named by the
+    -- Episode 2 brief (`Miri.Interpreter.Projection` / `.PlaceDynamic`).
+    for (c, m) in [(`Miri.Interpreter.project, `Miri.Interpreter.Projection),
+                   (`Miri.Interpreter.PlaceDynamic.project,
+                    `Miri.Interpreter.PlaceDynamic)] do
+      let declMod := (env.getModuleIdxFor? c).map
+        fun i => env.header.moduleNames[i.toNat]!
+      unless declMod == some m do
+        throwError "cross-root reachability: {c} is declared in {declMod}, expected {m}"
+    -- Reachability self-test: a root-only observer never reaches vendored Miri.
+    if (reachFrom `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve).contains
+        `Miri.Interpreter.Step.step then
+      throwError "cross-root reachability self-test failed: mrOcObserve reaches Miri"
+    return (added.size, bundleCount, eqLockCount, sharedTopLevel,
       rejected, twins, reachChecked, crAxioms.toArray)
 
   let ctx : Core.Context :=
     { fileName := "<oc-fp-cross-root>", fileMap := default,
       options := opts, maxHeartbeats := 0 }
-  let ((addedCount, bundleCount, eqLockCount, totalLockCount,
+  let ((addedCount, bundleCount, eqLockCount, sharedCount,
         rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 160 && bundleCount = 4 && eqLockCount = 94 &&
-      totalLockCount = 98 && rejectedCount ≥ 45 &&
-      twinCount = rejectedCount && reachCount ≥ 44 do
-    throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, totalLocks={totalLockCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
-  logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, {eqLockCount} Eq.refl + 4 runner = {totalLockCount} fixture locks), rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
+  unless addedCount ≥ 186 && bundleCount = 4 && eqLockCount = 94 &&
+      sharedCount = 98 && rejectedCount ≥ 77 &&
+      twinCount = rejectedCount && reachCount ≥ 152 do
+    throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, shared={sharedCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
+  logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles; {eqLockCount} Eq.refl + 2 bijection + 2 universal runner + 1 ocCombine locks covering {sharedCount}/98 shared MR/LM declarations), kernel-rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
 
 /-! ## §3. Constructive Purity, Axiom Audit, and Auditor Self-Tests -/
 
@@ -1336,8 +1887,20 @@ run_cmd do
       `rootBackedLmAuthority, `rootBackedLmAuthority_tableCheck,
       `rootBackedLmAuthority_failClosed, `rootBacked_observer_level,
       `stepsM_eq_runToStopM, `stepsTB_eq_runToStopM,
+      `steps_eq_runToStopM_bm_of,
+      `trustedCompanion, `mrCompanion, `trustedCompanion_table,
+      `mrCompanion_table, `OcFpLmCompanionCells, `dual_companion_three_way,
+      `dual_companion_mode_sensitivity, `dual_type_switch_erasure_boundary,
+      `mrOcPhaseObserve, `mrOcPhaseObserve_table, `ocPhaseExpected_cell,
+      `lmPhaseCheckOf, `dual_d1_phase_boundary,
+      `ocStepG, `ocTrustedStep_running_eq, `ocStepG_natural, `repeat_natural,
+      `ocRunner_copy_lock, `ocCombine_copy_lock,
+      `rootBackedCompanion, `rootBackedCompanion_cells,
+      `rootBackedPhase_check, `rootBackedErased_eq,
       `ep2_opaquecast_fnentry_dual_authority_capstone,
-      `ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous ]
+      `ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous,
+      `ep2_opaquecast_fnentry_companion_phase_capstone,
+      `ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous ]
   let isChoiceFree (axs : Array Name) : Bool :=
     axs.all fun a => a == ``propext || a == ``Quot.sound
   for d in constructiveDecls do
@@ -1356,7 +1919,7 @@ run_cmd do
       unless isChoiceFree axs do
         throwError "exhaustive constructive audit failure: {c} uses non-constructive axiom ({axs})"
       exhaustiveChoiceFree := exhaustiveChoiceFree + 1
-  unless exhaustiveChoiceFree ≥ 280 do
+  unless exhaustiveChoiceFree ≥ 400 do
     throwError "exhaustive constructive audit vacuous: only {exhaustiveChoiceFree} decls checked"
   -- Self-tests: constructive check rejects `Classical.choice`; standard-axiom
   -- check rejects `sorryAx` and `Lean.ofReduceBool`; trivial-prop detector
@@ -1396,7 +1959,7 @@ run_cmd do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "test audit failure: {c} uses non-standard axiom {a}"
     if tNs.isPrefixOf c then checked := checked + 1
-  unless checked ≥ 12 do
+  unless checked ≥ 17 do
     throwError "test audit vacuous: only {checked} test declarations"
   logInfo m!"oc/fp constructive audit: {exhaustiveChoiceFree} DualSpec decls ({constructiveDecls.length} spotlighted) 100% in [propext, Quot.sound]; {checked} test decls non-trivial & standard-axiom clean"
 

@@ -83,7 +83,9 @@ MIR_BUNDLE_KERNEL_BRIDGES: dict[str, str] = {
 # Each promoted variant maps to `{rel_path: (theorems_or_bundle_variant_names, ...)}`.
 # For `MR`/`LM` files, every entry must be an actual `theorem`/`lemma` declaration in
 # comment-stripped Lean code; for `Bundle` files, the first entry is the variant
-# constructor listed in `allEp2Variants`/`allNpVariants` and the rest are theorems.
+# constructor listed in `allEp2Variants`/`allNpVariants` and the rest are theorems; for
+# `DualSpec` files, the first entry is the classification constructor pinning the variant's
+# honest boundary (`OcFpClass.castDerefBoundary`) and the rest are theorems.
 MIR_PROMOTED_VARIANT_THEOREMS: dict[str, dict[str, tuple[str, ...]]] = {
     "StatementKind.coverage": {
         "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
@@ -186,7 +188,12 @@ MIR_PROMOTED_VARIANT_THEOREMS: dict[str, dict[str, tuple[str, ...]]] = {
             ".castDerefBoundary",
             "dual_exact_three_way_classification",
             "dual_d1_cast_erasure_and_boundary",
+            "dual_d1_phase_boundary",
+            "dual_type_switch_erasure_boundary",
+            "dual_companion_three_way",
+            "ocRunner_copy_lock",
             "ep2_opaquecast_fnentry_dual_authority_capstone",
+            "ep2_opaquecast_fnentry_companion_phase_capstone",
         ),
     },
     "ProjectionElem.unwrapUnsafeBinder": {
@@ -750,8 +757,14 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 MIR_BUNDLE_KERNEL_BRIDGES["OpaqueCastAndFnEntryProtector"],
                 (
                     "d1_opaqueCast_canaries",
+                    "companion_direct_canaries",
+                    "d1_phase_boundary_canaries",
                     "d2_fnentry_protector_canaries",
+                    "d2_indirect_fnptr_direct_canaries",
+                    "bm_driver_is_minirust_steps",
                     "d3_safe_ptr_dereferenceable_canaries",
+                    "d3_some_vs_none_direct_canaries",
+                    "out_of_range_and_class_canaries",
                     "root_capstone_instantiation",
                 ),
             ),
@@ -831,6 +844,90 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 "CastKind": (11, 0, 0, 11),
                 "AggregateKind": (5, 0, 1, 6),
             },
+        )
+
+    def test_opaquecast_cross_root_bridge_locks_every_shared_fixture(self) -> None:
+        """`ProjectionElem.opaqueCast` is `proved_corresponding` only because the cross-root
+        bridge closes the `DualSpec` over the real `LM` module on fixtures shared verbatim
+        with `MR`: `section Fixtures` must be textually identical in both modules, and every
+        one of its declarations must be locked by name in the bridge."""
+        mr_rel, lm_rel, dual_rel = MIR_DUAL_AUTHORITY_MODULES["OpaqueCastAndFnEntryProtector"]
+        bridge_rel = MIR_BUNDLE_KERNEL_BRIDGES["OpaqueCastAndFnEntryProtector"]
+        fixtures_re = re.compile(r"(?ms)^section Fixtures\n(.*?)^end Fixtures$")
+        decl_re = re.compile(
+            r"(?m)^(?:@\[[^\]\n]*\]\s*)?(?:def|abbrev|inductive|structure)\s+([A-Za-z_][\w?!']*)"
+        )
+
+        def fixtures_block(rel: str) -> str:
+            blocks = fixtures_re.findall((REPO_ROOT / rel).read_text(encoding="utf-8"))
+            self.assertEqual(len(blocks), 1, rel)
+            return blocks[0]
+
+        mr_block = fixtures_block(mr_rel)
+        self.assertEqual(mr_block, fixtures_block(lm_rel), "section Fixtures drifted between MR and LM")
+        names = decl_re.findall(mr_block)
+        self.assertEqual(len(names), 97)
+        self.assertEqual(len(set(names)), 97)
+        runner_decls = {"OcTrustedOutcome", "OcTrustedRun", "ocTrustedStep", "ocRunTrustedRaw"}
+        self.assertLessEqual(runner_decls, set(names))
+        # 29 root bodies + 6 `D2` callees = 35 shared `CapturedMir` fixtures.
+        self.assertEqual(len(re.findall(r"(?m)^def ocCase\w+ : CapturedMir :=", mr_block)), 35)
+
+        bridge_text = (REPO_ROOT / bridge_rel).read_text(encoding="utf-8")
+        bridge_code, lex_errors = mir_audit.strip_lean_source(bridge_text, keep_strings=False)
+        self.assertEqual(lex_errors, [])
+        # Every shared fixture declaration is name-quoted in the bridge's lock tables.
+        for name in names:
+            self.assertRegex(
+                bridge_code,
+                rf"`{re.escape(name)}(?![\w?!'.])",
+                f"{bridge_rel} has no lock for shared fixture {name}",
+            )
+        # The `Eq.refl` lock list is exactly the 93 identically-typed fixture definitions.
+        lock_list = re.search(r"(?s)let fixtureNames : List Name :=\s*\[(.*?)\]", bridge_code)
+        self.assertIsNotNone(lock_list)
+        locked = re.findall(r"`([A-Za-z_][\w?!']*)", lock_list.group(1))
+        self.assertEqual(sorted(locked), sorted(set(names) - runner_decls))
+        # The bridge closes over the real modules of both Lake roots and enforces its counts,
+        # the exhaustive shared-name audit, universal runner locks, and kernel-only rejections.
+        for marker in (
+            r'"\.lake/build/lib/lean"',
+            r'"examples/\.lake/build/lib/lean"',
+            r"\{ module := `Anneal\.Mir\.OpaqueCastAndFnEntryProtectorDualSpec \}",
+            r"\{ module := `MiniRustSpec\.OpaqueCastAndFnEntryProtectorMR \}",
+            r"\{ module := `LeanMiriSpec\.OpaqueCastAndFnEntryProtectorLM \}",
+        ):
+            self.assertRegex(bridge_text, marker)
+        for marker in (
+            "`lmOcObserveU.eq_src",
+            "`lmOcObserve_out_of_range",
+            "`ocRunner_copy_lock",
+            "`ocCombine_copy_lock",
+            "`ep2_cross_root_three_engine_capstone",
+            "`ep2_opaquecast_fnentry_companion_phase_capstone",
+            "`dual_companion_three_way",
+            "`dual_d1_phase_boundary",
+            "eqLockCount = 94",
+            "sharedCount = 98",
+            "twinCount = rejectedCount",
+            "msg.startsWith",
+        ):
+            self.assertTrue(marker in bridge_code, marker)
+        for marker in ('msg.startsWith "(kernel)"', 'msg.splitOn "type mismatch"', "has no lock"):
+            self.assertTrue(marker in bridge_text, marker)
+
+        # `DualSpec` keeps strict import isolation: no `Miri.*` / `LeanMiriSpec.*` import.
+        dual_code, lex_errors = mir_audit.strip_lean_source(
+            (REPO_ROOT / dual_rel).read_text(encoding="utf-8"), keep_strings=False
+        )
+        self.assertEqual(lex_errors, [])
+        self.assertEqual(
+            re.findall(r"(?m)^import[ \t]+(\S+)[ \t]*$", dual_code),
+            [
+                "Anneal.DualCorrespondenceBundle",
+                "Anneal.Mir.DropBinderAndSubtypeBundle",
+                "MiniRustSpec.OpaqueCastAndFnEntryProtectorMR",
+            ],
         )
 
     def test_stage_b_blended_completeness_and_marginal_unlock_math(self) -> None:

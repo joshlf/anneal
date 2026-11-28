@@ -224,10 +224,12 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             # OpaqueCastAndFnEntryProtector{MR,LM,DualSpec} (`D1`, closed in
             # `tests/mir/OpaqueCastAndFnEntryProtectorCorrespondenceTests.lean`): Trusted
             # value-transparent dispatch + cast-erasure correspondence (with honest `.unsupported`
-            # deref-below-cast boundary on case `8`), MiniRust fail-closed translation +
-            # cast-erased execution, and vendored Miri `OpaqueCast after borrowck` phase-boundary
-            # rejection (`Projection.lean` `.invariant` / `PlaceDynamic.lean` `.invalidProgram`)
-            # plus `Step.step` execution on the post-borrowck cast-erased image.
+            # deref-below-cast boundary on case `8`, `dual_exact_three_way_classification`),
+            # MiniRust fail-closed translation + cast-erased execution, and vendored Miri
+            # `OpaqueCast after borrowck` phase-boundary rejection (`Projection.lean` `.invariant`
+            # / `PlaceDynamic.lean` `.invalidProgram`) plus `Step.step` execution on the
+            # post-borrowck cast-erased image (`dual_d1_phase_boundary`); cast erasure is faithful
+            # only for type-preserving casts (`dual_type_switch_erasure_boundary`).
             ("opaqueCast", "proved_corresponding"),
             # UnwindSetDiscrAndFnPtr{MR,LM} (`C9`) and NullaryAndPtrCoercion{MR,LM,Bundle}.
             ("unwrapUnsafeBinder", "proved_corresponding"),
