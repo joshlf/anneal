@@ -748,6 +748,34 @@ def _validate_olean_parts(module: str, olean_parts: list[str], phase: str, ir_pa
     _validate_layer_chain(module, ir_parts, phase, ol_layers)
 
 
+def _walk_region(data: bytes, base: int, root: int, parents) -> set:
+    """Validate every own-region object reachable from `root` (m_rc 0, known kind, in bounds); a pointer
+    may leave the region only to an object already reached in a parent layer."""
+    size, seen, stack = len(data), set(), [root]
+    while stack:
+        p = stack.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        o = p - base
+        rc, cs, oth, tag = struct.unpack_from("<iHBB", data, o)
+        msz, cap = struct.unpack_from("<QQ", data, o + 8) if o + 24 <= size else (1, 0)
+        if tag <= 243:
+            end, n, at = o + max(cs, 8 + 8 * oth), oth, o + 8
+        elif tag in (246, 248, 249) and msz <= cap:
+            end, n, at = o + {246: 24 + 8 * cap, 248: 24 + oth * cap, 249: 32 + cap}[tag], (msz if tag == 246 else 0), o + 24
+        else:
+            end, n, at = (o + 8 if tag == 250 else size + 1), 0, o
+        if rc != 0 or end > size:
+            raise ValueError(f"invalid object (tag {tag}) at offset {o}")
+        for c in struct.unpack_from(f"<{n}Q", data, at):
+            if c & 7 == 0 and base + 96 <= c <= base + size - 8:
+                stack.append(c)
+            elif not (c & 1 or any(c in ps for ps in parents)):
+                raise ValueError(f"pointer {c:#x} at offset {o} escapes the region")
+    return seen
+
+
 def _validate_layer_chain(module: str, chain, phase: str, disjoint=()) -> list[tuple]:
     parents: list[tuple] = []
     for raw in chain:
@@ -772,32 +800,24 @@ def _validate_layer_chain(module: str, chain, phase: str, disjoint=()) -> list[t
         if any(not (base_addr + size <= pb or pb + ps <= base_addr) for pb, ps, *_ in (*parents, *disjoint)):
             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: overlapping compacted-region layer in {p}")
         kids: tuple[int, ...] = ()
+        seen: set[int] = set()
         if base_addr + 96 <= root_ptr <= base_addr + size - 8:
             off = root_ptr - base_addr
             # Pinned roots are `ModuleData`-shaped: tag 0, 5 object fields, 56 bytes.
             if (root_ptr & 7) != 0 or off + 56 > size or struct.unpack_from("<iHBB", data, off) != (0, 56, 5, 0):
                 raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root object header in {p}")
             kids = struct.unpack_from("<5Q", data, off + 8)
-            for k, child in enumerate(kids):
-                if (child & 7) == 0 and base_addr + 96 <= child and child + 24 <= base_addr + size:
-                    co = child - base_addr
-                    crc, _, _, ctag, asz, cap = struct.unpack_from("<iHBBQQ", data, co)
-                    if crc != 0 or ctag != 246 or asz > cap or co + 24 + 8 * cap > size:
-                        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root child array header in {p}")
-                    for e in struct.unpack_from(f"<{asz}Q", data, co + 24):
-                        if e & 1:
-                            continue
-                        if (e & 7) == 0 and base_addr + 96 <= e <= base_addr + size - 8:
-                            eo = e - base_addr
-                            if struct.unpack_from("<i", data, eo)[0] != 0 or data[eo + 7] > 249:
-                                raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root array element header in {p}")
-                        elif not ((e & 7) == 0 and any(pb + 96 <= e <= pb + ps - 8 for pb, ps, *_ in parents)):
-                            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: out-of-bounds root array element ptr in {p}")
-                elif not any(len(pk) == 5 and pk[k] == child for *_, pk in parents):
-                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: out-of-bounds root child ptr in {p}")
-        elif not parents or size != 96 or not any(root_ptr == pr for _, _, pr, _ in parents):
+            for k, child in enumerate(kids):  # Own-region `Array` fields (bounds: `_walk_region`) or a parent's same slot.
+                own = (child & 7) == 0 and base_addr + 96 <= child <= base_addr + size - 8
+                if not (data[child - base_addr + 7] == 246 if own else any(len(pl[3]) == 5 and pl[3][k] == child for pl in parents)):
+                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid or out-of-bounds root child ptr in {p}")
+            try:  # Every reachable object, not just the root's first hops (`importModules` maps them all).
+                seen = _walk_region(data, base_addr, root_ptr, [pl[4] for pl in parents])
+            except (ValueError, struct.error) as error:
+                raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: {error} in {p}") from error
+        elif not parents or size != 96 or not any(root_ptr == pr for _, _, pr, *_ in parents):
             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid out-of-region rootPtr in {p}")
-        parents.append((base_addr, size, root_ptr, kids))
+        parents.append((base_addr, size, root_ptr, kids, seen))
     return parents
 
 
@@ -1618,7 +1638,7 @@ class Checker:
             if merged_graph is not None:
                 self.graph = merged_graph
             effective_build_roots = (
-                list(dict.fromkeys([*raw_build_roots, *(str(d) for d in (self.stage / "lib", self.stage / "downstream-lib") if d.is_dir())]))
+                list(dict.fromkeys([*(str(r) for r in approved_roots), *(str(d) for d in (self.stage / "lib", self.stage / "downstream-lib") if d.is_dir())]))
                 if approved_roots else []
             )
             verdict = self.olean_audit(
