@@ -31,26 +31,36 @@ import LeanMiriSpec.Correspondence.EnumLM2_3
 The vendored LeanMiri (`lean-miri/vendor/`, unmodified) side of the frozen 22-case (`0..21`) ×
 2-mode matrix shared with `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR`:
 
-* `D1` (`0..9`): vendored `Miri.Interpreter.project` and `Miri.Interpreter.PlaceDynamic.project`
-  reject `ProjectionElem.OpaqueCast` at the phase boundary (`OpaqueCast after borrowck`, never a UB
-  verdict; `lm_opaqueCast_phase_boundary`), because rustc's validator forbids `OpaqueCast` at
-  `MirPhase::Runtime`. Every `D1` case supported by pinned rustc MIR / the `Step.step` adapter
-  (`0`–`4`, `6`, `8`, `9`) executes the cast-erased (post-`PostAnalysisNormalize`) image
-  `ocEraseBody` of the shared fixture directly through unmodified vendored
-  `Miri.Interpreter.Step.step` (`ocStepHooks`: `annealStepHooksLM2_3` + `wdStepHooks`, including
-  real vendored `writeAggregate`, `Discriminant.writeDiscriminant`, and
-  `Discriminant.readDiscriminant` for `6`, with kernel-checked `reserveAllocIdU` unrolling for
-  memory-backed locals). Only `5` (`Deinit`, removed from pinned rustc MIR) and `7` (`Drop`,
-  adapter boundary pinned by `lm_step_adapter_boundaries`) use vendored `Allocation.writeUninit`
-  followed by `Allocation.readScalar`.
-* `D2` (`10..15`): callee-only `FnEntry` protectors through the vendored Tree Borrows retag
-  pipeline (`RetagPipeline.retagPointerValue`, `MachineMemoryHooks.beforeMemoryWrite`,
-  `BorrowTree.releaseProtector`), plus universal laws on vendored `Miri.Interpreter.Call.initStackFrame`,
-  `Call.passArgument`, `MachineHooks.withRetagMode`, `RetagPolicy.create`, and `RetagPipeline.retagPointerValue`.
-* `D3` (`16..21`): safe-pointer validity through vendored `Validity.checkScalar` (non-null valid
-  range of `pointerLayoutData true`), then REAL `ValidityMachine.checkPointerAccess` /
-  `ValidityMachine.checkPointerAlign` executed on the harness allocations (`lmOcValChecks`),
-  plus universal laws on vendored `ValidityMachine.{checkPointerAccess, checkPointerAlign, scalarMayBeNull}`.
+* `D1` (`0..9` + companions): vendored `Miri.Interpreter.project` and
+  `Miri.Interpreter.PlaceDynamic.project` reject `ProjectionElem.OpaqueCast` at the phase boundary
+  (`OpaqueCast after borrowck`, never a UB verdict; universal `lm_opaqueCast_phase_boundary` and
+  all-place fixture audit `lm_d1_phase_boundary_table`), because rustc's validator forbids
+  `OpaqueCast` at `MirPhase::Runtime`. Every `D1` case supported by pinned rustc MIR / the
+  `Step.step` adapter (`0`–`4`, `6`, `8`, `9`, plus `SetDiscriminant` payload `ocCase6PayloadMir`
+  and dead-local control `ocCase9DeadLocalMir`) executes the cast-erased (post-`PostAnalysisNormalize`,
+  universally cast-free by `lm_ocEraseBody_cast_free`) image `ocEraseBody` of the shared fixture
+  directly through unmodified vendored `Miri.Interpreter.Step.step` (`ocStepHooks`:
+  `annealStepHooksLM2_3` + `wdStepHooks`, including real vendored `writeAggregate`,
+  `Discriminant.writeDiscriminant`, and `Discriminant.readDiscriminant` for `6`, with kernel-checked
+  `reserveAllocIdU` unrolling for memory-backed locals). Only `5` (`Deinit`, removed from pinned
+  rustc MIR) and `7` (`Drop`, adapter boundary pinned by `lm_step_adapter_boundaries`, plus
+  mode-sensitive protected-drop companion `ocCase7ProtectedDropMir`) use vendored
+  `Allocation.writeUninit` / `Allocation.readScalar`; `ocCase9InvalidBoolMir` pins invalid `bool`
+  byte `2` non-masking via Trusted and vendored `Validity.checkScalar`.
+* `D2` (`10..15` + reverse-transmutation companion `lmOcD2RevTransmute`): callee-only `FnEntry`
+  protectors through the vendored Tree Borrows retag pipeline (`RetagPipeline.retagPointerValue`
+  with explicit caller `.Default` reborrows on `10`, `11`, `13`, `14`,
+  `MachineMemoryHooks.beforeMemoryWrite`, `BorrowTree.releaseProtector`, `GlobalState.endCall`),
+  plus universal laws on vendored `Miri.Interpreter.Call.initStackFrame`, `Call.passArgument`,
+  `MachineHooks.withRetagMode`, `RetagPolicy.create`, `RetagPipeline.retagPointerValue`, and
+  `GlobalState.endCall`.
+* `D3` (`16..21` + ZST dangling/null companions): safe-pointer validity through vendored
+  `Validity.checkScalar` (non-null valid range of `pointerLayoutData true`), then REAL
+  `ValidityMachine.checkPointerAccess` / `ValidityMachine.checkPointerAlign` executed on the live,
+  misaligned, OOB, and deallocated harness allocations (`lmOcValChecks`, exact kernel-checked
+  diagnostics `lm_d3_exact_validityMachine_diagnostics`, and complete real-allocation non-vacuity
+  witnesses `lm_validityMachine_nonvacuity_witnesses`), plus universal laws on vendored
+  `ValidityMachine.{checkPointerAccess, checkPointerAlign, scalarMayBeNull}`.
 
 The memory harness (`lmAllocate`, `lmStore`, `lmLoad`, `lmRetag`, `lmEndCall`, `lmDeallocate`) is
 the one of `LeanMiriSpec.HeapAllocAndWidePtrLM`: every state change is a vendored definition. The
@@ -125,7 +135,7 @@ def ocFixtureCaseCount : Nat := 22
 
 /-- Layout table: `0 = u8`, `1 = u32`, `2 = ()`, `3 = thin pointer / reference`,
 `4 = (u32, u32)`, `5 = TwoVar` (`#[repr(u8)] enum TwoVar { A(u32) = 0, B(u32) = 1 }`: `u8` tag at
-offset `0`, payload at `4`), `6 = u64 / usize / isize`, `7 = (u8, u8)`. -/
+offset `0`, payload at `4`), `6 = u64 / usize / isize`, `7 = (u8, u8)`, `8 = bool`. -/
 def ocU8Layout : TypeLayout :=
   { size := ⟨1⟩, align := ⟨1⟩,
     backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 }),
@@ -158,15 +168,20 @@ def ocBytePairLayout : TypeLayout :=
   { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
     fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1], variants := .single 0, isUninhabited := false,
     fieldLayouts := [0, 0] }
+def ocBoolLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
 
 def ocLayouts : LayoutTable :=
   { pointerBits := 64, isLittleEndian := true,
     entries := [ocU8Layout, ocU32Layout, ocUnitLayout, ocPtrLayout, ocPairLayout, ocTwoVarLayout,
-                ocU64Layout, ocBytePairLayout] }
+                ocU64Layout, ocBytePairLayout, ocBoolLayout] }
 
 @[reducible] def ocU8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
 @[reducible] def ocU32Ty : Ty := { kind := .uint .u32, layoutIdx := 1 }
 @[reducible] def ocUnitTy : Ty := { kind := .tuple [], layoutIdx := 2 }
+@[reducible] def ocBoolTy : Ty := { kind := .bool, layoutIdx := 8 }
 @[reducible] def ocUsizeTy : Ty := { kind := .uint .usize, layoutIdx := 6 }
 @[reducible] def ocIsizeTy : Ty := { kind := .int .isize, layoutIdx := 6 }
 @[reducible] def ocU64Ty : Ty := { kind := .uint .u64, layoutIdx := 6 }
@@ -283,6 +298,13 @@ def ocCase9Mir : CapturedMir :=
 def ocCase9DeadLocalMir : CapturedMir :=
   ocBody "oc::case9_dead_local_read_through_cast" 0 [ocU32Ty, ocU32Ty]
     [ocBb (ocInit7 ++ [.storageDead 1, .assign (ocLoc 0) (.use (.copy (ocLoc 1 [ocCastU32])))]) .return_]
+/-- Case 9 invalid-`bool` companion (negative, `D1.6` type-switch UB not masked): `_1 : u8 = 2`,
+then `_0 = move (_1 as bool)` — `.opaqueCast bool` enforces `bool` scalar validity (`2 ∉ {0, 1}`)
+and faults with UB rather than masking an invalid `bool` byte. -/
+def ocCase9InvalidBoolMir : CapturedMir :=
+  ocBody "oc::case9_invalid_bool_through_cast" 0 [ocBoolTy, ocU8Ty]
+    [ocBb [.storageLive 1, .assign (ocLoc 1) (.use (ocConstU8 2)),
+           .assign (ocLoc 0) (.use (.move (ocLoc 1 [.opaqueCast ocBoolTy])))] .return_]
 
 /-! #### Cast erasure (the post-borrowck / `PostAnalysisNormalize` image) and place extraction
 
@@ -1332,10 +1354,11 @@ theorem lm_d1_phase_boundary_table :
     lmOcPhaseObserveBody ocCase6PayloadMir = .phaseBoundary ∧
     lmOcPhaseObserveBody ocCase7ProtectedDropMir = .phaseBoundary ∧
     lmOcPhaseObserveBody ocCase9DeadLocalMir = .phaseBoundary ∧
+    lmOcPhaseObserveBody ocCase9InvalidBoolMir = .phaseBoundary ∧
     ((List.range 10).all fun idx => match ocCaseFixture? idx with
       | some (b, _) => ((ocBodyPlaces (ocEraseBody b)).filter ocPlaceHasCast).isEmpty
       | none => false) = true := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- `D1` **the cast erasure removes every cast from a place (universal, constructive)**. -/
 theorem lm_ocErasePlace_cast_free (p : Trusted.Rustc.V2026_06_01.MirAst.Place) :
@@ -1459,6 +1482,31 @@ theorem lm_oc_dead_local_ub_non_masking :
   refine ⟨?_, ?_⟩
   · rw [ocRunStepU.eq_src]; decide +kernel
   · decide +kernel
+
+/-- Validate a 1-byte scalar `b` against the Rust `bool` valid range `[0, 1]` through REAL
+vendored `Miri.Memory.Validity.checkScalar`. -/
+def lmOcBoolValidity (b : Nat) : LmOcFpObs :=
+  let boolLay : ScalarValidityLayout :=
+    ⟨Size.ofBytes 1, ⟨BitVec.ofNat 128 0, BitVec.ofNat 128 1⟩⟩
+  match ScalarInt.tryFromUInt (BitVec.ofNat 128 b) (Size.ofBytes 1) with
+  | .ok (some si) =>
+    match Miri.Memory.Validity.checkScalar (MachineError := Unit) (HookState := Unit) boolLay
+        (Scalar.fromScalarInt (Prov := Provenance) si) (fun _ st => .error () st) () with
+    | .ok () _ => .okScalar b
+    | .error (.failure _) _ | .error (.pathFailure _ _) _ => .ub
+    | .error _ _ => .unsupported
+  | _ => .unsupported
+
+/-- `D1.6` **invalid-`bool` byte under type-switch UB non-masking control (kernel-checked)**:
+Trusted `stepMirFn` on `ocCase9InvalidBoolMir` (`move (_1 as bool)` with `_1 : u8 = 2`) reports
+`.ub`, and REAL vendored `Miri.Memory.Validity.checkScalar` accepts `0` / `1` while rejecting
+byte `2` against the `bool` range `[0, 1]` with `.ub`. -/
+theorem lm_oc_invalid_bool_ub_non_masking :
+    lmOcTrustedObsOf 0 (ocRunTrustedRaw ocCase9InvalidBoolMir []) = .ub ∧
+    lmOcBoolValidity 0 = .okScalar 0 ∧
+    lmOcBoolValidity 1 = .okScalar 1 ∧
+    lmOcBoolValidity 2 = .ub := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- `D2.3` **reverse transmutation `fn(*mut u8, *mut u8) -> fn(&mut u8, *mut u8)` mode-sensitivity
 (kernel-checked)**: Trusted on `ocCase13RevTransmuteMir` (caller holds NO `&mut` local) and
@@ -2121,6 +2169,7 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     type_of% lm_oc_setDiscriminant_payload_agreement ∧
     type_of% lm_oc_protected_drop_mode_sensitive ∧
     type_of% lm_oc_dead_local_ub_non_masking ∧
+    type_of% lm_oc_invalid_bool_ub_non_masking ∧
     type_of% lm_oc_d2_rev_transmute_mode_sensitive ∧
     type_of% lm_oc_d3_zst_dangling_and_null ∧
     type_of% lm_step_adapter_boundaries ∧
@@ -2148,6 +2197,7 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
    @lm_opaqueCast_phase_boundary, lm_d1_phase_boundary_table, @lm_ocErasePlace_cast_free,
    @lm_ocEraseBody_cast_free, lm_oc_setDiscriminant_payload_agreement,
    lm_oc_protected_drop_mode_sensitive, lm_oc_dead_local_ub_non_masking,
+   lm_oc_invalid_bool_ub_non_masking,
    lm_oc_d2_rev_transmute_mode_sensitive, lm_oc_d3_zst_dangling_and_null, lm_step_adapter_boundaries,
    @lm_retagPolicy_protector, @lm_retagPolicy_none, lm_retagPolicy_fnEntry_witness,
    @lm_call_passArgument_copyAllowTransmute, @lm_call_initStackFrame_enters_fnEntry_mode,
@@ -2182,6 +2232,8 @@ run_cmd do
       (ns ++ `lm_oc_protected_drop_mode_sensitive, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
       (ns ++ `lm_oc_protected_drop_mode_sensitive, `Miri.Memory.Allocation.writeUninit),
       (ns ++ `lm_oc_dead_local_ub_non_masking, `Miri.Interpreter.Step.step),
+      (ns ++ `lm_oc_invalid_bool_ub_non_masking, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `lm_oc_invalid_bool_ub_non_masking, `Miri.Memory.Validity.checkScalar),
       (ns ++ `lm_oc_d2_rev_transmute_mode_sensitive, `Miri.TreeBorrows.RetagPipeline.retagPointerValue),
       (ns ++ `lm_oc_d2_rev_transmute_mode_sensitive, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
       (ns ++ `lm_oc_d3_zst_dangling_and_null, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
@@ -2235,35 +2287,71 @@ run_cmd do
     unless seen.contains req do
       throwError "shadow-evaluator audit: {thm} does not reach real {req}"
   -- 3. Standard-3-axiom purity across the environment, constructive `[propext, Quot.sound]` purity
-  -- across every theorem that does not inherit upstream vendored `Classical.choice` (upstream
-  -- `Miri.Memory.{ScalarInt, MemoryState}` / `Miri.Interpreter.{Call, MachineHooks, ValidityMachine}` /
-  -- `RetagPipeline` / loop-unrolling twins use `Classical.choice` upstream), and a non-vacuous
-  -- theorem count floor.
+  -- on every theorem outside the explicit audited upstream-`Classical.choice` allowlist
+  -- (`choiceAllowed`, bounded ≤ 23 entries for theorems inheriting `Classical.choice` from
+  -- vendored `Miri.Memory.{ScalarInt, MemoryState}`, `Miri.Interpreter.{Call, MachineHooks,
+  -- ValidityMachine}`, `RetagPipeline`, or `unroll_loops` twins), and a non-vacuous theorem floor.
   let constructive : List Lean.Name :=
     [ ns ++ `lmOcTrustedObserve_table,
       ns ++ `lm_opaqueCast_phase_boundary, ns ++ `lm_ocErasePlace_cast_free,
       ns ++ `lm_ocEraseBody_cast_free,
+      ns ++ `lm_oc_invalid_bool_ub_non_masking,
       ns ++ `lm_retagPolicy_protector, ns ++ `lm_retagPolicy_none,
       ns ++ `lm_retagPolicy_fnEntry_witness,
       ns ++ `lm_globalState_endCall_laws,
       ns ++ `lm_checkPtrAccess_zero_size,
       ns ++ `lm_safe_ptr_range_contains_iff, ns ++ `lm_safe_ptr_validity_layout ]
+  let choiceAllowed : List Lean.Name :=
+    [ ns ++ `lmOcObserve_table,
+      ns ++ `lmOcObserve_out_of_range,
+      ns ++ `lmOcObserve_mode_sensitivity,
+      ns ++ `lmOc_trusted_agreement,
+      ns ++ `lm_d1_phase_boundary_table,
+      ns ++ `lm_oc_protected_drop_mode_sensitive,
+      ns ++ `lm_oc_dead_local_ub_non_masking,
+      ns ++ `lm_oc_d2_rev_transmute_mode_sensitive,
+      ns ++ `lm_oc_d3_zst_dangling_and_null,
+      ns ++ `lm_oc_setDiscriminant_payload_agreement,
+      ns ++ `lm_step_adapter_boundaries,
+      ns ++ `lm_call_passArgument_copyAllowTransmute,
+      ns ++ `lm_call_initStackFrame_enters_fnEntry_mode,
+      ns ++ `lm_call_initStackFrame_fnEntry_witness,
+      ns ++ `lm_machineHooks_withRetagMode_laws,
+      ns ++ `lm_retagPipeline_rawPointer_no_protector,
+      ns ++ `lm_validityMachine_checkPointerAccess_laws,
+      ns ++ `lm_validityMachine_checkPointerAlign_laws,
+      ns ++ `lm_d3_exact_validityMachine_diagnostics,
+      ns ++ `lm_validityMachine_nonvacuity_witnesses,
+      ns ++ `lm_d3_null_both_halves_ub,
+      ns ++ `lm_scalarMayBeNull_int,
+      ns ++ `ep1_lean_miri_opaquecast_fnentry_capstone ]
   let mut theorems : Nat := 0
   let mut badConstructive : Array Lean.Name := #[]
+  let mut unexpectedChoice : Array Lean.Name := #[]
   for (c, info) in env.constants.map₂.toList do
-    for a in ← liftCoreM <| Lean.collectAxioms c do
+    let axioms ← liftCoreM <| Lean.collectAxioms c
+    let mut hasChoice := false
+    for a in axioms do
       if a == ``sorryAx then throwError "{c} depends on sorryAx"
       if a == ``Lean.ofReduceBool || a == ``Lean.trustCompiler then
         throwError "{c} depends on forbidden axiom {a}"
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "{c} depends on non-standard axiom {a}"
-      if constructive.contains c && a == ``Classical.choice then
-        badConstructive := badConstructive.push c
+      if a == ``Classical.choice then hasChoice := true
+    if hasChoice && constructive.contains c then
+      badConstructive := badConstructive.push c
     if ns.isPrefixOf c && !c.isInternal then
-      if let .thmInfo _ := info then theorems := theorems + 1
+      if let .thmInfo _ := info then
+        theorems := theorems + 1
+        if hasChoice && !choiceAllowed.contains c && !c.toString.endsWith ".eq_src" then
+          unexpectedChoice := unexpectedChoice.push c
   if !badConstructive.isEmpty then
     throwError "constructive theorems unexpectedly depend on Classical.choice: {badConstructive}"
-  if theorems < 32 then
+  if !unexpectedChoice.isEmpty then
+    throwError "theorems unexpectedly depend on Classical.choice (outside choiceAllowed): {unexpectedChoice}"
+  if choiceAllowed.length > 23 then
+    throwError "choiceAllowed grew beyond audited cap: {choiceAllowed.length}"
+  if theorems < 34 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit

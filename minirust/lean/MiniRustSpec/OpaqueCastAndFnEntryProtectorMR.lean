@@ -25,30 +25,42 @@ both `BasicMemory<x86_64>` `Mach` and `TreeBorrowsMemory<x86_64>` `MachTB`) and 
 `Trusted.Rustc.V2026_06_01.MirSemantics` (`stepMirFn`) on the frozen 22-case (`0..21`) × 2-mode
 matrix shared with `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM`:
 
-* `D1` (`0..9`): `ProjectionElem.opaqueCast` in every place context — `copy` / `move` through a
-  (nested) cast chain, use after move, nested cast-chain assignment, cast-then-field into an
-  uninitialized local, `Deinit`, `SetDiscriminant` + `Rvalue.discriminant`, `Drop`, the
-  fail-closed dereference directly below a leading cast (`8`), and the uninitialized-read UB
-  non-masking control (`9`). Every Trusted cell runs the `.opaqueCast` fixture; every MiniRust
-  cell runs the cast-erased program (MiniRust has no `OpaqueCast`, and upstream `minimize` aborts
-  on it). `mrOcTrusted_cast_erasure` proves that Trusted on the `.opaqueCast` fixture agrees with
-  Trusted on its cast-erased image (`ocEraseBody`) on every `D1` case except the documented
-  boundary `8`, where the cast fixture fails closed (`.unsupported`) and the erased one reads `5`.
-* `D2` (`10..15`): callee-only `FnEntry` protectors across transmuted function pointers in BOTH
-  directions. Case `10` is the post-`#166253` callee-only view (caller passes its `&mut u8` and
-  parent `*mut u8` into a `fn(*mut u8, *mut u8)` callee: no protector, the aliased foreign write
+* `D1` (`0..9` + companions): `ProjectionElem.opaqueCast` in every place context — `copy` / `move`
+  through a (nested) cast chain, use after move, nested cast-chain assignment, cast-then-field into
+  an uninitialized local, `Deinit`, `SetDiscriminant` + `Rvalue.discriminant` (plus payload
+  companion `ocCase6PayloadMir`), `Drop` (plus mode-sensitive protected-drop companion
+  `ocCase7ProtectedDropMir`), the fail-closed dereference directly below a leading cast (`8`), and
+  UB non-masking controls (`9` uninit read, `ocCase9DeadLocalMir` dead local, and
+  `ocCase9InvalidBoolMir` invalid `bool` byte `2` under `.opaqueCast bool`). Every Trusted cell
+  runs the `.opaqueCast` fixture; every MiniRust cell runs the cast-erased program (MiniRust has no
+  `OpaqueCast`, and upstream `minimize` aborts on it, pinned by `mr_translate_opaqueCast_fail_closed`).
+  `mrOcTrusted_cast_erasure` proves that Trusted on the `.opaqueCast` fixture agrees with Trusted on
+  its cast-erased image (`ocEraseBody`, universally cast-free by `mr_ocEraseBody_cast_free`) on
+  every `D1` case except the documented boundary `8`, where the cast fixture fails closed
+  (`.unsupported`) and the erased one reads `5`.
+* `D2` (`10..15` + companions): callee-only `FnEntry` protectors across transmuted function pointers
+  in BOTH directions. Case `10` is the post-`#166253` callee-only view (caller passes its `&mut u8`
+  and parent `*mut u8` into a `fn(*mut u8, *mut u8)` callee: no protector, the aliased foreign write
   succeeds in both modes); case `11` is the pre-`#166253` caller-signature contrast (the EXACT SAME
   caller and arguments retagged at the caller's `&mut u8` signature: OK without a borrow tracker, UB
   under Tree Borrows); case `12` is the direct `&mut u8` positive return/release case; case `13` is
-  the reverse transmutation (`fn(*mut u8, *mut u8)` caller view calling a `fn(&mut u8, *mut u8)`
-  callee: callee attaches `FnEntry` strong protector -> TB UB on foreign write); cases `14`–`15` are
-  the `&u8` (`Frozen`) protected-foreign-write negative and positive scenarios. The MiniRust callers
-  of `10`, `11`, and `13` invoke the callee through a transmuted function pointer.
-* `D3` (`16..21`): `checkPtr` / `checkPtrM (m := some mach)` (`CM.dereferenceable` /
+  the direct `&mut u8` negative foreign-write case, paired with the dedicated reverse-transmutation
+  companion `ocCase13RevTransmuteMir` / `ocMrProg13RevTransmute` (`fn(*mut u8, *mut u8)` caller with
+  no `&mut` local calling a `fn(&mut u8, *mut u8)` callee -> callee's own `FnEntry` strong protector
+  causes TB UB); cases `14`–`15` are the `&u8` (`Frozen`) negative and positive scenarios. The
+  MiniRust callers of `10`, `11`, and `ocMrProg13RevTransmute` invoke the callee through a
+  transmuted function pointer; on Trusted, `trusted_fnEntryCompatibleWithCallSite_transmute_boundary`
+  and end-to-end `trusted_d2_indirect_fnptr_calls` (`ReifyFnPointer` + `transmute` + indirect call
+  via `stepMirFn`) prove that exact-signature indirect calls match the direct cells while transmuted
+  `fn(*mut u8, *mut u8)` ↔ `fn(&mut u8, *mut u8)` calls succeed at `.transmute` and fail at
+  `resolveCallTarget`'s syntactic signature check (explaining why Trusted table cells call by `fnDef`).
+* `D3` (`16..21` + companions): `checkPtr` / `checkPtrM (m := some mach)` (`CM.dereferenceable` /
   `ConcurrentMemory.dereferenceable`) on safe pointers (`&T`, `Box<T>`) over both machines: valid,
-  zero-sized, null (sized & ZST), unaligned, out-of-bounds, and deallocated, with complete `Ref` and
-  `Box` `some mach` vs `none` contrasts on both `Mach` and `MachTB`, plus the universal
-  `mr_checkPtr_sized_never_unsupported` and `mr_checkPtrM_sized_never_unsupported_bm_tbm` laws.
+  zero-sized (plus dangling no-prov ZST companion `ocCase17DanglingZstMir`), null (sized & ZST, plus
+  Trusted ZST-null companion `ocCase18ZstNullMir`), unaligned, out-of-bounds, and deallocated, with
+  complete `Ref` and `Box` `some mach` vs `none` contrasts on both `Mach` and `MachTB`, plus the
+  universal `mr_checkPtr_sized_never_unsupported`, `mr_checkPtrM_sized_never_unsupported_bm_tbm`,
+  `mr_checkPtr_dereferenceable_exact`, and `mr_checkPtrM_dereferenceable_exact` laws.
 
 Trusted has no borrow-tracker switch: its `tb = false` cells run the callees' no-borrow-tracker
 image (`ocEraseRetags`, every `Retag` replaced by `Nop`), mirroring MiniRust's universally no-op
@@ -122,7 +134,7 @@ def ocFixtureCaseCount : Nat := 22
 
 /-- Layout table: `0 = u8`, `1 = u32`, `2 = ()`, `3 = thin pointer / reference`,
 `4 = (u32, u32)`, `5 = TwoVar` (`#[repr(u8)] enum TwoVar { A(u32) = 0, B(u32) = 1 }`: `u8` tag at
-offset `0`, payload at `4`), `6 = u64 / usize / isize`, `7 = (u8, u8)`. -/
+offset `0`, payload at `4`), `6 = u64 / usize / isize`, `7 = (u8, u8)`, `8 = bool`. -/
 def ocU8Layout : TypeLayout :=
   { size := ⟨1⟩, align := ⟨1⟩,
     backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 }),
@@ -155,15 +167,20 @@ def ocBytePairLayout : TypeLayout :=
   { size := ⟨2⟩, align := ⟨1⟩, backendRepr := .memory,
     fields := .arbitrary [⟨0⟩, ⟨1⟩] [0, 1], variants := .single 0, isUninhabited := false,
     fieldLayouts := [0, 0] }
+def ocBoolLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
 
 def ocLayouts : LayoutTable :=
   { pointerBits := 64, isLittleEndian := true,
     entries := [ocU8Layout, ocU32Layout, ocUnitLayout, ocPtrLayout, ocPairLayout, ocTwoVarLayout,
-                ocU64Layout, ocBytePairLayout] }
+                ocU64Layout, ocBytePairLayout, ocBoolLayout] }
 
 @[reducible] def ocU8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
 @[reducible] def ocU32Ty : Ty := { kind := .uint .u32, layoutIdx := 1 }
 @[reducible] def ocUnitTy : Ty := { kind := .tuple [], layoutIdx := 2 }
+@[reducible] def ocBoolTy : Ty := { kind := .bool, layoutIdx := 8 }
 @[reducible] def ocUsizeTy : Ty := { kind := .uint .usize, layoutIdx := 6 }
 @[reducible] def ocIsizeTy : Ty := { kind := .int .isize, layoutIdx := 6 }
 @[reducible] def ocU64Ty : Ty := { kind := .uint .u64, layoutIdx := 6 }
@@ -280,6 +297,13 @@ def ocCase9Mir : CapturedMir :=
 def ocCase9DeadLocalMir : CapturedMir :=
   ocBody "oc::case9_dead_local_read_through_cast" 0 [ocU32Ty, ocU32Ty]
     [ocBb (ocInit7 ++ [.storageDead 1, .assign (ocLoc 0) (.use (.copy (ocLoc 1 [ocCastU32])))]) .return_]
+/-- Case 9 invalid-`bool` companion (negative, `D1.6` type-switch UB not masked): `_1 : u8 = 2`,
+then `_0 = move (_1 as bool)` — `.opaqueCast bool` enforces `bool` scalar validity (`2 ∉ {0, 1}`)
+and faults with UB rather than masking an invalid `bool` byte. -/
+def ocCase9InvalidBoolMir : CapturedMir :=
+  ocBody "oc::case9_invalid_bool_through_cast" 0 [ocBoolTy, ocU8Ty]
+    [ocBb [.storageLive 1, .assign (ocLoc 1) (.use (ocConstU8 2)),
+           .assign (ocLoc 0) (.use (.move (ocLoc 1 [.opaqueCast ocBoolTy])))] .return_]
 
 /-! #### Cast erasure (the post-borrowck / `PostAnalysisNormalize` image) and place extraction
 
@@ -1166,6 +1190,16 @@ def ocMrProg9DeadLocal : Program :=
     ([.Assign (wdLc 3) (cU32 7), .StorageDead (locId 3)] ++
      wdFinish 0 (wdToU64 (wdLd 3)) (wdCU64 0))
 
+/-- `ocMrProg9`'s invalid-`bool` companion (`D1.6` type-switch UB non-masking): store `2 : u8` in
+`_3`, take `&raw const _3`, and load `*(_4 as *const bool)` (`Type.Bool`) -> UB on both `Mach`
+and `MachTB`. -/
+def ocMrProg9InvalidBool : Program :=
+  wdProg [mrU8Ty, rawThinTy, .Bool]
+    ([.Assign (wdLc 3) (ocCU8 2),
+      .Assign (wdLc 4) (.AddrOf (wdLc 3) (.Raw .None)),
+      .Assign (wdLc 5) (.Load (.Deref (wdLd 4) .Bool))] ++
+     wdFinish 0 (wdCU64 1) (wdCU64 0))
+
 /-- **`D1.5` protected-drop through `.opaqueCast` mode-sensitive UB (kernel-checked)**:
 dropping `_1 as u8` while `_2 = &mut _1` carries an active `FnEntry` protector returns `7` without
 a borrow tracker (`ocEraseRetags` / `Mach`) and faults with UB under Tree Borrows (Trusted raw &
@@ -1189,6 +1223,20 @@ theorem mr_oc_dead_local_ub_non_masking :
     ocRun false [] ocMrProg9DeadLocal = .ub ∧
     ocRun true [] ocMrProg9DeadLocal = .ub := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **`D1.6` invalid-`bool` byte under type-switch UB non-masking control (kernel-checked)**:
+`move (_1 as bool)` with `_1 : u8 = 2` faults with `.ub` in Trusted (enforcing `bool` validity at
+the `.opaqueCast` target type), and loading byte `2` at `Type.Bool` faults with the exact
+language-invariant UB in MiniRust on both `Mach` and `MachTB`. -/
+theorem mr_oc_invalid_bool_ub_non_masking :
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw ocCase9InvalidBoolMir []) = .ub ∧
+    ocRun false [] ocMrProg9InvalidBool = .ub ∧
+    ocRun true [] ocMrProg9InvalidBool = .ub ∧
+    runStopMsgBasic ocMrProg9InvalidBool =
+      some "load at type but the data in memory violates the language invariant" ∧
+    runStopMsgTB ocMrProg9InvalidBool =
+      some "load at type but the data in memory violates the language invariant" := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- **`D2.3` reverse transmutation `fn(*mut u8, *mut u8) -> fn(&mut u8, *mut u8)` mode-sensitivity
 (kernel-checked)**: when the caller has NO `&mut` local and invokes a `fn(&mut u8, *mut u8)` callee
@@ -1827,6 +1875,19 @@ def ocIndirectMain (callee : String) (sigTy callTy : Trusted.Rustc.V2026_06_01.M
        (.call (.copy (ocLoc 6)) [.copy (ocLoc 3), .copy (ocLoc 2)] (ocLoc 4) (some 1) .continue_),
      ocBb [.assign (ocLoc 0) (.aggregate .tuple [.copy (ocLoc 4), .copy (ocLoc 1)])] .return_]
 
+/-- Transmute-only control for `ocIndirectMain`: reifies `callee` at `sigTy` and transmutes to
+`callTy` WITHOUT calling `_6`, returning `1 : u8`. Proves the `.cast .transmute` itself succeeds
+and that the `.ub` of `trusted_d2_indirect_fnptr_calls` originates specifically at
+`resolveCallTarget` / `fnEntryCompatibleWithCallSite`. -/
+def ocIndirectTransmuteOnly (callee : String) (sigTy callTy : Trusted.Rustc.V2026_06_01.MirAst.Ty) :
+    Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  ocBody "oc::d2_indirect_transmute_only" 0
+    [ocU8Ty, sigTy, callTy]
+    [ocBb [.storageLive 1, .storageLive 2,
+           .assign (ocLoc 1) (.cast (.pointerCoercion "ReifyFnPointer") (ocFnOp callee) sigTy),
+           .assign (ocLoc 2) (.cast .transmute (.copy (ocLoc 1)) callTy),
+           .assign (ocLoc 0) (.use (ocConstU8 1))] .return_]
+
 /-- **`D2` end-to-end Trusted INDIRECT calls through reified / transmuted function pointers
 (kernel-checked, real `stepMirFn`)**:
 1. exact-signature indirect call of the callee-only `fn(*mut u8, *mut u8)` (case `10` callee):
@@ -1834,11 +1895,12 @@ def ocIndirectMain (callee : String) (sigTy callTy : Trusted.Rustc.V2026_06_01.M
 2. exact-signature indirect call of the `&mut u8`-retagging callee (case `11` callee): `.ub`
    (the strong `FnEntry` protector rejects the foreign write), and `(5, 5)` on its
    no-borrow-tracker image — exactly the direct-call cells of case `11`;
-3. the TRANSMUTED calls `fn(*mut u8, *mut u8)` ↦ `fn(&mut u8, *mut u8)` view and back are `.ub` in
-   Trusted (its `fnEntryCompatibleWithCallSite` compares signatures syntactically,
-   `trusted_fnEntryCompatibleWithCallSite_transmute_boundary`), whereas MiniRust's transmuted call of
-   case `10` (`ocMrProg10`, through `_8 = transmute(_7)`) succeeds with `(5, 5)` in both modes: the
-   documented reason the Trusted `D2` table cells call by `fnDef`. -/
+3. the `.cast .transmute` between `fn(*mut u8, *mut u8)` and `fn(&mut u8, *mut u8)` SUCCEEDS in
+   BOTH directions (`ocIndirectTransmuteOnly` returns `1`), while invoking the transmuted pointer is
+   `.ub` in BOTH directions because `resolveCallTarget` / `fnEntryCompatibleWithCallSite` compares
+   signatures syntactically (`trusted_fnEntryCompatibleWithCallSite_transmute_boundary`), whereas
+   MiniRust's transmuted call of case `10` (`ocMrProg10`, through `_8 = transmute(_7)`) succeeds with
+   `(5, 5)` in both modes: the documented reason the Trusted `D2` table cells call by `fnDef`. -/
 theorem trusted_d2_indirect_fnptr_calls :
     mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case10_callee" ocFnRawSigTy ocFnRawSigTy)
       [ocCase10Callee]) = .okRetagPair 5 5 ∧
@@ -1846,6 +1908,12 @@ theorem trusted_d2_indirect_fnptr_calls :
       [ocCase11Callee]) = .ub ∧
     mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRefSigTy)
       [ocEraseRetags ocCase11Callee]) = .okRetagPair 5 5 ∧
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw
+      (ocIndirectTransmuteOnly "oc::case10_callee" ocFnRawSigTy ocFnRefSigTy) [ocCase10Callee]) =
+      .okScalar 1 ∧
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw
+      (ocIndirectTransmuteOnly "oc::case11_callee" ocFnRefSigTy ocFnRawSigTy) [ocCase11Callee]) =
+      .okScalar 1 ∧
     mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case10_callee" ocFnRawSigTy ocFnRefSigTy)
       [ocCase10Callee]) = .ub ∧
     mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRawSigTy)
@@ -1853,7 +1921,7 @@ theorem trusted_d2_indirect_fnptr_calls :
     mrOcTrustedObserve false 10 = .okRetagPair 5 5 ∧ mrOcTrustedObserve false 11 = .okRetagPair 5 5 ∧
     mrOcTrustedObserve true 11 = .ub ∧
     mrOcObserve false 10 = .okRetagPair 5 5 ∧ mrOcObserve true 10 = .okRetagPair 5 5 := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- `D1`/`D2` **non-vacuity witnesses for Trusted conditional universal laws**: instantiates the
 hypotheses of `trusted_evalOperand_cast_deref_unsupported`, `trusted_evalOperand_move_pure_cast_deinit`,
@@ -2560,6 +2628,7 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% mr_oc_minimize_lowering_contrasts ∧
     type_of% mr_oc_protected_drop_mode_sensitive ∧
     type_of% mr_oc_dead_local_ub_non_masking ∧
+    type_of% mr_oc_invalid_bool_ub_non_masking ∧
     type_of% mr_oc_d2_rev_transmute_mode_sensitive ∧
     type_of% mr_oc_setDiscriminant_payload_agreement ∧
     type_of% mr_oc_d3_zst_dangling_and_null ∧
@@ -2585,7 +2654,8 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
    @mr_checkPtrM_dereferenceable_exact, mr_checkPtrM_nonvacuity,
    @mr_checkValueM_ptr_eq_checkPtrM, mr_oc_exact_ub_diagnostics,
    mr_oc_minimize_lowering_contrasts, mr_oc_protected_drop_mode_sensitive,
-   mr_oc_dead_local_ub_non_masking, mr_oc_d2_rev_transmute_mode_sensitive,
+   mr_oc_dead_local_ub_non_masking, mr_oc_invalid_bool_ub_non_masking,
+   mr_oc_d2_rev_transmute_mode_sensitive,
    mr_oc_setDiscriminant_payload_agreement, mr_oc_d3_zst_dangling_and_null,
    mr_checkPtr_some_vs_none_contrast, mr_checkPtrM_tb_some_vs_none_contrast⟩
 
@@ -2611,6 +2681,8 @@ run_cmd do
       (ns ++ `mr_oc_protected_drop_mode_sensitive, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_dead_local_ub_non_masking, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mr_oc_dead_local_ub_non_masking, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mr_oc_invalid_bool_ub_non_masking, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `mr_oc_invalid_bool_ub_non_masking, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_d2_rev_transmute_mode_sensitive, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mr_oc_d2_rev_transmute_mode_sensitive, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_d3_zst_dangling_and_null, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
