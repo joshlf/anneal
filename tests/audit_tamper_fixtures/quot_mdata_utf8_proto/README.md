@@ -96,6 +96,23 @@ bypasses reproduced live against Round B1:
   linear fuel-charged tree walk (fail-closed on oversize / exponential DAGs), an iterative
   byte-injective `ofSyntax` key, and an `MData`-aware `StrictExprKey` hash.
 
+## Adversarial Hardening Regressions (Round A2)
+
+`tests/mir/OleanQuotMdataUtf8ProtoTests.lean` Section 11e pins bypasses reproduced live
+against Round B2:
+
+- **V-N6 / Tarjan SCC & `.recInfo` axiom closure**: B2's `independentAxiomClosures`
+  permanently cached `#[]` sentinel results on mutual-recursion back-edges (`cycB <-> cycC`,
+  accepting a forged empty cache for `cycC`) and omitted `.recInfo.rules` (`r.rhs`) and
+  `.ctorInfo.induct`; replaced by iterative Tarjan SCC covering every `ConstantInfo` field,
+  plus strict `binExportedAxiomClaims` ctor/name validation across both `.olean*` and `.ir*`,
+  and duplicate / foreign-owned `exportedAxiomsExt` entry rejection (`forgedExportedAxioms`).
+- **V-U3 / Fail-closed `ofSyntax` equality & O(1) hashing**: B2's `syntaxStrictKey`
+  truncation made distinct `>100k`-node `Syntax` chains compare equal (`0xFF == 0xFF`) and
+  allocated full byte arrays inside `Hashable.hash`; replaced by fail-closed iterative
+  lockstep `strictSyntaxEqIter` (`withPtrEq` fast-path) and bounded-budget
+  `syntaxBoundedFingerprint`.
+
 ## Running the Suite
 
 ```bash
