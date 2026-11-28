@@ -39,6 +39,7 @@ import MiniRustSpec.Correspondence.IntrinsicBoundary
 import MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 import MiniRustSpec.FloatArithMR
 import MiniRustSpec.ClosureFnPtrMR
+import MiniRustSpec.PtrByteCoherenceMR
 import MiniRustSpec.Audit
 
 /-!
@@ -118,6 +119,22 @@ import MiniRustSpec.Audit
   characterization of the pre-existing thin-pointer / `usize`-vs-`u64`
   false-positive UB divergence (pinned by `#assert_closure_fn_ptr_mr_audit` and
   `[CLOSURE-FNPTR-AUDIT]`).
+* `MiniRustSpec.PtrByteCoherenceMR`: dual-authority correspondence for
+  pointer-byte fragment coherence (`UCG#558` / `rust#148259`) and read-time
+  validity (`Kani#5205`), in lockstep for `V2026_06_01` and `V2026_08_01`. The
+  fragment projection `PtrByteFrag → ProvenanceFrag { provenance, position }`
+  relates `Trusted`'s `encodePtrBytes`, `abstractBytesCoherentPtrProv?`,
+  `decodePtrBytesNoForge`, `decodeScalarLayoutBytesNoForge`, and the union
+  raw-byte carrier to MiniRust `encode_ptr` / `decode_ptr` across `BasicMemory`
+  and `TreeBorrowsMemory`: exact encoding and intact round trips, exact
+  characterizations of both authorities, `Trusted → MiniRust` soundness, shared
+  stripping on reversals, swaps, duplicates, permutations, mixed / missing
+  provenance and uninitialized bytes, the kernel-proved offset-splice strict
+  refinement (`Trusted` strips where vendored MiniRust retains) with its exact
+  gap characterization, wide pointers, and `Kani#5205` typed-read rejection,
+  with non-vacuity instantiations, kernel-checked witnesses, and classified
+  scoped divergences (pinned by `#assert_ptr_byte_coherence_mr_audit` and
+  `[PTR-BYTE-COHERENCE-AUDIT]`).
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

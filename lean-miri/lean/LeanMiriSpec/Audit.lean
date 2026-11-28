@@ -61,6 +61,7 @@ import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
 import LeanMiriSpec.ClosureFnPtrLM
+import LeanMiriSpec.PtrByteCoherenceLM
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -27180,6 +27181,40 @@ example :
       [cfFx_finding_driver, cfFx_finding_closure_0, cfFx_finding_closure_1] [] [] 600 =
       some (.scalar 9147 4, 15) :=
   cf_finding_0007_main_stutter_sim.1
+
+-- Episode 2 pointer-byte coherence correspondence (`LeanMiriSpec.PtrByteCoherenceLM`).
+#assert_standard_axioms
+  LeanMiriSpec.PtrByteCoherenceLM.ptrImage_inj
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr8_runtime
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr8_ctfe
+  LeanMiriSpec.PtrByteCoherenceLM.w_lm_misaligned
+  LeanMiriSpec.PtrByteCoherenceLM.w_lm_wildcard
+  LeanMiriSpec.PtrByteCoherenceLM.w_lm_kani5205_miri
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity
+  LeanMiriSpec.PtrByteCoherenceLM.V06.normOffset_image_inj
+  LeanMiriSpec.PtrByteCoherenceLM.V06.coh_iff8
+  LeanMiriSpec.PtrByteCoherenceLM.V06.coh_iff4
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_reversal
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_splice_p_p256
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_splice32_q_q256
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_missing_and_uninit
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_kani5205_trusted
+  LeanMiriSpec.PtrByteCoherenceLM.V08.normOffset_image_inj
+  LeanMiriSpec.PtrByteCoherenceLM.V08.coh_iff8
+  LeanMiriSpec.PtrByteCoherenceLM.V08.coh_iff4
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_reversal
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_splice_p_p256
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_splice32_q_q256
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_missing_and_uninit
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_kani5205_trusted
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
 -- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.

@@ -61,6 +61,7 @@ import LeanMiriSpec.Correspondence.WideSliceDstLM
 import LeanMiriSpec.UnwindSetDiscrAndFnPtrLM
 import LeanMiriSpec.FloatArithLM
 import LeanMiriSpec.ClosureFnPtrLM
+import LeanMiriSpec.PtrByteCoherenceLM
 import LeanMiriSpec.Audit
 
 /-!
@@ -532,6 +533,14 @@ import LeanMiriSpec.Audit
   non-closure-specific thin-pointer / `usize`-vs-`u64` false-positive UB
   divergence witnesses, the correspondence-gap postmortem, and
   `#assert_closure_fn_ptr_lm_audit`.
+* `LeanMiriSpec.PtrByteCoherenceLM`: Episode 2 dual-authority correspondence for
+  pointer-byte fragment coherence (`UCG#558` / `rust#148259`) against the unmodified
+  vendored `Miri.Memory.ProvenanceMap` (`fromParts`, `readPtr`, `inspectFragments`):
+  byte-vector injectivity of `normPtrByteOffset`, universal `Trusted` ↔ vendored `readPtr`
+  correspondence for 4- and 8-byte fragment streams in runtime and CTFE modes, three-way
+  witnesses for every named attack, `Kani#5205` via vendored `Validity.checkPrimitive`,
+  `V2026_06_01 ↔ V2026_08_01` parity, the correspondence-gap postmortem, and
+  `#assert_ptr_byte_coherence_lm_audit`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).
