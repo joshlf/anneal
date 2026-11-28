@@ -1678,6 +1678,78 @@ class InternalHygieneMixin:
         self.assertEqual(self.internal(), {
             self.ref("third_party/sub", 1, "internal-cli")})
 
+    def test_source_prose_and_symlinks_ignore_nul_plus_invalid_utf8(self):
+        # Combining NUL and invalid UTF-8 in source, prose, config, or symlink
+        # entries must not classify them as binary to hide banned references.
+        md = self.repo / self.ROOT / "docs" / "sneaky.md"
+        lean = self.repo / self.ROOT / "theory" / "Sneaky.lean"
+        cfg = self.repo / self.ROOT / "data" / "sneaky.json"
+        md.parent.mkdir(parents=True, exist_ok=True)
+        lean.parent.mkdir(parents=True, exist_ok=True)
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        md.write_bytes(HEADER_MD.encode() + b"\x00\xff\n"
+                       + self.MOUNT.encode() + b"\n")
+        lean.write_bytes(HEADER_LEAN.encode() + b"-- \x00\xff\n"
+                         + f"def x := {self.CLI}\n".encode())
+        cfg.write_bytes(b'{"k": "\x00\xff ' + self.CLIENT.encode() + b'"}\n')
+
+        # A crafted `120000` symlink blob containing NUL + 0xff is also text.
+        sym_oid = subprocess.run(
+            ["git", "-C", str(self.repo), "hash-object", "-w", "--stdin"],
+            input=self.WORKSTATION.encode() + b"\x00\xff",
+            capture_output=True, check=True,
+        ).stdout.decode().strip()
+        git(self.repo, "add", "-A")
+        git(self.repo, "update-index", "--add", "--cacheinfo",
+            f"120000,{sym_oid},{self.ROOT}docs/raw_link")
+        git(self.repo, "commit", "-q", "-m", GOOD_MESSAGE)
+        expected = {
+            self.ref("docs/sneaky.md", 9, "internal-mount"),
+            self.ref("theory/Sneaky.lean", 9, "internal-cli"),
+            self.ref("data/sneaky.json", 1, "internal-client"),
+            self.ref("docs/raw_link", 1, "internal-workstation"),
+        }
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
+
+    def test_rename_from_binary_to_text_extension_scans_all_lines(self):
+        # At `base`, `.bin` with NUL + 0xff is skipped as binary; renaming it
+        # untouched (`R100`) to `.md` brings it into text scope at `head`.
+        raw_bin = self.repo / self.ROOT / "assets" / "payload.bin"
+        raw_bin.parent.mkdir(parents=True, exist_ok=True)
+        raw_bin.write_bytes(HEADER_MD.encode() + b"\x00\xff\n"
+                            + self.CLI.encode() + b"\n")
+        self.commit("Seed binary payload")
+        git(self.repo, "branch", "-f", "base")
+        (self.repo / self.ROOT / "docs").mkdir(parents=True, exist_ok=True)
+        git(self.repo, "mv", self.ROOT + "assets/payload.bin",
+            self.ROOT + "docs/payload.md")
+        self.commit()
+        expected = {self.ref("docs/payload.md", 9, "internal-cli")}
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
+
+    def test_banned_skill_entry_without_trailing_slash(self):
+        # A symlink or gitlink placed directly at `skills/<banned>` has no
+        # trailing slash in `ls-tree` / `ls-files`, and must still be flagged.
+        sub_sha = git(self.repo, "rev-parse", "HEAD").strip()
+        sym_dir = self.repo / self.ROOT / "skills"
+        sym_dir.mkdir(parents=True, exist_ok=True)
+        os.symlink("../docs", sym_dir / "adversarial-rounds")
+        os.symlink("../docs", sym_dir / "adversarial-roundsx")
+        git(self.repo, "add", "-A")
+        git(self.repo, "update-index", "--add", "--cacheinfo",
+            f"160000,{sub_sha},{self.ROOT}skills/hierarchical-supervision")
+        git(self.repo, "commit", "-q", "-m", GOOD_MESSAGE)
+        expected = {
+            ("internal-path", self.ROOT + "skills/adversarial-rounds",
+             None, None),
+            ("internal-path", self.ROOT + "skills/hierarchical-supervision",
+             None, None),
+        }
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
+
 
 class MonorepoInternalHygieneTests(InternalHygieneMixin, RepoTestCase):
     ROOT = "anneal/"
@@ -1723,6 +1795,7 @@ class InternalUnitTests(unittest.TestCase):
         text = f"a\n{self.CLI} x\r\nb\f{self.CLI}\n"
         self.assertEqual(cph.internal_reference_hits(text),
                          [(2, "internal-cli"), (3, "internal-cli")])
+        self.assertEqual(cph.internal_reference_hits(text, set()), [])
         self.assertEqual(cph.internal_reference_hits(text, {1, 4}), [])
         self.assertEqual(cph.internal_reference_hits(text, {3}),
                          [(3, "internal-cli")])
@@ -1769,11 +1842,14 @@ class InternalUnitTests(unittest.TestCase):
         for path, layout in (("HANDOFF.md", solo), ("a/PROGRESS.md", solo),
                              ("REPRODUCE.md", solo),
                              ("anneal/HANDOFF.md", mono),
+                             ("skills/adversarial-rounds", solo),
                              ("skills/adversarial-rounds/x", solo),
+                             ("anneal/skills/hierarchical-supervision", mono),
                              ("anneal/skills/hierarchical-supervision/x",
                               mono)):
             self.assertIsNotNone(cph.internal_path_message(path, layout), path)
         for path, layout in (("HANDOFF.mdx", solo), ("xHANDOFF.md", solo),
+                             ("skills/adversarial-roundsx", solo),
                              ("skills/adversarial-rounds/x", mono),
                              ("anneal/skills/adversarial-rounds/x", solo),
                              ("skills/other/x", solo)):
@@ -1784,6 +1860,13 @@ class InternalUnitTests(unittest.TestCase):
         # Valid UTF-8 is text even with NUL bytes.
         self.assertEqual(cph.scannable_text(b"\x00ok"), "\x00ok")
         self.assertIsNone(cph.scannable_text(b"\x00\xff"))
+        self.assertIsNone(cph.scannable_text(b"\x00\xff", "assets/blob.bin"))
+        self.assertEqual(cph.scannable_text(b"\x00\xff", "docs/note.MD"),
+                         "\x00\ufffd")
+        self.assertEqual(cph.scannable_text(b"\x00\xff", "AGENTS.md"),
+                         "\x00\ufffd")
+        self.assertEqual(cph.scannable_text(b"\x00\xff", is_symlink=True),
+                         "\x00\ufffd")
         self.assertEqual(cph.scannable_text(b"a\xff\nb"), "a\ufffd\nb")
         # Git only sniffs the first 8000 bytes for NUL.
         late = b"x" * 8000 + b"\x00\xff"

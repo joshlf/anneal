@@ -8,10 +8,9 @@
 
 """Repository hygiene checks for public distribution boundaries."""
 
-import os
 from pathlib import Path
+import os
 import re
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -39,16 +38,15 @@ _BANNED_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 def _tracked_files() -> list[str]:
-    # `-z` avoids Git's C-quoting of paths with quotes or non-ASCII bytes.
-    out = subprocess.check_output(
-        ["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
-    )
+    # `cph.Git` strips ambient `GIT_*` variables and global config; `-z` avoids
+    # Git's C-quoting of paths containing quotes or non-ASCII bytes.
+    out = cph.Git(REPO_ROOT).run("ls-files", "-z")
     return [
         rel for rel in out.decode("utf-8", "surrogateescape").split("\0") if rel
     ]
 
 
-def _tracked_text(path: Path) -> str | None:
+def _tracked_text(path: Path, rel: str = "") -> str | None:
     """Read a file, or a symlink's target, as `check_pr_hygiene.py` does.
 
     Bytes are decoded by `cph.scannable_text` without newline translation;
@@ -57,13 +55,13 @@ def _tracked_text(path: Path) -> str | None:
     try:
         if path.is_symlink():
             raw = os.fsencode(os.readlink(path))
-        elif path.is_file():
+            return cph.scannable_text(raw, rel or path.name, is_symlink=True)
+        if path.is_file():
             raw = path.read_bytes()
-        else:
-            return None
+            return cph.scannable_text(raw, rel or path.name)
+        return None
     except OSError:
         return None
-    return cph.scannable_text(raw)
 
 
 class RepoHygieneTests(unittest.TestCase):
@@ -113,14 +111,34 @@ class RepoHygieneTests(unittest.TestCase):
                 cph.internal_reference_hits(_tracked_text(latin1) or ""),
                 [(2, "internal-cli")],
             )
+            # Known source/prose extensions are scanned even with NUL + 0xff.
+            sneaky_md = root / "sneaky.md"
+            sneaky_md.write_bytes(b"\x00\xff\n" + mnt.encode() + b"\n")
+            self.assertEqual(
+                cph.internal_reference_hits(
+                    _tracked_text(sneaky_md, "docs/sneaky.md") or ""
+                ),
+                [(2, "internal-mount")],
+            )
+
+    def test_tracked_files_ignores_ambient_git_dir(self) -> None:
+        old = os.environ.get("GIT_DIR")
+        os.environ["GIT_DIR"] = "/nonexistent-git-dir"
+        try:
+            tracked = _tracked_files()
+        finally:
+            if old is None:
+                os.environ.pop("GIT_DIR", None)
+            else:
+                os.environ["GIT_DIR"] = old
+        self.assertIn("ci/test_repo_hygiene.py", tracked)
 
     def test_no_ephemeral_batons_or_internal_skills(self) -> None:
-        bad_paths: list[str] = []
-        for rel in _tracked_files():
-            if _BANNED_FILENAME_RE.search(rel) or rel.startswith(
-                _BANNED_INTERNAL_PREFIXES
-            ):
-                bad_paths.append(rel)
+        bad_paths = [
+            rel
+            for rel in _tracked_files()
+            if cph.internal_path_message(rel, cph.STANDALONE) is not None
+        ]
         self.assertEqual(
             bad_paths,
             [],
@@ -132,7 +150,7 @@ class RepoHygieneTests(unittest.TestCase):
         for rel in _tracked_files():
             if rel.startswith(_EXCLUDED_PREFIXES):
                 continue
-            text = _tracked_text(REPO_ROOT / rel)
+            text = _tracked_text(REPO_ROOT / rel, rel)
             if text is None:
                 continue
             for line_no, label in cph.internal_reference_hits(text):

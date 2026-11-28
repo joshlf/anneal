@@ -258,6 +258,8 @@ def internal_reference_hits(
     Lines are numbered from 1 and split at LF only, as Git numbers them.
     `lines`, if given, limits the scan to those line numbers.
     """
+    if lines is not None and not lines:
+        return []
     folded = _fold(text)
     present = [
         (label, pat, lit)
@@ -455,10 +457,10 @@ class Git:
             return None
         return data.decode("utf-8", "replace")
 
-    def tree_entries(
+    def tree_records(
         self, commit: str, paths: list[str] | None = None
-    ) -> dict[str, tuple[str, str]]:
-        """Map paths in the tree at `commit` to their object type and ID."""
+    ) -> dict[str, tuple[str, str, str]]:
+        """Map paths in `commit` to `(mode, object_type, oid)`."""
         if paths is not None and not paths:
             return {}
         extra = (
@@ -467,7 +469,7 @@ class Git:
         keep = set(paths) if paths is not None and not extra else None
         listing = self.run("ls-tree", "-r", "-z", "--full-tree", commit,
                            *extra)
-        out: dict[str, tuple[str, str]] = {}
+        out: dict[str, tuple[str, str, str]] = {}
         for entry in listing.decode("utf-8", "surrogateescape").split("\0"):
             if not entry:
                 continue
@@ -477,8 +479,17 @@ class Git:
             parts = meta.split()
             if len(parts) != 3:
                 raise GitError(f"malformed `git ls-tree` entry {entry[:80]!r}")
-            out[path] = (parts[1], parts[2])
+            out[path] = (parts[0], parts[1], parts[2])
         return out
+
+    def tree_entries(
+        self, commit: str, paths: list[str] | None = None
+    ) -> dict[str, tuple[str, str]]:
+        """Map paths in the tree at `commit` to their object type and ID."""
+        return {
+            path: (kind, oid)
+            for path, (_, kind, oid) in self.tree_records(commit, paths).items()
+        }
 
     def blobs(self, oids: list[str]) -> dict[str, bytes]:
         """Read many blobs with a single `git cat-file --batch`."""
@@ -1714,28 +1725,49 @@ def internal_path_message(path: str, layout: Layout = MONOREPO) -> str | None:
         return ("ephemeral agent baton; keep handoff, progress, and "
                 "reproduction notes out of the repository")
     if (path.startswith(layout.root)
-            and path[len(layout.root):].startswith(BANNED_INTERNAL_PREFIXES)):
+            and (path[len(layout.root):] + "/").startswith(
+                BANNED_INTERNAL_PREFIXES)):
         return "internal-only skill; keep it out of the repository"
     return None
 
 
 # Git's own binary heuristic looks for a NUL byte this far into a blob.
 _BINARY_SNIFF_BYTES = 8000
+# Source, prose, and structured config extensions are never treated as binary
+# blobs even when both a NUL byte and an invalid UTF-8 byte appear (matching
+# `blob_text` in the header, wrap, review-round-id, and citation checks).
+ALWAYS_TEXT_EXTS = (
+    HEADER_EXTS | {".json", ".lock", ".cfg", ".ini", ".csv", ".xml", ".svg"}
+)
 
 
-def scannable_text(raw: bytes) -> str | None:
+def _always_text_path(path: str, is_symlink: bool = False) -> bool:
+    if is_symlink or not path:
+        return is_symlink
+    p = Path(path)
+    return (
+        p.suffix.lower() in ALWAYS_TEXT_EXTS
+        or p.name in HRS_CONFIG_NAMES
+        or p.name.startswith(("lakefile", "rust-toolchain"))
+    )
+
+
+def scannable_text(
+    raw: bytes, path: str = "", *, is_symlink: bool = False
+) -> str | None:
     """Decode a blob for the internal-reference scan; `None` if binary.
 
-    Valid UTF-8 is always scanned. Other content is scanned with U+FFFD
-    replacements unless Git would also call it binary (a NUL byte in its
-    first 8000 bytes), where short patterns would match by chance. One
-    stray invalid byte therefore cannot hide a text file's references.
+    Valid UTF-8 is always scanned, as are symlinks and known source, prose,
+    or config paths (`_always_text_path`). Other non-UTF-8 content is scanned
+    with U+FFFD replacements unless Git would also call it binary (a NUL byte
+    in its first 8000 bytes), where short patterns would match by chance.
     Replacement never consumes a line feed, so line numbers are kept.
     """
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
-        if b"\0" in raw[:_BINARY_SNIFF_BYTES]:
+        if (not _always_text_path(path, is_symlink)
+                and b"\0" in raw[:_BINARY_SNIFF_BYTES]):
             return None
         return raw.decode("utf-8", "replace")
 
@@ -1750,25 +1782,27 @@ def internal_findings(
     With `files` (diff mode), checks each non-deleted in-scope changed path,
     every line of a file entering Anneal scope or text scope (added, copied,
     renamed from outside scope, changed from a non-blob, or changed from a
-    binary blob at `base` to text at `head`), and the added lines of other
-    files, so untouched already-scanned lines never fail a change. Without
-    `files` (tree mode), checks every in-scope path and line. Like
-    `ci/test_repo_hygiene.py`, content scanning skips binary blobs (see
+    binary-skipped entry at `base` to scannable text at `head`), and the added
+    lines of other files, so untouched already-scanned lines never fail a
+    change. Without `files` (tree mode), checks every in-scope path and line.
+    Like `ci/test_repo_hygiene.py`, content scanning skips binary blobs (see
     `scannable_text`); a symbolic link is scanned as its target text.
     """
     out: list[Finding] = []
-    scan: list[tuple[str, str, str | None, set[int] | None]] = []
+    # `(path, is_sym, oid, prev_oid, prev_path, prev_sym, lines)`.
+    scan: list[tuple[str, bool, str, str | None, str, bool, set[int] | None]] = []
     if files is None:
-        entries = git.tree_entries(head)
-        for path in sorted(entries):
+        records = git.tree_records(head)
+        for path in sorted(records):
             if not layout.in_scope(path):
                 continue
             msg = internal_path_message(path, layout)
             if msg is not None:
                 out.append(Finding("internal-path", msg, path))
-            kind, oid = entries[path]
+            mode, kind, oid = records[path]
             if kind == "blob":
-                scan.append((path, oid, None, None))
+                scan.append(
+                    (path, mode == "120000", oid, None, "", False, None))
     else:
         changed = [
             f for f in sorted(files.values(), key=lambda f: f.path)
@@ -1776,51 +1810,64 @@ def internal_findings(
         ]
         if not changed:
             return []
-        entries = git.tree_entries(head, [f.path for f in changed])
+        records = git.tree_records(head, [f.path for f in changed])
         prev_lookup: list[str] = []
         for f in changed:
             entered = f.status in ("A", "C") or (
                 f.old_path is not None and not layout.in_scope(f.old_path))
             if not entered and base is not None:
                 prev_lookup.append(f.old_path or f.path)
-        base_entries = (
-            git.tree_entries(base, prev_lookup) if prev_lookup else {}
+        base_records = (
+            git.tree_records(base, prev_lookup) if prev_lookup else {}
         )
         for f in changed:
             msg = internal_path_message(f.path, layout)
             if msg is not None:
                 out.append(Finding("internal-path", msg, f.path))
-            entry = entries.get(f.path)
-            if entry is None:
+            rec = records.get(f.path)
+            if rec is None:
                 raise GitError(f"cannot find {head[:12]}:{f.path}")
             # Submodule entries (`commit`) have no blob content here.
-            if entry[0] != "blob":
+            if rec[1] != "blob":
                 continue
-            oid = entry[1]
+            is_sym = rec[0] == "120000"
+            oid = rec[2]
             entered = f.status in ("A", "C") or (
                 f.old_path is not None and not layout.in_scope(f.old_path))
             if entered:
-                scan.append((f.path, oid, None, None))
+                scan.append((f.path, is_sym, oid, None, "", False, None))
                 continue
             if base is not None:
-                prev = base_entries.get(f.old_path or f.path)
-                if prev is None or prev[0] != "blob":
-                    scan.append((f.path, oid, None, None))
+                prev_path = f.old_path or f.path
+                prev = base_records.get(prev_path)
+                if prev is None or prev[1] != "blob":
+                    scan.append((f.path, is_sym, oid, None, "", False, None))
                     continue
-                if prev[1] != oid:
-                    scan.append((f.path, oid, prev[1], f.added))
+                prev_sym = prev[0] == "120000"
+                prev_oid = prev[2]
+                forced_flip = (
+                    not _always_text_path(prev_path, prev_sym)
+                    and _always_text_path(f.path, is_sym)
+                )
+                if prev_oid != oid or forced_flip:
+                    scan.append((
+                        f.path, is_sym, oid, prev_oid, prev_path, prev_sym,
+                        f.added,
+                    ))
                     continue
             if f.added:
-                scan.append((f.path, oid, None, f.added))
-    need_oids = [oid for _, oid, _, _ in scan] + [
-        prev_oid for _, _, prev_oid, _ in scan if prev_oid is not None
+                scan.append((f.path, is_sym, oid, None, "", False, f.added))
+    need_oids = [oid for _, _, oid, _, _, _, _ in scan] + [
+        prev_oid for _, _, _, prev_oid, _, _, _ in scan if prev_oid is not None
     ]
     blobs = git.blobs(need_oids)
-    for path, oid, prev_oid, lines in scan:
-        text = scannable_text(blobs[oid])
+    for path, is_sym, oid, prev_oid, prev_path, prev_sym, lines in scan:
+        text = scannable_text(blobs[oid], path, is_symlink=is_sym)
         if text is None:
             continue
-        if prev_oid is not None and scannable_text(blobs[prev_oid]) is None:
+        if (prev_oid is not None
+                and scannable_text(blobs[prev_oid], prev_path,
+                                   is_symlink=prev_sym) is None):
             lines = None
         if lines == set():
             continue
