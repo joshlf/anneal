@@ -21,20 +21,23 @@ import Anneal.Hybrid
 Concrete instances of every combinator in `Anneal.Hybrid`, together with
 the counterexamples that motivate its design:
 
-1. **Portfolios:** choosing the first producer that returns any candidate
-   and only then checking it loses a valid backup
+1. **Portfolios and `toOption`:** choosing the first producer that returns
+   any candidate and only then checking it loses a valid backup
    (`naive_precheck_orelse_drops_valid_backup`); `firstAccepted` skips an
-   oversized witness and a wrong candidate (`canary_portfolio`).
+   oversized witness and a wrong candidate (`canary_portfolio`); `toOption`
+   projects accepted and rejected gate results (`canary_toOption_projection`).
 2. **Fallbacks:** re-checking the fallback's result with an incomplete
    checker aborts on an input where the fallback is correct
    (`runtime_checked_fallback_aborts`), while `withFallback` stays sound.
 3. **Hint steps and streams:** a rejected hint falls back to the current
    state (`canary_hint_steps`), and a stream stops at the first rejected
-   chunk without emitting it (`canary_stream_prefix`).
+   chunk without emitting it while every emitted chunk stays valid
+   (`canary_stream_prefix`, `canary_stream_prefix_valid`).
 4. **Certificate cuts:** `Anneal.LinearArith` natural-number and integer
    cut certificates and an `Anneal.BitTrieLrat` refutation discharge their
-   goals by `rfl` through `certGateCut_sound`; an oversized or forged
-   certificate is rejected.
+   goals by `rfl` through `certGateCut_sound`; oversized and forged
+   certificates are rejected across all three gates (`canary_natCut_bounds`,
+   `canary_rup_bounds`, `canary_intCut_bounds`).
 5. **`zerocopy` slice-DST casts (`sliceDstCastGate`):** a witness-free
    relational gate for the result of zerocopy's
    `DstLayout::validate_cast_and_convert_metadata`
@@ -55,11 +58,13 @@ the counterexamples that motivate its design:
 7. **Anti-vacuity:** an always-`none` body has no accepted witness, and an
    accepting body does (`canary_hasAcceptedWitness`); the slice-DST gate's
    specification kills a mutant inside the accepted fibre
-   (`canary_dst_accepted_dichotomy`).
+   (`canary_dst_accepted_dichotomy`); an impossible specification still
+   passes ordinary `PostconditionDichotomy` under `optionLift` while failing
+   accepted-fibre dichotomy (`canary_optionLift_vacuity_trap`).
 8. **Ratchets:** a two-producer portfolio with stronger effect guarantees
    may replace a single producer and returns the same output
-   (`canary_ratchet`), and a caller's proof carries over
-   (`canary_ratchet_outer`).
+   (`canary_ratchet`), ratchets compose transitively (`canary_ratchet_trans`),
+   and a caller's proof carries over (`canary_ratchet_outer`).
 9. **Effect-mask order laws:** `maskLe` is definitionally the body of
    upstream `Anneal.Framework.effectMaskLe` (`maskLe_eq_effectMaskLe_body`);
    it is reflexive, transitive, and antisymmetric (`canary_maskLe_refl`,
@@ -138,6 +143,15 @@ theorem canary_portfolio :
           List (RawOutcome Unit Nat (List Nat))) =
       .error (.producerFailed ()) :=
   ⟨rfl, rfl, rfl⟩
+
+/-- `toOption` preserves accepted outputs and maps rejections to `none`,
+lifting gate soundness to the `Option` carrier. -/
+theorem canary_toOption_projection :
+    toOption (evalGate (E := Unit) eqGate 7 (.candidate 7 ())) = some 7 ∧
+    toOption (evalGate (E := Unit) eqGate 7 (.candidate 9 ())) = none ∧
+    (∀ raw : RawOutcome Unit Nat Unit, ∀ y,
+      toOption (evalGate eqGate 7 raw) = some y → y = 7) :=
+  ⟨rfl, rfl, fun raw y h => toOption_evalGate_sound eqGate 7 raw y True.intro h⟩
 
 /-! ## Fallbacks -/
 
@@ -231,6 +245,30 @@ theorem canary_stream_prefix :
       ([10, 25], some .rejectedByChecker) :=
   rfl
 
+/-- Every emitted chunk is valid across arbitrary input streams, and a
+rejected head chunk halts immediately without emitting anything. -/
+theorem canary_stream_prefix_valid :
+    (∀ us : List Nat, ∀ c,
+      c ∈ (foldStreamPrefix (AccInv := fun s => s < 100)
+        (ValidChunk := fun c => c < 100)
+        monotoneChunkGate
+        (fun _ u => (.candidate (u, u) () : RawOutcome Unit (Nat × Nat) Unit))
+        0 us).1 → c < 100) ∧
+    (∀ us : List Nat,
+      foldStreamPrefix (AccInv := fun s => s < 100)
+        (ValidChunk := fun c => c < 100)
+        monotoneChunkGate
+        (fun _ u => (.candidate (u, u) () : RawOutcome Unit (Nat × Nat) Unit))
+        0 (500 :: us) = ([], some .rejectedByChecker)) :=
+  ⟨fun us c h =>
+    foldStreamPrefix_all_emitted_valid (AccInv := fun s => s < 100)
+      (ValidChunk := fun c => c < 100) monotoneChunkGate _ us 0
+      (Nat.zero_lt_succ 99) c h,
+    fun us =>
+      foldStreamPrefix_halts (AccInv := fun s => s < 100)
+        (ValidChunk := fun c => c < 100) monotoneChunkGate _ 0 500 us
+        .rejectedByChecker rfl⟩
+
 /-! ## Certificate cuts -/
 
 /-- `2 * i + 1 ≤ 2 * n → i < n` from the existing Farkas certificate,
@@ -267,6 +305,20 @@ theorem canary_rup_forged_rejected :
           [.addRup 5 [Anneal.BitTrieLrat.mkLit 3 true] [0]]) =
       .error .rejectedByChecker :=
   rfl
+
+/-- The three-step RUP refutation is rejected under a two-step bound and
+accepted under an eight-step bound; a forged step list is rejected. -/
+theorem canary_rup_bounds :
+    evalGate (E := Unit) (rupGate 6 2) Anneal.BitTrieLrat.sampleUnsatCnf
+        (.candidate () Anneal.BitTrieLrat.sampleUnsatSteps) =
+      .error (.witnessOversized 3 2) ∧
+    evalGate (E := Unit) (rupGate 6 8) Anneal.BitTrieLrat.sampleUnsatCnf
+        (.candidate () Anneal.BitTrieLrat.sampleUnsatSteps) = .ok () ∧
+    evalGate (E := Unit) (rupGate 6 8) Anneal.BitTrieLrat.sampleUnsatCnf
+        (.candidate ()
+          [.addRup 5 [Anneal.BitTrieLrat.mkLit 3 true] [0]]) =
+      .error .rejectedByChecker :=
+  ⟨rfl, rfl, rfl⟩
 
 /-! ## `zerocopy` slice-DST casts -/
 
@@ -548,6 +600,26 @@ theorem canary_hasAcceptedWitness_requires_bodyAt :
     have hNone : (none : Option Unit) = some () := h.bodyAt_eq
     cases hNone
 
+/-- Anti-vacuity trap for `optionLift`: an impossible specification
+(`fun _ _ => False`) still satisfies ordinary `PostconditionDichotomy` under
+`optionLift` and admits the always-`none` implementation, yet fails
+accepted-fibre dichotomy (`DichotomyModuloObservation` on `Option.isSome`). -/
+theorem canary_optionLift_vacuity_trap :
+    PostconditionDichotomy (fun (_ : Nat) => True)
+        (optionLift (fun (_ : Nat) (_ : Nat) => False)) ∧
+    (∀ x : Nat, optionLift (fun (_ : Nat) (_ : Nat) => False) x none) ∧
+    ¬ DichotomyModuloObservation (fun _ o => Option.isSome o)
+        (fun (_ : Nat) => True)
+        (optionLift (fun (_ : Nat) (_ : Nat) => False)) :=
+  let hPass :=
+    optionLift_dichotomy_while_none_passes
+      (Pre := fun (_ : Nat) => True)
+      (Spec := fun (_ : Nat) (_ : Nat) => False)
+      0 True.intro 0 (fun h => h)
+  ⟨hPass.1, hPass.2, fun hDich =>
+    let ⟨_, _, ⟨_, hOk⟩, _⟩ := optionLift_acceptedDichotomy_iff.1 hDich
+    hOk⟩
+
 /-! ## Ratchets -/
 
 /-- No effect guarantees. -/
@@ -625,6 +697,45 @@ theorem canary_ratchet_outer (x z : Nat)
   exact (ratchet_result_preserves_outer_safety_and_availability doubleOuter
     (fun x z => z = x + x) hOuter canary_ratchet.1).1 x True.intro z h
 
+/-- Intermediate portfolio guaranteeing termination and no-unwind, used to
+exercise transitive multi-step ratchets. -/
+def midPortfolio : HybridComponent Nat Unit Nat :=
+  { mask := { terminates := true, noUnwind := true, noAbort := false }
+    run := fun x => firstAccepted eqGate x [.trapped, .candidate x ()] }
+
+theorem midPortfolio_sound :
+    ResultSound (fun _ => True) (fun x y => y = x) midPortfolio.run :=
+  fun x _ y h =>
+    firstAccepted_sound eqGate x [.trapped, .candidate x ()] y True.intro h
+
+/-- Two-step transitive ratchet (`singleProducer -> midPortfolio -> portfolio`)
+composed via `hybridRefines_trans`. -/
+theorem canary_ratchet_trans :
+    HybridRefines (fun _ => True) (fun x y => y = x) singleProducer
+        midPortfolio ∧
+    HybridRefines (fun _ => True) (fun x y => y = x) midPortfolio portfolio ∧
+    HybridRefines (fun _ => True) (fun x y => y = x) singleProducer
+        portfolio := by
+  have h12 : HybridRefines (fun _ => True) (fun x y => y = x)
+      singleProducer midPortfolio :=
+    ⟨⟨fun h => Bool.noConfusion h, fun h => Bool.noConfusion h,
+        fun h => Bool.noConfusion h⟩,
+      midPortfolio_sound,
+      fun x _ _ _ =>
+        (firstAccepted_ok_iff_exists eqGate x [.trapped, .candidate x ()]).2
+          ⟨.candidate x (), List.Mem.tail _ (List.Mem.head _), x,
+            evalGate_eqGate_self x⟩⟩
+  have h23 : HybridRefines (fun _ => True) (fun x y => y = x)
+      midPortfolio portfolio :=
+    ⟨⟨fun _ => rfl, fun _ => rfl, fun h => Bool.noConfusion h⟩,
+      portfolio_sound,
+      fun x _ _ _ =>
+        (firstAccepted_ok_iff_exists eqGate x
+          [.candidate (x + 1) (), .candidate x ()]).2
+          ⟨.candidate x (), List.Mem.tail _ (List.Mem.head _), x,
+            evalGate_eqGate_self x⟩⟩
+  exact ⟨h12, h23, hybridRefines_trans h12 h23⟩
+
 /-! ## Integer cuts -/
 
 /-- `(-2) * x - y ≤ 5 → -3 ≤ -y → -4 ≤ x` through the integer-cut gate. -/
@@ -634,6 +745,19 @@ theorem canary_intCut (x y : Int)
   certGateCut_sound (intCutGate 8) (x := Anneal.LinearArith.intSubNegMulGoal)
     (y := ()) (w := Anneal.LinearArith.intSubNegMulCert) True.intro
     (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl) [x, y] h1 h2
+
+/-- The five-step integer-cut certificate is rejected under a two-step bound
+and accepted under an eight-step bound; a truncated certificate is rejected
+by the checker. -/
+theorem canary_intCut_bounds :
+    evalGate (E := Unit) (intCutGate 2) Anneal.LinearArith.intSubNegMulGoal
+        (.candidate () Anneal.LinearArith.intSubNegMulCert) =
+      .error (.witnessOversized 5 2) ∧
+    evalGate (E := Unit) (intCutGate 8) Anneal.LinearArith.intSubNegMulGoal
+        (.candidate () Anneal.LinearArith.intSubNegMulCert) = .ok () ∧
+    evalGate (E := Unit) (intCutGate 8) Anneal.LinearArith.intSubNegMulGoal
+        (.candidate () [.hyp 0]) = .error .rejectedByChecker :=
+  ⟨rfl, rfl, rfl⟩
 
 /-! ## Effect-mask order laws -/
 
@@ -771,6 +895,26 @@ theorem canary_effectiveSafetyPre :
     fun _ => True.intro, fun _ => True.intro,
     fun h => h.2, fun h => h.2⟩
 
+/-- Positive-polarity effect gating in `OutcomeAllowed`: `totalMask` forbids
+unwinding, aborting, divergence, and UB while permitting normal returns;
+`anyExitMask` permits unwinding, aborting, and divergence yet still forbids
+undefined behavior. -/
+theorem canary_outcomeAllowed_effects :
+    let cTot : FnContract Unit Unit Unit := { effects := totalMask }
+    let cAny : FnContract Unit Unit Unit := { effects := anyExitMask }
+    OutcomeAllowed cTot () (.terminal (.returned () ())) ∧
+    ¬ OutcomeAllowed cTot () (.terminal (.unwound ())) ∧
+    ¬ OutcomeAllowed cTot () (.terminal (.aborted ())) ∧
+    ¬ OutcomeAllowed cTot () .diverged ∧
+    ¬ OutcomeAllowed cTot () .faultUB ∧
+    OutcomeAllowed cAny () (.terminal (.unwound ())) ∧
+    OutcomeAllowed cAny () (.terminal (.aborted ())) ∧
+    OutcomeAllowed cAny () .diverged ∧
+    ¬ OutcomeAllowed cAny () .faultUB :=
+  ⟨True.intro, fun h => Bool.noConfusion h.1, fun h => Bool.noConfusion h.1,
+    fun h => Bool.noConfusion h, fun h => h,
+    ⟨rfl, True.intro⟩, ⟨rfl, True.intro⟩, rfl, fun h => h⟩
+
 /-- Pins the nine `DisclosedGap` constructors of
 `Trusted.Framework.DisclosedGap`: their payload types, their declaration
 order (`ctorIdx` is `0` through `8`), and that no other constructor exists
@@ -787,9 +931,17 @@ theorem canary_disclosedGap_constructors (s : String) :
       DisclosedGap.rawLegacySpec.ctorIdx,
       (DisclosedGap.unverifiedDownstream s).ctorIdx] =
       [0, 1, 2, 3, 4, 5, 6, 7, 8] ∧
-    ∀ g : DisclosedGap, g.ctorIdx < 9 := by
-  refine ⟨rfl, fun g => ?_⟩
-  cases g <;> exact Nat.le_of_ble_eq_true rfl
+    ∀ g : DisclosedGap, g.ctorIdx < 9 :=
+  ⟨rfl, fun
+    | .unbridgedSemantics _ => Nat.le_of_ble_eq_true rfl
+    | .callerRawPtrAliasing _ => Nat.le_of_ble_eq_true rfl
+    | .callerMemoryThreadIsolation _ => Nat.le_of_ble_eq_true rfl
+    | .configuredReferenceScope _ => Nat.le_of_ble_eq_true rfl
+    | .assumedExternalCallee _ => Nat.le_of_ble_eq_true rfl
+    | .waivedInhabitation _ => Nat.le_of_ble_eq_true rfl
+    | .selectedUnitScope => Nat.le_of_ble_eq_true rfl
+    | .rawLegacySpec => Nat.le_of_ble_eq_true rfl
+    | .unverifiedDownstream _ => Nat.le_of_ble_eq_true rfl⟩
 
 /-- Pins the closed constructor sets, declaration order, and payload types of
 `TerminalOutcome`, `ClaimShape` (canonical lexicographic order), and
@@ -806,11 +958,24 @@ theorem canary_closed_constructors {Ret Mem : Type} (r : Ret) (m : Mem)
     (∀ c : ClaimShape, c.ctorIdx < 5) ∧
     [(OracleGrade.unbridged s).ctorIdx, (OracleGrade.forwardSim s).ctorIdx,
       (OracleGrade.biFaultEquiv s).ctorIdx] = [0, 1, 2] ∧
-    (∀ g : OracleGrade, g.ctorIdx < 3) := by
-  refine ⟨rfl, fun o => ?_, rfl, fun c => ?_, rfl, fun g => ?_⟩
-  · cases o <;> exact Nat.le_of_ble_eq_true rfl
-  · cases c <;> exact Nat.le_of_ble_eq_true rfl
-  · cases g <;> exact Nat.le_of_ble_eq_true rfl
+    (∀ g : OracleGrade, g.ctorIdx < 3) :=
+  ⟨rfl,
+    fun
+      | .returned _ _ => Nat.le_of_ble_eq_true rfl
+      | .unwound _ => Nat.le_of_ble_eq_true rfl
+      | .aborted _ => Nat.le_of_ble_eq_true rfl,
+    rfl,
+    fun
+      | .existsWitness => Nat.le_of_ble_eq_true rfl
+      | .forallSafety => Nat.le_of_ble_eq_true rfl
+      | .generalHyper => Nat.le_of_ble_eq_true rfl
+      | .subsetHyper => Nat.le_of_ble_eq_true rfl
+      | .termination => Nat.le_of_ble_eq_true rfl,
+    rfl,
+    fun
+      | .unbridged _ => Nat.le_of_ble_eq_true rfl
+      | .forwardSim _ => Nat.le_of_ble_eq_true rfl
+      | .biFaultEquiv _ => Nat.le_of_ble_eq_true rfl⟩
 
 /-- Pins the field order of `EffectMask` and `FnContract`: positional
 construction agrees with named construction, so swapping two same-typed
