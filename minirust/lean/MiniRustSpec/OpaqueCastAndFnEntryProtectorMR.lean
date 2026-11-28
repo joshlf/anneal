@@ -1799,6 +1799,62 @@ theorem trusted_fnEntryCompatibleWithCallSite_transmute_boundary (allocId : MirA
     simp [fnEntryCompatibleWithCallSite, hNotIntr, hAbiSelf, hSafSelf,
       Trusted.Sequence.length, rigidTyListEq, rigidTyEq, mutabilityEq]
 
+
+/-- The `fn(*mut u8, *mut u8) -> u8` pointer type. -/
+@[reducible] def ocFnRawSigTy : Trusted.Rustc.V2026_06_01.MirAst.Ty :=
+  { kind := .fnPtr [.rawPtr .mut (.uint .u8), .rawPtr .mut (.uint .u8)] (.uint .u8) .safe .rust,
+    layoutIdx := 3 }
+/-- The `fn(&mut u8, *mut u8) -> u8` pointer type. -/
+@[reducible] def ocFnRefSigTy : Trusted.Rustc.V2026_06_01.MirAst.Ty :=
+  { kind := .fnPtr [.ref .mut (.uint .u8), .rawPtr .mut (.uint .u8)] (.uint .u8) .safe .rust,
+    layoutIdx := 3 }
+
+/-- A `D2` caller that calls `callee` INDIRECTLY: `_5 = callee as sigTy` (`ReifyFnPointer`, which
+registers the function pointer in Trusted's `fnPtrs` with signature `sigTy`),
+`_6 = transmute::<sigTy, callTy>(_5)`, then `_6(_3, _2)` with the caller's `&mut u8` `_3` and parent
+`*mut u8` `_2`; observes `(_4, x)`. -/
+def ocIndirectMain (callee : String) (sigTy callTy : Trusted.Rustc.V2026_06_01.MirAst.Ty) :
+    Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  ocBody "oc::d2_indirect_main" 0
+    [ocBytePairTy, ocU8Ty, ocRawMutU8Ty, ocMutRefU8Ty, ocU8Ty, sigTy, callTy]
+    [ocBb [.storageLive 1, .storageLive 2, .storageLive 3, .storageLive 4, .storageLive 5,
+           .storageLive 6,
+           .assign (ocLoc 1) (.use (ocConstU8 3)),
+           .assign (ocLoc 2) (.rawPtr .mut (ocLoc 1)),
+           .assign (ocLoc 3) (.ref (.mut false) (ocLoc 2 [.deref])),
+           .assign (ocLoc 5) (.cast (.pointerCoercion "ReifyFnPointer") (ocFnOp callee) sigTy),
+           .assign (ocLoc 6) (.cast .transmute (.copy (ocLoc 5)) callTy)]
+       (.call (.copy (ocLoc 6)) [.copy (ocLoc 3), .copy (ocLoc 2)] (ocLoc 4) (some 1) .continue_),
+     ocBb [.assign (ocLoc 0) (.aggregate .tuple [.copy (ocLoc 4), .copy (ocLoc 1)])] .return_]
+
+/-- **`D2` end-to-end Trusted INDIRECT calls through reified / transmuted function pointers
+(kernel-checked, real `stepMirFn`)**:
+1. exact-signature indirect call of the callee-only `fn(*mut u8, *mut u8)` (case `10` callee):
+   `(5, 5)`, exactly the direct-call cell (no protector);
+2. exact-signature indirect call of the `&mut u8`-retagging callee (case `11` callee): `.ub`
+   (the strong `FnEntry` protector rejects the foreign write), and `(5, 5)` on its
+   no-borrow-tracker image — exactly the direct-call cells of case `11`;
+3. the TRANSMUTED calls `fn(*mut u8, *mut u8)` ↦ `fn(&mut u8, *mut u8)` view and back are `.ub` in
+   Trusted (its `fnEntryCompatibleWithCallSite` compares signatures syntactically,
+   `trusted_fnEntryCompatibleWithCallSite_transmute_boundary`), whereas MiniRust's transmuted call of
+   case `10` (`ocMrProg10`, through `_8 = transmute(_7)`) succeeds with `(5, 5)` in both modes: the
+   documented reason the Trusted `D2` table cells call by `fnDef`. -/
+theorem trusted_d2_indirect_fnptr_calls :
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case10_callee" ocFnRawSigTy ocFnRawSigTy)
+      [ocCase10Callee]) = .okRetagPair 5 5 ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRefSigTy)
+      [ocCase11Callee]) = .ub ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRefSigTy)
+      [ocEraseRetags ocCase11Callee]) = .okRetagPair 5 5 ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case10_callee" ocFnRawSigTy ocFnRefSigTy)
+      [ocCase10Callee]) = .ub ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRawSigTy)
+      [ocEraseRetags ocCase11Callee]) = .ub ∧
+    mrOcTrustedObserve false 10 = .okRetagPair 5 5 ∧ mrOcTrustedObserve false 11 = .okRetagPair 5 5 ∧
+    mrOcTrustedObserve true 11 = .ub ∧
+    mrOcObserve false 10 = .okRetagPair 5 5 ∧ mrOcObserve true 10 = .okRetagPair 5 5 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
 /-- `D1`/`D2` **non-vacuity witnesses for Trusted conditional universal laws**: instantiates the
 hypotheses of `trusted_evalOperand_cast_deref_unsupported`, `trusted_evalOperand_move_pure_cast_deinit`,
 `trusted_fnEntryRetagPerm`, and `trusted_evalFnEntryRetag_ref_creates_protected_child`. -/
@@ -2480,6 +2536,7 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% @trusted_fnEntryRetagPerm ∧
     type_of% @trusted_ocEraseRetags_retag_free ∧
     type_of% @trusted_fnEntryCompatibleWithCallSite_transmute_boundary ∧
+    type_of% trusted_d2_indirect_fnptr_calls ∧
     type_of% trusted_d1_d2_nonvacuity_witnesses ∧
     type_of% @mr_ocEraseBody_cast_free ∧
     type_of% @mr_basic_retag_fnEntry_irrelevant ∧
@@ -2517,7 +2574,7 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
    @trusted_evalStmt_setDiscriminant_opaqueCast, @trusted_evalTerminator_drop_opaqueCast,
    @trusted_evalFnEntryRetag_attach, @trusted_evalFnEntryRetag_ref_creates_protected_child,
    @trusted_restoreCallerProtectors_law, @trusted_fnEntryRetagPerm, @trusted_ocEraseRetags_retag_free,
-   @trusted_fnEntryCompatibleWithCallSite_transmute_boundary,
+   @trusted_fnEntryCompatibleWithCallSite_transmute_boundary, trusted_d2_indirect_fnptr_calls,
    trusted_d1_d2_nonvacuity_witnesses, @mr_ocEraseBody_cast_free,
    @mr_basic_retag_fnEntry_irrelevant, @mr_tb_retag_raw_noop,
    @mr_reborrowSettings_ref_protector, @mr_reborrowSettings_box_weak_protector,
@@ -2546,6 +2603,8 @@ run_cmd do
   -- 2. Bridge-reality audit: our theorems transitively reach the real interpreters.
   let bridgeReq : List (Lean.Name × Lean.Name) :=
     [ (ns ++ `mrOcObserve_table, `MiniRustSpec.Interp.stepM),
+      (ns ++ `trusted_d2_indirect_fnptr_calls, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `trusted_d2_indirect_fnptr_calls, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_setDiscriminant_payload_agreement, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mr_oc_setDiscriminant_payload_agreement, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_protected_drop_mode_sensitive, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
