@@ -23,12 +23,14 @@ the counterexamples that motivate its design:
 
 1. **Portfolios and `toOption`:** choosing the first producer that returns
    any candidate and only then checking it loses a valid backup
-   (`naive_precheck_orelse_drops_valid_backup`); `firstAccepted` skips an
-   oversized witness and a wrong candidate (`canary_portfolio`); `toOption`
-   projects accepted and rejected gate results (`canary_toOption_projection`).
+   (`naive_precheck_orelse_drops_valid_backup`); `firstAccepted` and
+   `firstAcceptedOpt` skip an oversized witness, a wrong candidate, and a
+   trap (`canary_portfolio`, `canary_firstAcceptedOpt`); `toOption` projects
+   accepted and rejected gate results (`canary_toOption_projection`).
 2. **Fallbacks:** re-checking the fallback's result with an incomplete
    checker aborts on an input where the fallback is correct
-   (`runtime_checked_fallback_aborts`), while `withFallback` stays sound.
+   (`runtime_checked_fallback_aborts`), while `withFallback` stays sound
+   both on single gates and on portfolios (`canary_withFallback_portfolio`).
 3. **Hint steps and streams:** a rejected hint falls back to the current
    state (`canary_hint_steps`), and a stream stops at the first rejected
    chunk without emitting it while every emitted chunk stays valid
@@ -55,7 +57,10 @@ the counterexamples that motivate its design:
    (`rung15_without_callerMemPreserved_unsound`); a memory-preserving
    producer with the same wrong candidate does not
    (`canary_rung15_preserving`), including under `isUnsafe = true`, unwinding,
-   and strict effect-mask weakening (`canary_rung15_unsafe_and_effects`).
+   and strict `terminates` weakening (`canary_rung15_unsafe_and_effects`), as
+   well as the accepted-candidate commit path (distinct from fallback),
+   divergence propagation, and strict `noUnwind` weakening
+   (`canary_rung15_accept_and_diverge`).
 7. **Anti-vacuity:** an always-`none` body has no accepted witness, and an
    accepting body does (`canary_hasAcceptedWitness`); the slice-DST gate's
    specification kills a mutant inside the accepted fibre
@@ -161,6 +166,26 @@ theorem canary_toOption_projection :
       toOption (evalGate eqGate 7 raw) = some y → y = 7) :=
   ⟨rfl, rfl, fun raw y h => toOption_evalGate_sound eqGate 7 raw y True.intro h⟩
 
+/-- `firstAcceptedOpt` returns `none` on the empty list, skips oversized,
+wrong, and trapped entries to return `some (.ok 11)`, reports the last
+rejection when every entry fails, and preserves soundness across arbitrary
+producer lists. -/
+theorem canary_firstAcceptedOpt :
+    firstAcceptedOpt succGate 10
+        ([] : List (RawOutcome Unit Nat (List Nat))) = none ∧
+    firstAcceptedOpt succGate 10
+        ([.candidate 11 [0, 0, 0, 0, 0], .candidate 999 [], .trapped,
+          .candidate 11 [1, 2]] : List (RawOutcome Unit Nat (List Nat))) =
+      some (.ok 11) ∧
+    firstAcceptedOpt succGate 10
+        ([.candidate 999 [], .prodErr ()] :
+          List (RawOutcome Unit Nat (List Nat))) =
+      some (.error (.producerFailed ())) ∧
+    (∀ rs : List (RawOutcome Unit Nat (List Nat)), ∀ y,
+      firstAcceptedOpt succGate 10 rs = some (.ok y) → y = 11) :=
+  ⟨rfl, rfl, rfl, fun rs y h =>
+    firstAcceptedOpt_sound succGate 10 True.intro rs y h⟩
+
 /-! ## Fallbacks -/
 
 /-- Sound for `x ≤ y` but accepts only `y = x + 1`. -/
@@ -198,6 +223,27 @@ theorem runtime_checked_fallback_aborts :
   ⟨Nat.le_refl, rfl, fun raw =>
     withFallback_total_sound strictSuccGate 5 raw (fun x => x) True.intro
       (fun x _ => Nat.le_refl x)⟩
+
+/-- Composing a portfolio with a verified fallback via
+`withFallback_firstAccepted_sound` accepts a valid candidate, falls back when
+every producer fails, and stays sound for every producer list. -/
+theorem canary_withFallback_portfolio :
+    withFallback 5
+        (firstAccepted strictSuccGate 5
+          ([.trapped, .candidate 6 ()] :
+            List (RawOutcome Unit Nat Unit)))
+        (fun x => x) = 6 ∧
+    withFallback 5
+        (firstAccepted strictSuccGate 5
+          ([.candidate 4 (), .prodErr ()] :
+            List (RawOutcome Unit Nat Unit)))
+        (fun x => x) = 5 ∧
+    (∀ rs : List (RawOutcome Unit Nat Unit),
+      5 ≤ withFallback 5 (firstAccepted strictSuccGate 5 rs)
+        (fun x => x)) :=
+  ⟨rfl, rfl, fun rs =>
+    withFallback_firstAccepted_sound strictSuccGate 5 rs (fun x => x)
+      True.intro (fun x _ => Nat.le_refl x)⟩
 
 /-! ## Hint steps and streams -/
 
@@ -564,18 +610,17 @@ def unsafeUnwindProducer (q : Nat × Nat)
 
 /-- Exercises `rung15_with_callerMemPreserved_sound` under `isUnsafe = true`,
 a nontrivial `safetyPre`, and an unwinding producer. The statement itself
-pins the strict effect weakening (`fEff` guarantees `noAbort`, `outerEff`
-does not, and `maskLe` holds in one direction only) and the producer's own
-`fEff` contract, so the weakening cannot silently collapse to equal masks.
-Both composed paths are inhabited on `(mem, x) = (10, 5)`: the
-wrong candidate falls back to `15` with memory `10`, and the unwind
-propagates. The same `.faultUB`-capable producer fails a safe
-(`isUnsafe = false`) contract even when `safetyPre := False`. -/
+pins strict effect weakening on the live `terminates` bit (`fEff` guarantees
+`terminates` and `noAbort`, `outerEff` drops both, and `maskLe` holds in one
+direction only) and the producer's own `fEff` contract, so the weakening
+cannot collapse to equal masks. Both fallback and unwind paths are inhabited
+on `(mem, x) = (10, 5)`, and the same `.faultUB`-capable producer fails a
+safe (`isUnsafe = false`) contract even when `safetyPre := False`. -/
 theorem canary_rung15_unsafe_and_effects :
     let fEff : EffectMask :=
       { terminates := true, noUnwind := false, noAbort := true }
     let outerEff : EffectMask :=
-      { terminates := true, noUnwind := false, noAbort := false }
+      { terminates := false, noUnwind := false, noAbort := false }
     let run := rung15Run unsafeUnwindProducer sumCheck keepMem sumFb
     maskLe outerEff fEff ∧ ¬ maskLe fEff outerEff ∧
     ContractHolds
@@ -594,7 +639,8 @@ theorem canary_rung15_unsafe_and_effects :
         false run := by
   intro fEff outerEff run
   have hMask : maskLe outerEff fEff :=
-    ⟨fun _ => rfl, fun h => Bool.noConfusion h, fun h => Bool.noConfusion h⟩
+    ⟨fun h => Bool.noConfusion h, fun h => Bool.noConfusion h,
+      fun h => Bool.noConfusion h⟩
   have hF : ContractHolds
       (rung15ProducerContract (Ret := Nat × Unit) (fun q => q.1 = 10)
         (fun _ => True) fEff)
@@ -620,7 +666,7 @@ theorem canary_rung15_unsafe_and_effects :
         | inr hU =>
           rw [hU]
           exact ⟨rfl, rfl⟩
-  refine ⟨hMask, fun h => Bool.noConfusion (h.2.2 rfl), hF,
+  refine ⟨hMask, fun h => Bool.noConfusion (h.1 rfl), hF,
     rung15_with_callerMemPreserved_sound (fun q => q.1 = 10) (fun _ => True)
       sumPost fEff outerEff true unsafeUnwindProducer sumCheck keepMem sumFb
       hMask hF (fun q y w _ h => sumCheck_sound q y w h)
@@ -630,6 +676,82 @@ theorem canary_rung15_unsafe_and_effects :
   intro hSafe
   exact hSafe.1 (0, 0) (fun h => Bool.noConfusion h)
     ⟨.faultUB, Or.inr ⟨by decide, rfl⟩, rfl⟩
+
+/-- Output must be at least `x + mem`, with memory unchanged. -/
+def geSumPost (q : Nat × Nat) (y : Nat) (m' : Nat) : Prop :=
+  q.2 + q.1 ≤ y ∧ m' = q.1
+
+def geSumCheck (q : Nat × Nat) (y : Nat) (_ : Unit) : Bool :=
+  Nat.ble (q.2 + q.1) y
+
+/-- A memory-preserving producer that may propose an accepted candidate
+(`x + mem + 1`, distinct from `sumFb`), a rejected candidate (`0`), or
+diverge. -/
+def acceptOrDivergeProducer (q : Nat × Nat)
+    (o : RunOutcome (Nat × Unit) Nat) : Prop :=
+  o = .terminal (.returned (q.2 + q.1 + 1, ()) q.1) ∨
+  o = .terminal (.returned (0, ()) q.1) ∨
+  o = .diverged
+
+/-- Exercises the `check = true` commit branch of `rung15Step` (returning `16`,
+strictly distinct from fallback `15`), the `check = false` fallback branch
+(returning `15`), `.diverged` propagation, and strict effect weakening on the
+live `noUnwind` bit. -/
+theorem canary_rung15_accept_and_diverge :
+    let fEff : EffectMask :=
+      { terminates := false, noUnwind := true, noAbort := true }
+    let outerEff : EffectMask :=
+      { terminates := false, noUnwind := false, noAbort := true }
+    let run := rung15Run acceptOrDivergeProducer geSumCheck keepMem sumFb
+    maskLe outerEff fEff ∧ ¬ maskLe fEff outerEff ∧
+    ContractHolds
+        (rung15ProducerContract (Ret := Nat × Unit) (fun _ => True)
+          (fun _ => True) fEff)
+        false acceptOrDivergeProducer ∧
+    ContractHolds
+        (rung15OuterContract (fun _ => True) (fun _ => True) geSumPost
+          outerEff)
+        false run ∧
+    run (10, 5) (.terminal (.returned 16 10)) ∧
+    run (10, 5) (.terminal (.returned 15 10)) ∧
+    run (10, 5) .diverged := by
+  intro fEff outerEff run
+  have hMask : maskLe outerEff fEff :=
+    ⟨fun h => Bool.noConfusion h, fun h => Bool.noConfusion h, fun _ => rfl⟩
+  have hF : ContractHolds
+      (rung15ProducerContract (Ret := Nat × Unit) (fun _ => True)
+        (fun _ => True) fEff)
+      false acceptOrDivergeProducer := by
+    refine ⟨?_, ?_⟩
+    · intro q _ hUb
+      cases hUb with
+      | inl h => cases h
+      | inr h =>
+        cases h with
+        | inl h => cases h
+        | inr h => cases h
+    · intro q _ o ho
+      cases ho with
+      | inl hR =>
+        rw [hR]
+        exact rfl
+      | inr hRest =>
+        cases hRest with
+        | inl hR =>
+          rw [hR]
+          exact rfl
+        | inr hDiv =>
+          rw [hDiv]
+          exact rfl
+  exact ⟨hMask, fun h => Bool.noConfusion (h.2.1 rfl), hF,
+    rung15_with_callerMemPreserved_sound (fun _ => True) (fun _ => True)
+      geSumPost fEff outerEff false acceptOrDivergeProducer geSumCheck
+      keepMem sumFb hMask hF
+      (fun _ _ _ _ h => ⟨Nat.le_of_ble_eq_true h, rfl⟩)
+      (fun _ _ => ⟨Nat.le_refl _, rfl⟩),
+    ⟨.terminal (.returned (5 + 10 + 1, ()) 10), Or.inl rfl, rfl⟩,
+    ⟨.terminal (.returned (0, ()) 10), Or.inr (Or.inl rfl), rfl⟩,
+    ⟨.diverged, Or.inr (Or.inr rfl), rfl⟩⟩
 
 /-! ## Anti-vacuity -/
 
