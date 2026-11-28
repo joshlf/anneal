@@ -232,7 +232,9 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             # only for type-preserving casts (`dual_type_switch_erasure_boundary`). On that
             # post-borrowck image Trusted `stepMirFn` agrees with both authorities on ALL 44 cells,
             # so the post-borrowck bundles gate every case, case `8` included
-            # (`post_borrowck_bundle_closes_case8`, `dual_post_borrowck_exact_all_nat`).
+            # (`post_borrowck_bundle_closes_case8`, `dual_post_borrowck_exact_all_nat`), while
+            # `dual_d1_lowering_dependent_cells` and `dual_d3_zst_fixture_divergence` explicitly
+            # document lowering-dependent `D1` cells `2`/`7` and the `D3` case-`17` ZST fixture.
             ("opaqueCast", "proved_corresponding"),
             # UnwindSetDiscrAndFnPtr{MR,LM} (`C9`) and NullaryAndPtrCoercion{MR,LM,Bundle}.
             ("unwrapUnsafeBinder", "proved_corresponding"),

@@ -2062,78 +2062,6 @@ theorem postBorrowck_modeSensitivity_present (A : OcFpLmAuthority)
   · exact ⟨_, rfl, rfl, rfl, rfl⟩
   · exact ⟨_, rfl, rfl, rfl, rfl⟩
 
-/-! ## §7f. Lowering-Dependent `D1` Cells (`2`, `7`)
-
-The 3-way `.ub` agreement of `D1` cases `2` (use after move) and `7` (use after
-a glue-free drop) is NOT a fact about upstream MiniRust or vendored Miri: it
-holds only under Anneal's move-deinit / drop-deinit lowering, which the
-MiniRust programs and the LeanMiri adapter adopt to mirror Trusted.
-* MiniRust lowers the move of case `2` as `Load` + `Deinit` and the drop of
-  case `7` as `Deinit`, so `ocMrProg7` IS `ocMrProg5` (the `Deinit` case);
-  under upstream `minimize` lowering both programs return `7`, NOT `.ub`.
-* LeanMiri's case `7` runs the very same `lmOcDeinitThenRead` harness as case
-  `5` (locked definitionally in the cross-root bridge), and its case `2` UB
-  comes from the Anneal adapter `annealEvalOperand`, which invalidates moved
-  locals, whereas vendored `Miri.Interpreter.evalOperand` treats `Move` like
-  `Copy` ("no invented move invalidation").
-* Only Trusted's fixture `7` contains a genuine `Drop` terminator. -/
-
-/-- Whether a `CapturedMir` body contains a `Drop` terminator. -/
-def ocBodyHasDrop (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) : Bool :=
-  b.basicBlocks.any fun bb =>
-    match bb.terminator.kind with
-    | .drop _ _ _ => true
-    | _ => false
-
-/-- **Lowering-dependent `D1` cells (`2`, `7`)**, for every certified LeanMiri
-authority and both modes:
-1. MiniRust's case `7` program is literally its case `5` (`Deinit`) program;
-2. among the 22 shared fixtures, ONLY Trusted's fixture `7` has a `Drop`
-   terminator (fixture `5` uses a `Deinit` statement instead);
-3. cases `2` and `7` are `.ub` on all three authorities;
-4. under upstream `minimize` lowering MiniRust returns `7` on both, i.e. the
-   agreement with Trusted is lowering-dependent. -/
-theorem dual_d1_lowering_dependent_cells (A : OcFpLmAuthority)
-    (hA : lmTableCheckOf A = true) (tb : Bool) :
-    ocMrProg7 = ocMrProg5 ∧
-    mrOcObserve tb 7 = mrOcObserve tb 5 ∧
-    ocBodyHasDrop ocCase7Mir = true ∧ ocBodyHasDrop ocCase5Mir = false ∧
-    (List.range mrOcCaseCount).filter (fun i =>
-      match ocCaseFixture? i with
-      | some (b, _) => ocBodyHasDrop b
-      | none => false) = [7] ∧
-    trustedVerdict tb 2 = some .undefinedBehavior ∧
-    mrVerdict tb 2 = some .undefinedBehavior ∧
-    A.verdict tb 2 = some .undefinedBehavior ∧
-    trustedVerdict tb 7 = some .undefinedBehavior ∧
-    mrVerdict tb 7 = some .undefinedBehavior ∧
-    A.verdict tb 7 = some .undefinedBehavior ∧
-    ocRun tb [] ocMrProg2Minimize = .okScalar 7 ∧
-    ocRun tb [] ocMrProg7Minimize = .okScalar 7 ∧
-    ocVerdictOf (ocRun tb [] ocMrProg2Minimize) ≠ trustedVerdict tb 2 ∧
-    ocVerdictOf (ocRun tb [] ocMrProg7Minimize) ≠ trustedVerdict tb 7 := by
-  have hMin := mr_oc_minimize_lowering_contrasts
-  have h2M : ocRun tb [] ocMrProg2Minimize = .okScalar 7 := by
-    cases tb
-    · exact hMin.1
-    · exact hMin.2.1
-  have h7M : ocRun tb [] ocMrProg7Minimize = .okScalar 7 := by
-    cases tb
-    · exact hMin.2.2.1
-    · exact hMin.2.2.2.1
-  have hT2 : trustedVerdict tb 2 = some .undefinedBehavior := by
-    rw [trustedVerdict_cell tb 2 (by decide)]; cases tb <;> rfl
-  have hT7 : trustedVerdict tb 7 = some .undefinedBehavior := by
-    rw [trustedVerdict_cell tb 7 (by decide)]; cases tb <;> rfl
-  refine ⟨rfl, rfl, by decide +kernel, by decide +kernel, by decide +kernel,
-    hT2, ?_, ?_, hT7, ?_, ?_, h2M, h7M, ?_, ?_⟩
-  · rw [mrVerdict_cell tb 2 (by decide)]; cases tb <;> rfl
-  · rw [lmTableCheckOf_sound A hA tb 2 (by decide)]; cases tb <;> rfl
-  · rw [mrVerdict_cell tb 7 (by decide)]; cases tb <;> rfl
-  · rw [lmTableCheckOf_sound A hA tb 7 (by decide)]; cases tb <;> rfl
-  · rw [h2M, hT2]; decide
-  · rw [h7M, hT7]; decide
-
 /-! ## §7e. Verbatim-Copy Locks for the Shared Trusted Runner
 
 `section Fixtures` of `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR` is shared
@@ -2278,6 +2206,163 @@ theorem ocCombine_copy_lock {L : Type} [DecidableEq L] (g : L → MrOcFpObs)
   · have hne : g a ≠ g b := fun e =>
       h ((hrt a).symm.trans ((congrArg g' e).trans (hrt b)))
     rw [ite_eq_right h, ite_eq_right hne, hu]
+
+/-! ## §7f. Lowering-Dependent `D1` Cells (`2`, `7`)
+
+The 3-way `.ub` agreement of `D1` cases `2` (use after move) and `7` (use after
+a glue-free drop) is NOT a fact about upstream MiniRust or vendored Miri: it
+holds only under Anneal's move-deinit / drop-deinit lowering, which the
+MiniRust programs and the LeanMiri adapter adopt to mirror Trusted.
+* MiniRust lowers the move of case `2` as `Load` + `Deinit` and the drop of
+  case `7` as `Deinit`, so `ocMrProg7` IS `ocMrProg5` (the `Deinit` case);
+  under upstream `minimize` lowering both programs return `7`, NOT `.ub`.
+* LeanMiri's case `7` runs the very same `lmOcDeinitThenRead` harness as case
+  `5` (locked definitionally in the cross-root bridge), and its case `2` UB
+  comes from the Anneal adapter `annealEvalOperand`, which invalidates moved
+  locals, whereas vendored `Miri.Interpreter.evalOperand` treats `.Move`
+  definitionally identically to `.Copy` (proved universally by `Eq.refl` in
+  the cross-root bridge).
+* On Trusted `stepMirFn`, replacing `.move` with `.copy` in `ocCase2Mir`
+  (`ocMoveToCopyBody`) or replacing `.drop` with `.goto` in `ocCase7Mir`
+  (`ocDropToNopBody`) yields `.okScalar 7`, proving the Trusted UB comes
+  strictly from move / drop invalidation.
+* Among all 22 canonical fixtures ONLY fixture `7` has a `Drop` terminator;
+  among all 7 companions ONLY `protectedDrop` (`ocCase7ProtectedDropMir`) does. -/
+
+/-- Whether a `CapturedMir` body contains a `Drop` terminator. -/
+def ocBodyHasDrop (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) : Bool :=
+  b.basicBlocks.any fun bb =>
+    match bb.terminator.kind with
+    | .drop _ _ _ => true
+    | _ => false
+
+/-- Replace `.move p` with `.copy p` in an operand (modeling vendored
+`Miri.Interpreter.evalOperand`, which treats `.Move` and `.Copy` identically). -/
+def ocMoveToCopyOperand :
+    Trusted.Rustc.V2026_06_01.MirAst.Operand →
+      Trusted.Rustc.V2026_06_01.MirAst.Operand
+  | .move p => .copy p
+  | op => op
+
+/-- Replace `.move` operands with `.copy` inside an rvalue. -/
+def ocMoveToCopyRvalue :
+    Trusted.Rustc.V2026_06_01.MirAst.Rvalue →
+      Trusted.Rustc.V2026_06_01.MirAst.Rvalue
+  | .use op => .use (ocMoveToCopyOperand op)
+  | .repeat op n => .repeat (ocMoveToCopyOperand op) n
+  | .cast k op t => .cast k (ocMoveToCopyOperand op) t
+  | .binaryOp o a b => .binaryOp o (ocMoveToCopyOperand a) (ocMoveToCopyOperand b)
+  | .unaryOp o a => .unaryOp o (ocMoveToCopyOperand a)
+  | .aggregate k ops => .aggregate k (ops.map ocMoveToCopyOperand)
+  | .shallowInitBox op t => .shallowInitBox (ocMoveToCopyOperand op) t
+  | .wrapUnsafeBinder op t => .wrapUnsafeBinder (ocMoveToCopyOperand op) t
+  | rv => rv
+
+/-- Replace `.move` operands with `.copy` inside a statement. -/
+def ocMoveToCopyStmt :
+    Trusted.Rustc.V2026_06_01.MirAst.StatementKind →
+      Trusted.Rustc.V2026_06_01.MirAst.StatementKind
+  | .assign p rv => .assign p (ocMoveToCopyRvalue rv)
+  | k => k
+
+/-- Replace `.move` with `.copy` across all statements of a `CapturedMir`. -/
+def ocMoveToCopyBody (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  { b with basicBlocks := b.basicBlocks.map fun bb =>
+      { bb with statements := bb.statements.map fun s =>
+          { s with kind := ocMoveToCopyStmt s.kind } } }
+
+/-- Replace glue-free `.drop _ target _` terminators with `.goto target`
+(modeling upstream `minimize`, which skips deinitialization on glue-free drops). -/
+def ocDropToNopBody (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    Trusted.Rustc.V2026_06_01.MirAst.CapturedMir :=
+  { b with basicBlocks := b.basicBlocks.map fun bb =>
+      { bb with terminator :=
+          { bb.terminator with kind := match bb.terminator.kind with
+              | .drop _ target _ => .goto target
+              | k => k } } }
+
+/-- Exact predicate for the lowering-dependent `D1` cells (`2` and `7`). -/
+def ocLoweringDependent (idx : Nat) : Bool :=
+  idx == 2 || idx == 7
+
+/-- **Lowering-dependent `D1` cells (`2`, `7`)**, for every certified LeanMiri
+authority and both modes:
+1. MiniRust's case `7` program is literally its case `5` (`Deinit`) program;
+2. among the 22 shared fixtures ONLY fixture `7` has a `Drop` terminator, and
+   among the 7 companions ONLY `protectedDrop` does;
+3. cases `2` and `7` are `.ub` on all three authorities;
+4. under upstream `minimize` lowering MiniRust returns `7` on both;
+5. on Trusted `stepMirFn`, rewriting `.move → .copy` (`ocMoveToCopyBody`) on
+   case `2` or `.drop → .goto` (`ocDropToNopBody`) on case `7` yields `7`. -/
+theorem dual_d1_lowering_dependent_cells (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) (tb : Bool) :
+    ocMrProg7 = ocMrProg5 ∧
+    mrOcObserve tb 7 = mrOcObserve tb 5 ∧
+    ocBodyHasDrop ocCase7Mir = true ∧ ocBodyHasDrop ocCase5Mir = false ∧
+    (List.range mrOcCaseCount).filter (fun i =>
+      match ocCaseFixture? i with
+      | some (b, _) => ocBodyHasDrop b
+      | none => false) = [7] ∧
+    allOcFpCompanions.filter (fun c => ocBodyHasDrop (ocCompanionBody c)) =
+      [.protectedDrop] ∧
+    trustedVerdict tb 2 = some .undefinedBehavior ∧
+    mrVerdict tb 2 = some .undefinedBehavior ∧
+    A.verdict tb 2 = some .undefinedBehavior ∧
+    trustedVerdict tb 7 = some .undefinedBehavior ∧
+    mrVerdict tb 7 = some .undefinedBehavior ∧
+    A.verdict tb 7 = some .undefinedBehavior ∧
+    ocRun tb [] ocMrProg2Minimize = .okScalar 7 ∧
+    ocRun tb [] ocMrProg7Minimize = .okScalar 7 ∧
+    ocVerdictOf (ocRun tb [] ocMrProg2Minimize) ≠ trustedVerdict tb 2 ∧
+    ocVerdictOf (ocRun tb [] ocMrProg7Minimize) ≠ trustedVerdict tb 7 ∧
+    mrOcTrustedObsOf .scalar
+      (ocRunTrustedRaw (ocMoveToCopyBody ocCase2Mir) []) = .okScalar 7 ∧
+    mrOcTrustedObsOf .scalar
+      (ocRunTrustedRaw (ocDropToNopBody ocCase7Mir) []) = .okScalar 7 := by
+  have hMin := mr_oc_minimize_lowering_contrasts
+  have h2M : ocRun tb [] ocMrProg2Minimize = .okScalar 7 := by
+    cases tb
+    · exact hMin.1
+    · exact hMin.2.1
+  have h7M : ocRun tb [] ocMrProg7Minimize = .okScalar 7 := by
+    cases tb
+    · exact hMin.2.2.1
+    · exact hMin.2.2.2.1
+  have hT2 : trustedVerdict tb 2 = some .undefinedBehavior := by
+    rw [trustedVerdict_cell tb 2 (by decide)]; cases tb <;> rfl
+  have hT7 : trustedVerdict tb 7 = some .undefinedBehavior := by
+    rw [trustedVerdict_cell tb 7 (by decide)]; cases tb <;> rfl
+  refine ⟨rfl, rfl, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, hT2, ?_, ?_, hT7, ?_, ?_, h2M, h7M, ?_, ?_,
+    by decide +kernel, by decide +kernel⟩
+  · rw [mrVerdict_cell tb 2 (by decide)]; cases tb <;> rfl
+  · rw [lmTableCheckOf_sound A hA tb 2 (by decide)]; cases tb <;> rfl
+  · rw [mrVerdict_cell tb 7 (by decide)]; cases tb <;> rfl
+  · rw [lmTableCheckOf_sound A hA tb 7 (by decide)]; cases tb <;> rfl
+  · rw [h2M, hT2]; decide
+  · rw [h7M, hT7]; decide
+
+/-- Exact characterization of `ocLoweringDependent`: true iff `idx ∈ {2, 7}`,
+both in `D1` and `threeWay`, and `.ub` across all three authorities. -/
+theorem ocLoweringDependent_characterization (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) (tb : Bool) (idx : Nat) :
+    (ocLoweringDependent idx = true ↔ idx = 2 ∨ idx = 7) ∧
+    (ocLoweringDependent idx = true →
+      ocDomainOf idx = .d1 ∧ ocClassOf idx = .threeWay ∧
+      trustedVerdict tb idx = some .undefinedBehavior ∧
+      mrVerdict tb idx = some .undefinedBehavior ∧
+      A.verdict tb idx = some .undefinedBehavior) := by
+  have hIff : ocLoweringDependent idx = true ↔ idx = 2 ∨ idx = 7 := by
+    unfold ocLoweringDependent
+    rw [Bool.or_eq_true, beq_iff_eq, beq_iff_eq]
+  refine ⟨hIff, fun h => ?_⟩
+  have hCells := dual_d1_lowering_dependent_cells A hA tb
+  rcases hIff.mp h with rfl | rfl
+  · exact ⟨rfl, rfl, hCells.2.2.2.2.2.2.1, hCells.2.2.2.2.2.2.2.1,
+      hCells.2.2.2.2.2.2.2.2.1⟩
+  · exact ⟨rfl, rfl, hCells.2.2.2.2.2.2.2.2.2.1, hCells.2.2.2.2.2.2.2.2.2.2.1,
+      hCells.2.2.2.2.2.2.2.2.2.2.2.1⟩
 
 /-! ## §8. Non-Vacuity of the LeanMiri Hypotheses (Root-Side Witness) -/
 
@@ -2439,6 +2524,7 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone (A : OcFpLmAuthority)
       type_of% (dual_mode_sensitivity_exact A hA idx hi)) ∧
     type_of% (dual_d1_cast_erasure_and_boundary A hA) ∧
     (∀ tb, type_of% (dual_d1_lowering_dependent_cells A hA tb)) ∧
+    (∀ tb idx, type_of% (ocLoweringDependent_characterization A hA tb idx)) ∧
     type_of% (dual_d2_fnentry_protectors_and_transmute_boundary A hA) ∧
     type_of% (dual_d3_dereferenceable_and_zst_boundary A hA) ∧
     type_of% dual_d2_machine_termination_contrast ∧
@@ -2459,6 +2545,7 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone (A : OcFpLmAuthority)
    dual_mode_sensitivity_exact A hA,
    dual_d1_cast_erasure_and_boundary A hA,
    dual_d1_lowering_dependent_cells A hA,
+   ocLoweringDependent_characterization A hA,
    dual_d2_fnentry_protectors_and_transmute_boundary A hA,
    dual_d3_dereferenceable_and_zst_boundary A hA,
    dual_d2_machine_termination_contrast,
@@ -2695,7 +2782,11 @@ run_cmd do
       ns ++ `trustedPostBorrowckObserve_eq_uniform_erased,
       ns ++ `postBorrowckDomain_bundle_claims,
       ns ++ `postBorrowck_modeSensitivity_present,
-      ns ++ `ocBodyHasDrop, ns ++ `dual_d1_lowering_dependent_cells,
+      ns ++ `ocBodyHasDrop, ns ++ `ocMoveToCopyOperand,
+      ns ++ `ocMoveToCopyRvalue, ns ++ `ocMoveToCopyStmt,
+      ns ++ `ocMoveToCopyBody, ns ++ `ocDropToNopBody,
+      ns ++ `ocLoweringDependent, ns ++ `dual_d1_lowering_dependent_cells,
+      ns ++ `ocLoweringDependent_characterization,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   for c in spotlightDecls do
@@ -2835,6 +2926,11 @@ run_cmd do
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocEraseBody,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocEraseRetags,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocRunTrustedRaw ]),
+      (ns ++ `dual_d1_lowering_dependent_cells,
+        [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocMrProg2Minimize,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocMrProg7Minimize,
+          ns ++ `ocMoveToCopyBody, ns ++ `ocDropToNopBody ]),
       (ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
         [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve,

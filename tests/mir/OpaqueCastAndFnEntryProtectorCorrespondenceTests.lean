@@ -59,10 +59,14 @@ import MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
      observer is fail-closed because it factors through the `Eq.refl`-locked
      fixture table);
    - pins the lowering-dependent `D1` cells `2` / `7`
-     (`dual_d1_lowering_dependent_cells`): LeanMiri's case `7` IS its case `5`
-     harness (`lmCase7_is_case5_harness`, `Eq.refl` for every mode), its case
-     `2` path reaches the Anneal adapter `annealEvalOperand`, and upstream
-     `minimize` makes MiniRust return `7` on both;
+     (`dual_d1_lowering_dependent_cells`, `ocLoweringDependent_characterization`):
+     LeanMiri's case `7` IS its case `5` harness (`lmCase7_is_case5_harness`,
+     `Eq.refl` for every mode); vendored `Miri.Interpreter.evalOperand` treats
+     `.Move` and `.Copy` identically for EVERY state/frame/place
+     (`vendored_evalOperand_move_eq_copy`, `Eq.refl`), while replacing `.move`
+     by `.copy` in `ocCase2Mir` turns BOTH Trusted and LeanMiri from `.ub` to
+     `okScalar 7` (`lmCase2MoveAsCopy_eq`); and upstream `minimize` makes
+     MiniRust return `7` on both;
    - locks LeanMiri's canonical cell `17` to its dangling-ZST companion
      harness for every mode (`lmCompanion_zstDangling_is_canonical17`) and
      closes `dual_d3_zst_fixture_divergence` (Trusted's canonical case `17` is
@@ -309,7 +313,15 @@ theorem d1_lowering_dependent_canaries :
     ocRun true [] ocMrProg7Minimize = .okScalar 7 ∧
     mrOcObserve true 7 = mrOcObserve true 5 ∧
     ocBodyHasDrop ocCase7Mir = true ∧ ocBodyHasDrop ocCase5Mir = false ∧
-    ocBodyHasDrop ocCase7ProtectedDropMir = true := by
+    ocBodyHasDrop ocCase7ProtectedDropMir = true ∧
+    allOcFpCompanions.filter (fun c => ocBodyHasDrop (ocCompanionBody c)) =
+      [.protectedDrop] ∧
+    ocLoweringDependent 2 = true ∧ ocLoweringDependent 7 = true ∧
+    ocLoweringDependent 5 = false ∧ ocLoweringDependent 8 = false ∧
+    mrOcTrustedObsOf .scalar
+      (ocRunTrustedRaw (ocMoveToCopyBody ocCase2Mir) []) = .okScalar 7 ∧
+    mrOcTrustedObsOf .scalar
+      (ocRunTrustedRaw (ocDropToNopBody ocCase7Mir) []) = .okScalar 7 := by
   decide +kernel
 
 /-- **Case `17` fixture divergence (direct kernel execution)**: MiniRust's
@@ -549,8 +561,770 @@ theorem root_capstone_instantiation :
 
 /-! ## §2. Cross-Root 3-Way Kernel Closure (`MiniRustSpec` + `LeanMiriSpec` + `Anneal`) -/
 
--- The bridge is one long `do` block: raise only the ELABORATOR's recursion
--- limit for it (every declaration it adds is still checked by the kernel).
+section CrossRootForgedControls
+open Lean Meta
+
+private structure CrossRootForgedArgs where
+  authUC : Expr
+  invAuth : Expr
+  swapUbAuth : Expr
+  swapPhaseAuth : Expr
+  lmToMr : Expr
+  mrOutToLm : Expr
+  runnerTy : Expr
+  runnerPf : Expr
+  forgedRunnerTy : Expr
+  forgedRunnerPf : Expr
+  compObsU : Expr
+  erasedULhs : Expr
+  phaseCompObs : Expr
+  evalOpTy : Expr
+  evalOpPf : Expr
+  forgedEvalOpTy : Expr
+  forgedEvalOpPf : Expr
+  nilMir : Expr
+  unsV : Expr
+  noneV : Expr
+
+private def crNs : Name :=
+  `Anneal.Mir.OpaqueCastAndFnEntryProtectorCorrespondenceTests.CrossRoot
+private def crBNs : Name :=
+  `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec
+private def crCNs : Name :=
+  `Anneal.Mir.DropBinderAndSubtypeBundle.Corpus
+private def crMrNs : Name :=
+  `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
+private def crLmNs : Name :=
+  `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM
+
+private def crThmD (name : Name) (ty pf : Expr) : Declaration :=
+  .thmDecl { name, levelParams := [], type := ty, value := pf }
+
+private def crDefD (name : Name) (ty val : Expr) : Declaration :=
+  .defnDecl { name, levelParams := [], type := ty, value := val,
+              hints := .regular 0, safety := .safe }
+
+private def crMkEq (ty l r : Expr) : Expr :=
+  mkApp3 (mkConst ``Eq [1]) ty l r
+
+private def crMkRefl (ty x : Expr) : Expr :=
+  mkApp2 (mkConst ``Eq.refl [1]) ty x
+
+private def crEqTrue (e : Expr) : Expr :=
+  crMkEq (mkConst ``Bool) e (mkConst ``Bool.true)
+
+private def crReflTrue : Expr :=
+  crMkRefl (mkConst ``Bool) (mkConst ``Bool.true)
+
+private def crEqFalse (e : Expr) : Expr :=
+  crMkEq (mkConst ``Bool) e (mkConst ``Bool.false)
+
+private def crReflFalse : Expr :=
+  crMkRefl (mkConst ``Bool) (mkConst ``Bool.false)
+
+private def buildForgedCore (a : CrossRootForgedArgs) :
+    CoreM (List (String × Declaration × Declaration)) := do
+  let natTy := mkConst ``Nat
+  let obsTy := mkConst (crBNs ++ `OcFpObs)
+  let domNs := crBNs ++ `OcFpDomain
+  let mrObsTy0 := mkConst (crMrNs ++ `MrOcFpObs)
+  let lmObsTy := mkConst (crLmNs ++ `LmOcFpObs)
+  let lmObsC (c : Name) : Expr := mkConst (crLmNs ++ `LmOcFpObs ++ c)
+  let lmObserveU := mkConst (crLmNs ++ `lmOcObserveU)
+  let optVerdTy :=
+    mkApp (mkConst ``Option [0]) (mkApp (mkConst (crCNs ++ `Verdict)) obsTy)
+  let listMrTy := mkApp (mkConst ``List [0]) mrObsTy0
+  let tblCheck (x : Expr) := mkApp (mkConst (crBNs ++ `lmTableCheckOf)) x
+  let mrObs (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 (mkConst (crMrNs ++ `mrOcObserve)) (toExpr tb) (mkNatLit i)
+  let trObs (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 (mkConst (crMrNs ++ `mrOcTrustedObserve)) (toExpr tb) (mkNatLit i)
+  let lmObsU (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 lmObserveU (toExpr tb) (mkNatLit i)
+  let mrC (c : Name) : Expr := mkConst (crMrNs ++ `MrOcFpObs ++ c)
+  let mrSc (n : Nat) : Expr := mkApp (mrC `okScalar) (mkNatLit n)
+  let lmSc (n : Nat) : Expr := mkApp (lmObsC `okScalar) (mkNatLit n)
+  let mrPair (x y : Nat) : Expr :=
+    mkApp2 (mrC `okRetagPair) (mkNatLit x) (mkNatLit y)
+  let lmPair (x y : Nat) : Expr :=
+    mkApp2 (lmObsC `okRetagPair) (mkNatLit x) (mkNatLit y)
+  let repTy ← MetaM.run' <| inferType
+    (mkApp (mkConst (crBNs ++ `ocEncode))
+      (mkApp (mkConst (crBNs ++ `OcFpObs.scalar)) (mkNatLit 0)))
+  let optObsTy := mkApp (mkConst ``Option [0]) obsTy
+  let noneObs := mkApp (mkConst ``Option.none [0]) obsTy
+  let triple (x y z : Nat) : MetaM Expr := do
+    mkAppM ``Prod.mk #[mkNatLit x, ← mkAppM ``Prod.mk #[mkNatLit y, mkNatLit z]]
+  let scalarObs (n : Nat) :=
+    mkApp (mkConst (crBNs ++ `OcFpObs.scalar)) (mkNatLit n)
+  let ptrObs := mkConst (crBNs ++ `OcFpObs.ptrValid)
+  let someObs (e : Expr) := mkApp2 (mkConst ``Option.some [0]) obsTy e
+  let decode (t : Expr) := mkApp (mkConst (crBNs ++ `ocDecode)) t
+  let encode (o : Expr) := mkApp (mkConst (crBNs ++ `ocEncode)) o
+  let t071 ← MetaM.run' <| triple 0 7 1
+  let t070 ← MetaM.run' <| triple 0 7 0
+  let t210 ← MetaM.run' <| triple 2 1 0
+  let t201 ← MetaM.run' <| triple 2 0 1
+  let t200 ← MetaM.run' <| triple 2 0 0
+  let t300 ← MetaM.run' <| triple 3 0 0
+  let lmVerd (x : Expr) (tb : Bool) (i : Nat) : Expr :=
+    mkApp3 (mkConst (crBNs ++ `OcFpLmAuthority.verdict)) x (toExpr tb) (mkNatLit i)
+  let isRet (e : Expr) : Expr := mkApp2 (mkConst (crCNs ++ `isReturn)) obsTy e
+  let isFault (e : Expr) : Expr := mkApp2 (mkConst (crCNs ++ `isFaultV)) obsTy e
+  let mrVerd (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 (mkConst (crBNs ++ `mrVerdict)) (toExpr tb) (mkNatLit i)
+  let trVerd (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 (mkConst (crBNs ++ `trustedVerdict)) (toExpr tb) (mkNatLit i)
+  let capMirTy ← MetaM.run' <| inferType (mkConst (crMrNs ++ `ocCase0Mir))
+  let ocBundleTy := mkConst (crBNs ++ `OcFpBundle)
+  let noneSel := mkApp (mkConst ``Option.none [0]) (mkConst domNs)
+  let some (.defnInfo lmChkInfo) := (← getEnv).find? (crBNs ++ `lmCheckOf)
+    | throwError "cross-root: lmCheckOf definition missing"
+  let checkOnOcModel := lmChkInfo.value.bindingBody!.bindingBody!.appFn!
+  let allTrueGate ← MetaM.run' <|
+    withLocalDeclD `sel (mkApp (mkConst ``Option [0]) (mkConst domNs)) fun sel =>
+      withLocalDeclD `i (mkConst (crBNs ++ `OcFpCase)) fun i =>
+        mkLambdaFVars #[sel, i] (mkConst ``Bool.true)
+  let mrSideWithCase8 := mkApp3 (mkConst (crBNs ++ `sideOf))
+    noneSel allTrueGate (mkConst (crBNs ++ `mrVerdictFn))
+  let mrSideWithCase8Check := mkApp checkOnOcModel mrSideWithCase8
+  let lmSideWithCase8 := mkApp3 (mkConst (crBNs ++ `sideOf))
+    noneSel allTrueGate (mkApp (mkConst (crBNs ++ `lmVerdictFn)) a.authUC)
+  let lmSideWithCase8Check := mkApp checkOnOcModel lmSideWithCase8
+  let lmMapBasic := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 a.lmToMr
+    (mkConst (crLmNs ++ `lmOcExpectedBasic))
+  let lmMapTb := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 a.lmToMr
+    (mkConst (crLmNs ++ `lmOcExpectedTb))
+  let termClean (tb : Bool) (i : Nat) : Expr :=
+    mkApp3 (mkConst (crBNs ++ `ocTerminatesCleanly))
+      (toExpr tb) (mkConst (crMrNs ++ (Name.mkSimple s!"ocMrProg{i}")))
+      (mkNatLit 120)
+  let lmPhase0 := mkApp (mkConst (crLmNs ++ `lmOcPhaseObserve)) (mkNatLit 0)
+  let erasedInvalidBoolTr :=
+    mkApp2 (mkConst (crMrNs ++ `mrOcTrustedObsOf))
+      (mkConst (crMrNs ++ `OcRetKind.scalar))
+      (mkApp2 (mkConst (crMrNs ++ `ocRunTrustedRaw))
+        (mkApp (mkConst (crMrNs ++ `ocEraseBody))
+          (mkConst (crMrNs ++ `ocCase9InvalidBoolMir)))
+        a.nilMir)
+  let (chkTy, chk16L, chk16R, chk20L, chk20R) ← MetaM.run' do
+    let thTy ← inferType (mkConst (crMrNs ++ `mr_checkPtr_some_vs_none_contrast))
+    let some (c16, rest1) := thTy.and?
+      | throwError "cross-root: unexpected checkPtr contrast shape"
+    let some (cty, l16, r16) := c16.eq?
+      | throwError "cross-root: unexpected checkPtr eq shape"
+    let mut cur := rest1
+    for _ in List.range 9 do
+      let some (_, nxt) := cur.and?
+        | throwError "cross-root: unexpected checkPtr contrast length"
+      cur := nxt
+    let some (c20, _) := cur.and?
+      | throwError "cross-root: unexpected checkPtr case 20 shape"
+    let some (_, l20, r20) := c20.eq?
+      | throwError "cross-root: unexpected checkPtr case 20 eq"
+    return (cty, l16, r16, l20, r20)
+  return [ ("ill-typed 0 = 1",
+        crThmD (crNs ++ `forged.zeroEqOne)
+          (crMkEq natTy (mkNatLit 0) (mkNatLit 1)) (crMkRefl natTy (mkNatLit 0)),
+        crThmD (crNs ++ `honest.zeroEqZero)
+          (crMkEq natTy (mkNatLit 0) (mkNatLit 0)) (crMkRefl natTy (mkNatLit 0))),
+      ("negated LM 44-cell certificate",
+        crThmD (crNs ++ `forged.lmTableFalse) (crEqFalse (tblCheck a.authUC)) crReflFalse,
+        crThmD (crNs ++ `honest.lmTableTrue) (crEqTrue (tblCheck a.authUC)) crReflTrue),
+      ("mode-inverted LM authority (Bool.not tb) certificate",
+        crThmD (crNs ++ `forged.modeInverted) (crEqTrue (tblCheck a.invAuth)) crReflTrue,
+        crThmD (crNs ++ `honest.modeInvertedFalse) (crEqFalse (tblCheck a.invAuth)) crReflFalse),
+      ("ub/unsupported-swapped LM translation certificate",
+        crThmD (crNs ++ `forged.swappedUbTranslation)
+          (crEqTrue (tblCheck a.swapUbAuth)) crReflTrue,
+        crThmD (crNs ++ `honest.swappedUbTranslationFalse)
+          (crEqFalse (tblCheck a.swapUbAuth)) crReflFalse),
+      ("phaseBoundary/unsupported-swapped LM translation out-of-range verdict",
+        crThmD (crNs ++ `forged.swappedPhaseOutOfRange)
+          (crMkEq optVerdTy (lmVerd a.swapPhaseAuth false 22) a.unsV)
+          (crMkRefl optVerdTy (lmVerd a.swapPhaseAuth false 22)),
+        crThmD (crNs ++ `honest.swappedPhaseOutOfRangeNone)
+          (crMkEq optVerdTy (lmVerd a.swapPhaseAuth false 22) a.noneV)
+          (crMkRefl optVerdTy (lmVerd a.swapPhaseAuth false 22))),
+      ("forged DualCorrespondenceBundle from mode-inverted LM authority",
+        crDefD (crNs ++ `forged.bundleModeInverted) ocBundleTy
+          (mkApp2 (mkConst (crBNs ++ `bundleOf)) a.invAuth crReflTrue),
+        crDefD (crNs ++ `honest.bundleFromUnrolled) ocBundleTy
+          (mkApp2 (mkConst (crBNs ++ `bundleOf)) a.authUC crReflTrue)),
+      ("swapped fixture lock (ocCase0Mir = ocCase5Mir)",
+        crThmD (crNs ++ `forged.swappedFixture)
+          (crMkEq capMirTy (mkConst (crMrNs ++ `ocCase0Mir))
+            (mkConst (crLmNs ++ `ocCase5Mir)))
+          (crMkRefl capMirTy (mkConst (crMrNs ++ `ocCase0Mir))),
+        crThmD (crNs ++ `honest.fixture5)
+          (crMkEq capMirTy (mkConst (crMrNs ++ `ocCase5Mir))
+            (mkConst (crLmNs ++ `ocCase5Mir)))
+          (crMkRefl capMirTy (mkConst (crMrNs ++ `ocCase5Mir)))),
+      ("forged codec decode of non-zero padding (0,7,1)",
+        crThmD (crNs ++ `forged.decodePadding0)
+          (crMkEq optObsTy (decode t071) (someObs (scalarObs 7)))
+          (crMkRefl optObsTy (decode t071)),
+        crThmD (crNs ++ `honest.decodeCanonical0)
+          (crMkEq optObsTy (decode t070) (someObs (scalarObs 7)))
+          (crMkRefl optObsTy (decode t070))),
+      ("forged codec decode of non-zero padding (2,1,0)",
+        crThmD (crNs ++ `forged.decodePadding2a)
+          (crMkEq optObsTy (decode t210) (someObs ptrObs))
+          (crMkRefl optObsTy (decode t210)),
+        crThmD (crNs ++ `honest.decodeCanonical2a)
+          (crMkEq optObsTy (decode t200) (someObs ptrObs))
+          (crMkRefl optObsTy (decode t200))),
+      ("forged codec decode of non-zero padding (2,0,1)",
+        crThmD (crNs ++ `forged.decodePadding2b)
+          (crMkEq optObsTy (decode t201) (someObs ptrObs))
+          (crMkRefl optObsTy (decode t201)),
+        crThmD (crNs ++ `honest.decodeCanonical2b)
+          (crMkEq optObsTy (decode t201) noneObs)
+          (crMkRefl optObsTy (decode t201))),
+      ("forged codec decode of invalid wire tag 3",
+        crThmD (crNs ++ `forged.decodeTag3)
+          (crMkEq optObsTy (decode t300) (someObs (scalarObs 0)))
+          (crMkRefl optObsTy (decode t300)),
+        crThmD (crNs ++ `honest.decodeTag3None)
+          (crMkEq optObsTy (decode t300) noneObs)
+          (crMkRefl optObsTy (decode t300))),
+      ("forged colliding codec encodings (scalar 0 = ptrValid)",
+        crThmD (crNs ++ `forged.encodeCollision)
+          (crMkEq repTy (encode (scalarObs 0)) (encode ptrObs))
+          (crMkRefl repTy (encode (scalarObs 0))),
+        crThmD (crNs ++ `honest.encodePtrValid)
+          (crMkEq repTy (encode ptrObs) t200)
+          (crMkRefl repTy (encode ptrObs))),
+      ("forged case 8: Trusted computes okScalar 5 instead of unsupported",
+        crThmD (crNs ++ `forged.case8TrustedOk)
+          (crMkEq mrObsTy0 (trObs false 8) (mrSc 5))
+          (crMkRefl mrObsTy0 (trObs false 8)),
+        crThmD (crNs ++ `honest.case8TrustedUns)
+          (crMkEq mrObsTy0 (trObs false 8) (mrC `unsupported))
+          (crMkRefl mrObsTy0 (trObs false 8))),
+      ("forged case 8: MiniRust fails closed as unsupported",
+        crThmD (crNs ++ `forged.case8MrUns)
+          (crMkEq mrObsTy0 (mrObs true 8) (mrC `unsupported))
+          (crMkRefl mrObsTy0 (mrObs true 8)),
+        crThmD (crNs ++ `honest.case8MrOk)
+          (crMkEq mrObsTy0 (mrObs true 8) (mrSc 5))
+          (crMkRefl mrObsTy0 (mrObs true 8))),
+      ("forged case 8: LeanMiri fails closed as unsupported",
+        crThmD (crNs ++ `forged.case8LmUns)
+          (crMkEq lmObsTy (lmObsU true 8) (lmObsC `unsupported))
+          (crMkRefl lmObsTy (lmObsU true 8)),
+        crThmD (crNs ++ `honest.case8LmOk)
+          (crMkEq lmObsTy (lmObsU true 8) (lmSc 5))
+          (crMkRefl lmObsTy (lmObsU true 8))),
+      ("forged D1 phase boundary: case 0 returns unsupported instead of phaseBoundary",
+        crThmD (crNs ++ `forged.d1Phase0Uns)
+          (crMkEq lmObsTy lmPhase0 (lmObsC `unsupported))
+          (crMkRefl lmObsTy lmPhase0),
+        crThmD (crNs ++ `honest.d1Phase0Boundary)
+          (crMkEq lmObsTy lmPhase0 (lmObsC `phaseBoundary))
+          (crMkRefl lmObsTy lmPhase0)),
+      ("forged D1 type-switch erasure: erased ocCase9InvalidBoolMir still UB in Trusted",
+        crThmD (crNs ++ `forged.erasedInvalidBoolUb)
+          (crMkEq mrObsTy0 erasedInvalidBoolTr (mrC `ub))
+          (crMkRefl mrObsTy0 erasedInvalidBoolTr),
+        crThmD (crNs ++ `honest.erasedInvalidBoolMasks)
+          (crMkEq mrObsTy0 erasedInvalidBoolTr (mrSc 2))
+          (crMkRefl mrObsTy0 erasedInvalidBoolTr)),
+      ("forged case 2: Trusted accepts use-after-move through cast",
+        crThmD (crNs ++ `forged.case2TrAccepts) (crEqTrue (isRet (trVerd false 2))) crReflTrue,
+        crThmD (crNs ++ `honest.case2TrFaults) (crEqTrue (isFault (trVerd false 2))) crReflTrue),
+      ("forged case 2: MiniRust accepts use-after-move",
+        crThmD (crNs ++ `forged.case2MrAccepts) (crEqTrue (isRet (mrVerd false 2))) crReflTrue,
+        crThmD (crNs ++ `honest.case2MrFaults) (crEqTrue (isFault (mrVerd false 2))) crReflTrue),
+      ("forged case 2: LeanMiri accepts use-after-move",
+        crThmD (crNs ++ `forged.case2LmAccepts) (crEqTrue (isRet (lmVerd a.authUC false 2))) crReflTrue,
+        crThmD (crNs ++ `honest.case2LmFaults) (crEqTrue (isFault (lmVerd a.authUC false 2))) crReflTrue),
+      ("forged case 9: Trusted masks uninit read through cast",
+        crThmD (crNs ++ `forged.case9TrAccepts) (crEqTrue (isRet (trVerd true 9))) crReflTrue,
+        crThmD (crNs ++ `honest.case9TrFaults) (crEqTrue (isFault (trVerd true 9))) crReflTrue),
+      ("forged case 9: LeanMiri masks uninit read",
+        crThmD (crNs ++ `forged.case9LmAccepts) (crEqTrue (isRet (lmVerd a.authUC true 9))) crReflTrue,
+        crThmD (crNs ++ `honest.case9LmFaults) (crEqTrue (isFault (lmVerd a.authUC true 9))) crReflTrue),
+      ("forged case 10 (rust#166253 callee-only): Trusted faults under TB",
+        crThmD (crNs ++ `forged.case10TrTbUb)
+          (crMkEq mrObsTy0 (trObs true 10) (mrC `ub)) (crMkRefl mrObsTy0 (trObs true 10)),
+        crThmD (crNs ++ `honest.case10TrTbOk)
+          (crMkEq mrObsTy0 (trObs true 10) (mrPair 5 5)) (crMkRefl mrObsTy0 (trObs true 10))),
+      ("forged case 10 (rust#166253 callee-only): MiniRust faults under TB",
+        crThmD (crNs ++ `forged.case10MrTbUb)
+          (crMkEq mrObsTy0 (mrObs true 10) (mrC `ub)) (crMkRefl mrObsTy0 (mrObs true 10)),
+        crThmD (crNs ++ `honest.case10MrTbOk)
+          (crMkEq mrObsTy0 (mrObs true 10) (mrPair 5 5)) (crMkRefl mrObsTy0 (mrObs true 10))),
+      ("forged case 10 (rust#166253 callee-only): LeanMiri faults under TB",
+        crThmD (crNs ++ `forged.case10LmTbUb)
+          (crMkEq lmObsTy (lmObsU true 10) (lmObsC `ub)) (crMkRefl lmObsTy (lmObsU true 10)),
+        crThmD (crNs ++ `honest.case10LmTbOk)
+          (crMkEq lmObsTy (lmObsU true 10) (lmPair 5 5)) (crMkRefl lmObsTy (lmObsU true 10))),
+      ("forged case 11 mode invariance (Trusted basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case11TrInv)
+          (crMkEq mrObsTy0 (trObs false 11) (trObs true 11)) (crMkRefl mrObsTy0 (trObs false 11)),
+        crThmD (crNs ++ `honest.case11TrTbUb)
+          (crMkEq mrObsTy0 (trObs true 11) (mrC `ub)) (crMkRefl mrObsTy0 (trObs true 11))),
+      ("forged case 11 mode invariance (MiniRust basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case11MrInv)
+          (crMkEq mrObsTy0 (mrObs false 11) (mrObs true 11)) (crMkRefl mrObsTy0 (mrObs false 11)),
+        crThmD (crNs ++ `honest.case11MrTbUb)
+          (crMkEq mrObsTy0 (mrObs true 11) (mrC `ub)) (crMkRefl mrObsTy0 (mrObs true 11))),
+      ("forged case 11 mode invariance (LeanMiri basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case11LmInv)
+          (crMkEq lmObsTy (lmObsU false 11) (lmObsU true 11)) (crMkRefl lmObsTy (lmObsU false 11)),
+        crThmD (crNs ++ `honest.case11LmTbUb)
+          (crMkEq lmObsTy (lmObsU true 11) (lmObsC `ub)) (crMkRefl lmObsTy (lmObsU true 11))),
+      ("forged case 13 mode invariance (MiniRust basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case13MrInv)
+          (crMkEq mrObsTy0 (mrObs false 13) (mrObs true 13)) (crMkRefl mrObsTy0 (mrObs false 13)),
+        crThmD (crNs ++ `honest.case13MrTbUb)
+          (crMkEq mrObsTy0 (mrObs true 13) (mrC `ub)) (crMkRefl mrObsTy0 (mrObs true 13))),
+      ("forged case 13 mode invariance (LeanMiri basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case13LmInv)
+          (crMkEq lmObsTy (lmObsU false 13) (lmObsU true 13)) (crMkRefl lmObsTy (lmObsU false 13)),
+        crThmD (crNs ++ `honest.case13LmTbUb)
+          (crMkEq lmObsTy (lmObsU true 13) (lmObsC `ub)) (crMkRefl lmObsTy (lmObsU true 13))),
+      ("forged case 14 mode invariance (Trusted basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case14TrInv)
+          (crMkEq mrObsTy0 (trObs false 14) (trObs true 14)) (crMkRefl mrObsTy0 (trObs false 14)),
+        crThmD (crNs ++ `honest.case14TrTbUb)
+          (crMkEq mrObsTy0 (trObs true 14) (mrC `ub)) (crMkRefl mrObsTy0 (trObs true 14))),
+      ("forged case 14 mode invariance (LeanMiri basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case14LmInv)
+          (crMkEq lmObsTy (lmObsU false 14) (lmObsU true 14)) (crMkRefl lmObsTy (lmObsU false 14)),
+        crThmD (crNs ++ `honest.case14LmTbUb)
+          (crMkEq lmObsTy (lmObsU true 14) (lmObsC `ub)) (crMkRefl lmObsTy (lmObsU true 14))),
+      ("forged clean termination on TB-UB case 11 (Stop.ub must fail ocTerminatesCleanly)",
+        crThmD (crNs ++ `forged.termClean11Tb) (crEqTrue (termClean true 11)) crReflTrue,
+        crThmD (crNs ++ `honest.termNoClean11Tb) (crEqFalse (termClean true 11)) crReflFalse),
+      ("forged D3 case 16 checkPtr contrast matches case 20 OOB contrast",
+        crThmD (crNs ++ `forged.d3CheckPtr16Eq20) (crMkEq chkTy chk16L chk20R) (crMkRefl chkTy chk16L),
+        crThmD (crNs ++ `honest.d3CheckPtr16Exact) (crMkEq chkTy chk16L chk16R) (crMkRefl chkTy chk16L)),
+      ("forged D3 case 20 OOB checkPtr contrast matches case 16 valid contrast",
+        crThmD (crNs ++ `forged.d3CheckPtr20Eq16) (crMkEq chkTy chk20L chk16R) (crMkRefl chkTy chk20L),
+        crThmD (crNs ++ `honest.d3CheckPtr20Exact) (crMkEq chkTy chk20L chk20R) (crMkRefl chkTy chk20L)),
+      ("forged D3 case 18: LeanMiri accepts null safe pointer",
+        crThmD (crNs ++ `forged.case18LmOk)
+          (crMkEq lmObsTy (lmObsU false 18) (lmObsC `okPtrValid))
+          (crMkRefl lmObsTy (lmObsU false 18)),
+        crThmD (crNs ++ `honest.case18LmUb)
+          (crMkEq lmObsTy (lmObsU false 18) (lmObsC `ub))
+          (crMkRefl lmObsTy (lmObsU false 18))),
+      ("forged D3 case 19: LeanMiri accepts unaligned safe pointer",
+        crThmD (crNs ++ `forged.case19LmOk)
+          (crMkEq lmObsTy (lmObsU false 19) (lmObsC `okPtrValid))
+          (crMkRefl lmObsTy (lmObsU false 19)),
+        crThmD (crNs ++ `honest.case19LmUb)
+          (crMkEq lmObsTy (lmObsU false 19) (lmObsC `ub))
+          (crMkRefl lmObsTy (lmObsU false 19))),
+      ("forged D3 case 20: LeanMiri accepts OOB safe pointer",
+        crThmD (crNs ++ `forged.case20LmOk)
+          (crMkEq lmObsTy (lmObsU false 20) (lmObsC `okPtrValid))
+          (crMkRefl lmObsTy (lmObsU false 20)),
+        crThmD (crNs ++ `honest.case20LmUb)
+          (crMkEq lmObsTy (lmObsU false 20) (lmObsC `ub))
+          (crMkRefl lmObsTy (lmObsU false 20))),
+      ("forged D3 case 21: LeanMiri accepts freed safe pointer",
+        crThmD (crNs ++ `forged.case21LmOk)
+          (crMkEq lmObsTy (lmObsU false 21) (lmObsC `okPtrValid))
+          (crMkRefl lmObsTy (lmObsU false 21)),
+        crThmD (crNs ++ `honest.case21LmUb)
+          (crMkEq lmObsTy (lmObsU false 21) (lmObsC `ub))
+          (crMkRefl lmObsTy (lmObsU false 21))),
+      ("forged observer-level agreement at case 8 (LeanMiri = Trusted on 8)",
+        crThmD (crNs ++ `forged.observerLevelCase8)
+          (crMkEq mrObsTy0 (mkApp a.lmToMr (lmObsU false 8)) (trObs false 8))
+          (crMkRefl mrObsTy0 (mkApp a.lmToMr (lmObsU false 8))),
+        crThmD (crNs ++ `honest.observerLevelCase8Mr)
+          (crMkEq mrObsTy0 (mkApp a.lmToMr (lmObsU false 8)) (mrObs false 8))
+          (crMkRefl mrObsTy0 (mkApp a.lmToMr (lmObsU false 8)))),
+      ("forged observer-level out-of-range cell 100 returns okScalar 0",
+        crThmD (crNs ++ `forged.observerLevelOobOk)
+          (crMkEq mrObsTy0 (mkApp a.lmToMr (lmObsU true 100)) (mrSc 0))
+          (crMkRefl mrObsTy0 (mkApp a.lmToMr (lmObsU true 100))),
+        crThmD (crNs ++ `honest.observerLevelOobAgree)
+          (crMkEq mrObsTy0 (mkApp a.lmToMr (lmObsU true 100)) (mrObs true 100))
+          (crMkRefl mrObsTy0 (mkApp a.lmToMr (lmObsU true 100)))),
+      ("forged translation fidelity (lmToMr maps phaseBoundary to unsupported)",
+        crThmD (crNs ++ `forged.lmToMrPhase)
+          (crMkEq mrObsTy0 (mkApp a.lmToMr (lmObsC `phaseBoundary)) (mrC `unsupported))
+          (crMkRefl mrObsTy0 (mkApp a.lmToMr (lmObsC `phaseBoundary))),
+        crThmD (crNs ++ `honest.lmToMrPhase)
+          (crMkEq mrObsTy0 (mkApp a.lmToMr (lmObsC `phaseBoundary)) (mrC `phaseBoundary))
+          (crMkRefl mrObsTy0 (mkApp a.lmToMr (lmObsC `phaseBoundary)))),
+      ("forged MR Corpus.Side.check admitting cast-deref boundary case 8",
+        crThmD (crNs ++ `forged.mrGateIncludesCase8) (crEqTrue mrSideWithCase8Check) crReflTrue,
+        crThmD (crNs ++ `honest.mrGateRejectsCase8) (crEqFalse mrSideWithCase8Check) crReflFalse),
+      ("forged LM Corpus.Side.check admitting cast-deref boundary case 8",
+        crThmD (crNs ++ `forged.lmGateIncludesCase8) (crEqTrue lmSideWithCase8Check) crReflTrue,
+        crThmD (crNs ++ `honest.lmGateRejectsCase8) (crEqFalse lmSideWithCase8Check) crReflFalse),
+      ("forged cross-mode frozen-table lock (ocLmExpectedBasic = lmOcExpectedTb.map lmToMr)",
+        crThmD (crNs ++ `forged.frozenTableCrossMode)
+          (crMkEq listMrTy (mkConst (crBNs ++ `ocLmExpectedBasic)) lmMapTb)
+          (crMkRefl listMrTy (mkConst (crBNs ++ `ocLmExpectedBasic))),
+        crThmD (crNs ++ `honest.frozenTableBasic)
+          (crMkEq listMrTy (mkConst (crBNs ++ `ocLmExpectedBasic)) lmMapBasic)
+          (crMkRefl listMrTy (mkConst (crBNs ++ `ocLmExpectedBasic)))),
+      ("forged LM out-of-range cell 22 returns okScalar 0 instead of unsupported",
+        crThmD (crNs ++ `forged.lmOutOfRangeOk)
+          (crMkEq lmObsTy (lmObsU false 22) (lmSc 0))
+          (crMkRefl lmObsTy (lmObsU false 22)),
+        crThmD (crNs ++ `honest.lmOutOfRangeUns)
+          (crMkEq lmObsTy (lmObsU false 22) (lmObsC `unsupported))
+          (crMkRefl lmObsTy (lmObsU false 22))) ]
+
+private def buildForgedExtended (a : CrossRootForgedArgs) :
+    CoreM (List (String × Declaration × Declaration)) := do
+  let boolTy := mkConst ``Bool
+  let natTy := mkConst ``Nat
+  let domNs := crBNs ++ `OcFpDomain
+  let compNs := crBNs ++ `OcFpCompanion
+  let compTy := mkConst compNs
+  let mrObsTy0 := mkConst (crMrNs ++ `MrOcFpObs)
+  let lmObsTy := mkConst (crLmNs ++ `LmOcFpObs)
+  let lmOutTy := mkConst (crLmNs ++ `OcTrustedOutcome)
+  let lmOutC (c : Name) : Expr := mkConst (crLmNs ++ `OcTrustedOutcome ++ c)
+  let lmObsC (c : Name) : Expr := mkConst (crLmNs ++ `LmOcFpObs ++ c)
+  let lmObserve := mkConst (crLmNs ++ `lmOcObserve)
+  let lmObserveU := mkConst (crLmNs ++ `lmOcObserveU)
+  let lmPhaseObs := mkConst (crLmNs ++ `lmOcPhaseObserve)
+  let mrObs (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 (mkConst (crMrNs ++ `mrOcObserve)) (toExpr tb) (mkNatLit i)
+  let trObs (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 (mkConst (crMrNs ++ `mrOcTrustedObserve)) (toExpr tb) (mkNatLit i)
+  let lmObsU (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 lmObserveU (toExpr tb) (mkNatLit i)
+  let mrC (c : Name) : Expr := mkConst (crMrNs ++ `MrOcFpObs ++ c)
+  let mrSc (n : Nat) : Expr := mkApp (mrC `okScalar) (mkNatLit n)
+  let lmSc (n : Nat) : Expr := mkApp (lmObsC `okScalar) (mkNatLit n)
+  let mrPair (x y : Nat) : Expr :=
+    mkApp2 (mrC `okRetagPair) (mkNatLit x) (mkNatLit y)
+  let compC (c : Name) : Expr := mkConst (compNs ++ c)
+  let trComp (tb : Bool) (c : Name) : Expr :=
+    mkApp2 (mkConst (crBNs ++ `trustedCompanion)) (toExpr tb) (compC c)
+  let mrComp (tb : Bool) (c : Name) : Expr :=
+    mkApp2 (mkConst (crBNs ++ `mrCompanion)) (toExpr tb) (compC c)
+  let lmTwinRun (twin : Name) (tb : Bool) : Expr :=
+    mkApp a.lmToMr (mkApp (mkConst (crLmNs ++ `lmOcRun))
+      (mkApp (mkConst (crLmNs ++ twin)) (toExpr tb)))
+  let mrPhase (i : Nat) : Expr :=
+    mkApp (mkConst (crBNs ++ `mrOcPhaseObserve)) (mkNatLit i)
+  let noneSel := mkApp (mkConst ``Option.none [0]) (mkConst domNs)
+  let selOf (d : Name) : Expr :=
+    mkApp2 (mkConst ``Option.some [0]) (mkConst domNs) (mkConst (domNs ++ d))
+  let domCheck (d : Name) (x : Expr) : Expr :=
+    mkApp2 (mkConst (crBNs ++ `lmCheckOf)) (selOf d) x
+  let pbCheck (sel x : Expr) : Expr :=
+    mkApp2 (mkConst (crBNs ++ `lmPostBorrowckCheckOf)) sel x
+  let compCheck (obs : Expr) : Expr :=
+    mkApp3 (mkConst (crBNs ++ `lmCompanionCheckOf)) lmObsTy a.lmToMr obs
+  let phaseCheck (phase : Expr) : Expr :=
+    mkApp3 (mkConst (crBNs ++ `lmPhaseCheckOf)) lmObsTy a.lmToMr phase
+  let phaseCompCheck (pc : Expr) : Expr :=
+    mkApp3 (mkConst (crBNs ++ `lmPhaseCompanionCheckOf)) lmObsTy a.lmToMr pc
+  let layoutTy ← MetaM.run' <| inferType (mkConst (crMrNs ++ `ocU8Layout))
+  let lmCombine12 := mkApp a.lmToMr
+    (mkApp2 (mkConst (crLmNs ++ `ocCombine)) (lmSc 1) (lmSc 2))
+  let pbObs (tb : Bool) (i : Nat) : Expr :=
+    mkApp2 (mkConst (crBNs ++ `trustedPostBorrowckObserve)) (toExpr tb) (mkNatLit i)
+  let some (.defnInfo lmChkInfo) := (← getEnv).find? (crBNs ++ `lmCheckOf)
+    | throwError "cross-root: lmCheckOf definition missing"
+  let checkOnOcModel := lmChkInfo.value.bindingBody!.bindingBody!.appFn!
+  let some (.defnInfo pbChkInfo) := (← getEnv).find? (crBNs ++ `lmPostBorrowckCheckOf)
+    | throwError "cross-root: lmPostBorrowckCheckOf definition missing"
+  let checkOnPbModel := pbChkInfo.value.bindingBody!.bindingBody!.appFn!
+  let pbSideMr := mkApp3 (mkConst (crBNs ++ `sideOf)) noneSel
+    (mkConst (crBNs ++ `postBorrowckGate)) (mkConst (crBNs ++ `mrVerdictFn))
+  let fin8 : Expr :=
+    mkApp3 (mkConst ``Fin.mk) (mkNatLit 22) (mkNatLit 8)
+      (mkApp2 (mkConst ``Nat.le_add_left) (mkNatLit 9) (mkNatLit 13))
+  let bodyHasCast (mirConst : Expr) : Expr :=
+    mkApp3 (mkConst ``List.any [0])
+      (mkConst `Trusted.Rustc.V2026_06_01.MirAst.Place)
+      (mkApp (mkConst (crMrNs ++ `ocBodyPlaces)) mirConst)
+      (mkConst (crMrNs ++ `ocPlaceHasCast))
+  let ptrTysNil ← MetaM.run' do
+    let t ← inferType (mkConst (crMrNs ++ `ocRun))
+    let listTy := t.bindingBody!.bindingDomain!
+    return mkApp (mkConst ``List.nil [0]) listTy.appArg!
+  let mrRunNil (tb : Bool) (prog : Name) : Expr :=
+    mkApp3 (mkConst (crMrNs ++ `ocRun)) (toExpr tb) ptrTysNil
+      (mkConst (crMrNs ++ prog))
+  let eqCtl (what : String) (tag : Name) (ty lhs bad good : Expr) :
+      String × Declaration × Declaration :=
+    (what, crThmD (crNs ++ `forged ++ tag) (crMkEq ty lhs bad) (crMkRefl ty lhs),
+      crThmD (crNs ++ `honest ++ tag) (crMkEq ty lhs good) (crMkRefl ty lhs))
+  return [ ("forged universal runner lock (ub/unsupported-swapped outcome constructors)",
+        crThmD (crNs ++ `forged.runnerUniversal) a.forgedRunnerTy a.forgedRunnerPf,
+        crThmD (crNs ++ `honest.runnerUniversal) a.runnerTy a.runnerPf),
+      eqCtl "forged outcome bijection (mrOutToLm ub = unsupported)"
+        `outcomeBijection lmOutTy
+        (mkApp a.mrOutToLm (mkConst (crMrNs ++ `OcTrustedOutcome.ub)))
+        (lmOutC `unsupported) (lmOutC `ub),
+      eqCtl "forged ocCombine lock (disagreeing halves combine to the first half)"
+        `combineDisagree mrObsTy0 lmCombine12 (mrSc 1) (mrC `unsupported),
+      ("swapped layout fixture lock (ocU8Layout = ocU32Layout)",
+        crThmD (crNs ++ `forged.swappedLayout)
+          (crMkEq layoutTy (mkConst (crMrNs ++ `ocU8Layout))
+            (mkConst (crLmNs ++ `ocU32Layout)))
+          (crMkRefl layoutTy (mkConst (crMrNs ++ `ocU8Layout))),
+        crThmD (crNs ++ `honest.layoutU32)
+          (crMkEq layoutTy (mkConst (crMrNs ++ `ocU32Layout))
+            (mkConst (crLmNs ++ `ocU32Layout)))
+          (crMkRefl layoutTy (mkConst (crMrNs ++ `ocU32Layout)))),
+      eqCtl "forged case count (mrOcCaseCount = 23)" `caseCount natTy
+        (mkConst (crMrNs ++ `mrOcCaseCount)) (mkNatLit 23)
+        (mkConst (crLmNs ++ `lmOcCaseCount)),
+      ("forged case 13 mode invariance (Trusted basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case13TrInv)
+          (crMkEq mrObsTy0 (trObs false 13) (trObs true 13))
+          (crMkRefl mrObsTy0 (trObs false 13)),
+        crThmD (crNs ++ `honest.case13TrTbUb)
+          (crMkEq mrObsTy0 (trObs true 13) (mrC `ub))
+          (crMkRefl mrObsTy0 (trObs true 13))),
+      ("forged case 14 mode invariance (MiniRust basic = treeBorrows)",
+        crThmD (crNs ++ `forged.case14MrInv)
+          (crMkEq mrObsTy0 (mrObs false 14) (mrObs true 14))
+          (crMkRefl mrObsTy0 (mrObs false 14)),
+        crThmD (crNs ++ `honest.case14MrTbUb)
+          (crMkEq mrObsTy0 (mrObs true 14) (mrC `ub))
+          (crMkRefl mrObsTy0 (mrObs true 14))),
+      ("forged D2 per-domain side certificate from the mode-inverted LM authority",
+        crThmD (crNs ++ `forged.d2ModeInverted) (crEqTrue (domCheck `d2 a.invAuth)) crReflTrue,
+        crThmD (crNs ++ `honest.d1ModeInverted) (crEqTrue (domCheck `d1 a.invAuth)) crReflTrue),
+      eqCtl "forged companion: Trusted protected drop succeeds under Tree Borrows"
+        `compTrProtectedDrop mrObsTy0 (trComp true `protectedDrop) (mrSc 7) (mrC `ub),
+      eqCtl "forged companion: MiniRust protected drop succeeds under Tree Borrows"
+        `compMrProtectedDrop mrObsTy0 (mrComp true `protectedDrop) (mrSc 7) (mrC `ub),
+      eqCtl "forged companion: LeanMiri protected drop succeeds under Tree Borrows"
+        `compLmProtectedDrop mrObsTy0 (lmTwinRun `lmOcProtectedDropU true)
+        (mrSc 7) (mrC `ub),
+      eqCtl "forged companion: Trusted reverse transmute succeeds under Tree Borrows"
+        `compTrRevTransmute mrObsTy0 (trComp true `revTransmute) (mrPair 5 5) (mrC `ub),
+      eqCtl "forged companion: MiniRust reverse transmute succeeds under Tree Borrows"
+        `compMrRevTransmute mrObsTy0 (mrComp true `revTransmute) (mrPair 5 5) (mrC `ub),
+      eqCtl "forged companion: LeanMiri reverse transmute succeeds under Tree Borrows"
+        `compLmRevTransmute mrObsTy0 (lmTwinRun `lmOcD2RevTransmuteU true)
+        (mrPair 5 5) (mrC `ub),
+      eqCtl "forged companion: Trusted masks the invalid bool through the cast"
+        `compTrInvalidBool mrObsTy0 (trComp false `invalidBool) (mrSc 2) (mrC `ub),
+      eqCtl "forged companion: MiniRust masks the invalid bool"
+        `compMrInvalidBool mrObsTy0 (mrComp true `invalidBool) (mrSc 2) (mrC `ub),
+      eqCtl "forged companion: LeanMiri type-switched read masks the invalid bool"
+        `compLmInvalidBool mrObsTy0 (lmTwinRun `lmOcInvalidBoolReadU false)
+        (mrSc 2) (mrC `ub),
+      eqCtl "forged companion: Trusted accepts the dangling ZST (no boundary)"
+        `compTrZstDangling mrObsTy0 (trComp false `zstDangling)
+        (mrC `okPtrValid) (mrC `ub),
+      eqCtl "forged companion: MiniRust rejects the dangling ZST"
+        `compMrZstDangling mrObsTy0 (mrComp false `zstDangling)
+        (mrC `ub) (mrC `okPtrValid),
+      eqCtl "forged companion: MiniRust accepts the null ZST"
+        `compMrZstNull mrObsTy0 (mrComp true `zstNull) (mrC `okPtrValid) (mrC `ub),
+      eqCtl "forged phase boundary: cast-free D2 case 10 rejected statically"
+        `phaseD2 mrObsTy0 (mrPhase 10) (mrC `phaseBoundary) (mrC `unsupported),
+      eqCtl "forged phase boundary: MiniRust translates the cast places of case 8"
+        `phaseCase8 mrObsTy0 (mrPhase 8) (mrC `unsupported) (mrC `phaseBoundary),
+      ("forged LM phase certificate from the RUNTIME observer",
+        crThmD (crNs ++ `forged.phaseFromRuntime)
+          (crEqTrue (phaseCheck (mkApp lmObserveU (toExpr false)))) crReflTrue,
+        crThmD (crNs ++ `honest.phaseFromRuntimeFalse)
+          (crEqFalse (phaseCheck (mkApp lmObserveU (toExpr false)))) crReflFalse),
+      ("forged negated LM 14-cell companion certificate",
+        crThmD (crNs ++ `forged.compCheckFalse) (crEqFalse (compCheck a.compObsU)) crReflFalse,
+        crThmD (crNs ++ `honest.compCheckTrue) (crEqTrue (compCheck a.compObsU)) crReflTrue),
+      ("forged mode-inverted LM 14-cell companion certificate",
+        crThmD (crNs ++ `forged.compCheckInverted)
+          (crEqTrue (compCheck
+            (mkLambda `tb .default boolTy <| mkLambda `c .default compTy <|
+              mkApp2 a.compObsU (mkApp (mkConst ``Bool.not) (.bvar 1)) (.bvar 0))))
+          crReflTrue,
+        crThmD (crNs ++ `honest.compCheckInvertedFalse)
+          (crEqFalse (compCheck
+            (mkLambda `tb .default boolTy <| mkLambda `c .default compTy <|
+              mkApp2 a.compObsU (mkApp (mkConst ``Bool.not) (.bvar 1)) (.bvar 0))))
+          crReflFalse),
+      eqCtl "forged companion twin: LM dead-local read returns okScalar 7"
+        `compLmDeadLocal mrObsTy0
+        (mkApp a.lmToMr (mkApp2 a.compObsU (toExpr false) (compC `deadLocal)))
+        (mrSc 7) (mrC `ub),
+      eqCtl "forged companion twin: LM dangling ZST rejected as UB"
+        `compLmZstDangling mrObsTy0
+        (mkApp a.lmToMr (mkApp2 a.compObsU (toExpr false) (compC `zstDangling)))
+        (mrC `ub) (mrC `okPtrValid),
+      eqCtl "forged companion twin: LM null ZST accepted as okPtrValid"
+        `compLmZstNull mrObsTy0
+        (mkApp a.lmToMr (mkApp2 a.compObsU (toExpr true) (compC `zstNull)))
+        (mrC `okPtrValid) (mrC `ub),
+      eqCtl "forged companion twin: LM erased invalid-bool is UB instead of masking byte 2"
+        `compLmErasedUb mrObsTy0 (mkApp a.lmToMr a.erasedULhs)
+        (mrC `ub) (mrSc 2),
+      ("forged negated LM 7-companion phase certificate",
+        crThmD (crNs ++ `forged.phaseCompFalse)
+          (crEqFalse (phaseCompCheck a.phaseCompObs)) crReflFalse,
+        crThmD (crNs ++ `honest.phaseCompTrue)
+          (crEqTrue (phaseCompCheck a.phaseCompObs)) crReflTrue),
+      ("forged LM companion phase certificate from RUNTIME companion observer",
+        crThmD (crNs ++ `forged.phaseCompFromRuntime)
+          (crEqTrue (phaseCompCheck (mkApp a.compObsU (toExpr false)))) crReflTrue,
+        crThmD (crNs ++ `honest.phaseCompFromRuntimeFalse)
+          (crEqFalse (phaseCompCheck (mkApp a.compObsU (toExpr false)))) crReflFalse),
+      eqCtl "forged MR companion phase: cast-free revTransmute is phaseBoundary"
+        `phaseCompRevTr mrObsTy0
+        (mkApp (mkConst (crBNs ++ `mrOcPhaseCompanion)) (compC `revTransmute))
+        (mrC `phaseBoundary) (mrC `unsupported),
+      eqCtl "forged MR companion phase: D1 invalidBool is unsupported"
+        `phaseCompInvBool mrObsTy0
+        (mkApp (mkConst (crBNs ++ `mrOcPhaseCompanion)) (compC `invalidBool))
+        (mrC `unsupported) (mrC `phaseBoundary) ] ++
+    ([18, 19, 20, 21].map fun i =>
+      eqCtl s!"forged D3 case {i}: Trusted accepts the invalid safe pointer"
+        (Name.mkSimple s!"d3TrAccepts{i}") mrObsTy0 (trObs false i)
+        (mrC `okPtrValid) (mrC `ub)) ++
+    ([18, 19, 20, 21].map fun i =>
+      eqCtl s!"forged D3 case {i}: MiniRust accepts the invalid safe pointer"
+        (Name.mkSimple s!"d3MrAccepts{i}") mrObsTy0 (mrObs true i)
+        (mrC `okPtrValid) (mrC `ub)) ++
+    [ eqCtl "forged LM phase observer out of range: idx 22 rejected at the phase boundary"
+        `phaseOob22 mrObsTy0
+        (mkApp a.lmToMr (mkApp lmPhaseObs (mkNatLit 22)))
+        (mrC `phaseBoundary) (mrC `unsupported),
+      eqCtl "forged MR phase observer out of range: idx 1000 rejected at the phase boundary"
+        `phaseOob1000 mrObsTy0 (mrPhase 1000)
+        (mrC `phaseBoundary) (mrC `unsupported),
+      eqCtl "forged post-borrowck case 8: Trusted on the erased image stays unsupported"
+        `pbCase8 mrObsTy0 (pbObs false 8) (mrC `unsupported) (mrSc 5),
+      eqCtl "forged cast-erasure faithfulness at case 8 (cast fixture = erased image)"
+        `pbCase8Faithful mrObsTy0 (trObs false 8) (pbObs false 8)
+        (mrC `unsupported),
+      ("forged all-case MR gate on the CAST model (case 8 breaks Side.check)",
+        crThmD (crNs ++ `forged.pbGateOnCastModel)
+          (crEqTrue (mkApp checkOnOcModel pbSideMr)) crReflTrue,
+        crThmD (crNs ++ `honest.pbGateOnPostBorrowckModel)
+          (crEqTrue (mkApp checkOnPbModel pbSideMr)) crReflTrue),
+      ("forged post-borrowck LM side certificate from the mode-inverted LM authority",
+        crThmD (crNs ++ `forged.pbModeInverted)
+          (crEqTrue (pbCheck noneSel a.invAuth)) crReflTrue,
+        crThmD (crNs ++ `honest.pbFromUnrolled)
+          (crEqTrue (pbCheck noneSel a.authUC)) crReflTrue),
+      ("forged D2 post-borrowck LM side certificate from mode-inverted authority",
+        crThmD (crNs ++ `forged.pbD2ModeInverted)
+          (crEqTrue (pbCheck (selOf `d2) a.invAuth)) crReflTrue,
+        crThmD (crNs ++ `honest.pbD1ModeInverted)
+          (crEqTrue (pbCheck (selOf `d1) a.invAuth)) crReflTrue),
+      eqCtl "forged uniform erased observer at case 8: stays unsupported"
+        `pbUniformCase8Uns mrObsTy0
+        (mkApp2 (mkConst (crBNs ++ `trustedUniformErasedObserve))
+          (toExpr false) (mkNatLit 8))
+        (mrC `unsupported) (mrSc 5),
+      eqCtl "forged uniform erased observer out of range (idx 22): returns scalar 5"
+        `pbUniformOob22Ok mrObsTy0
+        (mkApp2 (mkConst (crBNs ++ `trustedUniformErasedObserve))
+          (toExpr true) (mkNatLit 22))
+        (mrSc 5) (mrC `unsupported),
+      eqCtl "forged D1 post-borrowck gate excludes case 8"
+        `pbD1Gate8 boolTy
+        (mkApp2 (mkConst (crBNs ++ `postBorrowckGate)) (selOf `d1) fin8)
+        (toExpr false) (toExpr true),
+      eqCtl "forged D1 case 8 carries no opaqueCast place"
+        `d1Case8NoCast boolTy
+        (bodyHasCast (mkConst (crMrNs ++ `ocCase8Mir)))
+        (toExpr false) (toExpr true),
+      eqCtl "forged D2 case 10 carries an opaqueCast place"
+        `d2Case10HasCast boolTy
+        (bodyHasCast (mkConst (crMrNs ++ `ocCase10Mir)))
+        (toExpr true) (toExpr false),
+      eqCtl "forged LM case 7 follows upstream minimize (no deinit): returns 7"
+        `lmCase7Minimize mrObsTy0 (mkApp a.lmToMr (lmObsU true 7))
+        (mrSc 7) (mrC `ub),
+      eqCtl "forged MR upstream-minimize case 7 is UB like Trusted"
+        `mrCase7MinimizeUb mrObsTy0 (mrRunNil false `ocMrProg7Minimize)
+        (mrC `ub) (mrSc 7),
+      eqCtl "forged MR upstream-minimize case 2 is UB like Trusted"
+        `mrCase2MinimizeUb mrObsTy0 (mrRunNil true `ocMrProg2Minimize)
+        (mrC `ub) (mrSc 7),
+      eqCtl "forged Trusted fixture 5 carries a Drop terminator"
+        `case5HasDrop boolTy
+        (mkApp (mkConst (crBNs ++ `ocBodyHasDrop)) (mkConst (crMrNs ++ `ocCase5Mir)))
+        (toExpr true) (toExpr false),
+      ("forged vendored Miri evalOperand equates Move with RuntimeChecks.UbChecks",
+        crThmD (crNs ++ `forged.vendoredEvalOpMoveEqRc) a.forgedEvalOpTy a.forgedEvalOpPf,
+        crThmD (crNs ++ `honest.vendoredEvalOpMoveEqCopy) a.evalOpTy a.evalOpPf),
+      eqCtl "forged LM case 2 under Move-as-Copy (vendored evalOperand) is UB"
+        `lmCase2MoveAsCopyUb mrObsTy0
+        (mkApp a.lmToMr (mkConst (crNs ++ `lmCase2MoveAsCopyU)))
+        (mrC `ub) (mrSc 7),
+      eqCtl "forged Trusted case 2 under Move-as-Copy is UB"
+        `trCase2MoveAsCopyUb mrObsTy0
+        (mkApp2 (mkConst (crMrNs ++ `mrOcTrustedObsOf))
+          (mkConst (crMrNs ++ `OcRetKind.scalar))
+          (mkApp2 (mkConst (crMrNs ++ `ocRunTrustedRaw))
+            (mkApp (mkConst (crBNs ++ `ocMoveToCopyBody))
+              (mkConst (crMrNs ++ `ocCase2Mir)))
+            a.nilMir))
+        (mrC `ub) (mrSc 7),
+      eqCtl "forged Trusted case 7 under Drop-as-Nop is UB"
+        `trCase7DropAsNopUb mrObsTy0
+        (mkApp2 (mkConst (crMrNs ++ `mrOcTrustedObsOf))
+          (mkConst (crMrNs ++ `OcRetKind.scalar))
+          (mkApp2 (mkConst (crMrNs ++ `ocRunTrustedRaw))
+            (mkApp (mkConst (crBNs ++ `ocDropToNopBody))
+              (mkConst (crMrNs ++ `ocCase7Mir)))
+            a.nilMir))
+        (mrC `ub) (mrSc 7),
+      eqCtl "forged lowering-dependent predicate tags genuine Deinit case 5"
+        `loweringDepCase5 boolTy
+        (mkApp (mkConst (crBNs ++ `ocLoweringDependent)) (mkNatLit 5))
+        (toExpr true) (toExpr false),
+      ("forged LM case 7 equals case 6 harness for every mode",
+        crThmD (crNs ++ `forged.lmCase7IsCase6)
+          (mkForall `tb .default boolTy <|
+            crMkEq lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7))
+              (mkApp2 lmObserve (.bvar 0) (mkNatLit 6)))
+          (mkLambda `tb .default boolTy <|
+            crMkRefl lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7))),
+        crThmD (crNs ++ `honest.lmCase7IsCase5)
+          (mkForall `tb .default boolTy <|
+            crMkEq lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7))
+              (mkApp2 lmObserve (.bvar 0) (mkNatLit 5)))
+          (mkLambda `tb .default boolTy <|
+            crMkRefl lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7)))) ]
+
+private def runCrossRootForgedControls (a : CrossRootForgedArgs) :
+    CoreM (Nat × Nat) := do
+  let saved ← getEnv
+  let rejection (d : Declaration) : CoreM (Option String) := do
+    let r ← try addDecl d; pure none
+      catch ex => pure (some (← ex.toMessageData.toString))
+    setEnv saved
+    return r
+  let pairs := (← buildForgedCore a) ++ (← buildForgedExtended a)
+  let mut rejected : Nat := 0
+  let mut twins : Nat := 0
+  for (what, d, h) in pairs do
+    match ← rejection d with
+    | none =>
+      throwError "cross-root negative control FAILED: kernel accepted {what}"
+    | some msg =>
+      -- Only `(kernel) declaration type mismatch` / `(kernel) application
+      -- type mismatch` count: never a name-resolution, elaboration, or
+      -- resource (`deep recursion`) failure.
+      unless msg.startsWith "(kernel)" &&
+          (msg.splitOn "type mismatch").length > 1 do
+        throwError "cross-root negative control VACUOUS: {what} was not rejected by a kernel type mismatch: {msg}"
+    rejected := rejected + 1
+    if let some msg ← rejection h then
+      throwError "cross-root negative control VACUOUS: honest twin of {what} was rejected: {msg}"
+    twins := twins + 1
+  let natTy := mkConst ``Nat
+  if let some msg ← rejection (crThmD (crNs ++ `honest.selfTest)
+      (crMkEq natTy (mkNatLit 2) (mkNatLit 2)) (crMkRefl natTy (mkNatLit 2))) then
+    throwError "cross-root control harness self-test failed: {msg}"
+  return (rejected, twins)
+
+end CrossRootForgedControls
+
 set_option maxRecDepth 8192 in
 open Lean Elab Command Meta in
 run_cmd do
@@ -587,17 +1361,8 @@ run_cmd do
       mkApp3 (mkConst ``Eq [1]) boolTy e (mkConst ``Bool.true)
     let reflTrue : Expr :=
       mkApp2 (mkConst ``Eq.refl [1]) boolTy (mkConst ``Bool.true)
-    let eqFalse (e : Expr) : Expr :=
-      mkApp3 (mkConst ``Eq [1]) boolTy e (mkConst ``Bool.false)
-    let reflFalse : Expr :=
-      mkApp2 (mkConst ``Eq.refl [1]) boolTy (mkConst ``Bool.false)
     let mkEq (ty a b : Expr) : Expr := mkApp3 (mkConst ``Eq [1]) ty a b
     let mkRefl (ty a : Expr) : Expr := mkApp2 (mkConst ``Eq.refl [1]) ty a
-    let thmD (n : Name) (ty pf : Expr) : Declaration :=
-      .thmDecl { name := n, levelParams := [], type := ty, value := pf }
-    let defD (n : Name) (ty val : Expr) : Declaration :=
-      .defnDecl { name := n, levelParams := [], type := ty, value := val,
-                  hints := .regular 0, safety := .safe }
 
     -- 1. Genuine LeanMiri authority over `lmOcObserve` (translation via
     -- `LmOcFpObs.rec.{1}`, zero mocks).
@@ -1458,6 +2223,79 @@ run_cmd do
     addThmInfer (ns ++ `dual_d1_lowering_dependent_cells)
       (mkApp2 (mkConst (bNs ++ `dual_d1_lowering_dependent_cells)) authC hA)
     added := added.push (ns ++ `dual_d1_lowering_dependent_cells)
+    addThmInfer (ns ++ `ocLoweringDependent_characterization)
+      (mkApp2 (mkConst (bNs ++ `ocLoweringDependent_characterization)) authC hA)
+    added := added.push (ns ++ `ocLoweringDependent_characterization)
+    -- Universal vendored-Miri theorem: `Miri.Interpreter.evalOperand` treats
+    -- `.Move place` and `.Copy place` identically (by `Eq.refl` for EVERY
+    -- `hooks`, `frame`, `state`, `place`, `known`), proving case `2`'s
+    -- move-invalidation UB comes strictly from Anneal's `annealEvalOperand`.
+    let evalOpMoveEqCopyName := ns ++ `vendored_evalOperand_move_eq_copy
+    let (evalOpTy, evalOpPf, forgedEvalOpTy, forgedEvalOpPf) ← MetaM.run' do
+      let evalOpC := mkConst `Miri.Interpreter.evalOperand
+      let ty ← inferType evalOpC
+      forallTelescopeReducing ty fun xs _ => do
+        let prov := xs[0]!
+        let extra := xs[1]!
+        let stTy := xs[2]!
+        let hooks := xs[3]!
+        let frame := xs[4]!
+        let st := xs[5]!
+        let known := xs[7]!
+        withLocalDeclD `place (mkConst `Miri.MIR.Place) fun place => do
+          let mv := mkApp (mkConst `Miri.MIR.Operand.Move) place
+          let cp := mkApp (mkConst `Miri.MIR.Operand.Copy) place
+          let rc := mkApp (mkConst `Miri.MIR.Operand.RuntimeChecks)
+            (mkConst `Miri.MIR.RuntimeChecks.UbChecks)
+          let lhs := mkAppN evalOpC #[prov, extra, stTy, hooks, frame, st, mv, known]
+          let rhs := mkAppN evalOpC #[prov, extra, stTy, hooks, frame, st, cp, known]
+          let badRhs := mkAppN evalOpC #[prov, extra, stTy, hooks, frame, st, rc, known]
+          let resTy ← inferType lhs
+          let fvars := #[prov, extra, stTy, hooks, frame, st, place, known]
+          let thmTy ← mkForallFVars fvars (mkEq resTy lhs rhs)
+          let thmPf ← mkLambdaFVars fvars (mkRefl resTy lhs)
+          let badTy ← mkForallFVars fvars (mkEq resTy lhs badRhs)
+          return (thmTy, thmPf, badTy, thmPf)
+    addThm evalOpMoveEqCopyName evalOpTy evalOpPf
+    added := added.push evalOpMoveEqCopyName
+    -- Direct kernel-evaluated contrast on `ocCase2Mir`: replacing `.move` by
+    -- `.copy` (modeling vendored `evalOperand`) turns LeanMiri from `.ub` into
+    -- `okScalar 7` (twin-evaluated via `ocRunStepU` and transported along
+    -- `ocRunStepU.eq_src`).
+    let mkCase2MoveAsCopy (fStep : Expr) : Expr :=
+      mkApp2 lmStepObs (toExpr (4 : UInt64))
+        (mkApp2 fStep
+          (mkApp (mkConst (lmNs ++ `ocEraseBody))
+            (mkApp (mkConst (bNs ++ `ocMoveToCopyBody))
+              (mkConst (lmNs ++ `ocCase2Mir))))
+          (mkConst (lmNs ++ `ocU32Ty)))
+    let case2CopyName := ns ++ `lmCase2MoveAsCopy
+    let _ ← addDef case2CopyName (mkCase2MoveAsCopy runStepC)
+    let case2CopyUName := ns ++ `lmCase2MoveAsCopyU
+    let _ ← addDef case2CopyUName (mkCase2MoveAsCopy runStepU)
+    added := added.push case2CopyName |>.push case2CopyUName
+    let case2CopyEqName := ns ++ `lmCase2MoveAsCopy_eq_unrolled
+    let case2CopyEqPf ← MetaM.run' do
+      let runStepTy ← inferType runStepC
+      let g ← withLocalDeclD `f runStepTy fun f =>
+        mkLambdaFVars #[f] (mkCase2MoveAsCopy f)
+      mkCongrArg g (mkConst (lmNs ++ `ocRunStepU.eq_src))
+    addThmInfer case2CopyEqName case2CopyEqPf
+    added := added.push case2CopyEqName
+    let mrSc7 := mkApp (mkConst (mrNs ++ `MrOcFpObs.okScalar)) (mkNatLit 7)
+    let case2CopyUOkName := ns ++ `lmCase2MoveAsCopyU_eq
+    addThm case2CopyUOkName
+      (mkEq mrObsTy0 (mkApp lmToMr (mkConst case2CopyUName)) mrSc7)
+      (mkRefl mrObsTy0 mrSc7)
+    added := added.push case2CopyUOkName
+    let case2CopyOkName := ns ++ `lmCase2MoveAsCopy_eq
+    let case2CopyOkPf ← MetaM.run' do
+      let p1 ← mkCongrArg lmToMr (mkConst case2CopyEqName)
+      mkEqTrans p1 (mkConst case2CopyUOkName)
+    addThm case2CopyOkName
+      (mkEq mrObsTy0 (mkApp lmToMr (mkConst case2CopyName)) mrSc7)
+      case2CopyOkPf
+    added := added.push case2CopyOkName
 
     -- 4b. Observer-level 3-way agreement over raw `lmOcObserve` + unified
     -- cross-root 3-engine capstone.
@@ -1511,6 +2349,9 @@ run_cmd do
           mkConst zstLockName,
           mkConst case7LockName,
           mkConst (ns ++ `dual_d1_lowering_dependent_cells),
+          mkConst (ns ++ `ocLoweringDependent_characterization),
+          mkConst evalOpMoveEqCopyName,
+          mkConst case2CopyOkName,
           mkConst (ns ++ `dual_d3_zst_fixture_divergence),
           mkConst runnerUnivName ] ++
         (lockNames.toList.map mkConst)
@@ -1526,13 +2367,6 @@ run_cmd do
     -- declaration MUST be rejected BY THE KERNEL (its error message must be a
     -- `(kernel)` type mismatch) AND paired with an accepted honest twin
     -- (`twins = rejected`).
-    let saved ← getEnv
-    -- `none` when the kernel accepts `d`; otherwise the rejection message.
-    let rejection (d : Declaration) : CoreM (Option String) := do
-      let r ← try addDecl d; pure none
-        catch ex => pure (some (← ex.toMessageData.toString))
-      setEnv saved
-      return r
     let invObserve ← MetaM.run' <|
       withLocalDeclD `tb boolTy fun tb => withLocalDeclD `idx natTy fun idx =>
         mkLambdaFVars #[tb, idx]
@@ -1540,629 +2374,16 @@ run_cmd do
     let invAuth := mkAuth invObserve toV
     let swapUbAuth := mkAuth lmObserveU (← MetaM.run' <| mkToVerdict true false)
     let swapPhaseAuth := mkAuth lmObserveU (← MetaM.run' <| mkToVerdict false true)
-    let tblCheck (a : Expr) := mkApp (mkConst (bNs ++ `lmTableCheckOf)) a
-    let mrObs (tb : Bool) (i : Nat) : Expr :=
-      mkApp2 (mkConst (mrNs ++ `mrOcObserve)) (toExpr tb) (mkNatLit i)
-    let trObs (tb : Bool) (i : Nat) : Expr :=
-      mkApp2 (mkConst (mrNs ++ `mrOcTrustedObserve)) (toExpr tb) (mkNatLit i)
-    let lmObsU (tb : Bool) (i : Nat) : Expr :=
-      mkApp2 lmObserveU (toExpr tb) (mkNatLit i)
-    let mrObsTy := mkConst (mrNs ++ `MrOcFpObs)
-    let mrC (c : Name) : Expr := mkConst (mrNs ++ `MrOcFpObs ++ c)
-    let mrSc (n : Nat) : Expr := mkApp (mrC `okScalar) (mkNatLit n)
-    let lmSc (n : Nat) : Expr := mkApp (lmObsC `okScalar) (mkNatLit n)
-    let mrPair (a b : Nat) : Expr :=
-      mkApp2 (mrC `okRetagPair) (mkNatLit a) (mkNatLit b)
-    let lmPair (a b : Nat) : Expr :=
-      mkApp2 (lmObsC `okRetagPair) (mkNatLit a) (mkNatLit b)
-    let repTy ← MetaM.run' <| inferType
-      (mkApp (mkConst (bNs ++ `ocEncode))
-        (mkApp (mkConst (bNs ++ `OcFpObs.scalar)) (mkNatLit 0)))
-    let optObsTy := mkApp (mkConst ``Option [0]) obsTy
-    let noneObs := mkApp (mkConst ``Option.none [0]) obsTy
-    let triple (a b c : Nat) : MetaM Expr := do
-      mkAppM ``Prod.mk #[mkNatLit a, ← mkAppM ``Prod.mk #[mkNatLit b, mkNatLit c]]
-    let scalarObs (n : Nat) :=
-      mkApp (mkConst (bNs ++ `OcFpObs.scalar)) (mkNatLit n)
-    let ptrObs := mkConst (bNs ++ `OcFpObs.ptrValid)
-    let someObs (e : Expr) := mkApp2 (mkConst ``Option.some [0]) obsTy e
-    let decode (t : Expr) := mkApp (mkConst (bNs ++ `ocDecode)) t
-    let encode (o : Expr) := mkApp (mkConst (bNs ++ `ocEncode)) o
-    let t071 ← MetaM.run' <| triple 0 7 1
-    let t070 ← MetaM.run' <| triple 0 7 0
-    let t210 ← MetaM.run' <| triple 2 1 0
-    let t201 ← MetaM.run' <| triple 2 0 1
-    let t200 ← MetaM.run' <| triple 2 0 0
-    let t300 ← MetaM.run' <| triple 3 0 0
-    let lmVerd (a : Expr) (tb : Bool) (i : Nat) : Expr :=
-      mkApp3 (mkConst (bNs ++ `OcFpLmAuthority.verdict)) a (toExpr tb) (mkNatLit i)
-    let isRet (e : Expr) : Expr := mkApp2 (mkConst (cNs ++ `isReturn)) obsTy e
-    let isFault (e : Expr) : Expr := mkApp2 (mkConst (cNs ++ `isFaultV)) obsTy e
-    let mrVerd (tb : Bool) (i : Nat) : Expr :=
-      mkApp2 (mkConst (bNs ++ `mrVerdict)) (toExpr tb) (mkNatLit i)
-    let trVerd (tb : Bool) (i : Nat) : Expr :=
-      mkApp2 (mkConst (bNs ++ `trustedVerdict)) (toExpr tb) (mkNatLit i)
-    let capMirTy ← MetaM.run' <| inferType (mkConst (mrNs ++ `ocCase0Mir))
-    let ocBundleTy := mkConst (bNs ++ `OcFpBundle)
-    -- Gate-boundary forgery helpers: admitting case `8` (where Trusted is
-    -- `.unsupported` while MR & LM return `okScalar 5`) fails `Side.check`.
-    let noneSel := mkApp (mkConst ``Option.none [0]) (mkConst domNs)
-    let some (.defnInfo lmChkInfo) := (← getEnv).find? (bNs ++ `lmCheckOf)
-      | throwError "cross-root: lmCheckOf definition missing"
-    let checkOnOcModel := lmChkInfo.value.bindingBody!.bindingBody!.appFn!
-    let allTrueGate ← MetaM.run' <|
-      withLocalDeclD `sel (mkApp (mkConst ``Option [0]) (mkConst domNs)) fun sel =>
-        withLocalDeclD `i (mkConst (bNs ++ `OcFpCase)) fun i =>
-          mkLambdaFVars #[sel, i] (mkConst ``Bool.true)
-    let mrSideWithCase8 := mkApp3 (mkConst (bNs ++ `sideOf))
-      noneSel allTrueGate (mkConst (bNs ++ `mrVerdictFn))
-    let mrSideWithCase8Check := mkApp checkOnOcModel mrSideWithCase8
-    let lmSideWithCase8 := mkApp3 (mkConst (bNs ++ `sideOf))
-      noneSel allTrueGate (mkApp (mkConst (bNs ++ `lmVerdictFn)) authUC)
-    let lmSideWithCase8Check := mkApp checkOnOcModel lmSideWithCase8
-    let lmMapBasic := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 lmToMr
-      (mkConst (lmNs ++ `lmOcExpectedBasic))
-    let lmMapTb := mkApp4 (mkConst ``List.map [0, 0]) lmObsTy mrObsTy0 lmToMr
-      (mkConst (lmNs ++ `lmOcExpectedTb))
-    let termClean (tb : Bool) (i : Nat) : Expr :=
-      mkApp3 (mkConst (bNs ++ `ocTerminatesCleanly))
-        (toExpr tb) (mkConst (mrNs ++ (Name.mkSimple s!"ocMrProg{i}")))
-        (mkNatLit 120)
-    -- `D1` phase-boundary observer & type-switch erasure expressions.
-    let lmPhase0 := mkApp (mkConst (lmNs ++ `lmOcPhaseObserve)) (mkNatLit 0)
-    let erasedInvalidBoolTr :=
-      mkApp2 (mkConst (mrNs ++ `mrOcTrustedObsOf))
-        (mkConst (mrNs ++ `OcRetKind.scalar))
-        (mkApp2 (mkConst (mrNs ++ `ocRunTrustedRaw))
-          (mkApp (mkConst (mrNs ++ `ocEraseBody))
-            (mkConst (mrNs ++ `ocCase9InvalidBoolMir)))
-          nilMir)
-    -- `D3` `checkPtr` `some mach` vs `none` expressions from Episode 1 theorem.
-    let (chkTy, chk16L, chk16R, chk20L, chk20R) ← MetaM.run' do
-      let thTy ← inferType (mkConst (mrNs ++ `mr_checkPtr_some_vs_none_contrast))
-      let some (c16, rest1) := thTy.and?
-        | throwError "cross-root: unexpected checkPtr contrast shape"
-      let some (cty, l16, r16) := c16.eq?
-        | throwError "cross-root: unexpected checkPtr eq shape"
-      -- Navigate to 11th conjunct (case 20 Ref): skip 9 more conjuncts.
-      let mut cur := rest1
-      for _ in List.range 9 do
-        let some (_, nxt) := cur.and?
-          | throwError "cross-root: unexpected checkPtr contrast length"
-        cur := nxt
-      let some (c20, _) := cur.and?
-        | throwError "cross-root: unexpected checkPtr case 20 shape"
-      let some (_, l20, r20) := c20.eq?
-        | throwError "cross-root: unexpected checkPtr case 20 eq"
-      return (cty, l16, r16, l20, r20)
-    let forged : List (String × Declaration × Declaration) :=
-      [ ("ill-typed 0 = 1",
-          thmD (ns ++ `forged.zeroEqOne)
-            (mkEq natTy (mkNatLit 0) (mkNatLit 1)) (mkRefl natTy (mkNatLit 0)),
-          thmD (ns ++ `honest.zeroEqZero)
-            (mkEq natTy (mkNatLit 0) (mkNatLit 0)) (mkRefl natTy (mkNatLit 0))),
-        ("negated LM 44-cell certificate",
-          thmD (ns ++ `forged.lmTableFalse) (eqFalse (tblCheck authUC)) reflFalse,
-          thmD (ns ++ `honest.lmTableTrue) (eqTrue (tblCheck authUC)) reflTrue),
-        ("mode-inverted LM authority (Bool.not tb) certificate",
-          thmD (ns ++ `forged.modeInverted) (eqTrue (tblCheck invAuth)) reflTrue,
-          thmD (ns ++ `honest.modeInvertedFalse) (eqFalse (tblCheck invAuth)) reflFalse),
-        ("ub/unsupported-swapped LM translation certificate",
-          thmD (ns ++ `forged.swappedUbTranslation)
-            (eqTrue (tblCheck swapUbAuth)) reflTrue,
-          thmD (ns ++ `honest.swappedUbTranslationFalse)
-            (eqFalse (tblCheck swapUbAuth)) reflFalse),
-        ("phaseBoundary/unsupported-swapped LM translation out-of-range verdict",
-          thmD (ns ++ `forged.swappedPhaseOutOfRange)
-            (mkEq optVerdTy (lmVerd swapPhaseAuth false 22) unsV)
-            (mkRefl optVerdTy (lmVerd swapPhaseAuth false 22)),
-          thmD (ns ++ `honest.swappedPhaseOutOfRangeNone)
-            (mkEq optVerdTy (lmVerd swapPhaseAuth false 22) noneV)
-            (mkRefl optVerdTy (lmVerd swapPhaseAuth false 22))),
-        ("forged DualCorrespondenceBundle from mode-inverted LM authority",
-          defD (ns ++ `forged.bundleModeInverted) ocBundleTy
-            (mkApp2 (mkConst (bNs ++ `bundleOf)) invAuth reflTrue),
-          -- Same-shaped twin: the kernel re-evaluates the 44-cell certificate.
-          defD (ns ++ `honest.bundleFromUnrolled) ocBundleTy
-            (mkApp2 (mkConst (bNs ++ `bundleOf)) authUC reflTrue)),
-        ("swapped fixture lock (ocCase0Mir = ocCase5Mir)",
-          thmD (ns ++ `forged.swappedFixture)
-            (mkEq capMirTy (mkConst (mrNs ++ `ocCase0Mir))
-              (mkConst (lmNs ++ `ocCase5Mir)))
-            (mkRefl capMirTy (mkConst (mrNs ++ `ocCase0Mir))),
-          thmD (ns ++ `honest.fixture5)
-            (mkEq capMirTy (mkConst (mrNs ++ `ocCase5Mir))
-              (mkConst (lmNs ++ `ocCase5Mir)))
-            (mkRefl capMirTy (mkConst (mrNs ++ `ocCase5Mir)))),
-        ("forged codec decode of non-zero padding (0,7,1)",
-          thmD (ns ++ `forged.decodePadding0)
-            (mkEq optObsTy (decode t071) (someObs (scalarObs 7)))
-            (mkRefl optObsTy (decode t071)),
-          thmD (ns ++ `honest.decodeCanonical0)
-            (mkEq optObsTy (decode t070) (someObs (scalarObs 7)))
-            (mkRefl optObsTy (decode t070))),
-        ("forged codec decode of non-zero padding (2,1,0)",
-          thmD (ns ++ `forged.decodePadding2a)
-            (mkEq optObsTy (decode t210) (someObs ptrObs))
-            (mkRefl optObsTy (decode t210)),
-          thmD (ns ++ `honest.decodeCanonical2a)
-            (mkEq optObsTy (decode t200) (someObs ptrObs))
-            (mkRefl optObsTy (decode t200))),
-        ("forged codec decode of non-zero padding (2,0,1)",
-          thmD (ns ++ `forged.decodePadding2b)
-            (mkEq optObsTy (decode t201) (someObs ptrObs))
-            (mkRefl optObsTy (decode t201)),
-          thmD (ns ++ `honest.decodeCanonical2b)
-            (mkEq optObsTy (decode t201) noneObs)
-            (mkRefl optObsTy (decode t201))),
-        ("forged codec decode of invalid wire tag 3",
-          thmD (ns ++ `forged.decodeTag3)
-            (mkEq optObsTy (decode t300) (someObs (scalarObs 0)))
-            (mkRefl optObsTy (decode t300)),
-          thmD (ns ++ `honest.decodeTag3None)
-            (mkEq optObsTy (decode t300) noneObs)
-            (mkRefl optObsTy (decode t300))),
-        ("forged colliding codec encodings (scalar 0 = ptrValid)",
-          thmD (ns ++ `forged.encodeCollision)
-            (mkEq repTy (encode (scalarObs 0)) (encode ptrObs))
-            (mkRefl repTy (encode (scalarObs 0))),
-          thmD (ns ++ `honest.encodePtrValid)
-            (mkEq repTy (encode ptrObs) t200)
-            (mkRefl repTy (encode ptrObs))),
-        ("forged case 8: Trusted computes okScalar 5 instead of unsupported",
-          thmD (ns ++ `forged.case8TrustedOk)
-            (mkEq mrObsTy (trObs false 8) (mrSc 5))
-            (mkRefl mrObsTy (trObs false 8)),
-          thmD (ns ++ `honest.case8TrustedUns)
-            (mkEq mrObsTy (trObs false 8) (mrC `unsupported))
-            (mkRefl mrObsTy (trObs false 8))),
-        ("forged case 8: MiniRust fails closed as unsupported",
-          thmD (ns ++ `forged.case8MrUns)
-            (mkEq mrObsTy (mrObs true 8) (mrC `unsupported))
-            (mkRefl mrObsTy (mrObs true 8)),
-          thmD (ns ++ `honest.case8MrOk)
-            (mkEq mrObsTy (mrObs true 8) (mrSc 5))
-            (mkRefl mrObsTy (mrObs true 8))),
-        ("forged case 8: LeanMiri fails closed as unsupported",
-          thmD (ns ++ `forged.case8LmUns)
-            (mkEq lmObsTy (lmObsU true 8) (lmObsC `unsupported))
-            (mkRefl lmObsTy (lmObsU true 8)),
-          thmD (ns ++ `honest.case8LmOk)
-            (mkEq lmObsTy (lmObsU true 8) (lmSc 5))
-            (mkRefl lmObsTy (lmObsU true 8))),
-        ("forged D1 phase boundary: case 0 returns unsupported instead of phaseBoundary",
-          thmD (ns ++ `forged.d1Phase0Uns)
-            (mkEq lmObsTy lmPhase0 (lmObsC `unsupported))
-            (mkRefl lmObsTy lmPhase0),
-          thmD (ns ++ `honest.d1Phase0Boundary)
-            (mkEq lmObsTy lmPhase0 (lmObsC `phaseBoundary))
-            (mkRefl lmObsTy lmPhase0)),
-        ("forged D1 type-switch erasure: erased ocCase9InvalidBoolMir still UB in Trusted",
-          thmD (ns ++ `forged.erasedInvalidBoolUb)
-            (mkEq mrObsTy erasedInvalidBoolTr (mrC `ub))
-            (mkRefl mrObsTy erasedInvalidBoolTr),
-          thmD (ns ++ `honest.erasedInvalidBoolMasks)
-            (mkEq mrObsTy erasedInvalidBoolTr (mrSc 2))
-            (mkRefl mrObsTy erasedInvalidBoolTr)),
-        ("forged case 2: Trusted accepts use-after-move through cast",
-          thmD (ns ++ `forged.case2TrAccepts) (eqTrue (isRet (trVerd false 2))) reflTrue,
-          thmD (ns ++ `honest.case2TrFaults) (eqTrue (isFault (trVerd false 2))) reflTrue),
-        ("forged case 2: MiniRust accepts use-after-move",
-          thmD (ns ++ `forged.case2MrAccepts) (eqTrue (isRet (mrVerd false 2))) reflTrue,
-          thmD (ns ++ `honest.case2MrFaults) (eqTrue (isFault (mrVerd false 2))) reflTrue),
-        ("forged case 2: LeanMiri accepts use-after-move",
-          thmD (ns ++ `forged.case2LmAccepts) (eqTrue (isRet (lmVerd authUC false 2))) reflTrue,
-          thmD (ns ++ `honest.case2LmFaults) (eqTrue (isFault (lmVerd authUC false 2))) reflTrue),
-        ("forged case 9: Trusted masks uninit read through cast",
-          thmD (ns ++ `forged.case9TrAccepts) (eqTrue (isRet (trVerd true 9))) reflTrue,
-          thmD (ns ++ `honest.case9TrFaults) (eqTrue (isFault (trVerd true 9))) reflTrue),
-        ("forged case 9: LeanMiri masks uninit read",
-          thmD (ns ++ `forged.case9LmAccepts) (eqTrue (isRet (lmVerd authUC true 9))) reflTrue,
-          thmD (ns ++ `honest.case9LmFaults) (eqTrue (isFault (lmVerd authUC true 9))) reflTrue),
-        ("forged case 10 (rust#166253 callee-only): Trusted faults under TB",
-          thmD (ns ++ `forged.case10TrTbUb)
-            (mkEq mrObsTy (trObs true 10) (mrC `ub)) (mkRefl mrObsTy (trObs true 10)),
-          thmD (ns ++ `honest.case10TrTbOk)
-            (mkEq mrObsTy (trObs true 10) (mrPair 5 5)) (mkRefl mrObsTy (trObs true 10))),
-        ("forged case 10 (rust#166253 callee-only): MiniRust faults under TB",
-          thmD (ns ++ `forged.case10MrTbUb)
-            (mkEq mrObsTy (mrObs true 10) (mrC `ub)) (mkRefl mrObsTy (mrObs true 10)),
-          thmD (ns ++ `honest.case10MrTbOk)
-            (mkEq mrObsTy (mrObs true 10) (mrPair 5 5)) (mkRefl mrObsTy (mrObs true 10))),
-        ("forged case 10 (rust#166253 callee-only): LeanMiri faults under TB",
-          thmD (ns ++ `forged.case10LmTbUb)
-            (mkEq lmObsTy (lmObsU true 10) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU true 10)),
-          thmD (ns ++ `honest.case10LmTbOk)
-            (mkEq lmObsTy (lmObsU true 10) (lmPair 5 5)) (mkRefl lmObsTy (lmObsU true 10))),
-        ("forged case 11 mode invariance (Trusted basic = treeBorrows)",
-          thmD (ns ++ `forged.case11TrInv)
-            (mkEq mrObsTy (trObs false 11) (trObs true 11)) (mkRefl mrObsTy (trObs false 11)),
-          thmD (ns ++ `honest.case11TrTbUb)
-            (mkEq mrObsTy (trObs true 11) (mrC `ub)) (mkRefl mrObsTy (trObs true 11))),
-        ("forged case 11 mode invariance (MiniRust basic = treeBorrows)",
-          thmD (ns ++ `forged.case11MrInv)
-            (mkEq mrObsTy (mrObs false 11) (mrObs true 11)) (mkRefl mrObsTy (mrObs false 11)),
-          thmD (ns ++ `honest.case11MrTbUb)
-            (mkEq mrObsTy (mrObs true 11) (mrC `ub)) (mkRefl mrObsTy (mrObs true 11))),
-        ("forged case 11 mode invariance (LeanMiri basic = treeBorrows)",
-          thmD (ns ++ `forged.case11LmInv)
-            (mkEq lmObsTy (lmObsU false 11) (lmObsU true 11)) (mkRefl lmObsTy (lmObsU false 11)),
-          thmD (ns ++ `honest.case11LmTbUb)
-            (mkEq lmObsTy (lmObsU true 11) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU true 11))),
-        ("forged case 13 mode invariance (MiniRust basic = treeBorrows)",
-          thmD (ns ++ `forged.case13MrInv)
-            (mkEq mrObsTy (mrObs false 13) (mrObs true 13)) (mkRefl mrObsTy (mrObs false 13)),
-          thmD (ns ++ `honest.case13MrTbUb)
-            (mkEq mrObsTy (mrObs true 13) (mrC `ub)) (mkRefl mrObsTy (mrObs true 13))),
-        ("forged case 13 mode invariance (LeanMiri basic = treeBorrows)",
-          thmD (ns ++ `forged.case13LmInv)
-            (mkEq lmObsTy (lmObsU false 13) (lmObsU true 13)) (mkRefl lmObsTy (lmObsU false 13)),
-          thmD (ns ++ `honest.case13LmTbUb)
-            (mkEq lmObsTy (lmObsU true 13) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU true 13))),
-        ("forged case 14 mode invariance (Trusted basic = treeBorrows)",
-          thmD (ns ++ `forged.case14TrInv)
-            (mkEq mrObsTy (trObs false 14) (trObs true 14)) (mkRefl mrObsTy (trObs false 14)),
-          thmD (ns ++ `honest.case14TrTbUb)
-            (mkEq mrObsTy (trObs true 14) (mrC `ub)) (mkRefl mrObsTy (trObs true 14))),
-        ("forged case 14 mode invariance (LeanMiri basic = treeBorrows)",
-          thmD (ns ++ `forged.case14LmInv)
-            (mkEq lmObsTy (lmObsU false 14) (lmObsU true 14)) (mkRefl lmObsTy (lmObsU false 14)),
-          thmD (ns ++ `honest.case14LmTbUb)
-            (mkEq lmObsTy (lmObsU true 14) (lmObsC `ub)) (mkRefl lmObsTy (lmObsU true 14))),
-        ("forged clean termination on TB-UB case 11 (Stop.ub must fail ocTerminatesCleanly)",
-          thmD (ns ++ `forged.termClean11Tb) (eqTrue (termClean true 11)) reflTrue,
-          thmD (ns ++ `honest.termNoClean11Tb) (eqFalse (termClean true 11)) reflFalse),
-        ("forged D3 case 16 checkPtr contrast matches case 20 OOB contrast",
-          thmD (ns ++ `forged.d3CheckPtr16Eq20) (mkEq chkTy chk16L chk20R) (mkRefl chkTy chk16L),
-          thmD (ns ++ `honest.d3CheckPtr16Exact) (mkEq chkTy chk16L chk16R) (mkRefl chkTy chk16L)),
-        ("forged D3 case 20 OOB checkPtr contrast matches case 16 valid contrast",
-          thmD (ns ++ `forged.d3CheckPtr20Eq16) (mkEq chkTy chk20L chk16R) (mkRefl chkTy chk20L),
-          thmD (ns ++ `honest.d3CheckPtr20Exact) (mkEq chkTy chk20L chk20R) (mkRefl chkTy chk20L)),
-        ("forged D3 case 18: LeanMiri accepts null safe pointer",
-          thmD (ns ++ `forged.case18LmOk)
-            (mkEq lmObsTy (lmObsU false 18) (lmObsC `okPtrValid))
-            (mkRefl lmObsTy (lmObsU false 18)),
-          thmD (ns ++ `honest.case18LmUb)
-            (mkEq lmObsTy (lmObsU false 18) (lmObsC `ub))
-            (mkRefl lmObsTy (lmObsU false 18))),
-        ("forged D3 case 19: LeanMiri accepts unaligned safe pointer",
-          thmD (ns ++ `forged.case19LmOk)
-            (mkEq lmObsTy (lmObsU false 19) (lmObsC `okPtrValid))
-            (mkRefl lmObsTy (lmObsU false 19)),
-          thmD (ns ++ `honest.case19LmUb)
-            (mkEq lmObsTy (lmObsU false 19) (lmObsC `ub))
-            (mkRefl lmObsTy (lmObsU false 19))),
-        ("forged D3 case 20: LeanMiri accepts OOB safe pointer",
-          thmD (ns ++ `forged.case20LmOk)
-            (mkEq lmObsTy (lmObsU false 20) (lmObsC `okPtrValid))
-            (mkRefl lmObsTy (lmObsU false 20)),
-          thmD (ns ++ `honest.case20LmUb)
-            (mkEq lmObsTy (lmObsU false 20) (lmObsC `ub))
-            (mkRefl lmObsTy (lmObsU false 20))),
-        ("forged D3 case 21: LeanMiri accepts freed safe pointer",
-          thmD (ns ++ `forged.case21LmOk)
-            (mkEq lmObsTy (lmObsU false 21) (lmObsC `okPtrValid))
-            (mkRefl lmObsTy (lmObsU false 21)),
-          thmD (ns ++ `honest.case21LmUb)
-            (mkEq lmObsTy (lmObsU false 21) (lmObsC `ub))
-            (mkRefl lmObsTy (lmObsU false 21))),
-        ("forged observer-level agreement at case 8 (LeanMiri = Trusted on 8)",
-          thmD (ns ++ `forged.observerLevelCase8)
-            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU false 8)) (trObs false 8))
-            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU false 8))),
-          thmD (ns ++ `honest.observerLevelCase8Mr)
-            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU false 8)) (mrObs false 8))
-            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU false 8)))),
-        ("forged observer-level out-of-range cell 100 returns okScalar 0",
-          thmD (ns ++ `forged.observerLevelOobOk)
-            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU true 100)) (mrSc 0))
-            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU true 100))),
-          thmD (ns ++ `honest.observerLevelOobAgree)
-            (mkEq mrObsTy0 (mkApp lmToMr (lmObsU true 100)) (mrObs true 100))
-            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU true 100)))),
-        ("forged translation fidelity (lmToMr maps phaseBoundary to unsupported)",
-          thmD (ns ++ `forged.lmToMrPhase)
-            (mkEq mrObsTy0 (mkApp lmToMr (lmObsC `phaseBoundary)) (mrC `unsupported))
-            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `phaseBoundary))),
-          thmD (ns ++ `honest.lmToMrPhase)
-            (mkEq mrObsTy0 (mkApp lmToMr (lmObsC `phaseBoundary)) (mrC `phaseBoundary))
-            (mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `phaseBoundary)))),
-        ("forged MR Corpus.Side.check admitting cast-deref boundary case 8",
-          thmD (ns ++ `forged.mrGateIncludesCase8) (eqTrue mrSideWithCase8Check) reflTrue,
-          thmD (ns ++ `honest.mrGateRejectsCase8) (eqFalse mrSideWithCase8Check) reflFalse),
-        ("forged LM Corpus.Side.check admitting cast-deref boundary case 8",
-          thmD (ns ++ `forged.lmGateIncludesCase8) (eqTrue lmSideWithCase8Check) reflTrue,
-          thmD (ns ++ `honest.lmGateRejectsCase8) (eqFalse lmSideWithCase8Check) reflFalse),
-        ("forged cross-mode frozen-table lock (ocLmExpectedBasic = lmOcExpectedTb.map lmToMr)",
-          thmD (ns ++ `forged.frozenTableCrossMode)
-            (mkEq listMrTy (mkConst (bNs ++ `ocLmExpectedBasic)) lmMapTb)
-            (mkRefl listMrTy (mkConst (bNs ++ `ocLmExpectedBasic))),
-          thmD (ns ++ `honest.frozenTableBasic)
-            (mkEq listMrTy (mkConst (bNs ++ `ocLmExpectedBasic)) lmMapBasic)
-            (mkRefl listMrTy (mkConst (bNs ++ `ocLmExpectedBasic)))),
-        ("forged LM out-of-range cell 22 returns okScalar 0 instead of unsupported",
-          thmD (ns ++ `forged.lmOutOfRangeOk)
-            (mkEq lmObsTy (lmObsU false 22) (lmSc 0))
-            (mkRefl lmObsTy (lmObsU false 22)),
-          thmD (ns ++ `honest.lmOutOfRangeUns)
-            (mkEq lmObsTy (lmObsU false 22) (lmObsC `unsupported))
-            (mkRefl lmObsTy (lmObsU false 22))) ]
-    -- Companion, phase-boundary, shared-runner, and remaining matrix controls.
-    let compC (c : Name) : Expr := mkConst (compNs ++ c)
-    let trComp (tb : Bool) (c : Name) : Expr :=
-      mkApp2 (mkConst (bNs ++ `trustedCompanion)) (toExpr tb) (compC c)
-    let mrComp (tb : Bool) (c : Name) : Expr :=
-      mkApp2 (mkConst (bNs ++ `mrCompanion)) (toExpr tb) (compC c)
-    -- LeanMiri companion harness on its kernel-evaluable loop-unrolled twin.
-    let lmTwinRun (twin : Name) (tb : Bool) : Expr :=
-      mkApp lmToMr (mkApp (mkConst (lmNs ++ `lmOcRun))
-        (mkApp (mkConst (lmNs ++ twin)) (toExpr tb)))
-    let mrPhase (i : Nat) : Expr :=
-      mkApp (mkConst (bNs ++ `mrOcPhaseObserve)) (mkNatLit i)
-    let selOf (d : Name) : Expr :=
-      mkApp2 (mkConst ``Option.some [0]) (mkConst domNs) (mkConst (domNs ++ d))
-    let domCheck (d : Name) (a : Expr) : Expr :=
-      mkApp2 (mkConst (bNs ++ `lmCheckOf)) (selOf d) a
-    let layoutTy ← MetaM.run' <| inferType (mkConst (mrNs ++ `ocU8Layout))
     let runnerTy ← MetaM.run' <| inferType runnerPf
     let forgedRunnerPf ← MetaM.run' <|
       dischargeRefl (runnerHead (lmOutC `unsupported)) 11
     let forgedRunnerTy ← MetaM.run' <| inferType forgedRunnerPf
-    let lmCombine12 := mkApp lmToMr
-      (mkApp2 (mkConst (lmNs ++ `ocCombine)) (lmSc 1) (lmSc 2))
-    let pbObs (tb : Bool) (i : Nat) : Expr :=
-      mkApp2 (mkConst (bNs ++ `trustedPostBorrowckObserve)) (toExpr tb)
-        (mkNatLit i)
-    let some (.defnInfo pbChkInfo) :=
-        (← getEnv).find? (bNs ++ `lmPostBorrowckCheckOf)
-      | throwError "cross-root: lmPostBorrowckCheckOf definition missing"
-    let checkOnPbModel := pbChkInfo.value.bindingBody!.bindingBody!.appFn!
-    let pbSideMr := mkApp3 (mkConst (bNs ++ `sideOf)) noneSel
-      (mkConst (bNs ++ `postBorrowckGate)) (mkConst (bNs ++ `mrVerdictFn))
-    let fin8 : Expr :=
-      mkApp3 (mkConst ``Fin.mk) (mkNatLit 22) (mkNatLit 8)
-        (mkApp2 (mkConst ``Nat.le_add_left) (mkNatLit 9) (mkNatLit 13))
-    let bodyHasCast (mirConst : Expr) : Expr :=
-      mkApp3 (mkConst ``List.any [0])
-        (mkConst `Trusted.Rustc.V2026_06_01.MirAst.Place)
-        (mkApp (mkConst (mrNs ++ `ocBodyPlaces)) mirConst)
-        (mkConst (mrNs ++ `ocPlaceHasCast))
-    let ptrTysNil ← MetaM.run' do
-      let t ← inferType (mkConst (mrNs ++ `ocRun))
-      let listTy := t.bindingBody!.bindingDomain!
-      return mkApp (mkConst ``List.nil [0]) listTy.appArg!
-    let mrRunNil (tb : Bool) (prog : Name) : Expr :=
-      mkApp3 (mkConst (mrNs ++ `ocRun)) (toExpr tb) ptrTysNil
-        (mkConst (mrNs ++ prog))
-    let eqCtl (what : String) (tag : Name) (ty lhs bad good : Expr) :
-        String × Declaration × Declaration :=
-      (what, thmD (ns ++ `forged ++ tag) (mkEq ty lhs bad) (mkRefl ty lhs),
-        thmD (ns ++ `honest ++ tag) (mkEq ty lhs good) (mkRefl ty lhs))
-    let forgedMore : List (String × Declaration × Declaration) :=
-      [ ("forged universal runner lock (ub/unsupported-swapped outcome constructors)",
-          thmD (ns ++ `forged.runnerUniversal) forgedRunnerTy forgedRunnerPf,
-          thmD (ns ++ `honest.runnerUniversal) runnerTy runnerPf),
-        eqCtl "forged outcome bijection (mrOutToLm ub = unsupported)"
-          `outcomeBijection lmOutTy
-          (mkApp mrOutToLm (mkConst (mrNs ++ `OcTrustedOutcome.ub)))
-          (lmOutC `unsupported) (lmOutC `ub),
-        eqCtl "forged ocCombine lock (disagreeing halves combine to the first half)"
-          `combineDisagree mrObsTy0 lmCombine12 (mrSc 1) (mrC `unsupported),
-        ("swapped layout fixture lock (ocU8Layout = ocU32Layout)",
-          thmD (ns ++ `forged.swappedLayout)
-            (mkEq layoutTy (mkConst (mrNs ++ `ocU8Layout))
-              (mkConst (lmNs ++ `ocU32Layout)))
-            (mkRefl layoutTy (mkConst (mrNs ++ `ocU8Layout))),
-          thmD (ns ++ `honest.layoutU32)
-            (mkEq layoutTy (mkConst (mrNs ++ `ocU32Layout))
-              (mkConst (lmNs ++ `ocU32Layout)))
-            (mkRefl layoutTy (mkConst (mrNs ++ `ocU32Layout)))),
-        eqCtl "forged case count (mrOcCaseCount = 23)" `caseCount natTy
-          (mkConst (mrNs ++ `mrOcCaseCount)) (mkNatLit 23)
-          (mkConst (lmNs ++ `lmOcCaseCount)),
-        ("forged case 13 mode invariance (Trusted basic = treeBorrows)",
-          thmD (ns ++ `forged.case13TrInv)
-            (mkEq mrObsTy (trObs false 13) (trObs true 13))
-            (mkRefl mrObsTy (trObs false 13)),
-          thmD (ns ++ `honest.case13TrTbUb)
-            (mkEq mrObsTy (trObs true 13) (mrC `ub))
-            (mkRefl mrObsTy (trObs true 13))),
-        ("forged case 14 mode invariance (MiniRust basic = treeBorrows)",
-          thmD (ns ++ `forged.case14MrInv)
-            (mkEq mrObsTy (mrObs false 14) (mrObs true 14))
-            (mkRefl mrObsTy (mrObs false 14)),
-          thmD (ns ++ `honest.case14MrTbUb)
-            (mkEq mrObsTy (mrObs true 14) (mrC `ub))
-            (mkRefl mrObsTy (mrObs true 14))),
-        ("forged D2 per-domain side certificate from the mode-inverted LM authority",
-          thmD (ns ++ `forged.d2ModeInverted) (eqTrue (domCheck `d2 invAuth)) reflTrue,
-          -- `D1` is mode-insensitive, so the SAME inversion is harmless there.
-          thmD (ns ++ `honest.d1ModeInverted) (eqTrue (domCheck `d1 invAuth)) reflTrue),
-        eqCtl "forged companion: Trusted protected drop succeeds under Tree Borrows"
-          `compTrProtectedDrop mrObsTy0 (trComp true `protectedDrop) (mrSc 7) (mrC `ub),
-        eqCtl "forged companion: MiniRust protected drop succeeds under Tree Borrows"
-          `compMrProtectedDrop mrObsTy0 (mrComp true `protectedDrop) (mrSc 7) (mrC `ub),
-        eqCtl "forged companion: LeanMiri protected drop succeeds under Tree Borrows"
-          `compLmProtectedDrop mrObsTy0 (lmTwinRun `lmOcProtectedDropU true)
-          (mrSc 7) (mrC `ub),
-        eqCtl "forged companion: Trusted reverse transmute succeeds under Tree Borrows"
-          `compTrRevTransmute mrObsTy0 (trComp true `revTransmute) (mrPair 5 5) (mrC `ub),
-        eqCtl "forged companion: MiniRust reverse transmute succeeds under Tree Borrows"
-          `compMrRevTransmute mrObsTy0 (mrComp true `revTransmute) (mrPair 5 5) (mrC `ub),
-        eqCtl "forged companion: LeanMiri reverse transmute succeeds under Tree Borrows"
-          `compLmRevTransmute mrObsTy0 (lmTwinRun `lmOcD2RevTransmuteU true)
-          (mrPair 5 5) (mrC `ub),
-        eqCtl "forged companion: Trusted masks the invalid bool through the cast"
-          `compTrInvalidBool mrObsTy0 (trComp false `invalidBool) (mrSc 2) (mrC `ub),
-        eqCtl "forged companion: MiniRust masks the invalid bool"
-          `compMrInvalidBool mrObsTy0 (mrComp true `invalidBool) (mrSc 2) (mrC `ub),
-        eqCtl "forged companion: LeanMiri type-switched read masks the invalid bool"
-          `compLmInvalidBool mrObsTy0 (lmTwinRun `lmOcInvalidBoolReadU false)
-          (mrSc 2) (mrC `ub),
-        eqCtl "forged companion: Trusted accepts the dangling ZST (no boundary)"
-          `compTrZstDangling mrObsTy0 (trComp false `zstDangling)
-          (mrC `okPtrValid) (mrC `ub),
-        eqCtl "forged companion: MiniRust rejects the dangling ZST"
-          `compMrZstDangling mrObsTy0 (mrComp false `zstDangling)
-          (mrC `ub) (mrC `okPtrValid),
-        eqCtl "forged companion: MiniRust accepts the null ZST"
-          `compMrZstNull mrObsTy0 (mrComp true `zstNull) (mrC `okPtrValid) (mrC `ub),
-        eqCtl "forged phase boundary: cast-free D2 case 10 rejected statically"
-          `phaseD2 mrObsTy0 (mrPhase 10) (mrC `phaseBoundary) (mrC `unsupported),
-        eqCtl "forged phase boundary: MiniRust translates the cast places of case 8"
-          `phaseCase8 mrObsTy0 (mrPhase 8) (mrC `unsupported) (mrC `phaseBoundary),
-        ("forged LM phase certificate from the RUNTIME observer",
-          thmD (ns ++ `forged.phaseFromRuntime)
-            (eqTrue (phaseCheck (mkApp lmObserveU (toExpr false)))) reflTrue,
-          thmD (ns ++ `honest.phaseFromRuntimeFalse)
-            (eqFalse (phaseCheck (mkApp lmObserveU (toExpr false)))) reflFalse),
-        ("forged negated LM 14-cell companion certificate",
-          thmD (ns ++ `forged.compCheckFalse) (eqFalse (compCheck compObsU)) reflFalse,
-          thmD (ns ++ `honest.compCheckTrue) (eqTrue (compCheck compObsU)) reflTrue),
-        ("forged mode-inverted LM 14-cell companion certificate",
-          thmD (ns ++ `forged.compCheckInverted)
-            (eqTrue (compCheck
-              (mkLambda `tb .default boolTy <| mkLambda `c .default compTy <|
-                mkApp2 compObsU (mkApp (mkConst ``Bool.not) (.bvar 1)) (.bvar 0))))
-            reflTrue,
-          thmD (ns ++ `honest.compCheckInvertedFalse)
-            (eqFalse (compCheck
-              (mkLambda `tb .default boolTy <| mkLambda `c .default compTy <|
-                mkApp2 compObsU (mkApp (mkConst ``Bool.not) (.bvar 1)) (.bvar 0))))
-            reflFalse),
-        eqCtl "forged companion twin: LM dead-local read returns okScalar 7"
-          `compLmDeadLocal mrObsTy0
-          (mkApp lmToMr (mkApp2 compObsU (toExpr false) (compC `deadLocal)))
-          (mrSc 7) (mrC `ub),
-        eqCtl "forged companion twin: LM dangling ZST rejected as UB"
-          `compLmZstDangling mrObsTy0
-          (mkApp lmToMr (mkApp2 compObsU (toExpr false) (compC `zstDangling)))
-          (mrC `ub) (mrC `okPtrValid),
-        eqCtl "forged companion twin: LM null ZST accepted as okPtrValid"
-          `compLmZstNull mrObsTy0
-          (mkApp lmToMr (mkApp2 compObsU (toExpr true) (compC `zstNull)))
-          (mrC `okPtrValid) (mrC `ub),
-        eqCtl "forged companion twin: LM erased invalid-bool is UB instead of masking byte 2"
-          `compLmErasedUb mrObsTy0 (mkApp lmToMr erasedULhs)
-          (mrC `ub) (mrSc 2),
-        ("forged negated LM 7-companion phase certificate",
-          thmD (ns ++ `forged.phaseCompFalse)
-            (eqFalse (phaseCompCheck phaseCompObs)) reflFalse,
-          thmD (ns ++ `honest.phaseCompTrue)
-            (eqTrue (phaseCompCheck phaseCompObs)) reflTrue),
-        ("forged LM companion phase certificate from RUNTIME companion observer",
-          thmD (ns ++ `forged.phaseCompFromRuntime)
-            (eqTrue (phaseCompCheck (mkApp compObsU (toExpr false)))) reflTrue,
-          thmD (ns ++ `honest.phaseCompFromRuntimeFalse)
-            (eqFalse (phaseCompCheck (mkApp compObsU (toExpr false)))) reflFalse),
-        eqCtl "forged MR companion phase: cast-free revTransmute is phaseBoundary"
-          `phaseCompRevTr mrObsTy0
-          (mkApp (mkConst (bNs ++ `mrOcPhaseCompanion)) (compC `revTransmute))
-          (mrC `phaseBoundary) (mrC `unsupported),
-        eqCtl "forged MR companion phase: D1 invalidBool is unsupported"
-          `phaseCompInvBool mrObsTy0
-          (mkApp (mkConst (bNs ++ `mrOcPhaseCompanion)) (compC `invalidBool))
-          (mrC `unsupported) (mrC `phaseBoundary) ] ++
-      ([18, 19, 20, 21].map fun i =>
-        eqCtl s!"forged D3 case {i}: Trusted accepts the invalid safe pointer"
-          (Name.mkSimple s!"d3TrAccepts{i}") mrObsTy (trObs false i)
-          (mrC `okPtrValid) (mrC `ub)) ++
-      ([18, 19, 20, 21].map fun i =>
-        eqCtl s!"forged D3 case {i}: MiniRust accepts the invalid safe pointer"
-          (Name.mkSimple s!"d3MrAccepts{i}") mrObsTy (mrObs true i)
-          (mrC `okPtrValid) (mrC `ub)) ++
-      -- Post-borrowck image and out-of-range phase controls.
-      [ eqCtl "forged LM phase observer out of range: idx 22 rejected at the phase boundary"
-          `phaseOob22 mrObsTy0
-          (mkApp lmToMr (mkApp lmPhaseObs (mkNatLit 22)))
-          (mrC `phaseBoundary) (mrC `unsupported),
-        eqCtl "forged MR phase observer out of range: idx 1000 rejected at the phase boundary"
-          `phaseOob1000 mrObsTy0 (mrPhase 1000)
-          (mrC `phaseBoundary) (mrC `unsupported),
-        eqCtl "forged post-borrowck case 8: Trusted on the erased image stays unsupported"
-          `pbCase8 mrObsTy0 (pbObs false 8) (mrC `unsupported) (mrSc 5),
-        eqCtl "forged cast-erasure faithfulness at case 8 (cast fixture = erased image)"
-          `pbCase8Faithful mrObsTy0 (trObs false 8) (pbObs false 8)
-          (mrC `unsupported),
-        ("forged all-case MR gate on the CAST model (case 8 breaks Side.check)",
-          thmD (ns ++ `forged.pbGateOnCastModel)
-            (eqTrue (mkApp checkOnOcModel pbSideMr)) reflTrue,
-          -- Same side, same gate: only the post-borrowck model accepts it.
-          thmD (ns ++ `honest.pbGateOnPostBorrowckModel)
-            (eqTrue (mkApp checkOnPbModel pbSideMr)) reflTrue),
-        ("forged post-borrowck LM side certificate from the mode-inverted LM authority",
-          thmD (ns ++ `forged.pbModeInverted)
-            (eqTrue (pbCheck noneSel invAuth)) reflTrue,
-          thmD (ns ++ `honest.pbFromUnrolled)
-            (eqTrue (pbCheck noneSel authUC)) reflTrue),
-        ("forged D2 post-borrowck LM side certificate from mode-inverted authority",
-          thmD (ns ++ `forged.pbD2ModeInverted)
-            (eqTrue (pbCheck (mkApp2 (mkConst ``Option.some [0]) (mkConst domNs)
-              (mkConst (domNs ++ `d2))) invAuth)) reflTrue,
-          -- `D1` post-borrowck is mode-insensitive, so the SAME inversion passes there.
-          thmD (ns ++ `honest.pbD1ModeInverted)
-            (eqTrue (pbCheck (mkApp2 (mkConst ``Option.some [0]) (mkConst domNs)
-              (mkConst (domNs ++ `d1))) invAuth)) reflTrue),
-        eqCtl "forged uniform erased observer at case 8: stays unsupported"
-          `pbUniformCase8Uns mrObsTy0
-          (mkApp2 (mkConst (bNs ++ `trustedUniformErasedObserve))
-            (toExpr false) (mkNatLit 8))
-          (mrC `unsupported) (mrSc 5),
-        eqCtl "forged uniform erased observer out of range (idx 22): returns scalar 5"
-          `pbUniformOob22Ok mrObsTy0
-          (mkApp2 (mkConst (bNs ++ `trustedUniformErasedObserve))
-            (toExpr true) (mkNatLit 22))
-          (mrSc 5) (mrC `unsupported),
-        eqCtl "forged D1 post-borrowck gate excludes case 8"
-          `pbD1Gate8 boolTy
-          (mkApp2 (mkConst (bNs ++ `postBorrowckGate))
-            (mkApp2 (mkConst ``Option.some [0]) (mkConst domNs)
-              (mkConst (domNs ++ `d1)))
-            fin8)
-          (toExpr false) (toExpr true),
-        eqCtl "forged D1 case 8 carries no opaqueCast place"
-          `d1Case8NoCast boolTy
-          (bodyHasCast (mkConst (mrNs ++ `ocCase8Mir)))
-          (toExpr false) (toExpr true),
-        eqCtl "forged D2 case 10 carries an opaqueCast place"
-          `d2Case10HasCast boolTy
-          (bodyHasCast (mkConst (mrNs ++ `ocCase10Mir)))
-          (toExpr true) (toExpr false),
-        -- Lowering-dependent cells `2` / `7`.
-        eqCtl "forged LM case 7 follows upstream minimize (no deinit): returns 7"
-          `lmCase7Minimize mrObsTy0 (mkApp lmToMr (lmObsU true 7))
-          (mrSc 7) (mrC `ub),
-        eqCtl "forged MR upstream-minimize case 7 is UB like Trusted"
-          `mrCase7MinimizeUb mrObsTy0 (mrRunNil false `ocMrProg7Minimize)
-          (mrC `ub) (mrSc 7),
-        eqCtl "forged MR upstream-minimize case 2 is UB like Trusted"
-          `mrCase2MinimizeUb mrObsTy0 (mrRunNil true `ocMrProg2Minimize)
-          (mrC `ub) (mrSc 7),
-        eqCtl "forged Trusted fixture 5 carries a Drop terminator"
-          `case5HasDrop boolTy
-          (mkApp (mkConst (bNs ++ `ocBodyHasDrop)) (mkConst (mrNs ++ `ocCase5Mir)))
-          (toExpr true) (toExpr false) ]
-    let mut rejected : Nat := 0
-    let mut twins : Nat := 0
-    for (what, d, h) in forged ++ forgedMore do
-      match ← rejection d with
-      | none =>
-        throwError "cross-root negative control FAILED: kernel accepted {what}"
-      | some msg =>
-        -- Only `(kernel) declaration type mismatch` / `(kernel) application
-        -- type mismatch` count: never a name-resolution, elaboration, or
-        -- resource (`deep recursion`) failure.
-        unless msg.startsWith "(kernel)" &&
-            (msg.splitOn "type mismatch").length > 1 do
-          throwError "cross-root negative control VACUOUS: {what} was not rejected by a kernel type mismatch: {msg}"
-      rejected := rejected + 1
-      if let some msg ← rejection h then
-        throwError "cross-root negative control VACUOUS: honest twin of {what} was rejected: {msg}"
-      twins := twins + 1
-    -- Harness self-test: an accepted declaration reports no rejection.
-    if let some msg ← rejection (thmD (ns ++ `honest.selfTest)
-        (mkEq natTy (mkNatLit 2) (mkNatLit 2)) (mkRefl natTy (mkNatLit 2))) then
-      throwError "cross-root control harness self-test failed: {msg}"
+    let (rejected, twins) ← runCrossRootForgedControls
+      { authUC, invAuth, swapUbAuth, swapPhaseAuth, lmToMr, mrOutToLm,
+        runnerTy, runnerPf, forgedRunnerTy, forgedRunnerPf,
+        compObsU, erasedULhs, phaseCompObs,
+        evalOpTy, evalOpPf, forgedEvalOpTy, forgedEvalOpPf,
+        nilMir, unsV, noneV }
 
     -- 6. Axiom / non-triviality audit of every added declaration & LM theorems.
     let env ← getEnv
@@ -2347,6 +2568,10 @@ run_cmd do
           [ `MiniRustSpec.Interp.steps,
             `MiniRustSpec.Interp.stepM,
             `MiniRustSpec.Correspondence.stepM_bm_eq ]),
+        (evalOpMoveEqCopyName, [`Miri.Interpreter.evalOperand]),
+        (case2CopyName,
+          [ `Miri.Interpreter.Step.step,
+            `LeanMiriSpec.Correspondence.annealEvalOperand ]),
         (runnerUnivName, runnerReach),
         (crossName, crossReach) ]
     let mut reachChecked : Nat := 0
@@ -2382,7 +2607,8 @@ run_cmd do
         [ (`lmOcObserve, lmObserve),
           (`lmCompanionObserve, compObs),
           (`lmOcPhaseObserve, lmPhaseObs),
-          (`lmPhaseCompanion, phaseCompObs) ] do
+          (`lmPhaseCompanion, phaseCompObs),
+          (`lmCase2MoveAsCopy, mkConst case2CopyName) ] do
       let seen := reachFromExpr lmExpr
       if seen.contains stepMirFnName then
         throwError "authority-independence audit FAILED: LM {lmTag} reaches Trusted stepMirFn"
@@ -2470,9 +2696,9 @@ run_cmd do
   let ((addedCount, bundleCount, eqLockCount, sharedCount,
         rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 229 && bundleCount = 8 && eqLockCount = 94 &&
-      sharedCount = 98 && rejectedCount ≥ 103 &&
-      twinCount = rejectedCount && reachCount ≥ 268 do
+  unless addedCount ≥ 238 && bundleCount = 8 && eqLockCount = 94 &&
+      sharedCount = 98 && rejectedCount ≥ 109 &&
+      twinCount = rejectedCount && reachCount ≥ 273 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, shared={sharedCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles; {eqLockCount} Eq.refl + 2 bijection + 2 universal runner + 1 ocCombine locks covering {sharedCount}/98 shared MR/LM declarations), kernel-rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
 
@@ -2541,7 +2767,10 @@ run_cmd do
       `ocEraseBody_fixture_fixed_iff, `ocEraseBody_companion_fixed_iff,
       `trustedPostBorrowckObserve_eq_uniform_erased,
       `postBorrowckDomain_bundle_claims, `postBorrowck_modeSensitivity_present,
-      `ocBodyHasDrop, `dual_d1_lowering_dependent_cells,
+      `ocBodyHasDrop, `ocMoveToCopyOperand, `ocMoveToCopyRvalue,
+      `ocMoveToCopyStmt, `ocMoveToCopyBody, `ocDropToNopBody,
+      `ocLoweringDependent, `dual_d1_lowering_dependent_cells,
+      `ocLoweringDependent_characterization,
       `ep2_opaquecast_fnentry_post_borrowck_capstone,
       `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   let isChoiceFree (axs : Array Name) : Bool :=
