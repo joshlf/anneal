@@ -324,6 +324,20 @@ theorem d1_lowering_dependent_canaries :
       (ocRunTrustedRaw (ocDropToNopBody ocCase7Mir) []) = .okScalar 7 := by
   decide +kernel
 
+/-- **Fuel audit (direct kernel execution)**: Trusted's case-`8` boundary is
+the genuine `.unsupported` step node (tag `2`), not fuel exhaustion (tag `3`),
+in both modes; neighbouring cells end in `ret` / `ub`; and out-of-range
+indices have no raw run at all. -/
+theorem trusted_fuel_audit_canaries :
+    (trustedRawOutcome false 8).map ocOutcomeTag = some 2 ∧
+    (trustedRawOutcome true 8).map ocOutcomeTag = some 2 ∧
+    (trustedRawOutcome false 0).map ocOutcomeTag = some 0 ∧
+    (trustedRawOutcome true 11).map ocOutcomeTag = some 1 ∧
+    (trustedRawOutcome false 21).map ocOutcomeTag = some 1 ∧
+    (trustedRawOutcome true 22).isNone = true ∧
+    mrOcTrustedObserve true 8 = .unsupported := by
+  decide +kernel
+
 /-- **Case `17` fixture divergence (direct kernel execution)**: MiniRust's
 canonical cell `17` IS its dangling-ZST companion, Trusted's canonical cell
 `17` (a live `&()`) is `okPtrValid`, and Trusted on the identical dangling
@@ -1051,6 +1065,14 @@ private def buildForgedExtended (a : CrossRootForgedArgs) :
   let mrRunNil (tb : Bool) (prog : Name) : Expr :=
     mkApp3 (mkConst (crMrNs ++ `ocRun)) (toExpr tb) ptrTysNil
       (mkConst (crMrNs ++ prog))
+  let optNatTy := mkApp (mkConst ``Option [0]) (mkConst ``Nat)
+  let someNat (n : Nat) : Expr :=
+    mkApp2 (mkConst ``Option.some [0]) (mkConst ``Nat) (mkNatLit n)
+  let rawTag (tb : Bool) (i : Nat) : Expr :=
+    mkApp4 (mkConst ``Option.map [0, 0])
+      (mkConst (crMrNs ++ `OcTrustedOutcome)) (mkConst ``Nat)
+      (mkConst (crBNs ++ `ocOutcomeTag))
+      (mkApp2 (mkConst (crBNs ++ `trustedRawOutcome)) (toExpr tb) (mkNatLit i))
   let eqCtl (what : String) (tag : Name) (ty lhs bad good : Expr) :
       String × Declaration × Declaration :=
     (what, crThmD (crNs ++ `forged ++ tag) (crMkEq ty lhs bad) (crMkRefl ty lhs),
@@ -1289,7 +1311,12 @@ private def buildForgedExtended (a : CrossRootForgedArgs) :
             crMkEq lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7))
               (mkApp2 lmObserve (.bvar 0) (mkNatLit 5)))
           (mkLambda `tb .default boolTy <|
-            crMkRefl lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7)))) ]
+            crMkRefl lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7)))),
+      -- Fuel audit: Trusted case `8` is a genuine `.unsupported` node.
+      eqCtl "forged Trusted case 8 unsupported is fuel exhaustion (tag 3)"
+        `trCase8OutOfFuel optNatTy (rawTag false 8) (someNat 3) (someNat 2),
+      eqCtl "forged Trusted case 8 (Tree Borrows) raw run returns a value (tag 0)"
+        `trCase8TbRet optNatTy (rawTag true 8) (someNat 0) (someNat 2) ]
 
 private def runCrossRootForgedControls (a : CrossRootForgedArgs) :
     CoreM (Nat × Nat) := do
@@ -2226,6 +2253,12 @@ run_cmd do
     addThmInfer (ns ++ `ocLoweringDependent_characterization)
       (mkApp2 (mkConst (bNs ++ `ocLoweringDependent_characterization)) authC hA)
     added := added.push (ns ++ `ocLoweringDependent_characterization)
+    -- Fuel audit over the REAL LeanMiri authority: no in-range LeanMiri cell
+    -- is `.unsupported` (so `Step.step`'s "out of fuel" never fires), and
+    -- Trusted's case `8` is a genuine `.unsupported` step node.
+    addThmInfer (ns ++ `dual_fuel_and_unsupported_audit)
+      (mkApp2 (mkConst (bNs ++ `dual_fuel_and_unsupported_audit)) authC hA)
+    added := added.push (ns ++ `dual_fuel_and_unsupported_audit)
     -- Universal vendored-Miri theorem: `Miri.Interpreter.evalOperand` treats
     -- `.Move place` and `.Copy place` identically (by `Eq.refl` for EVERY
     -- `hooks`, `frame`, `state`, `place`, `known`), proving case `2`'s
@@ -2350,6 +2383,7 @@ run_cmd do
           mkConst case7LockName,
           mkConst (ns ++ `dual_d1_lowering_dependent_cells),
           mkConst (ns ++ `ocLoweringDependent_characterization),
+          mkConst (ns ++ `dual_fuel_and_unsupported_audit),
           mkConst evalOpMoveEqCopyName,
           mkConst case2CopyOkName,
           mkConst (ns ++ `dual_d3_zst_fixture_divergence),
@@ -2696,8 +2730,8 @@ run_cmd do
   let ((addedCount, bundleCount, eqLockCount, sharedCount,
         rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 238 && bundleCount = 8 && eqLockCount = 94 &&
-      sharedCount = 98 && rejectedCount ≥ 109 &&
+  unless addedCount ≥ 239 && bundleCount = 8 && eqLockCount = 94 &&
+      sharedCount = 98 && rejectedCount ≥ 111 &&
       twinCount = rejectedCount && reachCount ≥ 273 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, shared={sharedCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles; {eqLockCount} Eq.refl + 2 bijection + 2 universal runner + 1 ocCombine locks covering {sharedCount}/98 shared MR/LM declarations), kernel-rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"

@@ -63,6 +63,11 @@ agreement holds only under Anneal's move-deinit / drop-deinit lowering
 (MiniRust's case `7` program IS its case `5` program; LeanMiri's case `7` is
 its case `5` harness; upstream `minimize` returns `7` on both).
 
+**Fuel audit** (§7g): every observer folds fuel exhaustion into
+`.unsupported`; Trusted's case `8` is a genuine `.unsupported` step node, no
+Trusted run exhausts its fuel, and no in-range MiniRust / LeanMiri cell is
+`.unsupported`.
+
 **Honest fixture note for case `17`**: Trusted's canonical fixture builds a
 live `&()`, whereas MiniRust and LeanMiri check a dangling provenance-less ZST
 pointer; on the identical dangling program Trusted is conservatively `.ub`
@@ -2364,6 +2369,86 @@ theorem ocLoweringDependent_characterization (A : OcFpLmAuthority)
   · exact ⟨rfl, rfl, hCells.2.2.2.2.2.2.2.2.2.1, hCells.2.2.2.2.2.2.2.2.2.2.1,
       hCells.2.2.2.2.2.2.2.2.2.2.2.1⟩
 
+/-! ## §7g. Fuel Audit: No `.unsupported` Cell Hides Fuel Exhaustion
+
+All three observers fold fuel exhaustion into `.unsupported`: Trusted maps
+`OcTrustedOutcome.outOfFuel` to `.unsupported` (`mrOcTrustedObsOf`), MiniRust
+maps a `runToStopM` run that never stops to `.unsupported` (`ocRunM`), and
+LeanMiri's `Step.step` driver reports `StepError.unsupported "out of fuel"`.
+The honest Trusted boundary at case `8` would be vacuous if it were merely
+fuel exhaustion. This section rules that out: Trusted's raw outcome at case
+`8` is the genuine `.unsupported` step node, no Trusted run of any canonical,
+companion, or cast-erased fixture exhausts its fuel, and no in-range MiniRust or
+LeanMiri cell is `.unsupported` at all. -/
+
+/-- Raw bounded Trusted outcome of a canonical case (`none` out of range),
+with the same callee convention as `mrOcTrustedObserve`. -/
+def trustedRawOutcome (tb : Bool) (idx : Nat) : Option OcTrustedOutcome :=
+  match ocCaseFixture? idx with
+  | none => none
+  | some (body, callees) =>
+    some (ocRunTrustedRaw body (if tb then callees else callees.map ocEraseRetags))
+
+/-- Constructor tag of a raw Trusted outcome (`3` = fuel exhausted). -/
+def ocOutcomeTag : OcTrustedOutcome → Nat
+  | .ret _ => 0
+  | .ub => 1
+  | .unsupported => 2
+  | .outOfFuel => 3
+
+/-- `mrOcTrustedObserve` is exactly the observation of the raw outcome. -/
+theorem mrOcTrustedObserve_eq_raw (tb : Bool) (idx : Nat) :
+    mrOcTrustedObserve tb idx =
+      (trustedRawOutcome tb idx).elim .unsupported
+        (mrOcTrustedObsOf (ocRetKindOf idx)) := by
+  unfold mrOcTrustedObserve trustedRawOutcome
+  cases ocCaseFixture? idx <;> rfl
+
+/-- Raw Trusted outcomes of the 7 companion fixtures in both modes and of the
+10 cast-erased `D1` fixtures (the post-borrowck image). -/
+def trustedRawAuxOutcomes : List OcTrustedOutcome :=
+  [ocRunTrustedRaw ocCase6PayloadMir [],
+   ocRunTrustedRaw ocCase7ProtectedDropMir [],
+   ocRunTrustedRaw (ocEraseRetags ocCase7ProtectedDropMir) [],
+   ocRunTrustedRaw ocCase9DeadLocalMir [],
+   ocRunTrustedRaw ocCase9InvalidBoolMir [],
+   ocRunTrustedRaw ocCase13RevTransmuteMir [ocCase13Callee],
+   ocRunTrustedRaw ocCase13RevTransmuteMir [ocEraseRetags ocCase13Callee],
+   ocRunTrustedRaw ocCase17DanglingZstMir [],
+   ocRunTrustedRaw ocCase18ZstNullMir []] ++
+  (List.range 10).filterMap fun idx =>
+    (ocCaseFixture? idx).map fun bc => ocRunTrustedRaw (ocEraseBody bc.1) bc.2
+
+/-- **Fuel audit on all three authorities.** For every certified LeanMiri
+authority:
+1. no Trusted run of the 44 canonical cells, the companion fixtures, or the
+   cast-erased `D1` fixtures exhausts `ocTrustedFuel`;
+2. Trusted's raw outcome at case `8` is the genuine `.unsupported` step node in
+   both modes, and case `8` is the ONLY in-range case with that outcome;
+3. no in-range MiniRust or LeanMiri verdict is `.unsupported`, so neither can
+   hide fuel exhaustion either. -/
+theorem dual_fuel_and_unsupported_audit (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) :
+    (allTbModes.all fun tb => (List.range mrOcCaseCount).all fun idx =>
+      (trustedRawOutcome tb idx).map ocOutcomeTag != some 3) = true ∧
+    (trustedRawAuxOutcomes.all fun o => ocOutcomeTag o != 3) = true ∧
+    trustedRawAuxOutcomes.length = 19 ∧
+    (trustedRawOutcome false 8).map ocOutcomeTag = some 2 ∧
+    (trustedRawOutcome true 8).map ocOutcomeTag = some 2 ∧
+    (allTbModes.all fun tb =>
+      ((List.range mrOcCaseCount).filter fun idx =>
+        (trustedRawOutcome tb idx).map ocOutcomeTag == some 2) == [8]) = true ∧
+    (∀ tb idx, idx < mrOcCaseCount →
+      mrVerdict tb idx ≠ some .unsupported ∧
+      A.verdict tb idx ≠ some .unsupported) := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel, ?_⟩
+  intro tb idx hi
+  rw [mrVerdict_cell tb idx hi, lmTableCheckOf_sound A hA tb idx hi]
+  revert hi
+  revert idx
+  cases tb <;> decide +kernel
+
 /-! ## §8. Non-Vacuity of the LeanMiri Hypotheses (Root-Side Witness) -/
 
 /-- A root-side authority satisfying `lmTableCheckOf` and `OcFpLmFailClosed`,
@@ -2524,6 +2609,7 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone (A : OcFpLmAuthority)
       type_of% (dual_mode_sensitivity_exact A hA idx hi)) ∧
     type_of% (dual_d1_cast_erasure_and_boundary A hA) ∧
     (∀ tb, type_of% (dual_d1_lowering_dependent_cells A hA tb)) ∧
+    type_of% (dual_fuel_and_unsupported_audit A hA) ∧
     (∀ tb idx, type_of% (ocLoweringDependent_characterization A hA tb idx)) ∧
     type_of% (dual_d2_fnentry_protectors_and_transmute_boundary A hA) ∧
     type_of% (dual_d3_dereferenceable_and_zst_boundary A hA) ∧
@@ -2545,6 +2631,7 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone (A : OcFpLmAuthority)
    dual_mode_sensitivity_exact A hA,
    dual_d1_cast_erasure_and_boundary A hA,
    dual_d1_lowering_dependent_cells A hA,
+   dual_fuel_and_unsupported_audit A hA,
    ocLoweringDependent_characterization A hA,
    dual_d2_fnentry_protectors_and_transmute_boundary A hA,
    dual_d3_dereferenceable_and_zst_boundary A hA,
@@ -2786,6 +2873,9 @@ run_cmd do
       ns ++ `ocMoveToCopyRvalue, ns ++ `ocMoveToCopyStmt,
       ns ++ `ocMoveToCopyBody, ns ++ `ocDropToNopBody,
       ns ++ `ocLoweringDependent, ns ++ `dual_d1_lowering_dependent_cells,
+      ns ++ `trustedRawOutcome, ns ++ `ocOutcomeTag,
+      ns ++ `mrOcTrustedObserve_eq_raw, ns ++ `trustedRawAuxOutcomes,
+      ns ++ `dual_fuel_and_unsupported_audit,
       ns ++ `ocLoweringDependent_characterization,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
