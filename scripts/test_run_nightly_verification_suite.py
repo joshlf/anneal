@@ -945,6 +945,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "`lmCompanion_zstDangling_is_canonical17",
             "`lmCase7_is_case5_harness",
             "`dual_fuel_and_unsupported_audit",
+            "`lmRawSteps_within_fuel",
             "`dual_d1_lowering_dependent_cells",
             "`ocLoweringDependent_characterization",
             "`vendored_evalOperand_move_eq_copy",

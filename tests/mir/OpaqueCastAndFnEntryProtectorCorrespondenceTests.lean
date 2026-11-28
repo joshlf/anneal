@@ -335,6 +335,10 @@ theorem trusted_fuel_audit_canaries :
     (trustedRawOutcome true 11).map ocOutcomeTag = some 1 ∧
     (trustedRawOutcome false 21).map ocOutcomeTag = some 1 ∧
     (trustedRawOutcome true 22).isNone = true ∧
+    trustedRawAuxOutcomes.length = 29 ∧
+    mrProgStopsWithinFuel false ocMrProg0 120 = true ∧
+    mrProgStopsWithinFuel true ocMrProg11 120 = true ∧
+    mrProgStopsWithinFuel false ocMrProg0 1 = false ∧
     mrOcTrustedObserve true 8 = .unsupported := by
   decide +kernel
 
@@ -573,7 +577,7 @@ theorem root_capstone_instantiation :
      lmPostBorrowckCheckOf_of_table sel _ rootBackedLmAuthority_tableCheck,
    ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous⟩
 
-/-! ## §2. Cross-Root 3-Way Kernel Closure (`MiniRustSpec` + `LeanMiriSpec` + `Anneal`) -/
+/-! ## §2. Cross-Root 3-Way Kernel Closure (`MR` + `LM` + `Anneal`) -/
 
 section CrossRootForgedControls
 open Lean Meta
@@ -596,6 +600,8 @@ private structure CrossRootForgedArgs where
   evalOpPf : Expr
   forgedEvalOpTy : Expr
   forgedEvalOpPf : Expr
+  lmStepStopped : Expr
+  lmErrOutOfFuel : Expr
   nilMir : Expr
   unsV : Expr
   noneV : Expr
@@ -1312,11 +1318,32 @@ private def buildForgedExtended (a : CrossRootForgedArgs) :
               (mkApp2 lmObserve (.bvar 0) (mkNatLit 5)))
           (mkLambda `tb .default boolTy <|
             crMkRefl lmObsTy (mkApp2 lmObserve (.bvar 0) (mkNatLit 7)))),
-      -- Fuel audit: Trusted case `8` is a genuine `.unsupported` node.
+      -- Fuel audit: Trusted case `8` is a genuine `.unsupported` node, MiniRust
+      -- stops within `fuel := 120` (and fails at `fuel := 1`), and LeanMiri's
+      -- raw `lmStepStopped` rejects `StepError.unsupported "out of fuel"`.
       eqCtl "forged Trusted case 8 unsupported is fuel exhaustion (tag 3)"
         `trCase8OutOfFuel optNatTy (rawTag false 8) (someNat 3) (someNat 2),
       eqCtl "forged Trusted case 8 (Tree Borrows) raw run returns a value (tag 0)"
-        `trCase8TbRet optNatTy (rawTag true 8) (someNat 0) (someNat 2) ]
+        `trCase8TbRet optNatTy (rawTag true 8) (someNat 0) (someNat 2),
+      eqCtl "forged Trusted outOfFuel tag collapses onto unsupported (tag 2)"
+        `trOutOfFuelTag natTy
+        (mkApp (mkConst (crBNs ++ `ocOutcomeTag))
+          (mkConst (crMrNs ++ `OcTrustedOutcome.outOfFuel)))
+        (mkNatLit 2) (mkNatLit 3),
+      eqCtl "forged MiniRust case 0 stops within fuel := 1 (fuel non-vacuity)"
+        `mrProg0Fuel1 boolTy
+        (mkApp3 (mkConst (crBNs ++ `mrProgStopsWithinFuel))
+          (toExpr false) (mkConst (crMrNs ++ `ocMrProg0)) (mkNatLit 1))
+        (toExpr true) (toExpr false),
+      eqCtl "forged MiniRust case 0 exhausts fuel := 120"
+        `mrProg0Fuel120 boolTy
+        (mkApp3 (mkConst (crBNs ++ `mrProgStopsWithinFuel))
+          (toExpr false) (mkConst (crMrNs ++ `ocMrProg0)) (mkNatLit 120))
+        (toExpr false) (toExpr true),
+      eqCtl "forged LeanMiri lmStepStopped accepts StepError.unsupported out-of-fuel"
+        `lmStepStoppedOutOfFuel boolTy
+        (mkApp a.lmStepStopped a.lmErrOutOfFuel)
+        (toExpr true) (toExpr false) ]
 
 private def runCrossRootForgedControls (a : CrossRootForgedArgs) :
     CoreM (Nat × Nat) := do
@@ -2254,11 +2281,104 @@ run_cmd do
       (mkApp2 (mkConst (bNs ++ `ocLoweringDependent_characterization)) authC hA)
     added := added.push (ns ++ `ocLoweringDependent_characterization)
     -- Fuel audit over the REAL LeanMiri authority: no in-range LeanMiri cell
-    -- is `.unsupported` (so `Step.step`'s "out of fuel" never fires), and
-    -- Trusted's case `8` is a genuine `.unsupported` step node.
+    -- is `.unsupported` (so `Step.step`'s "out of fuel" never fires), Trusted's
+    -- case `8` is a genuine `.unsupported` step node, AND all 12 raw
+    -- `ocRunStep` runs stop directly in `.ok (some _)` or
+    -- `.error (.undefinedBehavior _)` (never `.error (.unsupported _)`).
     addThmInfer (ns ++ `dual_fuel_and_unsupported_audit)
       (mkApp2 (mkConst (bNs ++ `dual_fuel_and_unsupported_audit)) authC hA)
     added := added.push (ns ++ `dual_fuel_and_unsupported_audit)
+    let (stepErrTy, stepValTy, lmStepStoppedFn) ← MetaM.run' do
+      let runTy ← inferType runStepC
+      let resTy := runTy.bindingBody!.bindingBody!
+      let errTy := resTy.appFn!.appArg!
+      let valTy := resTy.appArg!
+      let some (.inductInfo indInfo) :=
+          (← getEnv).find? `Miri.Interpreter.StepError
+        | throwError "cross-root: Miri.Interpreter.StepError missing"
+      let mut minors : Array Expr := #[]
+      for ctor in indInfo.ctors do
+        let cTy ← inferType (mkConst ctor)
+        let minor ← forallTelescopeReducing cTy fun xs _ => do
+          let ret := if ctor == `Miri.Interpreter.StepError.undefinedBehavior
+            then mkConst ``Bool.true else mkConst ``Bool.false
+          mkLambdaFVars xs ret
+        minors := minors.push minor
+      let errCheck :=
+        mkLambda `e .default errTy <|
+          mkAppN (mkConst `Miri.Interpreter.StepError.rec [1])
+            (#[mkLambda `x .default errTy boolTy] ++ minors ++ #[.bvar 0])
+      let okCheck :=
+        mkLambda `v .default valTy <|
+          mkApp2 (mkConst ``Option.isSome [0]) valTy.appArg! (.bvar 0)
+      let fn :=
+        mkLambda `r .default resTy <|
+          mkAppN (mkConst ``Except.rec [1, 0, 0])
+            #[errTy, valTy, mkLambda `x .default resTy boolTy,
+              errCheck, okCheck, .bvar 0]
+      return (errTy, valTy, fn)
+    let lmStepStoppedName := ns ++ `lmStepStopped
+    let _ ← addDef lmStepStoppedName lmStepStoppedFn
+    added := added.push lmStepStoppedName
+    let lmStepStoppedC := mkConst lmStepStoppedName
+    let lmErrOutOfFuel :=
+      mkApp3 (mkConst ``Except.error [0, 0]) stepErrTy stepValTy
+        (mkApp (mkConst `Miri.Interpreter.StepError.unsupported)
+          (toExpr "out of fuel"))
+    let rawStepPairs : List (Expr × Expr) :=
+      [ (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase0Mir)),
+          mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase1Mir)),
+          mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase2Mir)),
+          mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase3Mir)),
+          mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase4Mir)),
+          mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase6Mir)),
+          mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase8Mir)),
+          mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody)) (mkConst (lmNs ++ `ocCase9Mir)),
+          mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody))
+          (mkConst (lmNs ++ `ocCase6PayloadMir)), mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody))
+          (mkConst (lmNs ++ `ocCase9DeadLocalMir)), mkConst (lmNs ++ `ocU32Ty)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody))
+          (mkConst (lmNs ++ `ocCase9InvalidBoolMir)), mkConst (lmNs ++ `ocBoolTy)),
+        (mkApp (mkConst (lmNs ++ `ocEraseBody))
+          (mkApp (mkConst (bNs ++ `ocMoveToCopyBody))
+            (mkConst (lmNs ++ `ocCase2Mir))),
+          mkConst (lmNs ++ `ocU32Ty)) ]
+    let mkRawStepsCheck (fStep : Expr) : Expr :=
+      rawStepPairs.foldr
+        (fun (bodyE, tyE) acc =>
+          mkApp2 (mkConst ``Bool.and)
+            (mkApp lmStepStoppedC (mkApp2 fStep bodyE tyE)) acc)
+        (mkConst ``Bool.true)
+    let rawStepsChkName := ns ++ `lmRawStepsCheck
+    let _ ← addDef rawStepsChkName (mkRawStepsCheck runStepC)
+    let rawStepsChkUName := ns ++ `lmRawStepsCheckU
+    let _ ← addDef rawStepsChkUName (mkRawStepsCheck runStepU)
+    added := added.push rawStepsChkName |>.push rawStepsChkUName
+    let rawStepsEqName := ns ++ `lmRawStepsCheck_eq_unrolled
+    let rawStepsEqPf ← MetaM.run' do
+      let runStepTy ← inferType runStepC
+      let g ← withLocalDeclD `f runStepTy fun f =>
+        mkLambdaFVars #[f] (mkRawStepsCheck f)
+      mkCongrArg g (mkConst (lmNs ++ `ocRunStepU.eq_src))
+    addThmInfer rawStepsEqName rawStepsEqPf
+    added := added.push rawStepsEqName
+    let rawStepsUOkName := ns ++ `lmRawSteps_within_fuelU
+    addThm rawStepsUOkName (eqTrue (mkConst rawStepsChkUName)) reflTrue
+    added := added.push rawStepsUOkName
+    let rawStepsOkName := ns ++ `lmRawSteps_within_fuel
+    let rawStepsOkPf ← MetaM.run' <|
+      mkEqTrans (mkConst rawStepsEqName) (mkConst rawStepsUOkName)
+    addThm rawStepsOkName (eqTrue (mkConst rawStepsChkName)) rawStepsOkPf
+    added := added.push rawStepsOkName
     -- Universal vendored-Miri theorem: `Miri.Interpreter.evalOperand` treats
     -- `.Move place` and `.Copy place` identically (by `Eq.refl` for EVERY
     -- `hooks`, `frame`, `state`, `place`, `known`), proving case `2`'s
@@ -2384,6 +2504,7 @@ run_cmd do
           mkConst (ns ++ `dual_d1_lowering_dependent_cells),
           mkConst (ns ++ `ocLoweringDependent_characterization),
           mkConst (ns ++ `dual_fuel_and_unsupported_audit),
+          mkConst rawStepsOkName,
           mkConst evalOpMoveEqCopyName,
           mkConst case2CopyOkName,
           mkConst (ns ++ `dual_d3_zst_fixture_divergence),
@@ -2417,6 +2538,7 @@ run_cmd do
         runnerTy, runnerPf, forgedRunnerTy, forgedRunnerPf,
         compObsU, erasedULhs, phaseCompObs,
         evalOpTy, evalOpPf, forgedEvalOpTy, forgedEvalOpPf,
+        lmStepStopped := lmStepStoppedC, lmErrOutOfFuel,
         nilMir, unsV, noneV }
 
     -- 6. Axiom / non-triviality audit of every added declaration & LM theorems.
@@ -2606,6 +2728,14 @@ run_cmd do
         (case2CopyName,
           [ `Miri.Interpreter.Step.step,
             `LeanMiriSpec.Correspondence.annealEvalOperand ]),
+        (rawStepsOkName,
+          [ `Miri.Interpreter.Step.step,
+            `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.ocRunStep,
+            `Miri.Interpreter.StepError.rec ]),
+        (ns ++ `dual_fuel_and_unsupported_audit,
+          [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+            `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocRunTrustedRaw,
+            `MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM ]),
         (runnerUnivName, runnerReach),
         (crossName, crossReach) ]
     let mut reachChecked : Nat := 0
@@ -2642,7 +2772,8 @@ run_cmd do
           (`lmCompanionObserve, compObs),
           (`lmOcPhaseObserve, lmPhaseObs),
           (`lmPhaseCompanion, phaseCompObs),
-          (`lmCase2MoveAsCopy, mkConst case2CopyName) ] do
+          (`lmCase2MoveAsCopy, mkConst case2CopyName),
+          (`lmRawStepsCheck, mkConst rawStepsChkName) ] do
       let seen := reachFromExpr lmExpr
       if seen.contains stepMirFnName then
         throwError "authority-independence audit FAILED: LM {lmTag} reaches Trusted stepMirFn"
@@ -2662,7 +2793,7 @@ run_cmd do
         case2Seen.contains `LeanMiriSpec.Correspondence.annealEvalOperandLM2_3 do
       throwError "lowering audit: LM case 2 does not reach the Anneal adapter annealEvalOperand"
     reachChecked := reachChecked + 1
-    -- Positive self-test: MiniRust `mrOcObserve` IS caught by the anti-MiniRust detector.
+    -- Self-test: MiniRust `mrOcObserve` IS caught by the anti-MiniRust check.
     unless (reachFromExpr (mkConst (mrNs ++ `mrOcObserve))).contains mrStepMName do
       throwError "anti-MiniRust self-test failed: mrOcObserve not caught"
     let perCellReqs : List (Name × Expr × List Name) :=
@@ -2730,9 +2861,9 @@ run_cmd do
   let ((addedCount, bundleCount, eqLockCount, sharedCount,
         rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 239 && bundleCount = 8 && eqLockCount = 94 &&
-      sharedCount = 98 && rejectedCount ≥ 111 &&
-      twinCount = rejectedCount && reachCount ≥ 273 do
+  unless addedCount ≥ 245 && bundleCount = 8 && eqLockCount = 94 &&
+      sharedCount = 98 && rejectedCount ≥ 115 &&
+      twinCount = rejectedCount && reachCount ≥ 279 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, shared={sharedCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles; {eqLockCount} Eq.refl + 2 bijection + 2 universal runner + 1 ocCombine locks covering {sharedCount}/98 shared MR/LM declarations), kernel-rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
 
@@ -2805,6 +2936,9 @@ run_cmd do
       `ocMoveToCopyStmt, `ocMoveToCopyBody, `ocDropToNopBody,
       `ocLoweringDependent, `dual_d1_lowering_dependent_cells,
       `ocLoweringDependent_characterization,
+      `trustedRawOutcome, `ocOutcomeTag, `mrOcTrustedObserve_eq_raw,
+      `trustedRawAuxOutcomes, `mrProgStopsWithinFuel, `mrAuxProgs,
+      `dual_fuel_and_unsupported_audit,
       `ep2_opaquecast_fnentry_post_borrowck_capstone,
       `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   let isChoiceFree (axs : Array Name) : Bool :=

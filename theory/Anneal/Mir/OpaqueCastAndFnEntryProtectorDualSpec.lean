@@ -765,7 +765,7 @@ theorem domain_bundle_claims (d : OcFpDomain) (A : OcFpLmAuthority)
    (domainBundleOf d A hA).lmFlip.faultA,
    (domainBundleOf d A hA).lmFlip.faultR⟩
 
-/-! ## §7. Exact 44-Cell Classification, Observer-Level Agreement, and Domain Lifts -/
+/-! ## §7. Exact 44-Cell Classification, Observer Agreement, and Domain Lifts -/
 
 /-- **Exact 3-way classification `↔`** (every in-range cell, both modes): full
 agreement iff `threeWay`; MiniRust = LeanMiri with Trusted `.unsupported` iff
@@ -2404,44 +2404,114 @@ theorem mrOcTrustedObserve_eq_raw (tb : Bool) (idx : Nat) :
   unfold mrOcTrustedObserve trustedRawOutcome
   cases ocCaseFixture? idx <;> rfl
 
-/-- Raw Trusted outcomes of the 7 companion fixtures in both modes and of the
-10 cast-erased `D1` fixtures (the post-borrowck image). -/
+/-- Raw Trusted outcomes of ALL 29 auxiliary runs: the 7 companion fixtures in
+both modes (9), the 10 cast-erased `D1` fixtures, the cast-erased invalid-`bool`
+companion, the 2 lowering-contrast rewrites (`ocMoveToCopyBody`,
+`ocDropToNopBody`), and all 7 `D2` indirect fn-ptr harness runs. -/
 def trustedRawAuxOutcomes : List OcTrustedOutcome :=
   [ocRunTrustedRaw ocCase6PayloadMir [],
    ocRunTrustedRaw ocCase7ProtectedDropMir [],
    ocRunTrustedRaw (ocEraseRetags ocCase7ProtectedDropMir) [],
    ocRunTrustedRaw ocCase9DeadLocalMir [],
    ocRunTrustedRaw ocCase9InvalidBoolMir [],
+   ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) [],
    ocRunTrustedRaw ocCase13RevTransmuteMir [ocCase13Callee],
    ocRunTrustedRaw ocCase13RevTransmuteMir [ocEraseRetags ocCase13Callee],
    ocRunTrustedRaw ocCase17DanglingZstMir [],
-   ocRunTrustedRaw ocCase18ZstNullMir []] ++
+   ocRunTrustedRaw ocCase18ZstNullMir [],
+   ocRunTrustedRaw (ocMoveToCopyBody ocCase2Mir) [],
+   ocRunTrustedRaw (ocDropToNopBody ocCase7Mir) [],
+   ocRunTrustedRaw
+     (ocIndirectMain "oc::case10_callee" ocFnRawSigTy ocFnRawSigTy)
+     [ocCase10Callee],
+   ocRunTrustedRaw
+     (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRefSigTy)
+     [ocCase11Callee],
+   ocRunTrustedRaw
+     (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRefSigTy)
+     [ocEraseRetags ocCase11Callee],
+   ocRunTrustedRaw
+     (ocIndirectTransmuteOnly "oc::case10_callee" ocFnRawSigTy ocFnRefSigTy)
+     [ocCase10Callee],
+   ocRunTrustedRaw
+     (ocIndirectTransmuteOnly "oc::case11_callee" ocFnRefSigTy ocFnRawSigTy)
+     [ocCase11Callee],
+   ocRunTrustedRaw
+     (ocIndirectMain "oc::case10_callee" ocFnRawSigTy ocFnRefSigTy)
+     [ocCase10Callee],
+   ocRunTrustedRaw
+     (ocIndirectMain "oc::case11_callee" ocFnRefSigTy ocFnRawSigTy)
+     [ocEraseRetags ocCase11Callee]] ++
   (List.range 10).filterMap fun idx =>
     (ocCaseFixture? idx).map fun bc => ocRunTrustedRaw (ocEraseBody bc.1) bc.2
 
+open MiniRustSpec.CrossFrameRefAndPanicMR in
+/-- Direct MiniRust raw fuel-budget check: whether `prog` boots and reaches a
+genuine `Stop.machineStop` or `Stop.ub` within `fuel` steps on `Mach` (`false`)
+or `MachTB` (`true`), never returning `.ok _` (out of fuel) and never failing
+with `.unsupported` or `.panic`. -/
+def mrProgStopsWithinFuel (tb : Bool) (prog : MiniRustSpec.Gen.Program)
+    (fuel : Nat := 120) : Bool :=
+  if tb then
+    match bootProgramM (M := MiniRustSpec.Interp.TBM)
+        ({ implicit_writes := true } : MiniRustSpec.Gen.TreeBorrowsParams)
+        prog with
+    | .ok m0 =>
+      match runToStopM fuel m0 with
+      | .error (.machineStop, _) | .error (.ub _, _) => true
+      | _ => false
+    | .error _ => false
+  else
+    match bootProgramM (M := MiniRustSpec.Interp.BM)
+        () prog with
+    | .ok m0 =>
+      match runToStopM fuel m0 with
+      | .error (.machineStop, _) | .error (.ub _, _) => true
+      | _ => false
+    | .error _ => false
+
+/-- All 7 auxiliary MiniRust programs (minimize contrasts + companions). -/
+def mrAuxProgs : List MiniRustSpec.Gen.Program :=
+  [ocMrProg2Minimize, ocMrProg7Minimize, ocMrProg6Payload,
+   ocMrProg7ProtectedDrop, ocMrProg9DeadLocal, ocMrProg9InvalidBool,
+   ocMrProg13RevTransmute]
+
 /-- **Fuel audit on all three authorities.** For every certified LeanMiri
 authority:
-1. no Trusted run of the 44 canonical cells, the companion fixtures, or the
-   cast-erased `D1` fixtures exhausts `ocTrustedFuel`;
+1. no Trusted run of the 44 canonical cells or all 29 auxiliary runs (companions,
+   cast-erased `D1` + invalid-`bool`, lowering contrasts, indirect fn-ptr calls)
+   exhausts `ocTrustedFuel` (and no auxiliary run is `.unsupported` either);
 2. Trusted's raw outcome at case `8` is the genuine `.unsupported` step node in
    both modes, and case `8` is the ONLY in-range case with that outcome;
-3. no in-range MiniRust or LeanMiri verdict is `.unsupported`, so neither can
+3. EVERY canonical (`0..21`) and auxiliary (`7`) MiniRust program stops cleanly
+   in `Stop.machineStop` or `Stop.ub` within `fuel := 120` in both modes
+   (`mrProgStopsWithinFuel`, with non-vacuity witness `fuel := 1` failing);
+4. no in-range MiniRust or LeanMiri verdict is `.unsupported`, so neither can
    hide fuel exhaustion either. -/
 theorem dual_fuel_and_unsupported_audit (A : OcFpLmAuthority)
     (hA : lmTableCheckOf A = true) :
     (allTbModes.all fun tb => (List.range mrOcCaseCount).all fun idx =>
       (trustedRawOutcome tb idx).map ocOutcomeTag != some 3) = true ∧
-    (trustedRawAuxOutcomes.all fun o => ocOutcomeTag o != 3) = true ∧
-    trustedRawAuxOutcomes.length = 19 ∧
+    (trustedRawAuxOutcomes.all fun o =>
+      ocOutcomeTag o != 3 && ocOutcomeTag o != 2) = true ∧
+    trustedRawAuxOutcomes.length = 29 ∧
     (trustedRawOutcome false 8).map ocOutcomeTag = some 2 ∧
     (trustedRawOutcome true 8).map ocOutcomeTag = some 2 ∧
     (allTbModes.all fun tb =>
       ((List.range mrOcCaseCount).filter fun idx =>
         (trustedRawOutcome tb idx).map ocOutcomeTag == some 2) == [8]) = true ∧
+    (allTbModes.all fun tb => (List.range mrOcCaseCount).all fun idx =>
+      match mrOcProg? idx with
+      | some (prog, _) => mrProgStopsWithinFuel tb prog
+      | none => false) = true ∧
+    (allTbModes.all fun tb =>
+      mrAuxProgs.all fun prog => mrProgStopsWithinFuel tb prog) = true ∧
+    mrProgStopsWithinFuel false ocMrProg0 1 = false ∧
     (∀ tb idx, idx < mrOcCaseCount →
       mrVerdict tb idx ≠ some .unsupported ∧
       A.verdict tb idx ≠ some .unsupported) := by
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel, ?_⟩
   intro tb idx hi
   rw [mrVerdict_cell tb idx hi, lmTableCheckOf_sound A hA tb idx hi]
@@ -2875,6 +2945,7 @@ run_cmd do
       ns ++ `ocLoweringDependent, ns ++ `dual_d1_lowering_dependent_cells,
       ns ++ `trustedRawOutcome, ns ++ `ocOutcomeTag,
       ns ++ `mrOcTrustedObserve_eq_raw, ns ++ `trustedRawAuxOutcomes,
+      ns ++ `mrProgStopsWithinFuel, ns ++ `mrAuxProgs,
       ns ++ `dual_fuel_and_unsupported_audit,
       ns ++ `ocLoweringDependent_characterization,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
@@ -3021,6 +3092,14 @@ run_cmd do
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocMrProg2Minimize,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocMrProg7Minimize,
           ns ++ `ocMoveToCopyBody, ns ++ `ocDropToNopBody ]),
+      (ns ++ `dual_fuel_and_unsupported_audit,
+        [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocRunTrustedRaw,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcProg?,
+          `MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM,
+          `MiniRustSpec.CrossFrameRefAndPanicMR.runToStopM,
+          ns ++ `trustedRawOutcome, ns ++ `trustedRawAuxOutcomes,
+          ns ++ `mrProgStopsWithinFuel, ns ++ `mrAuxProgs ]),
       (ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
         [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve,
