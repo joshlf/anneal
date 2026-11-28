@@ -27777,6 +27777,47 @@ example (b : UInt8) (c : UInt32) :
       Trusted.Rustc.V2026_06_01.MirSemantics.validateValueForTy? V06.wLayouts (some V06.wTyChar) (.scalar ⟨c.toNat, 4⟩) :=
   LeanMiriSpec.PtrByteCoherenceLM.kani5205_parity b c
 
+-- `[adv ep2-A4]` mirror statement pins for V06/V08 symmetry.
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V06 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_06_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_06_01.MirAst.Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 32) (ha2 : a2 < 2 ^ 32)
+    (hp1a : p1.allocId + 1 < 2 ^ 64) (hp1t : p1.tag + 1 < 2 ^ 64)
+    (hp2a : p2.allocId + 1 < 2 ^ 64) (hp2t : p2.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 4 ++ leOptBytes a2 4,
+        relocations := [(0, p1), (4, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 4 p1.allocId p1.tag).drop 2 ++
+              (encodePtrBytes a2 4 p2.allocId p2.tag).take 2
+    let misAddr : Nat := (a1 / 256 ^ 2) + (a2 % 256 ^ 2) * 256 ^ 2
+    globalAllocSliceToAbstractBytes alloc 2 4 4 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    evalGlobalDerefRead [] alloc 2 4 [] wLayouts32 (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.scalar ⟨misAddr, 4⟩) [] ∧
+    evalGlobalDerefRead [] alloc 2 4 [] wLayouts32 (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 4 = .ok none ∧
+    trRead (trEntries pvCt bs) 0 4 = .error (.readPartialPointer (Size.ofBytes 0)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_misaligned_reloc_strips_4 gId al mutbl p1 p2 a1 a2 ha1 ha2 hp1a hp1t hp2a hp2t
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V08 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_08_01.MirAst Trusted.Rustc.V2026_08_01.MirSemantics Trusted.Rustc.V2026_08_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_08_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_08_01.MirAst.Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 64) (ha2 : a2 < 2 ^ 64)
+    (hp1a : p1.allocId + 1 < 2 ^ 64) (hp1t : p1.tag + 1 < 2 ^ 64)
+    (hp2a : p2.allocId + 1 < 2 ^ 64) (hp2t : p2.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 8 ++ leOptBytes a2 8,
+        relocations := [(0, p1), (8, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 8 p1.allocId p1.tag).drop 4 ++
+              (encodePtrBytes a2 8 p2.allocId p2.tag).take 4
+    let misAddr : Nat := (a1 / 256 ^ 4) + (a2 % 256 ^ 4) * 256 ^ 4
+    globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 8 = .ok none ∧
+    trRead (trEntries pvCt bs) 0 8 = .error (.readPartialPointer (Size.ofBytes 0)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_misaligned_reloc_strips_8 gId al mutbl p1 p2 a1 a2 ha1 ha2 hp1a hp1t hp2a hp2t
+
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
 -- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.
 #assert_all_leanmirispec_and_miri_standard_axioms
