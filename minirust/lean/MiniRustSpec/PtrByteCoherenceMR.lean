@@ -668,13 +668,6 @@ theorem mapM_data_init : ∀ (l : List UInt8),
       rw [List.map_cons, List.mapM_cons, mapM_data_init rest]
       rfl
 
-/-- `encode_ptr` bytes without provenance are plain initialized bytes. -/
-theorem encodePtrBytesM_none {M : Type} [Gen.Memory M] :
-    ∀ (l : List UInt8) (idx : Nat),
-      Interp.encodePtrBytesM (M := M) none idx l = l.map (fun b => Gen.AbstractByte.Init b none)
-  | [], _ => rfl
-  | _ :: rest, idx => congrArg (List.cons _) (encodePtrBytesM_none rest (idx + 1))
-
 theorem leBytes_length : ∀ (n u : Nat), (Interp.leBytes u n).length = n
   | 0, _ => rfl
   | n + 1, u => congrArg (· + 1) (leBytes_length n (u / 256))
@@ -2558,10 +2551,12 @@ theorem w_kani5205_bool :
     Interp.Type.decodeM (M := Interp.TBM) .Bool (projBytes tbProv [.init 2 none]) = .ok none := by
   repeat first | refine ⟨?_, ?_⟩ | rfl
 
-/-- **`Kani#5205`, `0xD800` as `char` (`DIV-MR-CHAR`).** The surrogate bit
-pattern is representable as untyped bytes (`u32`, MiniRust `Type::Int(u32)`) and
-is rejected by the `Trusted` typed `char` decode. MiniRust has no `char` type:
-its closest type, `Type::Int(u32)`, accepts the pattern. -/
+/-- **`Kani#5205`, `0xD800` as `char` (untyped half and naive `Type::Int(u32)` lowering).** The
+surrogate bit pattern is representable as untyped bytes (`u32`, MiniRust `Type::Int(u32)`) and is
+rejected by the `Trusted` typed `char` decode. MiniRust has no primitive `char` constructor: a
+naive lowering of `char` to `Type::Int(u32)` accepts the pattern, whereas the faithful
+`Type::Enum` lowering `minirustCharType` rejects it exactly as `Trusted` does
+(`kani5205_char_correspondence_M`). -/
 theorem w_kani5205_char :
     encodeUntypedValueToBytes 1 (.scalar ⟨0xD800, 4⟩) = some wSurrogate ∧
     decodeTypedValueFromBytes defaultCodecFuel wLayouts wTyU32 wSurrogate =
@@ -2858,11 +2853,12 @@ theorem ep2_b1_mr_non_vacuity_instances :
    kani5205_bool_correspondence_M (M := Interp.TBM) tbProv wLayouts wTyBool rfl 2⟩
 
 
-/-- **Universal `DIV-MR-CHAR` (`Kani#5205`, `char`).** For every 32-bit pattern `c`, `Trusted`'s
-typed `char` validity is exactly `isValidCharCode c` (rejecting every surrogate and every value
-above `0x10FFFF`), the `Trusted` untyped encoding of `c` projects to MiniRust's own little-endian
-encoding of `c`, and MiniRust's closest type `Type::Int(u32)` accepts that encoding for every `c`.
-MiniRust has no `char` type, so the typed rejection is `Trusted`-only. -/
+/-- **Naive `Type::Int(u32)` lowering of `char` (`Kani#5205`).** For every 32-bit pattern `c`,
+`Trusted`'s typed `char` validity is exactly `isValidCharCode c` (rejecting every surrogate and
+every value above `0x10FFFF`), the `Trusted` untyped encoding of `c` projects to MiniRust's own
+little-endian encoding of `c`, and `Type::Int(u32)` accepts that encoding for every `c`. This
+pins that the correspondence must not lower `char` to `Type::Int(u32)`: only the `Type::Enum`
+lowering `minirustCharType` agrees with `Trusted` (`kani5205_char_correspondence_M`). -/
 theorem kani5205_char_divergence (c : Nat) (hc : c < 2 ^ 32) :
     validateValueForTy? wLayouts (some wTyChar) (.scalar ⟨c, 4⟩) = isValidCharCode c ∧
     projBytes bmProv (encodePlainLittleEndianBytes c 4) =
@@ -2871,7 +2867,7 @@ theorem kani5205_char_divergence (c : Nat) (hc : c < 2 ^ 32) :
       .ok (some (.Int c)) := by
   have hp : projBytes bmProv (encodePlainLittleEndianBytes c 4) =
       (Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none) :=
-    (proj_plain_bytes (M := Interp.BM) bmProv 4 c 0).trans (encodePtrBytesM_none _ 0)
+    (proj_plain_bytes (M := Interp.BM) bmProv 4 c 0).trans (encodePtrBytesM_none_eq_map _ 0)
   refine ⟨?_, hp, ?_⟩
   · show Bool.and (Nat.beq 4 4) (isValidCharCode c) = isValidCharCode c
     rfl
@@ -4980,10 +4976,12 @@ theorem w_kani5205_bool :
     Interp.Type.decodeM (M := Interp.TBM) .Bool (projBytes tbProv [.init 2 none]) = .ok none := by
   repeat first | refine ⟨?_, ?_⟩ | rfl
 
-/-- **`Kani#5205`, `0xD800` as `char` (`DIV-MR-CHAR`).** The surrogate bit
-pattern is representable as untyped bytes (`u32`, MiniRust `Type::Int(u32)`) and
-is rejected by the `Trusted` typed `char` decode. MiniRust has no `char` type:
-its closest type, `Type::Int(u32)`, accepts the pattern. -/
+/-- **`Kani#5205`, `0xD800` as `char` (untyped half and naive `Type::Int(u32)` lowering).** The
+surrogate bit pattern is representable as untyped bytes (`u32`, MiniRust `Type::Int(u32)`) and is
+rejected by the `Trusted` typed `char` decode. MiniRust has no primitive `char` constructor: a
+naive lowering of `char` to `Type::Int(u32)` accepts the pattern, whereas the faithful
+`Type::Enum` lowering `minirustCharType` rejects it exactly as `Trusted` does
+(`kani5205_char_correspondence_M`). -/
 theorem w_kani5205_char :
     encodeUntypedValueToBytes 1 (.scalar ⟨0xD800, 4⟩) = some wSurrogate ∧
     decodeTypedValueFromBytes defaultCodecFuel wLayouts wTyU32 wSurrogate =
@@ -5280,11 +5278,12 @@ theorem ep2_b1_mr_non_vacuity_instances :
    kani5205_bool_correspondence_M (M := Interp.TBM) tbProv wLayouts wTyBool rfl 2⟩
 
 
-/-- **Universal `DIV-MR-CHAR` (`Kani#5205`, `char`).** For every 32-bit pattern `c`, `Trusted`'s
-typed `char` validity is exactly `isValidCharCode c` (rejecting every surrogate and every value
-above `0x10FFFF`), the `Trusted` untyped encoding of `c` projects to MiniRust's own little-endian
-encoding of `c`, and MiniRust's closest type `Type::Int(u32)` accepts that encoding for every `c`.
-MiniRust has no `char` type, so the typed rejection is `Trusted`-only. -/
+/-- **Naive `Type::Int(u32)` lowering of `char` (`Kani#5205`).** For every 32-bit pattern `c`,
+`Trusted`'s typed `char` validity is exactly `isValidCharCode c` (rejecting every surrogate and
+every value above `0x10FFFF`), the `Trusted` untyped encoding of `c` projects to MiniRust's own
+little-endian encoding of `c`, and `Type::Int(u32)` accepts that encoding for every `c`. This
+pins that the correspondence must not lower `char` to `Type::Int(u32)`: only the `Type::Enum`
+lowering `minirustCharType` agrees with `Trusted` (`kani5205_char_correspondence_M`). -/
 theorem kani5205_char_divergence (c : Nat) (hc : c < 2 ^ 32) :
     validateValueForTy? wLayouts (some wTyChar) (.scalar ⟨c, 4⟩) = isValidCharCode c ∧
     projBytes bmProv (encodePlainLittleEndianBytes c 4) =
@@ -5293,7 +5292,7 @@ theorem kani5205_char_divergence (c : Nat) (hc : c < 2 ^ 32) :
       .ok (some (.Int c)) := by
   have hp : projBytes bmProv (encodePlainLittleEndianBytes c 4) =
       (Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none) :=
-    (proj_plain_bytes (M := Interp.BM) bmProv 4 c 0).trans (encodePtrBytesM_none _ 0)
+    (proj_plain_bytes (M := Interp.BM) bmProv 4 c 0).trans (encodePtrBytesM_none_eq_map _ 0)
   refine ⟨?_, hp, ?_⟩
   · show Bool.and (Nat.beq 4 4) (isValidCharCode c) = isValidCharCode c
     rfl

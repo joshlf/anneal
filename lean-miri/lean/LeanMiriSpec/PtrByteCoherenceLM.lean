@@ -8336,6 +8336,25 @@ theorem lm_lockstep_parity_instance :
         (Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? V06.lP).isSome) :=
   ⟨rfl, lm_lockstep_parity pvRt V06.lP 0 8⟩
 
+/-- **Lockstep parity at every base offset.** On translated streams both dialects produce the
+same vendored fragment state at every base offset (`trEntriesAt`), hence the same vendored
+`readPtr` result for every embedding, offset, and size. -/
+theorem lm_lockstep_parity_at {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (base : Nat)
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) (off n : UInt64) :
+    V08.trEntriesAt pv base (bs.map byte68) = V06.trEntriesAt pv base bs ∧
+    trRead (V08.trEntriesAt pv base (bs.map byte68)) off n =
+      trRead (V06.trEntriesAt pv base bs) off n := by
+  have h : V08.trEntriesAt pv base (bs.map byte68) = V06.trEntriesAt pv base bs :=
+    congrArg List.toArray (trEntriesAux_parity pv bs base)
+  exact ⟨h, by rw [h]⟩
+
+theorem lm_lockstep_parity_at_instance :
+    V08.trEntriesAt pvRt 16 (V06.lP.map byte68) = V06.trEntriesAt pvRt 16 V06.lP ∧
+    trRead (V08.trEntriesAt pvRt 16 (V06.lP.map byte68)) 16 8 =
+      trRead (V06.trEntriesAt pvRt 16 V06.lP) 16 8 :=
+  lm_lockstep_parity_at pvRt 16 V06.lP 16 8
+
 end Parity
 
 /-! ## Axiom, import-isolation, and non-triviality audit -/
@@ -8413,7 +8432,8 @@ elab "#assert_ptr_byte_coherence_lm_audit" : command => do
     ``w_lm_kani5205_alloc_e2e, ``clear_and_prepareCopy_instance,
     ``w_lm_missing_miri_rt, ``w_lm_missing_miri_ct, ``w_lm_misaligned, ``w_lm_wildcard,
     ``w_lm_kani5205_miri, ``pm_w1_whole_pointer_path_only, ``coherent_parity,
-    ``lm_lockstep_parity, ``lm_lockstep_parity_instance ]
+    ``lm_lockstep_parity, ``lm_lockstep_parity_instance,
+    ``lm_lockstep_parity_at, ``lm_lockstep_parity_at_instance ]
   let mut headline : Nat := 0
   for dialect in ["V06", "V08"] do
     for name in perDialect do

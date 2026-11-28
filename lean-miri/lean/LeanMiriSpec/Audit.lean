@@ -27221,6 +27221,8 @@ example :
   LeanMiriSpec.PtrByteCoherenceLM.clear_and_prepareCopy_instance
   LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity
   LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity_instance
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity_at
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity_at_instance
   LeanMiriSpec.PtrByteCoherenceLM.V06.normOffset_image_inj
   LeanMiriSpec.PtrByteCoherenceLM.V06.encodePtrBytes_wf
   LeanMiriSpec.PtrByteCoherenceLM.V06.coh_iff8
