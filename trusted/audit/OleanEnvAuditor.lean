@@ -551,7 +551,8 @@ def preloadArtifactChecks (req : Request) (sysMods : Array Name) : AuditM Nat :=
       if !(olean ++ ir).contains p && (← entryExistsOnDisk p) then
         report "missingPrivateArtifact" m m s!"companion part {p} exists but was omitted from the artifacts"
     if allCanon then
-      validateOleanParts m olean
+      -- `.ir.sig`/`.ir` are compacted regions in the same format and are mapped by `importModules` too.
+      validateOleanParts m olean; validateOleanParts m ir
       if !isTool then
         let rootStr := (firstStr.dropEnd relSuffix.length).toString
         let artRoot : System.FilePath := ⟨if rootStr.isEmpty then "/" else rootStr⟩
@@ -573,12 +574,13 @@ def preloadArtifactChecks (req : Request) (sysMods : Array Name) : AuditM Nat :=
             let sameBytes ← (show IO Bool from do try pure ((← IO.FS.readBinFile stagedP) == (← IO.FS.readBinFile sysP)) catch _ => pure false)
             unless sameBytes do report "moduleProvenanceSpoofed" m m s!"foundation artifact {stagedP} bytes differ from pinned sysroot {sysP}"
   for sm in sysMods do
-    let (sysOlean, _) ← sysrootParts libDir sm
+    let (sysOlean, sysIR) ← sysrootParts libDir sm
     if sysOlean.isEmpty then report "missingPrivateArtifact" sm sm "sysroot module has no .olean parts"
     else
       let mut okAll := true
-      for sp in sysOlean do unless (← checkCanonicalPart sm sp) && pathWithinRoot libDir sp do okAll := false
-      if okAll then validateOleanParts sm sysOlean
+      for sp in sysOlean ++ sysIR do unless (← checkCanonicalPart sm sp) && pathWithinRoot libDir sp do okAll := false
+      if okAll then
+        validateOleanParts sm sysOlean; validateOleanParts sm sysIR
   return checked
 
 /-! ## Environment -/
@@ -1798,7 +1800,8 @@ closed-set foreign realized-auxiliary check. -/
 def checkPrivateName (L : Loaded) (toolchainNames : Std.HashSet Name) (m n : Name)
     (ci? : Option ConstantInfo) (isIRHelper : Bool := false) : AuditM Unit := do
   let parts := namePartsAcc n []
-  unless hasPrivateMention parts do return
+  -- Toolchain-owned names (e.g. private constants in specialization keys) are pinned, not audited.
+  unless hasPrivateMention parts && !L.toolchainProv.contains m do return
   modify fun s => { s with privateNamesAudited := s.privateNamesAudited + 1 }
   let env := L.env
   if isIRHelper && parts.contains (.inl "_at_") && (IR.findEnvDecl env n).isSome && origin? env n == some m then
@@ -1867,8 +1870,9 @@ def genuineCtorIdxMacroInline (env : Environment) (toolchainProv : Std.HashSet N
   unless ty == mkConst ``Nat && lastDom.getAppFn.isConstOf indName do return false
   let (valBody, nLams) := stripLeadingLams dv.value (nb + 1)
   unless nLams == nb && (dv.value.find? fun | .letE .. => true | _ => false).isNone do return false
-  if iv.numCtors == 1 && valBody != .lit (.natVal 0) then return false
-  let allowed := (exprEdges iv.type {}).insert indName |>.insert (indName.str "casesOn") |>.insert (indName.str "rec") |>.insert ``Nat
+  -- `mkCtorIdx` sets `@[macro_inline]` only for single-constructor types, whose body is raw `0`.
+  unless iv.numCtors == 1 && valBody == .lit (.natVal 0) do return false
+  let allowed := (exprEdges iv.type {}).insert indName |>.insert ``Nat
   return (exprEdges dv.value {}).all allowed.contains
 
 def overrideKinds (env : Environment) (toolchainProv : Std.HashSet Name) (n : Name) : Array String := Id.run do

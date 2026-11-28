@@ -739,12 +739,18 @@ def _check_no_toolchain_shadow(art_root: Path, phase: str) -> None:
                         raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact root shadows toolchain artifact: {p}")
 
 
-def _validate_olean_parts(module: str, olean_parts: list[str], phase: str) -> None:
-    """Pre-`importModules` binary header & compacted-region bounds check (leanprover/lean4#16737)."""
-    if len(olean_parts) not in (1, 3):
-        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: expected 1 or 3 olean parts, got {len(olean_parts)}")
+def _validate_olean_parts(module: str, olean_parts: list[str], phase: str, ir_parts=()) -> None:
+    """Pre-`importModules` binary header & compacted-region bounds check (leanprover/lean4#16737) of the
+    `.olean*` layer chain and the `.ir.sig`/`.ir` chain (same compacted-region format, also mapped)."""
+    if len(olean_parts) not in (1, 3) or len(ir_parts) not in (0, 2):
+        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: expected 1 or 3 olean and 0 or 2 IR parts")
+    for chain in (olean_parts, ir_parts):
+        _validate_layer_chain(module, chain, phase)
+
+
+def _validate_layer_chain(module: str, chain, phase: str) -> None:
     parents: list[tuple[int, int, int]] = []
-    for raw in olean_parts:
+    for raw in chain:
         p = Path(raw)
         if not _canonical_regular(p):
             raise Failure(1, phase, f"[moduleProvenanceSpoofed] {module}: non-canonical olean part {p}")
@@ -1087,7 +1093,7 @@ class Checker:
                         if str(cand) not in listed and (cand.exists() or cand.is_symlink()):
                             return None
                     try:
-                        _validate_olean_parts(mod, olean_parts, mode)
+                        _validate_olean_parts(mod, olean_parts, mode, ir_parts)
                     except Failure:
                         return None
                     if mod not in self.foundation:
@@ -1230,15 +1236,16 @@ class Checker:
             available[part] = str(dest)
             self.expected_artifacts[str(dest)] = expected_sha
         olean_parts = [available[p] for p in PARTS[:3] if p in available]
+        ir_parts = [available[p] for p in PARTS[3:] if p in available]
         try:
             if not _path_within_root(self.stage, output):
                 return False
-            _validate_olean_parts(module, olean_parts, "compile")
+            _validate_olean_parts(module, olean_parts, "compile", ir_parts)
         except Failure:
             return False
         self.artifacts[module] = [
             olean_parts,
-            [available[p] for p in PARTS[3:] if p in available],
+            ir_parts,
         ]
         return True
 
@@ -1278,7 +1285,7 @@ class Checker:
             raise Failure(2, mode, "hostile LEAN_PATH/LEAN_SYSROOT leaked into child environment")
         if mode.startswith("inductive-replay") or mode in ("audit", "downstream-audit"):
             for mod, groups in sorted(self.artifacts.items()):
-                _validate_olean_parts(mod, groups[0], mode)
+                _validate_olean_parts(mod, groups[0], mode, groups[1])
         cache_key = self._inspect_cache_key(mode, fields)
         if cache_key is not None and self.cache_dir is not None:
             cache_file = self.cache_dir / "inspect" / f"{mode}-{cache_key}.json"
@@ -1604,8 +1611,8 @@ class Checker:
                         if str(art_root) not in checked_roots:
                             _check_no_toolchain_shadow(art_root, phase)
                             checked_roots.add(str(art_root))
-                    if len(olean_parts) in (1, 3):
-                        _validate_olean_parts(mod, olean_parts, phase)
+                    if len(olean_parts) in (1, 3) and len(ir_parts) in (0, 2):
+                        _validate_olean_parts(mod, olean_parts, phase, ir_parts)
                 self.artifacts[mod] = [list(olean_parts), list(ir_parts)]
             if merged_graph is not None:
                 self.graph = merged_graph
@@ -1760,7 +1767,7 @@ class Checker:
                                       [available[p] for p in PARTS[3:] if p in available]]
             if not self.artifacts[module][0]:
                 raise Failure(2, "foundation", f"missing olean for {module}")
-            _validate_olean_parts(module, self.artifacts[module][0], "foundation")
+            _validate_olean_parts(module, self.artifacts[module][0], "foundation", self.artifacts[module][1])
         self.graph = dict(self.lock["graph"])
         if self.inspect("foundation").get("graph") != self.graph:
             raise Failure(1, "foundation", "locked compiled foundation DAG differs")
@@ -1900,7 +1907,7 @@ class Checker:
                 raise Failure(2, "compile", f"compiled output escapes downstream-lib: {output}")
             self.artifacts[module] = [[available[p] for p in PARTS[:3] if p in available],
                                       [available[p] for p in PARTS[3:] if p in available]]
-            _validate_olean_parts(module, self.artifacts[module][0], "compile")
+            _validate_olean_parts(module, self.artifacts[module][0], "compile", self.artifacts[module][1])
             self.graph[module] = edge_list
             self._store_cached_module(cache_key, available)
         if not self.fast:
@@ -2072,7 +2079,7 @@ class Checker:
                 raise Failure(2, "compile", f"compiled output escapes lib: {output}")
             self.artifacts[module] = [[available[p] for p in PARTS[:3] if p in available],
                                       [available[p] for p in PARTS[3:] if p in available]]
-            _validate_olean_parts(module, self.artifacts[module][0], "compile")
+            _validate_olean_parts(module, self.artifacts[module][0], "compile", self.artifacts[module][1])
             self._store_cached_module(cache_key, available)
         if not self.fast:
             self.freshness()
