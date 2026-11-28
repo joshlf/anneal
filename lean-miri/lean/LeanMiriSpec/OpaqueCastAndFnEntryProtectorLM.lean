@@ -243,6 +243,14 @@ def ocCase6Mir : CapturedMir :=
     [ocBb [.storageLive 1, .assign (ocLoc 1) (.aggregate (.adt "oc::TwoVar" 0 none) [ocConstU32 7]),
            .setDiscriminant (ocLoc 1 [.opaqueCast ocTwoVarTy]) 1,
            .assign (ocLoc 0) (.discriminant (ocLoc 1 [.opaqueCast ocTwoVarTy]))] .return_]
+/-- Case 6 payload companion: the same `SetDiscriminant(_1 as TwoVar, 1)` on `TwoVar::A(7)`, then
+the variant payload read `_0 = copy (((_1 as TwoVar) as B).0)` (the payload bytes are untouched). -/
+def ocCase6PayloadMir : CapturedMir :=
+  ocBody "oc::case6_set_discriminant_payload_through_cast" 0 [ocU32Ty, ocTwoVarTy]
+    [ocBb [.storageLive 1, .assign (ocLoc 1) (.aggregate (.adt "oc::TwoVar" 0 none) [ocConstU32 7]),
+           .setDiscriminant (ocLoc 1 [.opaqueCast ocTwoVarTy]) 1,
+           .assign (ocLoc 0)
+             (.use (.copy (ocLoc 1 [.opaqueCast ocTwoVarTy, .downcast none 1, .field 0 ocU32Ty])))] .return_]
 /-- Case 7 (negative): `Drop(_1 as u32) -> bb1`; `bb1: _0 = copy _1` (use after drop). -/
 def ocCase7Mir : CapturedMir :=
   ocBody "oc::case7_drop_through_cast" 0 [ocU32Ty, ocU32Ty]
@@ -959,23 +967,96 @@ theorem lm_opaqueCast_phase_boundary {Prov : Type} [PointerProvenance Prov]
     (StepError.invalidProgram "OpaqueCast after borrowck" ≠ .undefinedBehavior "OpaqueCast after borrowck") :=
   ⟨rfl, rfl, by simp⟩
 
-/-- The phase-boundary observation of a `D1` fixture place: `phaseBoundary` when the
-translated place projects through `OpaqueCast` (vendored `project` rejects it), otherwise the
-fixture is outside the boundary. -/
-def lmOcPhaseObs (proj : List Miri.MIR.ProjectionElem) : LmOcFpObs :=
-  if proj.any (fun e => match e with | .OpaqueCast _ => true | _ => false) then .phaseBoundary
-  else .unsupported
+/-- Whether a place carries a `ProjectionElem.opaqueCast` anywhere in its projection. -/
+def ocPlaceHasCast (p : Trusted.Rustc.V2026_06_01.MirAst.Place) : Bool :=
+  p.projection.any fun e => match e with | .opaqueCast _ => true | _ => false
 
-/-- `D1` **translated cast places hit the phase boundary**: the translated places of the cast
-fixtures carry `Miri.MIR.ProjectionElem.OpaqueCast`. -/
-theorem lm_translated_cast_places_phase_boundary :
-    lmOcPhaseObs (LeanMiriSpec.Correspondence.translatePlace (ocLoc 1 [ocCastU32])).projection.toList =
-      .phaseBoundary ∧
-    lmOcPhaseObs (LeanMiriSpec.Correspondence.translatePlace
-      (ocLoc 2 [.opaqueCast ocRawConstU32Ty, .deref])).projection.toList = .phaseBoundary ∧
-    lmOcPhaseObs (LeanMiriSpec.Correspondence.translatePlace (ocErasePlace (ocLoc 1 [ocCastU32]))).projection.toList =
-      .unsupported := by
-  refine ⟨?_, ?_, ?_⟩ <;> decide +kernel
+def ocOperandPlaces : Trusted.Rustc.V2026_06_01.MirAst.Operand → List Trusted.Rustc.V2026_06_01.MirAst.Place
+  | .copy p | .move p => [p]
+  | .constant _ => []
+
+def ocRvaluePlaces : Trusted.Rustc.V2026_06_01.MirAst.Rvalue → List Trusted.Rustc.V2026_06_01.MirAst.Place
+  | .use op => ocOperandPlaces op
+  | .ref _ p | .rawPtr _ p | .len p | .discriminant p | .copyForDeref p => [p]
+  | .cast _ op _ => ocOperandPlaces op
+  | .binaryOp _ a b => ocOperandPlaces a ++ ocOperandPlaces b
+  | .unaryOp _ a => ocOperandPlaces a
+  | .aggregate _ ops => ops.flatMap ocOperandPlaces
+  | _ => []
+
+/-- Every place a body addresses (statement destinations / operands / `Deinit` /
+`SetDiscriminant` / `Retag` / `PlaceMention`, and `Drop` / `Call` terminator places). -/
+def ocBodyPlaces (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    List Trusted.Rustc.V2026_06_01.MirAst.Place :=
+  b.basicBlocks.flatMap fun bb =>
+    bb.statements.flatMap (fun s => match s.kind with
+      | .assign p rv => p :: ocRvaluePlaces rv
+      | .setDiscriminant p _ | .deinit p | .retag _ p | .placeMention p => [p]
+      | _ => []) ++
+    (match bb.terminator.kind with
+      | .drop p _ _ => [p]
+      | .call f args d _ _ => ocOperandPlaces f ++ args.flatMap ocOperandPlaces ++ [d]
+      | _ => [])
+
+/-- Walk a translated projection chain with REAL vendored `Miri.Interpreter.project`. -/
+def lmOcProjectChain (base : OpTy Provenance) :
+    List Miri.MIR.ProjectionElem → Except ProjectionError (OpTy Provenance)
+  | [] => .ok base
+  | e :: rest => do
+    let b ← project (LeanMiriSpec.WideDstAndMaybeUninitLM.lmWdProjCx (lmInit false)) base e
+    lmOcProjectChain b rest
+
+/-- **Phase-boundary observer (`D1`)**: the first opaque-cast place of the case's (un-erased)
+fixture, translated to vendored `Miri.MIR`, is walked with REAL vendored `Miri.Interpreter.project`
+from its root local's translated layout; the exact `invariant "OpaqueCast after borrowck"`
+rejection is observed as `.phaseBoundary`. -/
+def lmOcPhaseObserve (idx : Nat) : LmOcFpObs :=
+  match ocCaseFixture? idx with
+  | none => .unsupported
+  | some (body, _) =>
+    match (ocBodyPlaces body).filter ocPlaceHasCast with
+    | [] => .unsupported
+    | p :: _ =>
+      let rootTy := ((body.localDecls[p.local_]?).map (·.ty)).getD ocUnitTy
+      let base : OpTy Provenance :=
+        ⟨.immediate .uninit, LeanMiriSpec.Correspondence.translateTy rootTy body.layouts⟩
+      match lmOcProjectChain base (LeanMiriSpec.Correspondence.translatePlace p).projection.toList with
+      | .error (.invariant "OpaqueCast after borrowck") => .phaseBoundary
+      | _ => .unsupported
+
+/-- **`D1` phase-boundary table (kernel-checked)**: EVERY `D1` `.opaqueCast` fixture (`0..9`) is
+rejected by real vendored `Miri.Interpreter.project` at the phase boundary, while no `D2` / `D3`
+fixture carries an opaque cast; and the cast-erased image `ocEraseBody` of every `D1` fixture
+addresses no opaque-cast place at all (so it is the program `Step.step` legitimately runs). -/
+theorem lm_d1_phase_boundary_table :
+    (List.range lmOcCaseCount).map lmOcPhaseObserve =
+      [.phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary,
+       .phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary,
+       .unsupported, .unsupported, .unsupported, .unsupported, .unsupported, .unsupported,
+       .unsupported, .unsupported, .unsupported, .unsupported, .unsupported, .unsupported] ∧
+    ((List.range 10).all fun idx => match ocCaseFixture? idx with
+      | some (b, _) => ((ocBodyPlaces (ocEraseBody b)).filter ocPlaceHasCast).isEmpty
+      | none => false) = true := by
+  refine ⟨?_, ?_⟩ <;> decide +kernel
+
+/-- `D1` **the cast erasure removes every cast (universal)**. -/
+theorem lm_ocErasePlace_cast_free (p : Trusted.Rustc.V2026_06_01.MirAst.Place) :
+    ocPlaceHasCast (ocErasePlace p) = false := by
+  obtain ⟨l, proj⟩ := p
+  simp only [ocPlaceHasCast, ocErasePlace]
+  induction proj with
+  | nil => rfl
+  | cons e rest ih => cases e <;> simp_all [ocEraseProj]
+
+/-- `D1` **`SetDiscriminant` payload companion (kernel-checked)**: vendored `Step.step` on the cast
+erasure of `ocCase6PayloadMir` (real `Discriminant.writeDiscriminant`, downcast field read) and
+Trusted `stepMirFn` on the `.opaqueCast` fixture both read the variant-`B` payload `7`. -/
+theorem lm_oc_setDiscriminant_payload_agreement :
+    lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase6PayloadMir) ocU32Ty) = .okScalar 7 ∧
+    lmOcTrustedObsOf 0 (ocRunTrustedRaw ocCase6PayloadMir []) = .okScalar 7 := by
+  refine ⟨?_, ?_⟩
+  · rw [ocRunStepU.eq_src]; decide +kernel
+  · decide +kernel
 
 /-- `D1` **pinned `Step.step` adapter boundaries**: the `.opaqueCast` fixtures themselves never
 reach a value through the adapter (`projected operand in scalar rvalue` /
@@ -1424,7 +1505,9 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     type_of% lmOcTrustedObserve_table ∧
     type_of% lmOc_trusted_agreement ∧
     type_of% @lm_opaqueCast_phase_boundary ∧
-    type_of% lm_translated_cast_places_phase_boundary ∧
+    type_of% lm_d1_phase_boundary_table ∧
+    type_of% @lm_ocErasePlace_cast_free ∧
+    type_of% lm_oc_setDiscriminant_payload_agreement ∧
     type_of% lm_step_adapter_boundaries ∧
     type_of% @lm_retagPolicy_protector ∧
     type_of% @lm_retagPolicy_none ∧
@@ -1444,7 +1527,8 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     lmOcCaseCount = ocFixtureCaseCount :=
   ⟨lmOcObserve_table, lmOcObserve_out_of_range, lmOcObserve_mode_sensitivity, lmOcTrustedObserve_table,
    lmOc_trusted_agreement,
-   @lm_opaqueCast_phase_boundary, lm_translated_cast_places_phase_boundary, lm_step_adapter_boundaries,
+   @lm_opaqueCast_phase_boundary, lm_d1_phase_boundary_table, @lm_ocErasePlace_cast_free,
+   lm_oc_setDiscriminant_payload_agreement, lm_step_adapter_boundaries,
    @lm_retagPolicy_protector, @lm_retagPolicy_none, lm_retagPolicy_fnEntry_witness,
    @lm_call_passArgument_copyAllowTransmute, @lm_call_initStackFrame_enters_fnEntry_mode,
    lm_call_initStackFrame_fnEntry_witness, @lm_machineHooks_withRetagMode_laws,
@@ -1467,6 +1551,8 @@ run_cmd do
   -- (traversing `LeanMiriSpec.*` adapters so wrappers cannot hide shadow evaluators).
   let bridgeReq : List (Lean.Name × Lean.Name) :=
     [ (ns ++ `lmOcObserve_table, `Miri.Interpreter.Step.step),
+      (ns ++ `lm_d1_phase_boundary_table, `Miri.Interpreter.project),
+      (ns ++ `lm_oc_setDiscriminant_payload_agreement, `Miri.Interpreter.Step.step),
       (ns ++ `lmOcObserve_table, `Miri.Interpreter.Discriminant.writeDiscriminant),
       (ns ++ `lmOcObserve_table, `Miri.Interpreter.Discriminant.readDiscriminant),
       (ns ++ `lmOcObserve_table, `Miri.Interpreter.writeAggregate),
@@ -1518,7 +1604,7 @@ run_cmd do
   -- theorem count floor.
   let constructive : List Lean.Name :=
     [ ns ++ `lmOcTrustedObserve_table,
-      ns ++ `lm_opaqueCast_phase_boundary, ns ++ `lm_translated_cast_places_phase_boundary,
+      ns ++ `lm_opaqueCast_phase_boundary, ns ++ `lm_ocErasePlace_cast_free,
       ns ++ `lm_retagPolicy_protector, ns ++ `lm_retagPolicy_none,
       ns ++ `lm_retagPolicy_fnEntry_witness,
       ns ++ `lm_checkPtrAccess_zero_size,

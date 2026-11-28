@@ -241,6 +241,14 @@ def ocCase6Mir : CapturedMir :=
     [ocBb [.storageLive 1, .assign (ocLoc 1) (.aggregate (.adt "oc::TwoVar" 0 none) [ocConstU32 7]),
            .setDiscriminant (ocLoc 1 [.opaqueCast ocTwoVarTy]) 1,
            .assign (ocLoc 0) (.discriminant (ocLoc 1 [.opaqueCast ocTwoVarTy]))] .return_]
+/-- Case 6 payload companion: the same `SetDiscriminant(_1 as TwoVar, 1)` on `TwoVar::A(7)`, then
+the variant payload read `_0 = copy (((_1 as TwoVar) as B).0)` (the payload bytes are untouched). -/
+def ocCase6PayloadMir : CapturedMir :=
+  ocBody "oc::case6_set_discriminant_payload_through_cast" 0 [ocU32Ty, ocTwoVarTy]
+    [ocBb [.storageLive 1, .assign (ocLoc 1) (.aggregate (.adt "oc::TwoVar" 0 none) [ocConstU32 7]),
+           .setDiscriminant (ocLoc 1 [.opaqueCast ocTwoVarTy]) 1,
+           .assign (ocLoc 0)
+             (.use (.copy (ocLoc 1 [.opaqueCast ocTwoVarTy, .downcast none 1, .field 0 ocU32Ty])))] .return_]
 /-- Case 7 (negative): `Drop(_1 as u32) -> bb1`; `bb1: _0 = copy _1` (use after drop). -/
 def ocCase7Mir : CapturedMir :=
   ocBody "oc::case7_drop_through_cast" 0 [ocU32Ty, ocU32Ty]
@@ -1028,6 +1036,23 @@ theorem mr_oc_minimize_lowering_contrasts :
     ocRun false [] ocMrProg7Minimize = .okScalar 7 ∧ ocRun true [] ocMrProg7Minimize = .okScalar 7 ∧
     mrOcObserve false 2 = .ub ∧ mrOcObserve false 7 = .ub := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- `ocMrProg6`'s payload companion: `GetDiscriminant` replaced by the payload load
+`(_3 as B).0`. -/
+def ocMrProg6Payload : Program :=
+  wdProg [ocMrTwoVarTy]
+    ([.Assign (wdLc 3) (.Variant 0 (.Tuple [cU32 7] ocMrTwoVarPayloadTy) ocMrTwoVarTy),
+      .SetDiscriminant (wdLc 3) 1] ++
+     wdFinish 0 (wdToU64 (.Load (.Field (.Downcast (wdLc 3) 1) 0))) (wdCU64 0))
+
+/-- **`D1` `SetDiscriminant` payload agreement (kernel-checked)**: after
+`SetDiscriminant(_1 as TwoVar, 1)` on `TwoVar::A(7)`, the variant-`B` payload reads `7` in Trusted
+on the `.opaqueCast` fixture, in Trusted on its cast erasure, and in MiniRust on `Mach` and `MachTB`. -/
+theorem mr_oc_setDiscriminant_payload_agreement :
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw ocCase6PayloadMir []) = .okScalar 7 ∧
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw (ocEraseBody ocCase6PayloadMir) []) = .okScalar 7 ∧
+    ocRun false [] ocMrProg6Payload = .okScalar 7 ∧ ocRun true [] ocMrProg6Payload = .okScalar 7 := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- The final `Mach` of a basic run (stopped at `Intrinsic.Exit`). -/
 def ocFinalMachBasic (prog : Program) : Option Mach :=
@@ -2000,6 +2025,7 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% mr_checkPtrM_nonvacuity ∧
     type_of% mr_oc_exact_ub_diagnostics ∧
     type_of% mr_oc_minimize_lowering_contrasts ∧
+    type_of% mr_oc_setDiscriminant_payload_agreement ∧
     type_of% mr_checkPtr_some_vs_none_contrast ∧
     type_of% mr_checkPtrM_tb_some_vs_none_contrast :=
   ⟨@mr_translate_opaqueCast_fail_closed, @trusted_stripLeadingOpaqueCast_laws,
@@ -2016,8 +2042,8 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
    @mr_checkPtr_sized_never_unsupported, @mr_checkPtrM_sized_never_unsupported_bm_tbm,
    @mr_checkPtrM_zst_always_ok, @mr_checkPtrM_null_always_ub, @mr_checkPtrM_unaligned_always_ub,
    @mr_checkPtrM_none_sized_prov_unsupported, mr_checkPtrM_nonvacuity, mr_oc_exact_ub_diagnostics,
-   mr_oc_minimize_lowering_contrasts, mr_checkPtr_some_vs_none_contrast,
-   mr_checkPtrM_tb_some_vs_none_contrast⟩
+   mr_oc_minimize_lowering_contrasts, mr_oc_setDiscriminant_payload_agreement,
+   mr_checkPtr_some_vs_none_contrast, mr_checkPtrM_tb_some_vs_none_contrast⟩
 
 section AxiomAudit
 open Lean Elab Command
@@ -2033,6 +2059,8 @@ run_cmd do
   -- 2. Bridge-reality audit: our theorems transitively reach the real interpreters.
   let bridgeReq : List (Lean.Name × Lean.Name) :=
     [ (ns ++ `mrOcObserve_table, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mr_oc_setDiscriminant_payload_agreement, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `mr_oc_setDiscriminant_payload_agreement, `MiniRustSpec.Interp.stepM),
       (ns ++ `mrOcObserve_table, `MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM),
       (ns ++ `mrOcObserve_table, `MiniRustSpec.Interp.checkPtrM),
       (ns ++ `mrOcObserve_table, `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable),
