@@ -2425,11 +2425,13 @@ def pinnedWithSpecCalleesClaim : Claim where
   post args ret :=
     MirBoolPredicateHoldsWithCallees companionWithCallEnsMir [incU8CallbackMir] (args ++ [ret])
 
+-- The `by rfl` the two `*WithSpecCalleesAuto` combinators default to, run
+-- once on their only fixture and shared by both certificates below.
 private theorem pinnedWithSpecCallees_check :
     checkMirAutoPinnedSpecWithSpecCallees 16 16 pinnedWithSpecCalleesSubjectMir
       [incU8CallbackMir] [incU8CallbackMir]
       (.some companionPinnedReqMir) (.some companionWithCallEnsMir) = true := by
-  decide +kernel
+  rfl
 
 /--
 Kernel-checked verification of `pinnedWithSpecCalleesClaim` where both the
