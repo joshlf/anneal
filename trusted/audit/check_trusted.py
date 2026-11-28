@@ -694,18 +694,15 @@ def _canonical_regular(path: Path) -> bool:
 
 
 def _canonical_dir(path: Path) -> bool:
-    """True iff `path` is an absolute, canonical, non-symlinked directory."""
     if not path.is_absolute():
         return False
     try:
-        st = path.lstat()
-        return stat.S_ISDIR(st.st_mode) and os.path.realpath(str(path)) == str(path)
+        return stat.S_ISDIR(path.lstat().st_mode) and os.path.realpath(str(path)) == str(path)
     except OSError:
         return False
 
 
 def _path_within_root(root: Path, target: Path) -> bool:
-    """Canonical component-boundary containment check (blocks `/tmp/root_evil` vs `/tmp/root` and symlinks)."""
     r, t = os.path.realpath(str(root)), os.path.realpath(str(target))
     try:
         return os.path.commonpath([r, t]) == r
@@ -713,14 +710,11 @@ def _path_within_root(root: Path, target: Path) -> bool:
         return False
 
 
-_OLEAN_MAGIC = b"olean"
-_OLEAN_LEAN_VER = b"4.34.1" + b"\x00" * 27
-_OLEAN_GITHASH = b"5045d0056413266e57c625dcd7c365b10e377c52"
-_OLEAN_MAX_BYTES = 256 * 1024 * 1024
+_OLEAN_MAGIC, _OLEAN_LEAN_VER, _OLEAN_GITHASH, _OLEAN_MAX_BYTES = (
+    b"olean", b"4.34.1" + b"\x00" * 27, b"5045d0056413266e57c625dcd7c365b10e377c52", 256 * 1024 * 1024)
 
 
 def _check_no_toolchain_shadow(art_root: Path, phase: str) -> None:
-    """Refuse artifact roots that shadow `Init`/`Std`/`Lean` `.olean*`/`.ir*` files or contain symlinks under them."""
     for root_name in ("Init", "Std", "Lean"):
         for ext in PARTS:
             cand = art_root / f"{root_name}.{ext}"
@@ -733,44 +727,44 @@ def _check_no_toolchain_shadow(art_root: Path, phase: str) -> None:
             for directory, dirs, files in os.walk(sub, followlinks=False):
                 for name in sorted(dirs + files):
                     p = Path(directory) / name
-                    if p.is_symlink():
-                        raise Failure(1, phase, f"[moduleProvenanceSpoofed] symlink under shadowed toolchain dir: {p}")
-                    if any(name.endswith("." + ext) for ext in PARTS):
-                        raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact root shadows toolchain artifact: {p}")
+                    if p.is_symlink() or any(name.endswith("." + ext) for ext in PARTS):
+                        raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact root shadows toolchain path: {p}")
 
 
 def _validate_olean_parts(module: str, olean_parts: list[str], phase: str, ir_parts=()) -> None:
-    """Pre-`importModules` binary header & compacted-region bounds check (leanprover/lean4#16737) of the
-    `.olean*` layer chain and the `.ir.sig`/`.ir` chain (same compacted-region format, disjoint regions)."""
     if len(olean_parts) not in (1, 3) or len(ir_parts) not in (0, 2):
         raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: expected 1 or 3 olean and 0 or 2 IR parts")
-    ol_layers = _validate_layer_chain(module, olean_parts, phase)
-    _validate_layer_chain(module, ir_parts, phase, ol_layers)
+    _validate_layer_chain(module, ir_parts, phase, _validate_layer_chain(module, olean_parts, phase))
 
 
 def _walk_region(data: bytes, base: int, root: int, parents) -> set:
-    """Validate every own-region object reachable from `root` (m_rc 0, known kind, in bounds); a pointer
-    may leave the region only to an object already reached in a parent layer."""
-    size, seen, stack = len(data), set(), [root]
+    """Validate every own-region object reachable from `root` (m_rc 0, known kind, bounds, MPZ/String/ScalarArray)."""
+    size, seen, stack = len(data), {root}, [root]
     while stack:
-        p = stack.pop()
-        if p in seen:
-            continue
-        seen.add(p)
-        o = p - base
+        o = stack.pop() - base
         rc, cs, oth, tag = struct.unpack_from("<iHBB", data, o)
         msz, cap = struct.unpack_from("<QQ", data, o + 8) if o + 24 <= size else (1, 0)
-        if tag <= 243:
+        if tag <= 243 and (cs == 0 or cs >= 8 + 8 * oth):
             end, n, at = o + max(cs, 8 + 8 * oth), oth, o + 8
-        elif tag in (246, 248, 249) and msz <= cap:
-            end, n, at = o + {246: 24 + 8 * cap, 248: 24 + oth * cap, 249: 32 + cap}[tag], (msz if tag == 246 else 0), o + 24
+        elif tag == 246 and msz <= cap:
+            end, n, at = o + 24 + 8 * cap, msz, o + 24
+        elif tag == 248 and oth > 0 and msz <= cap:
+            end, n, at = o + 24 + oth * cap, 0, o + 24
+        elif tag == 249 and 1 <= msz <= cap and o + 32 + cap <= size and data[o + 32 + msz - 1] == 0 and struct.unpack_from("<Q", data, o + 24)[0] < msz:
+            end, n, at = o + 32 + cap, 0, o + 24
+        elif tag == 250 and o + 24 <= size and (cs == 0 or cs >= 24):
+            alloc, msz_i, dptr = struct.unpack_from("<iiQ", data, o + 8)
+            ok = alloc >= 0 and abs(msz_i) <= alloc and (alloc == 0 or ((dptr & 7) == 0 and base + 96 <= dptr and dptr + 8 * alloc <= base + size))
+            end, n, at = (o + max(cs, 24) if ok else size + 1), 0, o
         else:
-            end, n, at = (o + 8 if tag == 250 else size + 1), 0, o
+            end, n, at = size + 1, 0, o
         if rc != 0 or end > size:
             raise ValueError(f"invalid object (tag {tag}) at offset {o}")
         for c in struct.unpack_from(f"<{n}Q", data, at):
             if c & 7 == 0 and base + 96 <= c <= base + size - 8:
-                stack.append(c)
+                if c not in seen:
+                    seen.add(c)
+                    stack.append(c)
             elif not (c & 1 or any(c in ps for ps in parents)):
                 raise ValueError(f"pointer {c:#x} at offset {o} escapes the region")
     return seen

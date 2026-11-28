@@ -366,61 +366,78 @@ def oleanMagicBytes : ByteArray := "olean".toUTF8
 def oleanVerBytes : ByteArray := "4.34.1".toUTF8
 def oleanGitBytes : ByteArray := "5045d0056413266e57c625dcd7c365b10e377c52".toUTF8
 
-/-- One validated compacted-region layer: `baseAddr`, byte size, `rootPtr`, root child pointers. -/
-abbrev OleanLayer := Nat × Nat × Nat × Array Nat
+/-- One validated compacted-region layer: `baseAddr`, byte size, `rootPtr`, root kids, reachable bitset. -/
+abbrev OleanLayer := Nat × Nat × Nat × Array Nat × ByteArray
+
+/-- Total O(N) reachable object walk over one compacted region (`leanprover/lean4#16737`). -/
+def walkOleanRegion (b : ByteArray) (base root : Nat) (parents : Array OleanLayer) : Except String ByteArray := do
+  let sz := b.size
+  let mut seen := ByteArray.mk (Array.replicate ((sz >>> 6) + 2) 0)
+  let rIdx := (root - base) >>> 3
+  seen := seen.set! (rIdx >>> 3) (1 <<< (rIdx &&& 7)).toUInt8
+  let mut stack : Array Nat := #[root]
+  for _ in [0:(sz >>> 3) + 1] do
+    if stack.isEmpty then return seen
+    let o := stack.back! - base; stack := stack.pop
+    let (rc, cs, oth, tag) := (readU32LE b o, readU16LE b (o + 4), (b.get! (o + 6)).toNat, (b.get! (o + 7)).toNat)
+    let (msz, cap) := if o + 24 <= sz then (readU64LE b (o + 8), readU64LE b (o + 16)) else (1, 0)
+    let (endO, n, atO) :=
+      if tag <= 243 && (cs == 0 || cs >= 8 + 8 * oth) then (o + max cs (8 + 8 * oth), oth, o + 8)
+      else if tag == 246 && msz <= cap then (o + 24 + 8 * cap, msz, o + 24)
+      else if tag == 248 && oth > 0 && msz <= cap then (o + 24 + oth * cap, 0, o + 24)
+      else if tag == 249 && 1 <= msz && msz <= cap && o + 32 + cap <= sz && b.get! (o + 32 + msz - 1) == 0 && readU64LE b (o + 24) < msz then (o + 32 + cap, 0, o + 24)
+      else if tag == 250 && o + 24 <= sz && (cs == 0 || cs >= 24) then
+        let (al, ms, dp) := (readU32LE b (o + 8), readU32LE b (o + 12), readU64LE b (o + 16))
+        let absMs := if ms >= 2147483648 then 4294967296 - ms else ms
+        let ok := al < 2147483648 && absMs <= al && (al == 0 || (dp % 8 == 0 && base + 96 <= dp && dp + 8 * al <= base + sz))
+        (if ok then o + max cs 24 else sz + 1, 0, o)
+      else (sz + 1, 0, o)
+    unless rc == 0 && endO <= sz do throw s!"invalid object (tag={tag}) at offset {o}"
+    for j in [0:n] do
+      let c := readU64LE b (atO + 8 * j)
+      if c % 8 == 0 && base + 96 <= c && c <= base + sz - 8 then
+        let ci := (c - base) >>> 3; let bi := ci >>> 3; let cur := seen.get! bi; let mk := (1 <<< (ci &&& 7)).toUInt8
+        if cur &&& mk == 0 then seen := seen.set! bi (cur ||| mk); stack := stack.push c
+      else unless c % 2 == 1 || (c % 8 == 0 && parents.any fun (pb, ps, _, _, pSeen) =>
+          pb + 96 <= c && c <= pb + ps - 8 && (let pi := (c - pb) >>> 3; (pSeen.get! (pi >>> 3) &&& (1 <<< (pi &&& 7)).toUInt8) != 0)) do
+        throw s!"out-of-region pointer at offset {o}"
+  throw "compacted-region object walk exhausted its fuel"
 
 /-- Pre-`importModules` binary `.olean*`/`.ir*` validation (`leanprover/lean4#16737`). -/
-def validateOleanBytes (b : ByteArray) (parents disjoint : Array OleanLayer) : Except String OleanLayer := do
+def validateOleanBytes (b : ByteArray) (parents disjoint : Array OleanLayer) (deep : Bool := true) : Except String OleanLayer := do
   let sz := b.size
-  unless sz >= 96 do throw s!"file smaller than 96-byte header ({sz})"
-  unless b.extract 0 5 == oleanMagicBytes && b.get! 5 == 2 && b.get! 6 <= 1 &&
-      b.extract 7 13 == oleanVerBytes && b.extract 40 80 == oleanGitBytes do
+  unless sz >= 96 && b.extract 0 5 == oleanMagicBytes && b.get! 5 == 2 && b.get! 6 <= 1 && b.extract 7 13 == oleanVerBytes && b.extract 40 80 == oleanGitBytes do
     throw "invalid .olean header magic/version/flags/githash"
   for idx in [13:40] do unless b.get! idx == 0 do throw "non-NUL padding in .olean version field"
   let (baseAddr, rootPtr) := (readU64LE b 80, readU64LE b 88)
-  unless baseAddr > 0 && baseAddr % 8 == 0 && baseAddr + sz < 18446744073709551616 do
-    throw "invalid, unaligned, or overflowing .olean baseAddr"
-  for (pb, ps, _) in parents ++ disjoint do
-    unless baseAddr + sz <= pb || pb + ps <= baseAddr do throw "overlapping compacted-region layer"
+  unless baseAddr > 0 && baseAddr % 8 == 0 && baseAddr + sz < 18446744073709551616 do throw "invalid/overflowing .olean baseAddr"
+  for (pb, ps, _) in parents ++ disjoint do unless baseAddr + sz <= pb || pb + ps <= baseAddr do throw "overlapping compacted-region layer"
   if baseAddr + 96 <= rootPtr && rootPtr <= baseAddr + sz - 8 then
-    unless rootPtr % 8 == 0 do throw "unaligned .olean rootPtr"
     let off := rootPtr - baseAddr
     let (rc, csSz, mOther, mTag) := (readU32LE b off, readU16LE b (off + 4), (b.get! (off + 6)).toNat, (b.get! (off + 7)).toNat)
-    unless rc == 0 && mTag == 0 && mOther == 5 && csSz == 56 && off + 56 <= sz do
+    unless rootPtr % 8 == 0 && rc == 0 && mTag == 0 && mOther == 5 && csSz == 56 && off + 56 <= sz do
       throw s!"invalid root object header (rc={rc}, tag={mTag}, cs_sz={csSz}, other={mOther})"
     let mut kids : Array Nat := #[]
     for k in [0:5] do
-      let c := readU64LE b (off + 8 + 8 * k)
-      if c % 8 == 0 && baseAddr + 96 <= c && c + 24 <= baseAddr + sz then
-        let co := c - baseAddr; let (asz, cap) := (readU64LE b (co + 8), readU64LE b (co + 16))
-        unless readU32LE b co == 0 && (b.get! (co + 7)).toNat == 246 && asz <= cap && co + 24 + 8 * cap <= sz do
-          throw s!"invalid root child array header at slot {k}"
-        for j in [0:asz] do
-          let e := readU64LE b (co + 24 + 8 * j)
-          if e % 2 == 1 then continue
-          if e % 8 == 0 && baseAddr + 96 <= e && e <= baseAddr + sz - 8 then
-            let eo := e - baseAddr
-            unless readU32LE b eo == 0 && (b.get! (eo + 7)).toNat <= 249 do throw s!"invalid root array element header at slot {k}[{j}]"
-          else unless e % 8 == 0 && parents.any fun (pb, ps, _, _) => pb + 96 <= e && e <= pb + ps - 8 do
-            throw s!"out-of-bounds root array element pointer at slot {k}[{j}]"
-      else unless parents.any fun (_, _, _, pk) => pk[k]? == some c do throw s!"out-of-bounds root child pointer at slot {k}"
+      let c := readU64LE b (off + 8 + 8 * k); let own := c % 8 == 0 && baseAddr + 96 <= c && c <= baseAddr + sz - 8
+      unless (if own then (b.get! (c - baseAddr + 7)).toNat == 246 else parents.any fun (_, _, _, pk, _) => pk[k]? == some c) do
+        throw s!"invalid or out-of-bounds root child pointer at slot {k}"
       kids := kids.push c
-    return (baseAddr, sz, rootPtr, kids)
-  else unless !parents.isEmpty && sz == 96 && parents.any fun (_, _, pr, _) => pr == rootPtr do
+    let seen ← if deep then walkOleanRegion b baseAddr rootPtr parents else pure ByteArray.empty
+    return (baseAddr, sz, rootPtr, kids, seen)
+  else unless !parents.isEmpty && sz == 96 && parents.any fun (_, _, pr, _, _) => pr == rootPtr do
     throw "out-of-region rootPtr is not a valid 96-byte empty delta layer"
-  return (baseAddr, sz, rootPtr, #[])
+  return (baseAddr, sz, rootPtr, #[], ByteArray.empty)
 
-def validateOleanParts (m : Name) (oleanParts : Array System.FilePath)
-    (disjoint : Array OleanLayer := #[]) : AuditM (Array OleanLayer) := do
+def validateOleanParts (m : Name) (oleanParts : Array System.FilePath) (disjoint : Array OleanLayer := #[]) (deep : Bool := true) : AuditM (Array OleanLayer) := do
   let mut parents : Array OleanLayer := #[]
   for p in oleanParts do
-    let sz? ← (show IO (Option Nat) from do try pure (some (← p.metadata).byteSize.toNat) catch _ => pure none)
-    let some sz := sz? | report "oleanBinaryInvalid" m m s!"cannot stat {p}"; return parents
-    unless sz >= 96 && sz <= 256 * 1024 * 1024 do
-      report "oleanBinaryInvalid" m m s!"{p} byte size {sz} outside [96, 256 MiB]"; return parents
+    let some sz ← (show IO (Option Nat) from do try pure (some (← p.metadata).byteSize.toNat) catch _ => pure none)
+      | report "oleanBinaryInvalid" m m s!"cannot stat {p}"; return parents
+    unless sz >= 96 && sz <= 256 * 1024 * 1024 do report "oleanBinaryInvalid" m m s!"{p} byte size {sz} outside [96, 256 MiB]"; return parents
     let some bytes ← (show IO (Option ByteArray) from do try pure (some (← IO.FS.readBinFile p)) catch _ => pure none)
       | report "oleanBinaryInvalid" m m s!"cannot read {p}"; return parents
-    match validateOleanBytes bytes parents disjoint with
+    match validateOleanBytes bytes parents disjoint deep with
     | .ok layer => parents := parents.push layer; modify fun s => { s with oleanFilesValidated := s.oleanFilesValidated + 1 }
     | .error e => report "oleanBinaryInvalid" m m s!"{p}: {e}"; return parents
   return parents
@@ -595,7 +612,7 @@ def preloadArtifactChecks (req : Request) (sysMods : Array Name) : AuditM Nat :=
       let mut okAll := true
       for sp in sysOlean ++ sysIR do unless (← checkCanonicalPart sm sp) && pathWithinRoot libDir sp do okAll := false
       if okAll then
-        let olLayers ← validateOleanParts sm sysOlean; let _ ← validateOleanParts sm sysIR olLayers
+        let olLayers ← validateOleanParts sm sysOlean #[] false; let _ ← validateOleanParts sm sysIR olLayers false
   return checked
 
 /-! ## Environment -/
@@ -3133,58 +3150,46 @@ public def auditDeclsForSpec (env : Environment) (ctx : SpecAuditCtx) (roots : A
     let addV (tag : String) (decl mod : Name) (detail : String) : StateM (Array Violation × Std.HashSet (String × Name)) Unit :=
       modify fun (vs, sv) => if sv.contains (tag, decl) then (vs, sv) else (vs.push { tag, decl, module := mod, detail }, sv.insert (tag, decl))
     let checkSpecAx (ci : ConstantInfo) (m : Name) : StateM (Array Violation × Std.HashSet (String × Name)) Unit := do
-      let n := ci.name; let isTool := ctx.toolchainProv.contains m
+      let (n, isTool) := (ci.name, ctx.toolchainProv.contains m)
       if n == ``sorryAx then addV "sorryAxiomReached" n m "incomplete proof (sorryAx)"
       else if isTool && ctx.allowedAxioms.contains (n.toString, m.toString) && (!constructive || n == ``propext || n == ``Quot.sound) then pure ()
       else if isFoundationalAxiomName n && !isTool then addV "unapprovedAxiom" n m "non-toolchain re-declaration of foundational axiom"
       else if n == ``Classical.choice && constructive then addV "unapprovedAxiom" n m "Classical.choice is forbidden under constructive policy"
       else if nativeBuiltinAxioms.contains n then addV (if isTool then "nativeDecideReached" else "unapprovedAxiom") n m "native evaluation axiom"
       else if hasNativeComponent n then
-        let wellFormed := match n with
-          | .str _ last =>
-            last.startsWith "ax_" && ci.levelParams.isEmpty && ci.type.isAppOfArity ``Eq 3 &&
-            (match ci.type.getAppFn with | .const _ [lvl] => lvl == Level.one | _ => false) &&
-            ci.type.getAppArgs[0]! == mkConst ``Bool && ci.type.getAppArgs[2]! == mkConst ``Bool.true &&
-            ci.type.getAppArgs[1]! != mkConst ``Bool.false && isClosedExpr ci.type.getAppArgs[1]! &&
+        let wf := match n with
+          | .str _ l => l.startsWith "ax_" && ci.levelParams.isEmpty && ci.type.isAppOfArity ``Eq 3 &&
+            (match ci.type.getAppFn with | .const _ [lv] => lv == Level.one | _ => false) && ci.type.getAppArgs[0]! == mkConst ``Bool &&
+            ci.type.getAppArgs[2]! == mkConst ``Bool.true && ci.type.getAppArgs[1]! != mkConst ``Bool.false && isClosedExpr ci.type.getAppArgs[1]! &&
             ([``Eq, ``Bool, ``Bool.true].all fun c => (origin? env c).any (ctx.toolchainProv.contains ·))
           | _ => false
-        addV (if wellFormed then "nativeDecideReached" else "unapprovedAxiom") n m "native_decide axiom"
+        addV (if wf then "nativeDecideReached" else "unapprovedAxiom") n m "native_decide axiom"
       else addV "unapprovedAxiom" n m "axiom outside locked policy"
     let badCSimp := nonToolchainCSimpTargets env ctx.toolchainProv
     let fuel := env.header.moduleData.foldl (fun a d => a + d.constants.size) 0 + env.constants.map₂.toList.length + 64
-    let mut visited : NameSet := {}; let mut pending : List Name := []; let mut rootMods : NameSet := {}
+    let mut (visited, pending, rootMods, done) : NameSet × List Name × NameSet × Bool := ({}, [], {}, false)
     for r in roots do
-      if let some m := effectiveOrigin? env ctx r then
-        if !ctx.toolchainProv.contains m then rootMods := rootMods.insert m
+      if let some m := effectiveOrigin? env ctx r then if !ctx.toolchainProv.contains m then rootMods := rootMods.insert m
       unless visited.contains r do visited := visited.insert r; pending := r :: pending
-    let mut done := false
     for _ in [0:fuel] do
       match pending with
       | [] => done := true; break
       | n :: rest =>
         pending := rest
-        let some ci := env.find? n
-          | addV "missingDeclaration" n ((effectiveOrigin? env ctx n).getD .anonymous) "dependency not found"; continue
-        let some m := effectiveOrigin? env ctx n
-          | addV "missingDeclaration" n .anonymous "dependency without module origin"; continue
-        let isTool := ctx.toolchainProv.contains m
-        if !isTool then rootMods := rootMods.insert m
+        let some ci := env.find? n | addV "missingDeclaration" n ((effectiveOrigin? env ctx n).getD .anonymous) "dependency not found"; continue
+        let some m := effectiveOrigin? env ctx n | addV "missingDeclaration" n .anonymous "dependency without module origin"; continue
+        let isTool := ctx.toolchainProv.contains m; if !isTool then rootMods := rootMods.insert m
         unless declIsClosed ci do addV "openExpression" n m "open expression in stored declaration"
         if ci.isUnsafe then addV "unsafeDeclaration" n m "unsafe declaration reached"
         else if ci.isPartial then addV "partialOrUnsafeRecDependency" n m "partial declaration reached"
         if kernelNativeEvaluators.contains n then addV "nativeDecideReached" n m "kernel-native evaluator (Lean.reduceBool / Lean.reduceNat) reached"
         if isShareCommonName env n then addV "shareCommonForbidden" n m "Init.ShareCommon reached"
-        if let .opaqueInfo _ := ci then
-          if let some sib := env.find? (n.str "_unsafe_rec") then
-            if sib.isPartial || sib.isUnsafe then addV "partialOrUnsafeRecDependency" n m "partial def (opaque with _unsafe_rec) reached"
-        if !isTool then
-          for k in overrideKinds env ctx.toolchainProv n do addV "compilerOverrideAttribute" n m k
+        if let .opaqueInfo _ := ci then if (env.find? (n.str "_unsafe_rec")).any fun s => s.isPartial || s.isUnsafe then addV "partialOrUnsafeRecDependency" n m "partial def (opaque with _unsafe_rec) reached"
+        if !isTool then for k in overrideKinds env ctx.toolchainProv n do addV "compilerOverrideAttribute" n m k
         if badCSimp.contains n then addV "compilerOverrideAttribute" n m "csimp_target"
         if ci matches .axiomInfo _ then checkSpecAx ci m
-        for d in declEdges ci do
-          unless visited.contains d do visited := visited.insert d; pending := d :: pending
+        for d in declEdges ci do unless visited.contains d do visited := visited.insert d; pending := d :: pending
     unless done do addV "auditFuelExhausted" (roots.getD 0 .anonymous) .anonymous "spec-strength dependency closure exhausted its fuel"
-    -- Vector 2 sweep: transitively imported non-toolchain modules of `roots` + live `env.constants.map₂`.
     let mut mIdx : Std.HashMap Name Nat := {}
     for h : i in [0:env.header.modules.size] do mIdx := mIdx.insert env.header.modules[i].module i
     let mut impPending := rootMods.toList
@@ -3195,15 +3200,11 @@ public def auditDeclsForSpec (env : Environment) (ctx : SpecAuditCtx) (roots : A
         impPending := rest
         if let some ri := mIdx[rm]? then
           for imp in env.header.moduleData[ri]!.imports do
-            if !ctx.toolchainProv.contains imp.module && !rootMods.contains imp.module then
-              rootMods := rootMods.insert imp.module; impPending := imp.module :: impPending
+            if !ctx.toolchainProv.contains imp.module && !rootMods.contains imp.module then rootMods := rootMods.insert imp.module; impPending := imp.module :: impPending
     for h : i in [0:env.header.modules.size] do
       let m := env.header.modules[i].module
-      if rootMods.contains m then
-        for ci in env.header.moduleData[i]!.constants do
-          if ci matches .axiomInfo _ then checkSpecAx ci m
-    for (n, ci) in env.constants.map₂.toList do
-      if ci matches .axiomInfo _ then checkSpecAx ci ((effectiveOrigin? env ctx n).getD env.header.mainModule)).2.1
+      if rootMods.contains m then for ci in env.header.moduleData[i]!.constants do if ci matches .axiomInfo _ then checkSpecAx ci m
+    for (n, ci) in env.constants.map₂.toList do if ci matches .axiomInfo _ then checkSpecAx ci ((effectiveOrigin? env ctx n).getD env.header.mainModule)).2.1
 
 def parseMutantCategoryExpr? (cat : String) : Option Expr :=
   match cat with
