@@ -337,6 +337,13 @@ theorem test_farkasMirGate_portfolio_rejections_and_idx_bridge
     -- Oversized rejection on `.triple` (size 13 > 10)
     Anneal.Hybrid.evalGate (E := Unit) (farkasMirGate 10) mirArrayCastGoal
       (.candidate () mirArrayCastCert) = .error (.witnessOversized 13 10) ∧
+    -- Empty-edge bomb: `farkasMirCertSize = 0`, bounded by
+    -- `farkasMirCertWeight`
+    farkasMirCertSize (.edge [[], [], [], [], []]) = 0 ∧
+    Anneal.Hybrid.evalGate (E := Unit) (farkasMirBoundedEdgeGate 2) mirEdgeGoal
+      (.candidate () (.edge [[], [], [], [], []])) =
+      .error (.witnessOversized 5 2) ∧
+    mirEdgeGoal.denote ∧
     -- Payload-shape mismatch rejection (`.pair` for `.uintAddNoOverflow`)
     Anneal.Hybrid.evalGate (E := Unit) (farkasMirGate 16) mirAddGoal
       (.candidate () (.pair [.hyp 0] [.hyp 1])) = .error .rejectedByChecker ∧
@@ -366,13 +373,41 @@ theorem test_farkasMirGate_portfolio_rejections_and_idx_bridge
       [.hyp 0, .hyp 1, .hyp 4, .comb 0 1 1 4, .comb 3 1 2 1]
       (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
       [a, b] locals mem ha hb
-  exact ⟨rfl, rfl, rfl, rfl, rfl, hIdxAdd.2.2.1, hIdxAdd.2.2.2⟩
+  have hEdgeBound :=
+    farkasMirBoundedEdgeGate_cut_sound 8 mirEdgeGoal mirEdgeCert
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+  have hBomb := neg_farkasMir_empty_edge_bomb_bounded mirEdgeGoal
+  exact ⟨rfl, hBomb.1, hBomb.2.2, hEdgeBound, rfl, rfl, rfl, rfl,
+    hIdxAdd.2.2.1, hIdxAdd.2.2.2⟩
 
-/-- Total `Bool` verdicts (`gateVerdict`, i.e. `withFallback` over
-`firstAccepted` on `verdictGate`): a `true` claim needs a gate-accepted
-witness, forged or oversized `true` claims fall back to `false`, and a `false`
-claim is accepted without consulting the checker. Unlike a `Unit`-valued
-fallback, the two results are distinguishable. -/
+/-- Indexed-to-MIR subtraction bridge: `natCutIdxGate` directly discharges
+`evalScalarBinOp .subUnchecked` and `.subWithOverflow`. -/
+theorem test_natCutIdxGate_sub_evalScalarBinOp
+    (c d : Nat) (locals : List LocalSlot) (mem : Memory)
+    (hc : c ≤ 1000) (hcd : d + 4 ≤ c) :
+    evalScalarBinOp .subUnchecked
+      ⟨c, uintBytes .u64⟩ ⟨d, uintBytes .u64⟩ locals mem false =
+      .ok (.scalar ⟨c - d, uintBytes .u64⟩) locals mem ∧
+    evalScalarBinOp .subWithOverflow
+      ⟨c, uintBytes .u64⟩ ⟨d, uintBytes .u64⟩ locals mem false =
+      .ok (.aggregate 0
+        [.scalar ⟨c - d, uintBytes .u64⟩, .scalar ⟨0, 1⟩]) locals mem := by
+  have hIdxSub :=
+    natCutIdxGate_discharges_uint_sub_no_underflow_certified 8 .u64
+      [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst 1000⟩]
+      (.var 0) (.var 1)
+      [.hyp 0, .hyp 4, .comb 0 1 1 1]
+      [.hyp 1, .hyp 4, .comb 0 1 1 1]
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      [c, d] locals mem hcd hc
+  exact ⟨hIdxSub.2.2.2.1, hIdxSub.2.2.2.2⟩
+
+/-- Total sabotage-resistant `Bool` verdicts (`gateVerdict`, i.e.
+`withFallback` over `firstAccepted` on `verdictGate`): a `true` claim needs a
+gate-accepted witness, forged/oversized `true` claims fall back to `false`,
+and an uncertified `false` claim is rejected so it cannot sabotage a valid
+later producer in the portfolio. -/
 theorem test_gateVerdict_withFallback_total_and_sound :
     -- Valid `true` claim after a forged claim and a trap
     gateVerdict (E := Unit) (natCutIdxGate 8) natRowReuseGoal
@@ -386,9 +421,14 @@ theorem test_gateVerdict_withFallback_total_and_sound :
       [ .candidate true natRowReuseCert ] = false ∧
     -- No producers at all: fallback `false`
     gateVerdict (E := Unit) (intCutIdxGate 8) intRowReuseGoal [] = false ∧
-    -- A `false` claim is accepted with an empty witness and ends the search
+    -- Sabotage resistance: uncertified `false` does NOT mask a valid later cert
     gateVerdict (E := Unit) (intCutIdxGate 8) intRowReuseGoal
-      [ .candidate false [], .candidate true intRowReuseCert ] = false ∧
+      [ .candidate false [], .candidate true intRowReuseCert ] = true ∧
+    -- Uncertified `false` alone falls back to `false` (never accepted)
+    gateVerdict (E := Unit) (intCutIdxGate 8) intRowReuseGoal
+      [ .candidate false [] ] = false ∧
+    (∀ b, Anneal.Hybrid.evalGate (E := Unit) (verdictGate (intCutIdxGate 8))
+      intRowReuseGoal (.candidate false []) ≠ .ok b) ∧
     -- `farkasMirGate`: valid, oversized, and payload-mismatched `true` claims
     gateVerdict (E := Unit) (farkasMirGate 16) mirAddGoal
       [ .candidate true mirAddCert ] = true ∧
@@ -396,10 +436,17 @@ theorem test_gateVerdict_withFallback_total_and_sound :
       [ .candidate true mirAddCert ] = false ∧
     gateVerdict (E := Unit) (farkasMirGate 16) mirAddGoal
       [ .candidate true (.pair [.hyp 0] [.hyp 1]) ] = false ∧
+    -- Exact characterization: `gateVerdict = true` iff an accepted cert exists
+    (∃ r : Anneal.Hybrid.RawOutcome Unit Bool (List CutStep),
+      r ∈ [ .candidate false [], .candidate true intRowReuseCert ] ∧
+      ∃ w, r = .candidate true w ∧
+        Anneal.Hybrid.gateCheckBounded (intCutIdxGate 8)
+          (intRowReuseGoal, (), w) = true) ∧
     -- A `true` verdict is accepted exactly when the underlying gate accepts
     Anneal.Hybrid.evalGate (E := Unit) (verdictGate (natCutIdxGate 8))
       natRowReuseGoal (.candidate true natRowReuseCert) = .ok true ∧
     natRowReuseGoal.denote ∧
+    intRowReuseGoal.denote ∧
     mirAddGoal.denote := by
   have hAllRej :
       gateVerdict (E := Unit) (natCutIdxGate 8) natRowReuseGoal
@@ -411,12 +458,20 @@ theorem test_gateVerdict_withFallback_total_and_sound :
       cases hTl with
       | head => cases hEv
       | tail _ hNil => cases hNil
-  exact ⟨rfl, hAllRej, rfl, rfl, rfl, rfl, rfl, rfl,
+  have hExInt :=
+    (gateVerdict_eq_true_iff_exists (E := Unit) (intCutIdxGate 8)
+      intRowReuseGoal
+      [ .candidate false [], .candidate true intRowReuseCert ]).1 rfl
+  exact ⟨rfl, hAllRej, rfl, rfl, rfl, rfl,
+    verdictGate_false_never_ok (intCutIdxGate 8) intRowReuseGoal [],
+    rfl, rfl, rfl, hExInt,
     (verdictGate_true_ok_iff (natCutIdxGate 8) natRowReuseGoal
       natRowReuseCert).2 rfl,
     gateVerdict_sound (E := Unit) (natCutIdxGate 8) natRowReuseGoal
       [ .candidate true [.hyp 0], .trapped,
         .candidate true natRowReuseCert ] rfl,
+    gateVerdict_sound (E := Unit) (intCutIdxGate 8) intRowReuseGoal
+      [ .candidate false [], .candidate true intRowReuseCert ] rfl,
     gateVerdict_sound (E := Unit) (farkasMirGate 16) mirAddGoal
       [ .candidate true mirAddCert ] rfl⟩
 
@@ -752,15 +807,15 @@ theorem test_backend_cert_transport_to_stepMirState
       (classifyMirExecState .abort
         (runMirCall (mkUncheckedArithBody .u64 .add) 2
           (uintArgs2 .u64 a b))) ∧
-    -- Wrapping target: checked is refined by wrapping under the fact
-    MirExactOutcomeRefines
+    -- Wrapping target: full equivalence under the discharged fact
+    MirExactOutcomeEquiv
       (classifyMirExecStateExact
         (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
           (uintArgs2 .u64 a b)))
       (classifyMirExecStateExact
         (runMirCall (mkWrappingArithBody .u64 .add) 2
           (uintArgs2 .u64 a b))) ∧
-    -- Subtraction, both gates chained
+    -- Subtraction, both gates chained (`farkasMirGate` + `blockOptGate`)
     MirExactOutcomeEquiv
       (classifyMirExecStateExact
         (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
@@ -768,12 +823,27 @@ theorem test_backend_cert_transport_to_stepMirState
       (classifyMirExecStateExact
         (runMirCall (mkUncheckedArithBody .u64 .sub) 2
           (uintArgs2 .u64 c d))) ∧
-    MirOutcomeRefines
+    MirOutcomeEquiv
       (classifyMirExecState .abort
         (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
           (uintArgs2 .u64 c d)))
       (classifyMirExecState .abort
         (runMirCall (mkWrappingArithBody .u64 .sub) 2
+          (uintArgs2 .u64 c d))) ∧
+    -- Both `natCutIdxGate` + `blockOptGate` two-gate capstones
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 a b)))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2
+          (uintArgs2 .u64 a b))) ∧
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 c d)))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2
           (uintArgs2 .u64 c d))) := by
   have hBig : 2000 < modPow2 (uintWidth .u64) := by decide
   have haLt : a < modPow2 (uintWidth .u64) :=
@@ -814,7 +884,75 @@ theorem test_backend_cert_transport_to_stepMirState
       u64CheckedSubToWrappingSteps
       (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
       c d hcLt hdLt hSubEntry
-  exact ⟨hAdd.1, hAdd.2, hAddWrap.1, hSub.1, hSubWrap.2⟩
+  have hAddIdx :=
+    u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState 8 2
+      [⟨.var 0, .cst 1000⟩, ⟨.var 1, .cst 2000⟩] (.var 0) (.var 1)
+      [.hyp 0, .hyp 1, .comb 0 1 1 1, .hyp 4, .comb 2 1 3 1]
+      u64AddAltSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      [a, b] ha hb
+  have hSubIdx :=
+    u64_sub_natCutIdx_and_blockOpt_cuts_to_stepMirState 8 2
+      [⟨.add (.var 1) (.cst 4), .var 0⟩, ⟨.var 0, .cst 1000⟩]
+      (.var 0) (.var 1)
+      [.hyp 0, .hyp 4, .comb 0 1 1 1]
+      [.hyp 1, .hyp 4, .comb 0 1 1 1]
+      u64CheckedSubToUncheckedSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      [c, d] hcd hc
+  exact ⟨hAdd.1, hAdd.2, hAddWrap.1, hSub.1, hSubWrap.2, hAddIdx.1, hSubIdx.1⟩
+
+/-- Genuinely asymmetric `.ub ⊑ .ret` certificate transport through
+`blockOptGate` to `stepMirState` and `ITree.toPartial`, plus the relational
+source-UB case of `semRefinesUnder_preserves_mirOptRefines_asymmetric`. -/
+theorem test_backend_asymmetric_ub_transport
+    (a b : Nat) (ha : a < modPow2 (uintWidth .u64))
+    (hb : b < modPow2 (uintWidth .u64)) :
+    MirExactOutcomeRefines
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2 (uintArgs2 .u64 a b)))
+      (classifyMirExecStateExact
+        (runMirCall (mkWrappingArithBody .u64 .add) 2 (uintArgs2 .u64 a b))) ∧
+    (mirCallTree (mkWrappingArithBody .u64 .add)
+        (uintArgs2 .u64 a b)).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .add)
+        (uintArgs2 .u64 a b)).toPartial ∧
+    ¬ MirExactOutcomeRefines
+        (classifyMirExecStateExact
+          (runMirCall (mkWrappingArithBody .u64 .add) 2
+            (uintArgs2 .u64 u64Max 1)))
+        (classifyMirExecStateExact
+          (runMirCall (mkUncheckedArithBody .u64 .add) 2
+            (uintArgs2 .u64 u64Max 1))) ∧
+    (∃ outSrc, evalSourceBlockUnit u64UncheckedAddSrc (env2 u64Max 1) outSrc ∧
+      MirOptOutcomeRefines (execOutcomeToMirClass? outSrc)
+        (execOutcomeToMirClass? (.returned 0 ()))) := by
+  have hTr := u64_addNuw_to_addWrap_asymmetric_ub_transport a b ha hb
+  have hCut :
+      Anneal.Framework.StepWp.BoolCertCut
+        (Anneal.Hybrid.gateCheckBounded (blockOptGate 2))
+        (u64UncheckedAddSrc, u64WrappingAddOpt,
+          [.dirRule .dropAddNuw [0, 1] 3 2]) :=
+    Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl
+  have hSem := Anneal.Hybrid.certGateCut_sound (blockOptGate 2) True.intro hCut
+  have hSrcUb : evalSourceBlockUnit u64UncheckedAddSrc
+      (env2 u64Max 1) .faultUB := by
+    dsimp only [evalSourceBlockUnit]
+    rw [evalBlockWithGuards_iff_det]
+    rfl
+  have hTgtRet : evalCompiledBlockUnit u64WrappingAddOpt
+      (env2 u64Max 1) (.returned 0 ()) := by
+    dsimp only [evalCompiledBlockUnit]
+    rw [evalBlockWithGuards_iff_det]
+    rfl
+  have hAsym :=
+    semRefinesUnder_preserves_mirOptRefines_asymmetric hSem
+      (fun _ _ h => nomatch h) (Or.inl hSrcUb) hTgtRet
+  have ⟨outSrc, hS, hR, _⟩ := hAsym
+  exact ⟨hTr.1, hTr.2.2.1, hTr.2.2.2, outSrc, hS, hR⟩
 
 /-- Undischarged-fact negatives. The SAME elision certificate that
 `blockOptGate` accepts for the `.proven` source is rejected once the fact is
@@ -1109,7 +1247,79 @@ run_cmd do
     auditModule `Anneal.Backend.Canaries true propextOnly propextOnly 30 64
   let r9 ←
     auditModule `Anneal.HybridCertBridgesV2026 false constructive
-      constructive 124 168
+      constructive 144 191
+  -- Enforce an EXACT duplicate-free `Quot.sound` allowlist on
+  -- `Anneal.HybridCertBridgesV2026`: every non-allowlisted constant must be
+  -- `<= [propext]`, and every allowlisted constant must genuinely use
+  -- `Quot.sound` (via `ITree.toPartial`).
+  let quotAllowed : List Name :=
+    [ ``blockOptGate_cut_transports_to_mirCallTree_toPartial,
+      ``blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv,
+      ``u64_add_ctxFact_to_stepMirState_bridge,
+      ``u64_sub_ctxFact_to_stepMirState_bridge,
+      ``u64_add_farkasMirGate_to_stepMirState_bridge,
+      ``u64_sub_farkasMirGate_to_stepMirState_bridge,
+      ``u64_add_natCutIdxGate_to_stepMirState_bridge,
+      ``u64_sub_natCutIdxGate_to_stepMirState_bridge,
+      ``u64_addNuw_to_addWrap_asymmetric_ub_transport,
+      ``neg_u64_add_undischarged_guard_elision_unsound,
+      ``neg_u64_sub_undischarged_guard_elision_unsound ]
+  let mut seenAllow : List Name := []
+  for q in quotAllowed do
+    if seenAllow.contains q then
+      throwError "audit: duplicate Quot.sound allowlist entry {q}"
+    seenAllow := q :: seenAllow
+  let some idxBr := env.getModuleIdx? `Anneal.HybridCertBridgesV2026
+    | throwError "audit: Anneal.HybridCertBridgesV2026 not imported"
+  let brConsts := env.header.moduleData[idxBr]!.constNames.toList
+  let mut quotActual : List Name := []
+  for c in brConsts do
+    let axs := (← liftCoreM <| Lean.collectAxioms c).toList
+    if axs.contains ``Quot.sound then
+      unless quotAllowed.any (fun q => q.isPrefixOf c) do
+        throwError "audit: unexpected Quot.sound in {c} (axs={axs})"
+      quotActual := c :: quotActual
+  for q in quotAllowed do
+    unless quotActual.contains q do
+      throwError "audit: stale Quot.sound allowlist entry {q}"
+  -- Transitive `unsafe_rec` closure walk across all `Anneal.*` dependencies
+  -- reachable from the 9 theory modules and this test module.
+  let theoryMods : List Name :=
+    [ `Anneal.Hybrid, `Anneal.Hybrid.Canaries, `Anneal.Backend.Rules,
+      `Anneal.Backend.CtxFact, `Anneal.Backend.CongruenceDagCtx,
+      `Anneal.Backend.PassRefines, `Anneal.Backend, `Anneal.Backend.Canaries,
+      `Anneal.HybridCertBridgesV2026 ]
+  let mut work : List Name := []
+  for m in theoryMods do
+    if let some idx := env.getModuleIdx? m then
+      for c in env.header.moduleData[idx]!.constNames do
+        work := c :: work
+  for (c, _) in env.constants.map₂.toList do
+    work := c :: work
+  let mut visited : NameSet := {}
+  let mut annealTransitive : Nat := 0
+  while !work.isEmpty do
+    match work with
+    | [] => pure ()
+    | n :: rest =>
+      work := rest
+      if visited.contains n then
+        pure ()
+      else
+        visited := visited.insert n
+        if hasUnsafeRecName n then
+          throwError "audit: transitive forbidden companion {n}"
+        let isAnneal := n.getRoot == `Anneal
+        if isAnneal then
+          annealTransitive := annealTransitive + 1
+          if let some ci := env.find? n then
+            for u in ci.type.getUsedConstants do
+              if !visited.contains u then
+                work := u :: work
+            if let some v := ci.value? then
+              for u in v.getUsedConstants do
+                if !visited.contains u then
+                  work := u :: work
   -- Sweep every constant defined so far in this test module
   let mut testThms : Nat := 0
   let mut testDefs : Nat := 0
@@ -1123,10 +1333,11 @@ run_cmd do
       testThms := testThms + 1
     else if kind == 2 then
       testDefs := testDefs + 1
-  if testThms < 20 || testDefs < 33 then
+  if testThms < 22 || testDefs < 35 then
     throwError "audit: test floor: thms={testThms}, defs={testDefs}"
   let rT :=
-    s!"test module: {testThms} thms, {testDefs} defs, axioms={testUsed}"
+    s!"test module: {testThms} thms, {testDefs} defs, axioms={testUsed}, " ++
+    s!"quotAllowed={quotAllowed.length}, annealTransitive={annealTransitive}"
   -- Pin the EXACT axiom set of every capstone, so a proof that starts to
   -- depend on a new axiom fails here even while it stays within the bound.
   let expectAxioms (expected : List Name) (cs : List Name) :
@@ -1136,7 +1347,10 @@ run_cmd do
       unless sameSet axs expected do
         throwError "audit: {c} uses axioms {axs}, expected {expected}"
   expectAxioms []
-    [ ``gateVerdict_sound,
+    [ ``verdictGate_false_never_ok,
+      ``gateVerdict_sound,
+      ``gateVerdict_eq_true_iff_exists,
+      ``farkasMirCertSize_le_weight,
       ``canonicalDiodeChunkGate_cut_sound,
       ``canonicalDiode_stream_all_emitted_canonical,
       ``canonicalDiode_stream_faithful_eq_filterAll,
@@ -1149,11 +1363,14 @@ run_cmd do
       ``natCutPortfolio_sound,
       ``intCutPortfolio_sound,
       ``farkasMirGate_cut_sound,
+      ``farkasMirBoundedEdgeGate_cut_sound,
+      ``neg_farkasMir_empty_edge_bomb_bounded,
       ``farkasMirPortfolio_sound,
       ``natCutIdxGate_discharges_uint_add_no_overflow,
       ``natCutIdxGate_discharges_uint_sub_no_underflow_certified,
       ``semRefinesUnder_preserves_mirOptRefines,
       ``semRefinesUnder_preserves_mirOptRefines_relational,
+      ``semRefinesUnder_preserves_mirOptRefines_asymmetric,
       ``blockOptGate_cut_preserves_mirRefines,
       ``blockOptGate_cut_transports_to_mirExecState,
       ``blockOptGate_cut_transports_to_mirExecState_equiv,
@@ -1163,6 +1380,8 @@ run_cmd do
       ``u64_sub_blockOptGate_cut_to_stepMirState_wrapping,
       ``u64_add_farkas_and_blockOpt_cuts_to_stepMirState,
       ``u64_sub_farkas_and_blockOpt_cuts_to_stepMirState,
+      ``u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState,
+      ``u64_sub_natCutIdx_and_blockOpt_cuts_to_stepMirState,
       ``neg_u64_add_unproven_elision_never_certified,
       ``neg_u64_sub_unproven_elision_never_certified,
       ``neg_u64_add_overflow_stepMirState_matrix,
@@ -1173,16 +1392,8 @@ run_cmd do
       ``neg5_fuzzAndSorryCandidatesRejectedByGate,
       ``neg7_unconditionalGuardElision_unsound,
       ``neg10_reversedDropSubNuw_rejected ]
-  -- `Quot.sound` enters only through `ITree.toPartial` statements
-  expectAxioms constructive
-    [ ``u64_add_ctxFact_to_stepMirState_bridge,
-      ``u64_sub_ctxFact_to_stepMirState_bridge,
-      ``u64_add_farkasMirGate_to_stepMirState_bridge,
-      ``u64_sub_farkasMirGate_to_stepMirState_bridge,
-      ``u64_add_natCutIdxGate_to_stepMirState_bridge,
-      ``u64_sub_natCutIdxGate_to_stepMirState_bridge,
-      ``neg_u64_add_undischarged_guard_elision_unsound,
-      ``neg_u64_sub_undischarged_guard_elision_unsound ]
+  -- `Quot.sound` enters only through `ITree.toPartial` statements (exact set)
+  expectAxioms constructive quotAllowed
   let report :=
     "\n  ".intercalate [r1, r2, r3, r4, r5, r6, r7, r8, r9, rT]
   logInfo m!"ALL 10 MODULES AUDITED CLEAN:\n  {report}"
@@ -1190,16 +1401,27 @@ run_cmd do
 #print axioms natCutIdxGate_cut_sound
 #print axioms intCutIdxGate_cut_sound
 #print axioms natCutPortfolio_sound
+#print axioms verdictGate_false_never_ok
 #print axioms gateVerdict_sound
+#print axioms gateVerdict_eq_true_iff_exists
 #print axioms farkasMirGate_cut_sound
+#print axioms farkasMirBoundedEdgeGate_cut_sound
+#print axioms neg_farkasMir_empty_edge_bomb_bounded
 #print axioms natCutIdxGate_discharges_uint_add_no_overflow
+#print axioms natCutIdxGate_discharges_uint_sub_no_underflow_certified
 #print axioms canonicalDiode_stream_all_emitted_canonical
 #print axioms canonicalDiode_stream_faithful_eq_filterAll
 #print axioms canonicalDiode_stream_prefix_eq_filterAll
+#print axioms semRefinesUnder_preserves_mirOptRefines_asymmetric
 #print axioms blockOptGate_cut_preserves_mirRefines
 #print axioms blockOptGate_cut_transports_to_mirExecState_equiv
+#print axioms blockOptGate_cut_transports_to_mirCallTree_toPartial
+#print axioms blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
 #print axioms u64_add_farkas_and_blockOpt_cuts_to_stepMirState
 #print axioms u64_sub_farkas_and_blockOpt_cuts_to_stepMirState
+#print axioms u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState
+#print axioms u64_sub_natCutIdx_and_blockOpt_cuts_to_stepMirState
+#print axioms u64_addNuw_to_addWrap_asymmetric_ub_transport
 #print axioms u64_add_farkasMirGate_to_stepMirState_bridge
 #print axioms u64_sub_natCutIdxGate_to_stepMirState_bridge
 #print axioms neg_u64_add_undischarged_guard_elision_unsound
@@ -1208,11 +1430,13 @@ run_cmd do
 #print axioms abstractCost_boolCertCut_shrink
 #print axioms test_linearArithIndexed_boolCertCut_discharges
 #print axioms test_farkasMirGate_boolCertCut_variants
+#print axioms test_natCutIdxGate_sub_evalScalarBinOp
 #print axioms test_gateVerdict_withFallback_total_and_sound
 #print axioms test_canonicalDiode_boolCertCut_and_valid_stream
 #print axioms test_canonicalDiode_midstream_halt_and_prefix_characterization
 #print axioms test_backend_overflowTrap_e2e_add_sub
 #print axioms test_backend_cert_transport_to_stepMirState
+#print axioms test_backend_asymmetric_ub_transport
 #print axioms test_backend_unproven_tier_elision_never_certified
 
 end Anneal.Mir.HybridBackendCertGateTests
