@@ -54,13 +54,15 @@ Unifies Anneal's four certificate-checked subsystems under `Anneal.Hybrid`
 4. **Pillar 4 (`Anneal.Backend.CtxFact` <-> `OverflowTrapRefinement`):**
    maps `ExecOutcome Nat Unit` faithfully into `Option (MirOutcomeClass Value)`
    and `Option (MirExactOutcomeClass Value)` under `PanicStrategy.abort`
-   without collapsing `.diverged` into `.ret`, `.trap`, or `.ub`; proves that
-   `SemRefinesUnder` (both relational and full asymmetric) and `blockOptGate`
-   preserve `MirOutcomeRefines` and `MirExactOutcomeRefines`; transports ANY
-   accepted `blockOptGate` certificate to real `stepMirState` runs and Layer 1A
-   `ITree.toPartial` refinement/equivalence (including genuinely asymmetric
-   `.ub ⊑ .ret` transport on `dropAddNuw` and two-gate `farkasMirGate` /
-   `natCutIdxGate` + `blockOptGate` capstones); and proves concrete negative
+   without collapsing `.diverged` into `.ret`, `.trap`, or `.ub` (the bridge
+   is injective and refinement-reflecting on `u64`-ranged outcomes); proves
+   that `SemRefinesUnder` (both relational and full asymmetric) and
+   `blockOptGate` preserve `MirOutcomeRefines` and `MirExactOutcomeRefines`;
+   transports ANY accepted `blockOptGate` certificate, at every `u64`-ranged
+   environment, to real `stepMirState` runs and Layer 1A `ITree.toPartial`
+   refinement/equivalence (including genuinely asymmetric `.ub ⊑ .ret`
+   transport on `dropAddNuw` and two-gate `farkasMirGate` / `natCutIdxGate` +
+   `blockOptGate` capstones); and proves concrete negative
    counterexamples for undischarged guard elision (including that no
    certificate is ever accepted while the fact is unproven) and
    abort-vs-unwind strategy separation.
@@ -519,6 +521,59 @@ theorem gateVerdict_sound {X W E : Type} {P : X → Prop}
   withFallback_firstAccepted_sound (verdictGate g) x rs (fun _ => false)
     True.intro (fun _ _ h => nomatch h) hTrue
 
+/-- The output `firstAccepted` returns is the very output the gate accepted
+for some producer in the list (`firstAccepted_ok_iff_exists` only relates the
+existence of the two). -/
+theorem firstAcceptedOpt_ok_mem {X Y W E : Type} {Pre : X → Prop}
+    {Spec : X → Y → Prop} (g : CertifiedGate X Y W Pre Spec) (x : X) :
+    ∀ (rs : List (RawOutcome E Y W)) (y : Y),
+      firstAcceptedOpt g x rs = some (.ok y) →
+      ∃ r, r ∈ rs ∧ evalGate g x r = .ok y
+  | [], _, h => by cases h
+  | r :: rs, y, h => by
+    rw [firstAcceptedOpt_cons] at h
+    injection h with h
+    revert h
+    dsimp only [firstAcceptedStep]
+    cases hEv : evalGate g x r with
+    | ok y' =>
+      intro h
+      have h' : (Except.ok y' : Except (HybridErr E) Y) = .ok y := h
+      injection h' with h'
+      rw [← h']
+      exact ⟨r, List.Mem.head _, hEv⟩
+    | error _ =>
+      cases hRest : firstAcceptedOpt g x rs with
+      | none => intro h; cases h
+      | some res =>
+        intro h
+        have h' : res = .ok y := h
+        rw [h'] at hRest
+        have ⟨r', hMem, hEv'⟩ := firstAcceptedOpt_ok_mem g x rs y hRest
+        exact ⟨r', List.Mem.tail _ hMem, hEv'⟩
+
+theorem firstAccepted_ok_mem {X Y W E : Type} {Pre : X → Prop}
+    {Spec : X → Y → Prop} (g : CertifiedGate X Y W Pre Spec) (x : X)
+    (rs : List (RawOutcome E Y W)) (y : Y)
+    (hOk : firstAccepted g x rs = .ok y) :
+    ∃ r, r ∈ rs ∧ evalGate g x r = .ok y :=
+  firstAcceptedOpt_ok_mem g x rs y ((firstAccepted_ok_iff_opt g x rs y).1 hOk)
+
+/-- Every verdict `verdictGate` accepts, from any raw producer outcome, is
+`true`. -/
+theorem verdictGate_ok_eq_true {X W E : Type} {P : X → Prop}
+    (g : CertifiedGate X Unit W (fun _ => True) (fun x _ => P x)) (x : X)
+    (r : RawOutcome E Bool W) (b : Bool)
+    (hOk : evalGate (verdictGate g) x r = .ok b) : b = true := by
+  cases r with
+  | trapped => cases hOk
+  | prodErr _ => cases hOk
+  | candidate bc wc =>
+    cases bc with
+    | false => exact False.elim (verdictGate_false_never_ok g x wc b hOk)
+    | true =>
+      exact ((evalGate_candidate_ok_iff (verdictGate g) x true wc b).1 hOk).1
+
 /-- Exact characterization of `gateVerdict`: returns `true` iff SOME producer
 in `rs` supplies a `.candidate true w` accepted by `gateCheckBounded g`,
 regardless of any preceding `.candidate false _` or failing producers. -/
@@ -529,95 +584,37 @@ theorem gateVerdict_eq_true_iff_exists {X W E : Type} {P : X → Prop}
       ∃ r, r ∈ rs ∧ ∃ w,
         r = .candidate true w ∧ gateCheckBounded g (x, (), w) = true := by
   dsimp only [gateVerdict]
-  cases hFirst : firstAccepted (verdictGate g) x rs with
-  | error e =>
-    dsimp only [withFallback]
-    constructor
-    · intro h; nomatch h
-    · intro ⟨r, hMem, w, hEq, hChk⟩
-      have hEv : evalGate (verdictGate g) x r = .ok true := by
-        rw [hEq]
-        exact (verdictGate_true_ok_iff g x w).2 hChk
-      have ⟨b, hOk⟩ :=
-        (firstAccepted_ok_iff_exists (verdictGate g) x rs).2
-          ⟨r, hMem, true, hEv⟩
-      rw [hFirst] at hOk
-      nomatch hOk
-  | ok b =>
-    dsimp only [withFallback]
-    have ⟨r, hMem, b', hEv⟩ :=
-      (firstAccepted_ok_iff_exists (verdictGate g) x rs).1 ⟨b, hFirst⟩
-    cases r with
-    | trapped => cases hEv
-    | prodErr _ => cases hEv
-    | candidate bc wc =>
-      cases bc with
-      | false => exact False.elim (verdictGate_false_never_ok g x wc b' hEv)
-      | true =>
-        have hCand :=
-          (evalGate_candidate_ok_iff (verdictGate g) x true wc b').1 hEv
-        have hBTrue : b = true := by
-          cases b with
-          | true => rfl
-          | false =>
-            have hEx :=
-              (firstAccepted_ok_iff_exists (verdictGate g) x rs).1
-                ⟨false, hFirst⟩
-            -- Every accepted `firstAccepted` verdict is `true`
-            have hNeverFalse :
-                ∀ (xs : List (RawOutcome E Bool W)),
-                  firstAccepted (verdictGate g) x xs ≠ .ok false := by
-              intro xs hF
-              have hOpt := (firstAccepted_ok_iff_opt (verdictGate g) x xs
-                false).1 hF
-              have hAux :
-                  ∀ (ys : List (RawOutcome E Bool W)),
-                    firstAcceptedOpt (verdictGate g) x ys ≠
-                      some (.ok false) := by
-                intro ys
-                induction ys with
-                | nil => intro h; cases h
-                | cons y ys' ih =>
-                  rw [firstAcceptedOpt_cons]
-                  dsimp only [firstAcceptedStep]
-                  cases hEy : evalGate (verdictGate g) x y with
-                  | ok by' =>
-                    cases by' with
-                    | true => intro h; injection h with h; nomatch h
-                    | false =>
-                      cases y with
-                      | trapped => cases hEy
-                      | prodErr _ => cases hEy
-                      | candidate ycb yw =>
-                        have hy :=
-                          (evalGate_candidate_ok_iff (verdictGate g) x ycb yw
-                            false).1 hEy
-                        cases ycb with
-                        | true => exact False.elim (nomatch hy.1)
-                        | false =>
-                          exact False.elim
-                            (verdictGate_false_never_ok g x yw false hEy)
-                  | error _ =>
-                    cases hR : firstAcceptedOpt (verdictGate g) x ys' with
-                    | none => intro h; injection h with h; nomatch h
-                    | some res =>
-                      intro h
-                      injection h with h
-                      dsimp only at h
-                      rw [h] at hR
-                      exact ih hR
-              exact hAux xs hOpt
-            exact False.elim (hNeverFalse rs hFirst)
-        rw [hBTrue]
-        refine ⟨fun _ => ?_, fun _ => rfl⟩
-        have hEvTrue :
-            evalGate (E := E) (verdictGate g) x (.candidate true wc) =
-              .ok true := by
-          rw [hCand.1] at hEv
-          exact hEv
-        have hChk : gateCheckBounded g (x, (), wc) = true :=
-          (verdictGate_true_ok_iff g x wc).1 hEvTrue
-        exact ⟨.candidate true wc, hMem, wc, rfl, hChk⟩
+  constructor
+  · intro hTrue
+    cases hFirst : firstAccepted (verdictGate g) x rs with
+    | error e =>
+      rw [hFirst] at hTrue
+      nomatch hTrue
+    | ok b =>
+      rw [hFirst] at hTrue
+      have hB : b = true := hTrue
+      rw [hB] at hFirst
+      have ⟨r, hMem, hEv⟩ :=
+        firstAccepted_ok_mem (verdictGate g) x rs true hFirst
+      cases r with
+      | trapped => cases hEv
+      | prodErr _ => cases hEv
+      | candidate bc wc =>
+        cases bc with
+        | false =>
+          exact False.elim (verdictGate_false_never_ok g x wc true hEv)
+        | true =>
+          exact ⟨.candidate true wc, hMem, wc, rfl,
+            (verdictGate_true_ok_iff g x wc).1 hEv⟩
+  · intro ⟨r, hMem, w, hEq, hChk⟩
+    have hEv : evalGate (verdictGate g) x r = .ok true := by
+      rw [hEq]
+      exact (verdictGate_true_ok_iff g x w).2 hChk
+    have ⟨b, hOk⟩ :=
+      (firstAccepted_ok_iff_exists (verdictGate g) x rs).2 ⟨r, hMem, true, hEv⟩
+    have ⟨r', _, hEv'⟩ := firstAccepted_ok_mem (verdictGate g) x rs b hOk
+    rw [hOk, verdictGate_ok_eq_true g x r' b hEv']
+    rfl
 
 /-- When the gate rejects every producer, `gateVerdict` is the fallback
 `false`: forged or oversized `true` claims do not leak through. -/
@@ -759,6 +756,66 @@ theorem farkasMirGate_rejects_forged {E : Type} (maxSteps : Nat)
       .error .rejectedByChecker := by
   dsimp only [evalGate, farkasMirGate]
   rw [Nat.ble_eq_true_of_le hFit, hBad]
+
+/-- The weight of an `.edge` certificate bounds its number of entries, so a
+weight cap also caps how many (possibly empty) step lists reach the checker.
+-/
+theorem farkasMirCertWeight_edge_length_le :
+    ∀ certs : List (List CutStep),
+      certs.length ≤ farkasMirCertWeight (.edge certs)
+  | [] => Nat.le_refl 0
+  | cs :: rest => by
+    have ih := farkasMirCertWeight_edge_length_le rest
+    have h1 : rest.length + 1 ≤ 1 + farkasMirCertWeight (.edge rest) := by
+      rw [Nat.add_comm 1]
+      exact Nat.succ_le_succ ih
+    exact Nat.le_trans h1
+      (Nat.add_le_add_right (Nat.le_add_right 1 cs.length) _)
+
+/-- General empty-edge bomb: for EVERY `n`, an `.edge` of `n` empty step
+lists has exact size `0`, so no `farkasMirGate` cap keeps it from the checker,
+while its weight is `n`. -/
+theorem farkasMirCert_empty_edge_size_and_weight :
+    ∀ n : Nat,
+      farkasMirCertSize (.edge (List.replicate n [])) = 0 ∧
+      farkasMirCertWeight (.edge (List.replicate n [])) = n
+  | 0 => ⟨rfl, rfl⟩
+  | n + 1 => by
+    have ih := farkasMirCert_empty_edge_size_and_weight n
+    refine ⟨?_, ?_⟩
+    · show 0 + farkasMirCertSize (.edge (List.replicate n [])) = 0
+      rw [ih.1]
+    · show 1 + 0 + farkasMirCertWeight (.edge (List.replicate n [])) = n + 1
+      rw [ih.2, Nat.add_zero, Nat.add_comm]
+
+/-- `farkasMirBoundedEdgeGate` rejects ANY `.edge` certificate with more
+entries than the cap, whatever the entries are, before `checkFarkasMirGoal`
+runs. -/
+theorem farkasMirBoundedEdgeGate_rejects_long_edge {E : Type}
+    (maxWeight : Nat) (goal : FarkasMirGoal) (certs : List (List CutStep))
+    (hLong : maxWeight < certs.length) :
+    evalGate (E := E) (farkasMirBoundedEdgeGate maxWeight) goal
+      (.candidate () (.edge certs)) =
+      .error
+        (.witnessOversized (farkasMirCertWeight (.edge certs)) maxWeight) :=
+  evalGate_rejects_oversized (farkasMirBoundedEdgeGate maxWeight) goal ()
+    (.edge certs)
+    (Nat.lt_of_lt_of_le hLong (farkasMirCertWeight_edge_length_le certs))
+
+/-- `farkasMirBoundedEdgeGate` is the stricter gate: whatever it accepts,
+`farkasMirGate` accepts under the same cap, so hardening the bound never
+admits a certificate the exact-size gate would refuse. -/
+theorem farkasMirBoundedEdgeGate_accept_imp_farkasMirGate (maxSteps : Nat)
+    (goal : FarkasMirGoal) (cert : FarkasMirCert)
+    (hOk : gateCheckBounded (farkasMirBoundedEdgeGate maxSteps)
+      (goal, (), cert) = true) :
+    gateCheckBounded (farkasMirGate maxSteps) (goal, (), cert) = true := by
+  dsimp only [gateCheckBounded, farkasMirBoundedEdgeGate, farkasMirGate]
+    at hOk ⊢
+  have hW := Nat.le_of_ble_eq_true (bool_and_left hOk)
+  rw [Nat.ble_eq_true_of_le
+    (Nat.le_trans (farkasMirCertSize_le_weight cert) hW), bool_and_right hOk]
+  rfl
 
 /-- `firstAccepted` portfolio selection over candidate `FarkasMirCert`
 producers. -/
@@ -1661,6 +1718,131 @@ theorem mirOptExactOutcomeRefines_refl
     | ub => exact True.intro
     | unsupported => exact True.intro
 
+/-! Faithfulness of the outcome bridge. Returned values are reduced modulo
+`2^64`, so the bridge is exact on `u64`-ranged outcomes and only there. -/
+
+/-- Backend outcomes whose returned value is `u64`-ranged. -/
+def ExecOutcomeInU64 : ExecOutcome Nat Unit → Prop
+  | .returned v () => v < modPow2 (uintWidth .u64)
+  | .aborted () => True
+  | .faultUB => True
+  | .diverged => True
+
+private theorem execOutcomeToMirValue_inj_on_u64 {v₁ v₂ : Nat}
+    (h₁ : v₁ < modPow2 (uintWidth .u64)) (h₂ : v₂ < modPow2 (uintWidth .u64))
+    (hEq : execOutcomeToMirValue v₁ = execOutcomeToMirValue v₂) :
+    v₁ = v₂ := by
+  dsimp only [execOutcomeToMirValue] at hEq
+  injection hEq with hSc
+  injection hSc with hBits _
+  rw [Nat.mod_eq_of_lt h₁, Nat.mod_eq_of_lt h₂] at hBits
+  exact hBits
+
+/-- The strategy-exact outcome bridge is injective on `u64`-ranged outcomes:
+no two distinct Backend outcomes (returns, abort, UB, divergence) are
+identified. -/
+theorem execOutcomeToMirExactClass?_injective_on_u64
+    {o₁ o₂ : ExecOutcome Nat Unit}
+    (h₁ : ExecOutcomeInU64 o₁) (h₂ : ExecOutcomeInU64 o₂)
+    (hEq : execOutcomeToMirExactClass? o₁ = execOutcomeToMirExactClass? o₂) :
+    o₁ = o₂ := by
+  cases o₁ with
+  | returned v₁ m₁ =>
+    cases m₁
+    cases o₂ with
+    | returned v₂ m₂ =>
+      cases m₂
+      have hV : execOutcomeToMirValue v₁ = execOutcomeToMirValue v₂ := by
+        injection hEq with hRet
+        injection hRet
+      rw [execOutcomeToMirValue_inj_on_u64 h₁ h₂ hV]
+    | aborted m₂ => cases m₂; nomatch hEq
+    | faultUB => nomatch hEq
+    | diverged => nomatch hEq
+  | aborted m₁ =>
+    cases m₁
+    cases o₂ with
+    | returned v₂ m₂ => cases m₂; nomatch hEq
+    | aborted m₂ => cases m₂; rfl
+    | faultUB => nomatch hEq
+    | diverged => nomatch hEq
+  | faultUB =>
+    cases o₂ with
+    | returned v₂ m₂ => cases m₂; nomatch hEq
+    | aborted m₂ => cases m₂; nomatch hEq
+    | faultUB => rfl
+    | diverged => nomatch hEq
+  | diverged =>
+    cases o₂ with
+    | returned v₂ m₂ => cases m₂; nomatch hEq
+    | aborted m₂ => cases m₂; nomatch hEq
+    | faultUB => nomatch hEq
+    | diverged => rfl
+
+/-- Refinement reflection: on `u64`-ranged outcomes, the divergence-preserving
+strategy-exact refinement between bridged outcomes holds exactly when the
+spec outcome is UB or the two Backend outcomes are equal. The bridge neither
+adds nor loses a refinement. -/
+theorem mirOptExactOutcomeRefines_exec_iff_on_u64
+    {o₁ o₂ : ExecOutcome Nat Unit}
+    (h₁ : ExecOutcomeInU64 o₁) (h₂ : ExecOutcomeInU64 o₂) :
+    MirOptExactOutcomeRefines (execOutcomeToMirExactClass? o₁)
+        (execOutcomeToMirExactClass? o₂) ↔
+      (o₁ = .faultUB ∨ o₁ = o₂) := by
+  constructor
+  · intro hRef
+    cases o₁ with
+    | faultUB => exact Or.inl rfl
+    | returned v₁ m₁ =>
+      cases m₁
+      cases o₂ with
+      | returned v₂ m₂ =>
+        cases m₂
+        have hV : execOutcomeToMirValue v₁ = execOutcomeToMirValue v₂ := hRef
+        exact Or.inr (by rw [execOutcomeToMirValue_inj_on_u64 h₁ h₂ hV])
+      | aborted m₂ => cases m₂; exact False.elim hRef
+      | faultUB => exact False.elim hRef
+      | diverged => exact False.elim hRef
+    | aborted m₁ =>
+      cases m₁
+      cases o₂ with
+      | returned v₂ m₂ => cases m₂; exact False.elim hRef
+      | aborted m₂ => cases m₂; exact Or.inr rfl
+      | faultUB => exact False.elim hRef
+      | diverged => exact False.elim hRef
+    | diverged =>
+      cases o₂ with
+      | returned v₂ m₂ => cases m₂; exact False.elim hRef
+      | aborted m₂ => cases m₂; exact False.elim hRef
+      | faultUB => exact False.elim hRef
+      | diverged => exact Or.inr rfl
+  · intro h
+    cases h with
+    | inl hUb =>
+      rw [hUb]
+      cases o₂ with
+      | returned v₂ m₂ => cases m₂; exact True.intro
+      | aborted m₂ => cases m₂; exact True.intro
+      | faultUB => exact True.intro
+      | diverged => exact True.intro
+    | inr hEq =>
+      rw [hEq]
+      exact mirOptExactOutcomeRefines_refl _
+
+/-- Without the range restriction the bridge is NOT injective: returned
+values are reduced modulo `2^64`, so `0` and `2^64` are identified. -/
+theorem neg_execOutcomeToMirExactClass?_not_injective_unranged :
+    execOutcomeToMirExactClass? (.returned 0 ()) =
+      execOutcomeToMirExactClass? (.returned u64Mod ()) ∧
+    (ExecOutcome.returned 0 () : ExecOutcome Nat Unit) ≠
+      .returned u64Mod () ∧
+    ¬ ExecOutcomeInU64 (.returned u64Mod ()) :=
+  ⟨rfl,
+   (fun h => by
+     injection h with hV _
+     exact absurd hV (Nat.ne_of_lt u64Mod_pos)),
+   (fun h => Nat.lt_irrefl _ h)⟩
+
 /-- Relational preservation with NO determinism assumption on `semSrc`: under
 `SemRefinesUnder`, on an input satisfying `EntryPre` where `semSrc` cannot
 fault with UB, no target outcome maps to `.ub`, and every target outcome is
@@ -2113,8 +2295,8 @@ theorem mirExactOutcomeRefines_to_full_outcome {stSrc stTgt : MirExecState}
 
 /-- Layer 1A `ITree.toPartial` certificate transport: ANY accepted
 `blockOptGate` `BoolCertCut` plus pointwise correspondences and final-memory
-agreement transports directly to `(mirCallTree bTgt args).toPartial ≤
-(mirCallTree bSrc args).toPartial` via
+agreement transports directly to the Layer 1A refinement of
+`mirCallTree bSrc args` by `mirCallTree bTgt args`, via
 `mirExactOutcomeRefines_iff_mirCallTree_toPartial_le`. -/
 theorem blockOptGate_cut_transports_to_mirCallTree_toPartial
     (maxStepsPerNode : Nat)
@@ -3460,6 +3642,159 @@ theorem u64_sub_farkas_and_blockOpt_cuts_to_stepMirState
     (farkasMirGate_cut_sound maxSteps
       (.uintSubNoUnderflowCertified .u64 hyps lhsExpr rhsExpr) cert hFarkas
       env [] canonInitMemory)
+
+/-! ### 4.3c Every Backend Environment
+
+`SemRefinesUnder` quantifies over every environment `env : Nat → Nat`, while
+the correspondences above are stated at `env2 a b`. Both block arenas read
+only variables `0` and `1`, so every environment evaluates them exactly as
+`env2 (env 0) (env 1)` does, and certificate transport holds at every
+`u64`-ranged environment, for ANY accepted certificate. -/
+
+/-- `u64CheckedAddArena` reads only variables `0` and `1`. -/
+theorem u64CheckedAddArena_evalArena_env (env : Nat → Nat) :
+    evalArena env u64CheckedAddArena =
+      evalArena (env2 (env 0) (env 1)) u64CheckedAddArena :=
+  rfl
+
+/-- `u64CheckedSubArena` reads only variables `0` and `1`. -/
+theorem u64CheckedSubArena_evalArena_env (env : Nat → Nat) :
+    evalArena env u64CheckedSubArena =
+      evalArena (env2 (env 0) (env 1)) u64CheckedSubArena :=
+  rfl
+
+/-- The `CtxFact` entry precondition of `u64CheckedAddSrc` at any environment
+is the one at `env2 (env 0) (env 1)`. -/
+theorem sourceEntryPre_u64CheckedAdd_env_iff (env : Nat → Nat) :
+    SourceEntryPre u64CheckedAddSrc env ↔
+      SourceEntryPre u64CheckedAddSrc (env2 (env 0) (env 1)) :=
+  Iff.rfl
+
+/-- The `CtxFact` entry precondition of `u64CheckedSubSrc` at any environment
+is the one at `env2 (env 0) (env 1)`. -/
+theorem sourceEntryPre_u64CheckedSub_env_iff (env : Nat → Nat) :
+    SourceEntryPre u64CheckedSubSrc env ↔
+      SourceEntryPre u64CheckedSubSrc (env2 (env 0) (env 1)) :=
+  Iff.rfl
+
+/-- `u64` checked addition at EVERY `u64`-ranged environment and for ANY
+accepted `blockOptGate` certificate: the `CtxFact` discharged at `env` makes
+the real `stepMirState` runs on `(env 0, env 1)` equivalent in the
+strategy-exact order, under `PanicStrategy.abort`, and as Layer 1A
+`ITree.toPartial`. -/
+theorem u64_add_blockOptGate_cut_to_stepMirState_env (maxStepsPerNode : Nat)
+    (steps : List DagStep)
+    (hCut : Anneal.Framework.StepWp.BoolCertCut
+      (gateCheckBounded (blockOptGate maxStepsPerNode))
+      (u64CheckedAddSrc, u64UncheckedAddOpt, steps))
+    (env : Nat → Nat)
+    (h0 : env 0 < modPow2 (uintWidth .u64))
+    (h1 : env 1 < modPow2 (uintWidth .u64))
+    (hEntry : SourceEntryPre u64CheckedAddSrc env) :
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 (env 0) (env 1))))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2
+          (uintArgs2 .u64 (env 0) (env 1)))) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 (env 0) (env 1))))
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u64 .add) 2
+          (uintArgs2 .u64 (env 0) (env 1)))) ∧
+    (mirCallTree (mkUncheckedArithBody .u64 .add)
+        (uintArgs2 .u64 (env 0) (env 1))).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 (env 0) (env 1))).toPartial ∧
+    (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 (env 0) (env 1))).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .add)
+        (uintArgs2 .u64 (env 0) (env 1))).toPartial := by
+  have hEntry2 := (sourceEntryPre_u64CheckedAdd_env_iff env).1 hEntry
+  have hLt : env 0 + env 1 < modPow2 (uintWidth .u64) :=
+    (sourceEntryPre_u64CheckedAdd_iff _ _ h0 h1).1 hEntry2
+  have hOk := runMirCall_checked_add_ok .u64 .abort (env 0) (env 1) hLt
+  dsimp only [PanicStrategy.toUnwindAction] at hOk
+  have hDef :
+      classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+          (uintArgs2 .u64 (env 0) (env 1))) ≠ .ub := by
+    rw [hOk]
+    intro h
+    nomatch h
+  have hEq := u64_add_blockOptGate_cut_to_stepMirState maxStepsPerNode steps
+    hCut (env 0) (env 1) h0 h1 hEntry2
+  have hTree :=
+    blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
+      maxStepsPerNode u64CheckedAddSrc u64UncheckedAddOpt steps hCut
+      (env2 (env 0) (env 1)) hEntry2
+      (u64CheckedAddSrc_corresponds_stepMirState _ _ h0 h1)
+      (u64UncheckedAddOpt_corresponds_stepMirState _ _ h0 h1) hDef
+      (fun _ _ _ _ hS hT =>
+        (canonMem_checked_add _ _ hS).trans
+          (canonMem_unchecked_add _ _ hT).symm)
+  exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩
+
+/-- `u64` checked subtraction at EVERY `u64`-ranged environment and for ANY
+accepted `blockOptGate` certificate. -/
+theorem u64_sub_blockOptGate_cut_to_stepMirState_env (maxStepsPerNode : Nat)
+    (steps : List DagStep)
+    (hCut : Anneal.Framework.StepWp.BoolCertCut
+      (gateCheckBounded (blockOptGate maxStepsPerNode))
+      (u64CheckedSubSrc, u64UncheckedSubOpt, steps))
+    (env : Nat → Nat)
+    (h0 : env 0 < modPow2 (uintWidth .u64))
+    (h1 : env 1 < modPow2 (uintWidth .u64))
+    (hEntry : SourceEntryPre u64CheckedSubSrc env) :
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (env 0) (env 1))))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2
+          (uintArgs2 .u64 (env 0) (env 1)))) ∧
+    MirOutcomeEquiv
+      (classifyMirExecState .abort
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (env 0) (env 1))))
+      (classifyMirExecState .abort
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2
+          (uintArgs2 .u64 (env 0) (env 1)))) ∧
+    (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 (env 0) (env 1))).toPartial ≤
+      (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 (env 0) (env 1))).toPartial ∧
+    (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 (env 0) (env 1))).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 (env 0) (env 1))).toPartial := by
+  have hEntry2 := (sourceEntryPre_u64CheckedSub_env_iff env).1 hEntry
+  have hLe : env 1 ≤ env 0 :=
+    (sourceEntryPre_u64CheckedSub_iff _ _ h0 h1).1 hEntry2
+  have hOk := runMirCall_checked_sub_ok .u64 .abort (env 0) (env 1) h0 h1 hLe
+  dsimp only [PanicStrategy.toUnwindAction] at hOk
+  have hDef :
+      classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (env 0) (env 1))) ≠ .ub := by
+    rw [hOk]
+    intro h
+    nomatch h
+  have hEq := u64_sub_blockOptGate_cut_to_stepMirState maxStepsPerNode steps
+    hCut (env 0) (env 1) h0 h1 hEntry2
+  have hTree :=
+    blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
+      maxStepsPerNode u64CheckedSubSrc u64UncheckedSubOpt steps hCut
+      (env2 (env 0) (env 1)) hEntry2
+      (u64CheckedSubSrc_corresponds_stepMirState _ _ h0 h1)
+      (u64UncheckedSubOpt_corresponds_stepMirState _ _ h0 h1) hDef
+      (fun _ _ _ _ hS hT =>
+        (canonMem_checked_sub _ _ h0 h1 hS).trans
+          (canonMem_unchecked_sub _ _ h0 hT).symm)
+  exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩
 
 /-! ### 4.4 Negative Counterexamples (Undischarged Elision & Strategy Split) -/
 
