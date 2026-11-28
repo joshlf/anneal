@@ -239,9 +239,9 @@ _BANNED_LITERALS = tuple(
 )
 _FOLD_EXTRA = (("\u0130", "i"), ("\u0131", "i"), ("\u017f", "s"),
                ("\u212a", "k"))
-# Binary blobs skip literals shorter than this: a three-letter literal such
-# as the internal CLI's name matches random bytes about once per 4 MB, while
-# a four-character one matches about once per 3 GB.
+# Binary blobs skip literals shorter than this: three case-folded ASCII
+# letters match uniform random bytes about once per 2 MB, while four-character
+# literals match only once per hundreds of megabytes to gigabytes.
 _BINARY_MIN_LITERAL = 4
 
 
@@ -255,21 +255,31 @@ def _fold(text: str) -> str:
 
 
 def internal_reference_hits(
-    text: str, lines: set[int] | None = None, *, binary: bool = False
+    text: str,
+    lines: set[int] | None = None,
+    *,
+    binary: bool = False,
+    short_on_all_lines: bool = False,
 ) -> list[tuple[int, str]]:
     """Return a `(line, label)` pair per banned reference in `text`.
 
     Lines are numbered from 1 and split at LF only, as Git numbers them.
-    `lines`, if given, limits the scan to those line numbers. `binary` (see
-    `decode_blob`) skips patterns too short to be meaningful in binary data.
+    `lines`, if given, limits the scan to those line numbers unless
+    `short_on_all_lines` is set (for a binary-to-text transition, where every
+    line newly gains patterns shorter than `_BINARY_MIN_LITERAL` while longer
+    patterns were already in scope on untouched lines). `binary` (see
+    `decode_blob`) skips patterns shorter than `_BINARY_MIN_LITERAL`.
     """
-    if lines is not None and not lines:
+    if lines is not None and not lines and not short_on_all_lines:
         return []
     folded = _fold(text)
     present = [
         (label, pat, lit)
-        for (label, pat), lit in zip(BANNED_CONTENT_PATTERNS, _BANNED_LITERALS)
+        for (label, pat), lit in zip(
+            BANNED_CONTENT_PATTERNS, _BANNED_LITERALS)
         if lit in folded and not (binary and len(lit) < _BINARY_MIN_LITERAL)
+        and (not (lines is not None and not lines)
+             or len(lit) < _BINARY_MIN_LITERAL)
     ]
     if not present:
         return []
@@ -277,9 +287,12 @@ def internal_reference_hits(
     # Folding never adds or removes a line feed, so the lines correspond.
     for lineno, (line, fline) in enumerate(
             zip(text.split("\n"), folded.split("\n")), 1):
-        if lines is not None and lineno not in lines:
+        in_added = lines is None or lineno in lines
+        if not in_added and not short_on_all_lines:
             continue
         for label, pat, lit in present:
+            if not in_added and len(lit) >= _BINARY_MIN_LITERAL:
+                continue
             if lit in fline and pat.search(line):
                 hits.append((lineno, label))
     return hits
@@ -1742,7 +1755,9 @@ _BINARY_SNIFF_BYTES = 8000
 # blobs even when both a NUL byte and an invalid UTF-8 byte appear (matching
 # `blob_text` in the header, wrap, review-round-id, and citation checks).
 ALWAYS_TEXT_EXTS = (
-    HEADER_EXTS | {".json", ".lock", ".cfg", ".ini", ".csv", ".xml", ".svg"}
+    HEADER_EXTS
+    | {".txt", ".rst", ".json", ".lock", ".cfg", ".ini", ".csv", ".xml",
+       ".svg", ".html", ".css", ".js", ".ts", ".c", ".h", ".cc", ".cpp"}
 )
 
 
@@ -1765,16 +1780,19 @@ def decode_blob(
     Returns the text, with U+FFFD for invalid UTF-8 (replacement never
     consumes a line feed, so line numbers are kept), and whether the blob is
     binary: not valid UTF-8, holding a NUL byte in its first 8000 bytes as
-    Git decides, and neither a symlink nor a known source, prose, or config
-    path (`_always_text_path`). Binary blobs are still scanned, but only for
-    patterns long enough not to match random bytes by chance (see
-    `_BINARY_MIN_LITERAL`), so no byte trick hides a file entirely.
+    Git decides, not starting with a `#!` shebang, and neither a symlink nor
+    a known source, prose, or config path (`_always_text_path`). Binary blobs
+    are still scanned, but only for patterns at least `_BINARY_MIN_LITERAL`
+    characters long, so no byte trick hides a file entirely.
     """
     try:
         return raw.decode("utf-8"), False
     except UnicodeDecodeError:
-        binary = (not _always_text_path(path, is_symlink)
-                  and b"\0" in raw[:_BINARY_SNIFF_BYTES])
+        binary = (
+            not _always_text_path(path, is_symlink)
+            and not raw.startswith(b"#!")
+            and b"\0" in raw[:_BINARY_SNIFF_BYTES]
+        )
         return raw.decode("utf-8", "replace"), binary
 
 
@@ -1870,16 +1888,17 @@ def internal_findings(
     blobs = git.blobs(need_oids)
     for path, is_sym, oid, prev_oid, prev_path, prev_sym, lines in scan:
         text, binary = decode_blob(blobs[oid], path, is_symlink=is_sym)
-        # A binary blob turning into text gains the short patterns on every
-        # line, not just the added ones.
-        if (prev_oid is not None and not binary
-                and decode_blob(blobs[prev_oid], prev_path,
-                                is_symlink=prev_sym)[1]):
-            lines = None
-        if lines == set():
+        # A binary blob turning into text newly gains only the short patterns
+        # on untouched lines; long patterns were already in scope at `base`.
+        became_text = (
+            prev_oid is not None and not binary
+            and decode_blob(blobs[prev_oid], prev_path, is_symlink=prev_sym)[1]
+        )
+        if lines == set() and not became_text:
             continue
-        for lineno, label in internal_reference_hits(text, lines,
-                                                     binary=binary):
+        for lineno, label in internal_reference_hits(
+            text, lines, binary=binary, short_on_all_lines=became_text
+        ):
             out.append(Finding(
                 "internal-reference",
                 f"internal-infrastructure reference ({label}); public "

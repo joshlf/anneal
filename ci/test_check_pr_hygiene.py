@@ -1599,27 +1599,47 @@ class InternalHygieneMixin:
                     f"{self.CLI}.\n\n{TRAILER}\n")
         self.assert_clean()
 
-    def test_binary_to_text_transition_scans_all_lines(self):
-        # At `base`, both blobs are skipped as binary. Making either text
-        # (even by deleting a line with zero added lines, or by editing an
-        # unrelated line) brings its pre-existing lines into text scope for
-        # `test_repo_hygiene.py`, so diff mode must catch them.
-        del_path = self.repo / self.ROOT / "assets" / "del_bad.txt"
-        edit_path = self.repo / self.ROOT / "assets" / "edit_head.txt"
+    def test_binary_to_text_transition_scans_short_patterns_without_false_blame(
+        self,
+    ):
+        # At `base`, `del_bad.bin` and `edit_head.bin` hold only the short CLI
+        # token and pass tree mode as binary blobs. Turning either into text
+        # (even by deleting a line with zero added lines, or editing line 1)
+        # brings that short token into scope, while an untouched long pattern
+        # in `legacy_long.bin` is not falsely blamed on an unrelated edit.
+        del_path = self.repo / self.ROOT / "assets" / "del_bad.bin"
+        edit_path = self.repo / self.ROOT / "assets" / "edit_head.bin"
         del_path.parent.mkdir(parents=True, exist_ok=True)
-        del_path.write_bytes(b"\x00\xff\n" + self.MOUNT.encode() + b"\n")
+        del_path.write_bytes(b"\x00\xff\n" + self.CLI.encode() + b"\n")
         edit_path.write_bytes(b"\x00\xff\n" + self.CLI.encode() + b"\n")
-        self.commit("Seed binary blobs")
+        self.commit("Seed binary blobs with short pattern")
         git(self.repo, "branch", "-f", "base")
-        del_path.write_bytes(self.MOUNT.encode() + b"\n")
+        self.assertEqual(self.internal(base=None), set())
+        del_path.write_bytes(self.CLI.encode() + b"\n")
         edit_path.write_bytes(b"clean header\n" + self.CLI.encode() + b"\n")
         self.commit()
         expected = {
-            self.ref("assets/del_bad.txt", 1, "internal-mount"),
-            self.ref("assets/edit_head.txt", 2, "internal-cli"),
+            self.ref("assets/del_bad.bin", 1, "internal-cli"),
+            self.ref("assets/edit_head.bin", 2, "internal-cli"),
         }
         self.assertEqual(self.internal(), expected)
         self.assertEqual(self.internal(base=None), expected)
+
+        # Now seed a binary blob carrying a pre-existing long reference on
+        # line 2; turning line 1 into clean UTF-8 must not blame line 2 in
+        # diff mode, though tree mode still reports it.
+        del_path.unlink()
+        edit_path.unlink()
+        legacy = self.repo / self.ROOT / "assets" / "legacy_long.bin"
+        legacy.write_bytes(b"\x00\xff\nold " + self.MOUNT.encode()
+                           + b"\ntail\n")
+        self.commit("Seed legacy long-pattern binary")
+        git(self.repo, "branch", "-f", "base")
+        legacy.write_bytes(b"clean\nold " + self.MOUNT.encode() + b"\ntail\n")
+        self.commit()
+        self.assertEqual(self.internal(), set())
+        self.assertEqual(self.internal(base=None), {
+            self.ref("assets/legacy_long.bin", 2, "internal-mount")})
 
     def test_non_utf8_text_is_scanned(self):
         # A stray invalid byte must not hide a text file's references.
@@ -1689,16 +1709,22 @@ class InternalHygieneMixin:
         # Combining NUL and invalid UTF-8 in source, prose, config, or symlink
         # entries must not classify them as binary to hide banned references.
         md = self.repo / self.ROOT / "docs" / "sneaky.md"
+        txt = self.repo / self.ROOT / "docs" / "sneaky.txt"
         lean = self.repo / self.ROOT / "theory" / "Sneaky.lean"
         cfg = self.repo / self.ROOT / "data" / "sneaky.json"
+        sh = self.repo / self.ROOT / "scripts" / "helper"
         md.parent.mkdir(parents=True, exist_ok=True)
         lean.parent.mkdir(parents=True, exist_ok=True)
         cfg.parent.mkdir(parents=True, exist_ok=True)
+        sh.parent.mkdir(parents=True, exist_ok=True)
         md.write_bytes(HEADER_MD.encode() + b"\x00\xff\n"
                        + self.MOUNT.encode() + b"\n")
+        txt.write_bytes(b"\x00\xff\n" + self.CLI.encode() + b"\n")
         lean.write_bytes(HEADER_LEAN.encode() + b"-- \x00\xff\n"
                          + f"def x := {self.CLI}\n".encode())
         cfg.write_bytes(b'{"k": "\x00\xff ' + self.CLIENT.encode() + b'"}\n')
+        sh.write_bytes(b"#!/bin/sh\n# \x00\xff\necho "
+                       + self.CLI.encode() + b"\n")
 
         # A crafted `120000` symlink blob containing NUL + 0xff is also text.
         sym_oid = subprocess.run(
@@ -1712,8 +1738,10 @@ class InternalHygieneMixin:
         git(self.repo, "commit", "-q", "-m", GOOD_MESSAGE)
         expected = {
             self.ref("docs/sneaky.md", 9, "internal-mount"),
+            self.ref("docs/sneaky.txt", 2, "internal-cli"),
             self.ref("theory/Sneaky.lean", 9, "internal-cli"),
             self.ref("data/sneaky.json", 1, "internal-client"),
+            self.ref("scripts/helper", 3, "internal-cli"),
             self.ref("docs/raw_link", 1, "internal-workstation"),
         }
         self.assertEqual(self.internal(), expected)
@@ -1870,10 +1898,12 @@ class InternalUnitTests(unittest.TestCase):
         self.assertEqual(dec(b"\x00\xff"), ("\x00\ufffd", True))
         self.assertEqual(dec(b"\x00\xff", "assets/blob.bin"),
                          ("\x00\ufffd", True))
-        # Symlinks and source, prose, or config paths are never binary.
-        for path in ("docs/note.MD", "AGENTS.md", "lakefile.toml",
+        # Symlinks, shebang scripts, and source/prose/config paths are text.
+        for path in ("docs/note.MD", "notes.txt", "AGENTS.md", "lakefile.toml",
                      "data/x.json"):
             self.assertEqual(dec(b"\x00\xff", path), ("\x00\ufffd", False))
+        self.assertEqual(dec(b"#!/bin/sh\n\x00\xff"),
+                         ("#!/bin/sh\n\x00\ufffd", False))
         self.assertEqual(dec(b"\x00\xff", is_symlink=True),
                          ("\x00\ufffd", False))
         self.assertEqual(dec(b"a\xff\nb"), ("a\ufffd\nb", False))

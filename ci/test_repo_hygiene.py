@@ -112,12 +112,21 @@ class RepoHygieneTests(unittest.TestCase):
             latin1.write_bytes(b"caf\xe9\n" + cli.encode() + b"\n")
             self.assertEqual(_hits(_tracked_blob(latin1)),
                              [(2, "internal-cli")])
-            # Known source/prose paths are text even with NUL + 0xff.
+            # Known source/prose paths and shebang scripts are text even with
+            # NUL + 0xff.
             sneaky_md = root / "sneaky.md"
             sneaky_md.write_bytes(b"\x00\xff\n" + cli.encode() + b"\n")
             self.assertEqual(
                 _hits(_tracked_blob(sneaky_md, "docs/sneaky.md")),
                 [(2, "internal-cli")],
+            )
+            shebang = root / "tool"
+            shebang.write_bytes(
+                b"#!/bin/sh\n# \x00\xff\n" + cli.encode() + b"\n"
+            )
+            self.assertEqual(
+                _hits(_tracked_blob(shebang, "scripts/tool")),
+                [(3, "internal-cli")],
             )
 
     def test_tracked_files_ignores_ambient_git_dir(self) -> None:
