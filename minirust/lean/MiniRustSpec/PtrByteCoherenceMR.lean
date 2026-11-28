@@ -61,12 +61,19 @@ position of the byte inside its pointer.
    is the directional refinement and `converse_gap_iff` characterizes exactly
    when the converse fails (some pair of fragments disagrees on `origOffset` or
    `ptrBytes`, or the fragment width is not the stream length).
-4. **Wide pointers, `Kani#5205`.** `decodePtrBytesNoForge_slice`,
-   `slice_meta_with_provenance_rejected`, the three-way wide-pointer witnesses
-   (`w_wide_*`), `minirust_bool_invalid`, and the `Kani#5205` witnesses
-   (`w_kani5205_*`).
-5. **Lockstep parity** (`Parity` section) and **non-vacuity** (`*_instance`
-   theorems and `w_*` witnesses, all kernel-checked).
+4. **Wide pointers, `Kani#5205`, `body.globals`, and `evalCopyMemory`.**
+   `decodePtrBytesNoForge_slice`, `slice_meta_with_provenance_rejected`, the
+   three-way wide-pointer witnesses (`w_wide_*`), `minirust_bool_invalid`,
+   `kani5205_bool_correspondence_M`, the faithful `Type::Enum` +
+   `Discriminator::Branch` encoding of Rust `char` (`minirustCharType`,
+   `minirust_char_decodeM_iff`, `kani5205_char_correspondence_M`), universal
+   64-bit `body.globals` relocation correspondence
+   (`globalAlloc_reloc_correspondence_M`, `globalAlloc_misaligned_reloc_strips_M`),
+   and end-to-end `evalCopyMemory` witnesses (`w_mr_global_reloc_and_copyMemory`,
+   `w_kani5205_*`).
+5. **Lockstep parity** (`Parity` section: `lockstep_parity`, `globalAlloc_parity`,
+   `kani5205_char_parity`) and **non-vacuity** (`*_instance` theorems,
+   `ep2_b{1,2,3}_mr_non_vacuity_instances`, and `w_*` witnesses, all kernel-checked).
 
 ## Scoped divergences (each pinned by a kernel-checked witness)
 
@@ -3147,6 +3154,162 @@ theorem globalAlloc_reloc_correspondence_M {M : Type} [Gen.Memory M] [Interp.Mem
       (some { kind := .uint .u64, layoutIdx := 0 }) = .ub := rfl
   exact ⟨hslice, henc, hdecM, hraw, href, hu64⟩
 
+/-- **Universal multi-relocation misaligned `body.globals` provenance-stripping correspondence
+(`Trusted` ↔ `MiniRustSpec.Interp`, 64-bit, BOTH `BasicMemory` and `TreeBorrowsMemory`).**
+For any two adjacent 8-byte global relocations `[(0, p1), (8, p2)]` with arbitrary addresses
+`a1, a2 < 2^64` (including `p1 = p2`, `a1 = a2`), reading 8 bytes at misaligned offset `4`
+strips provenance in **both** `Trusted` (`abstractBytesCoherentPtrProv? = none`, raw `*const u8`
+returns provenance-free `.scalar`, `&u8` faults with `.ub`) AND `MiniRustSpec.Interp`
+(`mrProvM = none`, `decodePtrM` returns provenance-free pointer with exact misaligned bits). -/
+theorem globalAlloc_misaligned_reloc_strips_M {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (gId : Nat) (al : Align) (mutbl : Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 64) (ha2 : a2 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 8 ++ leOptBytes a2 8,
+        relocations := [(0, p1), (8, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 8 p1.allocId p1.tag).drop 4 ++
+              (encodePtrBytes a2 8 p2.allocId p2.tag).take 4
+    let misAddr : Nat := (a1 / 256 ^ 4) + (a2 % 256 ^ 4) * 256 ^ 4
+    globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    mrProvM M (projBytes pv bs) = none ∧
+    Interp.decodePtrM (M := M) (projBytes pv bs) = .ok (some ⟨(misAddr : Int), none⟩) ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub := by
+  intro alloc bs misAddr
+  have hbits : ∀ a, a < 2 ^ 64 →
+      Nat.add (UInt8.ofNat a).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0))))))))))))))) = a := by
+    intro a ha
+    have h := decodeLittleEndianBits_encodePlain 8 a
+    rw [Nat.mod_eq_of_lt (by omega : a < 256 ^ 8)] at h
+    injection h with h
+  have horig1 : readGlobalRelocOrigOffset (leOptBytes a1 8 ++ leOptBytes a2 8) 0 8 p1 =
+      normPtrByteOffset 8 a1 := by
+    unfold readGlobalRelocOrigOffset
+    show (match some (Nat.add (UInt8.ofNat a1).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0)))))))))))))))) with
+      | some bits => normPtrByteOffset 8 bits
+      | none => normPtrByteOffset 8 p1.offsetBytes) = normPtrByteOffset 8 a1
+    rw [hbits a1 ha1]
+  have horig2 : readGlobalRelocOrigOffset (leOptBytes a1 8 ++ leOptBytes a2 8) 8 8 p2 =
+      normPtrByteOffset 8 a2 := by
+    unfold readGlobalRelocOrigOffset
+    show (match some (Nat.add (UInt8.ofNat a2).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0)))))))))))))))) with
+      | some bits => normPtrByteOffset 8 bits
+      | none => normPtrByteOffset 8 p2.offsetBytes) = normPtrByteOffset 8 a2
+    rw [hbits a2 ha2]
+  have hslice : globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs := by
+    unfold globalAllocSliceToAbstractBytes
+    dsimp only [alloc, bs, encodePtrBytes, encodePtrBytesAux]
+    simp only [globalAllocBytesAux, leOptBytes, List.cons_append, List.nil_append,
+      List.drop, List.take, lookupRelocEntry, get?, Nat.ble, Nat.blt,
+      Nat.add, Nat.sub, Bool.and, Bool.not]
+    have h1' : readGlobalRelocOrigOffset
+        [some (UInt8.ofNat a1), some (UInt8.ofNat (a1 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256)), some (UInt8.ofNat (a1 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat a2), some (UInt8.ofNat (a2 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256)), some (UInt8.ofNat (a2 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256 / 256))] 0 8 p1 =
+        normPtrByteOffset 8 a1 := horig1
+    have h2' : readGlobalRelocOrigOffset
+        [some (UInt8.ofNat a1), some (UInt8.ofNat (a1 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256)), some (UInt8.ofNat (a1 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat a2), some (UInt8.ofNat (a2 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256)), some (UInt8.ofNat (a2 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256 / 256))] 8 8 p2 =
+        normPtrByteOffset 8 a2 := horig2
+    rw [h1', h2']; rfl
+  have hcoh : abstractBytesCoherentPtrProv? bs = none := rfl
+  have hmr : mrProvM M (projBytes pv bs) = none := rfl
+  let misData : List UInt8 :=
+    [UInt8.ofNat (a1 / 256 / 256 / 256 / 256),
+     UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256),
+     UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256),
+     UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256 / 256),
+     UInt8.ofNat a2, UInt8.ofNat (a2 / 256), UInt8.ofNat (a2 / 256 / 256),
+     UInt8.ofNat (a2 / 256 / 256 / 256)]
+  have hdata : trData bs = some misData := rfl
+  have hle : Interp.leValue misData = misAddr := by
+    simp only [misData, misAddr, Interp.leValue, u8_ofNat_toNat]
+    omega
+  have hbits_mis : decodeLittleEndianBits bs = some misAddr := by
+    rw [bits_eq_leValue, hdata]; simp only [Option.map, hle]
+  have hdecM : Interp.decodePtrM (M := M) (projBytes pv bs) = .ok (some ⟨(misAddr : Int), none⟩) := by
+    rw [decodePtrM_proj pv bs rfl, hdata, hmr]
+    simp only [Option.map_some, hle]
+  have hthinF : decodePtrBytesNoForge false (.uint .u8) 8 bs = some (.scalar ⟨misAddr, 8⟩) := by
+    rw [decodePtrBytesNoForge_thin false (.uint .u8) 8 bs rfl]
+    unfold thinDecode
+    have hlen : length bs = 8 := rfl
+    simp only [hlen, hbits_mis, hcoh]; rfl
+  have hthinT : decodePtrBytesNoForge true (.uint .u8) 8 bs = none := by
+    rw [decodePtrBytesNoForge_thin true (.uint .u8) 8 bs rfl]
+    unfold thinDecode
+    have hlen : length bs = 8 := rfl
+    simp only [hlen, hbits_mis, hcoh]; rfl
+  have hraw : evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] := by
+    unfold evalGlobalDerefRead
+    simp only [wLayouts, wTyRawPtrU8, layoutPointerBytes, intCastTargetBytes, hslice]
+    change (match decodePtrBytesNoForge false (.uint .u8) 8 bs with
+      | some decodedVal =>
+        match readProjectedValue [] decodedVal [] with
+        | .ok fieldVal => PlaceReadResult.ok fieldVal []
+        | .ub => .ub | .unsupported => .unsupported
+      | none => .ub) = _
+    rw [hthinF]; rfl
+  have href : evalGlobalDerefRead [] alloc 4 8 [] wLayouts
+      (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub := by
+    unfold evalGlobalDerefRead
+    simp only [wLayouts, layoutPointerBytes, intCastTargetBytes, hslice]
+    change (match decodePtrBytesNoForge true (.uint .u8) 8 bs with
+      | some decodedVal =>
+        match readProjectedValue [] decodedVal [] with
+        | .ok fieldVal => PlaceReadResult.ok fieldVal []
+        | .ub => .ub | .unsupported => .unsupported
+      | none => .ub) = _
+    rw [hthinT]
+  exact ⟨hslice, hcoh, hmr, hdecM, hraw, href⟩
+
 def wPtrL : TypeLayout :=
   { size := ⟨8⟩, align := ⟨8⟩,
     backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
@@ -3264,6 +3427,34 @@ theorem ep2_b2_mr_non_vacuity_instances :
       evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub) :=
   ⟨globalAlloc_reloc_correspondence_M (M := Interp.TBM) tbProv 50 ⟨8⟩ .not { allocId := 7, offsetBytes := 0x1000 } 0x1000 (by decide),
    globalAlloc_reloc_correspondence_M (M := Interp.BM) bmProv 50 ⟨8⟩ .not { allocId := 7, offsetBytes := 0x1000 } 0x1000 (by decide)⟩
+
+/-- Non-vacuous instantiations of `globalAlloc_misaligned_reloc_strips_M` across both `TBM` and `BM`
+(same-pointer `[p, p]` at misaligned offset `4`). -/
+theorem ep2_b3_mr_non_vacuity_instances :
+    let p : ProvenancePtr := { allocId := 7, offsetBytes := 0x1000 }
+    let alloc : CapturedAllocation :=
+      { allocId := 50, bytes := leOptBytes 0x1000 8 ++ leOptBytes 0x1000 8,
+        relocations := [(0, p), (8, p)], align := ⟨8⟩, mutability := .not }
+    let bs := (encodePtrBytes 0x1000 8 7 7).drop 4 ++ (encodePtrBytes 0x1000 8 7 7).take 4
+    let misAddr : Nat := (0x1000 / 256 ^ 4) + (0x1000 % 256 ^ 4) * 256 ^ 4
+    (globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+      abstractBytesCoherentPtrProv? bs = none ∧
+      mrProvM Interp.TBM (projBytes tbProv bs) = none ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv bs) = .ok (some ⟨(misAddr : Int), none⟩) ∧
+      evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) = .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+      evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub) ∧
+    (globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+      abstractBytesCoherentPtrProv? bs = none ∧
+      mrProvM Interp.BM (projBytes bmProv bs) = none ∧
+      Interp.decodePtrM (M := Interp.BM) (projBytes bmProv bs) = .ok (some ⟨(misAddr : Int), none⟩) ∧
+      evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) = .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+      evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub) :=
+  ⟨globalAlloc_misaligned_reloc_strips_M (M := Interp.TBM) tbProv 50 ⟨8⟩ .not
+      { allocId := 7, offsetBytes := 0x1000 } { allocId := 7, offsetBytes := 0x1000 }
+      0x1000 0x1000 (by decide) (by decide),
+   globalAlloc_misaligned_reloc_strips_M (M := Interp.BM) bmProv 50 ⟨8⟩ .not
+      { allocId := 7, offsetBytes := 0x1000 } { allocId := 7, offsetBytes := 0x1000 }
+      0x1000 0x1000 (by decide) (by decide)⟩
 
 end Witnesses
 
@@ -5572,6 +5763,162 @@ theorem globalAlloc_reloc_correspondence_M {M : Type} [Gen.Memory M] [Interp.Mem
       (some { kind := .uint .u64, layoutIdx := 0 }) = .ub := rfl
   exact ⟨hslice, henc, hdecM, hraw, href, hu64⟩
 
+/-- **Universal multi-relocation misaligned `body.globals` provenance-stripping correspondence
+(`Trusted` ↔ `MiniRustSpec.Interp`, 64-bit, BOTH `BasicMemory` and `TreeBorrowsMemory`).**
+For any two adjacent 8-byte global relocations `[(0, p1), (8, p2)]` with arbitrary addresses
+`a1, a2 < 2^64` (including `p1 = p2`, `a1 = a2`), reading 8 bytes at misaligned offset `4`
+strips provenance in **both** `Trusted` (`abstractBytesCoherentPtrProv? = none`, raw `*const u8`
+returns provenance-free `.scalar`, `&u8` faults with `.ub`) AND `MiniRustSpec.Interp`
+(`mrProvM = none`, `decodePtrM` returns provenance-free pointer with exact misaligned bits). -/
+theorem globalAlloc_misaligned_reloc_strips_M {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (gId : Nat) (al : Align) (mutbl : Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 64) (ha2 : a2 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 8 ++ leOptBytes a2 8,
+        relocations := [(0, p1), (8, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 8 p1.allocId p1.tag).drop 4 ++
+              (encodePtrBytes a2 8 p2.allocId p2.tag).take 4
+    let misAddr : Nat := (a1 / 256 ^ 4) + (a2 % 256 ^ 4) * 256 ^ 4
+    globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    mrProvM M (projBytes pv bs) = none ∧
+    Interp.decodePtrM (M := M) (projBytes pv bs) = .ok (some ⟨(misAddr : Int), none⟩) ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub := by
+  intro alloc bs misAddr
+  have hbits : ∀ a, a < 2 ^ 64 →
+      Nat.add (UInt8.ofNat a).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0))))))))))))))) = a := by
+    intro a ha
+    have h := decodeLittleEndianBits_encodePlain 8 a
+    rw [Nat.mod_eq_of_lt (by omega : a < 256 ^ 8)] at h
+    injection h with h
+  have horig1 : readGlobalRelocOrigOffset (leOptBytes a1 8 ++ leOptBytes a2 8) 0 8 p1 =
+      normPtrByteOffset 8 a1 := by
+    unfold readGlobalRelocOrigOffset
+    show (match some (Nat.add (UInt8.ofNat a1).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0)))))))))))))))) with
+      | some bits => normPtrByteOffset 8 bits
+      | none => normPtrByteOffset 8 p1.offsetBytes) = normPtrByteOffset 8 a1
+    rw [hbits a1 ha1]
+  have horig2 : readGlobalRelocOrigOffset (leOptBytes a1 8 ++ leOptBytes a2 8) 8 8 p2 =
+      normPtrByteOffset 8 a2 := by
+    unfold readGlobalRelocOrigOffset
+    show (match some (Nat.add (UInt8.ofNat a2).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat (Nat.mul 256
+      (Nat.add (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256 / 256)).toBitVec.toNat
+        (Nat.mul 256 0)))))))))))))))) with
+      | some bits => normPtrByteOffset 8 bits
+      | none => normPtrByteOffset 8 p2.offsetBytes) = normPtrByteOffset 8 a2
+    rw [hbits a2 ha2]
+  have hslice : globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs := by
+    unfold globalAllocSliceToAbstractBytes
+    dsimp only [alloc, bs, encodePtrBytes, encodePtrBytesAux]
+    simp only [globalAllocBytesAux, leOptBytes, List.cons_append, List.nil_append,
+      List.drop, List.take, lookupRelocEntry, get?, Nat.ble, Nat.blt,
+      Nat.add, Nat.sub, Bool.and, Bool.not]
+    have h1' : readGlobalRelocOrigOffset
+        [some (UInt8.ofNat a1), some (UInt8.ofNat (a1 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256)), some (UInt8.ofNat (a1 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat a2), some (UInt8.ofNat (a2 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256)), some (UInt8.ofNat (a2 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256 / 256))] 0 8 p1 =
+        normPtrByteOffset 8 a1 := horig1
+    have h2' : readGlobalRelocOrigOffset
+        [some (UInt8.ofNat a1), some (UInt8.ofNat (a1 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256)), some (UInt8.ofNat (a1 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat a2), some (UInt8.ofNat (a2 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256)), some (UInt8.ofNat (a2 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256)),
+         some (UInt8.ofNat (a2 / 256 / 256 / 256 / 256 / 256 / 256 / 256))] 8 8 p2 =
+        normPtrByteOffset 8 a2 := horig2
+    rw [h1', h2']; rfl
+  have hcoh : abstractBytesCoherentPtrProv? bs = none := rfl
+  have hmr : mrProvM M (projBytes pv bs) = none := rfl
+  let misData : List UInt8 :=
+    [UInt8.ofNat (a1 / 256 / 256 / 256 / 256),
+     UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256),
+     UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256),
+     UInt8.ofNat (a1 / 256 / 256 / 256 / 256 / 256 / 256 / 256),
+     UInt8.ofNat a2, UInt8.ofNat (a2 / 256), UInt8.ofNat (a2 / 256 / 256),
+     UInt8.ofNat (a2 / 256 / 256 / 256)]
+  have hdata : trData bs = some misData := rfl
+  have hle : Interp.leValue misData = misAddr := by
+    simp only [misData, misAddr, Interp.leValue, u8_ofNat_toNat]
+    omega
+  have hbits_mis : decodeLittleEndianBits bs = some misAddr := by
+    rw [bits_eq_leValue, hdata]; simp only [Option.map, hle]
+  have hdecM : Interp.decodePtrM (M := M) (projBytes pv bs) = .ok (some ⟨(misAddr : Int), none⟩) := by
+    rw [decodePtrM_proj pv bs rfl, hdata, hmr]
+    simp only [Option.map_some, hle]
+  have hthinF : decodePtrBytesNoForge false (.uint .u8) 8 bs = some (.scalar ⟨misAddr, 8⟩) := by
+    rw [decodePtrBytesNoForge_thin false (.uint .u8) 8 bs rfl]
+    unfold thinDecode
+    have hlen : length bs = 8 := rfl
+    simp only [hlen, hbits_mis, hcoh]; rfl
+  have hthinT : decodePtrBytesNoForge true (.uint .u8) 8 bs = none := by
+    rw [decodePtrBytesNoForge_thin true (.uint .u8) 8 bs rfl]
+    unfold thinDecode
+    have hlen : length bs = 8 := rfl
+    simp only [hlen, hbits_mis, hcoh]; rfl
+  have hraw : evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] := by
+    unfold evalGlobalDerefRead
+    simp only [wLayouts, wTyRawPtrU8, layoutPointerBytes, intCastTargetBytes, hslice]
+    change (match decodePtrBytesNoForge false (.uint .u8) 8 bs with
+      | some decodedVal =>
+        match readProjectedValue [] decodedVal [] with
+        | .ok fieldVal => PlaceReadResult.ok fieldVal []
+        | .ub => .ub | .unsupported => .unsupported
+      | none => .ub) = _
+    rw [hthinF]; rfl
+  have href : evalGlobalDerefRead [] alloc 4 8 [] wLayouts
+      (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub := by
+    unfold evalGlobalDerefRead
+    simp only [wLayouts, layoutPointerBytes, intCastTargetBytes, hslice]
+    change (match decodePtrBytesNoForge true (.uint .u8) 8 bs with
+      | some decodedVal =>
+        match readProjectedValue [] decodedVal [] with
+        | .ok fieldVal => PlaceReadResult.ok fieldVal []
+        | .ub => .ub | .unsupported => .unsupported
+      | none => .ub) = _
+    rw [hthinT]
+  exact ⟨hslice, hcoh, hmr, hdecM, hraw, href⟩
+
 def wPtrL : TypeLayout :=
   { size := ⟨8⟩, align := ⟨8⟩,
     backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
@@ -5689,6 +6036,34 @@ theorem ep2_b2_mr_non_vacuity_instances :
       evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub) :=
   ⟨globalAlloc_reloc_correspondence_M (M := Interp.TBM) tbProv 50 ⟨8⟩ .not { allocId := 7, offsetBytes := 0x1000 } 0x1000 (by decide),
    globalAlloc_reloc_correspondence_M (M := Interp.BM) bmProv 50 ⟨8⟩ .not { allocId := 7, offsetBytes := 0x1000 } 0x1000 (by decide)⟩
+
+/-- Non-vacuous instantiations of `globalAlloc_misaligned_reloc_strips_M` across both `TBM` and `BM`
+(same-pointer `[p, p]` at misaligned offset `4`). -/
+theorem ep2_b3_mr_non_vacuity_instances :
+    let p : ProvenancePtr := { allocId := 7, offsetBytes := 0x1000 }
+    let alloc : CapturedAllocation :=
+      { allocId := 50, bytes := leOptBytes 0x1000 8 ++ leOptBytes 0x1000 8,
+        relocations := [(0, p), (8, p)], align := ⟨8⟩, mutability := .not }
+    let bs := (encodePtrBytes 0x1000 8 7 7).drop 4 ++ (encodePtrBytes 0x1000 8 7 7).take 4
+    let misAddr : Nat := (0x1000 / 256 ^ 4) + (0x1000 % 256 ^ 4) * 256 ^ 4
+    (globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+      abstractBytesCoherentPtrProv? bs = none ∧
+      mrProvM Interp.TBM (projBytes tbProv bs) = none ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv bs) = .ok (some ⟨(misAddr : Int), none⟩) ∧
+      evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) = .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+      evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub) ∧
+    (globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+      abstractBytesCoherentPtrProv? bs = none ∧
+      mrProvM Interp.BM (projBytes bmProv bs) = none ∧
+      Interp.decodePtrM (M := Interp.BM) (projBytes bmProv bs) = .ok (some ⟨(misAddr : Int), none⟩) ∧
+      evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some wTyRawPtrU8) = .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+      evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub) :=
+  ⟨globalAlloc_misaligned_reloc_strips_M (M := Interp.TBM) tbProv 50 ⟨8⟩ .not
+      { allocId := 7, offsetBytes := 0x1000 } { allocId := 7, offsetBytes := 0x1000 }
+      0x1000 0x1000 (by decide) (by decide),
+   globalAlloc_misaligned_reloc_strips_M (M := Interp.BM) bmProv 50 ⟨8⟩ .not
+      { allocId := 7, offsetBytes := 0x1000 } { allocId := 7, offsetBytes := 0x1000 }
+      0x1000 0x1000 (by decide) (by decide)⟩
 
 end Witnesses
 
@@ -5887,6 +6262,173 @@ theorem lockstep_parity_instance :
       mrProvM Interp.TBM (V06.projBytes tbProv V06.wP) :=
   lockstep_parity (M := Interp.TBM) tbProv true 8 V06.wP
 
+/-- Identity translation of `ProvenancePtr` from `V2026_06_01` to `V2026_08_01`. -/
+def ptr68 (p : Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr) :
+    Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr :=
+  ⟨p.allocId, p.offsetBytes⟩
+
+/-- Identity translation of `Mutability` from `V2026_06_01` to `V2026_08_01`. -/
+def mut68 : Trusted.Rustc.V2026_06_01.MirAst.Mutability →
+    Trusted.Rustc.V2026_08_01.MirAst.Mutability
+  | .not => .not
+  | .mut => .mut
+
+/-- Identity translation of `CapturedAllocation` from `V2026_06_01` to `V2026_08_01`. -/
+def alloc68 (a : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation) :
+    Trusted.Rustc.V2026_08_01.MirAst.CapturedAllocation :=
+  { allocId := a.allocId, bytes := a.bytes,
+    relocations := a.relocations.map (fun (o, p) => (o, ptr68 p)),
+    align := ⟨a.align.bytes⟩, mutability := mut68 a.mutability }
+
+theorem lookupRelocEntry_parity
+    (relocs : List (Nat × Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr))
+    (off pb : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.lookupRelocEntry
+        (relocs.map (fun (o, p) => (o, ptr68 p))) off pb =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocEntry relocs off pb).map
+        (fun (o, p) => (o, ptr68 p)) := by
+  induction relocs with
+  | nil => rfl
+  | cons hd tl ih =>
+    rcases hd with ⟨ro, tp⟩
+    unfold Trusted.Rustc.V2026_08_01.MirSemantics.lookupRelocEntry
+      Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocEntry
+    dsimp only [List.map]
+    cases Bool.and (Nat.ble ro off) (Bool.not (Nat.ble (Nat.add ro pb) off)) with
+    | true => rfl
+    | false => exact ih
+
+theorem readGlobalRelocOrigOffset_parity (bytes : List (Option UInt8)) (relocOff pb : Nat)
+    (tp : Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.readGlobalRelocOrigOffset bytes relocOff pb (ptr68 tp) =
+      Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset bytes relocOff pb tp := by
+  have hread : ∀ (rem off : Nat),
+      Trusted.Rustc.V2026_08_01.MirSemantics.readGlobalRelocOrigOffset.readLe bytes off rem =
+        Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset.readLe bytes off rem := by
+    intro rem
+    induction rem with
+    | zero => intro _; rfl
+    | succ r ih =>
+      intro off
+      unfold Trusted.Rustc.V2026_08_01.MirSemantics.readGlobalRelocOrigOffset.readLe
+        Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset.readLe
+      cases Trusted.Sequence.get? bytes off with
+      | none => rfl
+      | some ob =>
+        cases ob with
+        | none => rfl
+        | some b =>
+          dsimp only
+          rw [ih (Nat.add off 1)]
+          cases Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset.readLe bytes (Nat.add off 1) r <;> rfl
+  unfold Trusted.Rustc.V2026_08_01.MirSemantics.readGlobalRelocOrigOffset
+    Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset
+  rw [hread pb relocOff]
+  have hnorm : ∀ x, Trusted.Rustc.V2026_08_01.MirSemantics.normPtrByteOffset pb x =
+      Trusted.Rustc.V2026_06_01.MirSemantics.normPtrByteOffset pb x := by
+    intro x
+    unfold Trusted.Rustc.V2026_08_01.MirSemantics.normPtrByteOffset
+      Trusted.Rustc.V2026_06_01.MirSemantics.normPtrByteOffset
+    rw [scalarModulus_parity]
+  cases Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset.readLe bytes relocOff pb with
+  | some bits => exact hnorm bits
+  | none => exact hnorm tp.offsetBytes
+
+theorem globalAllocBytesAux_parity (bytes : List (Option UInt8))
+    (relocs : List (Nat × Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr)) (pb : Nat) :
+    ∀ (rem off : Nat),
+      Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocBytesAux bytes
+          (relocs.map (fun (o, p) => (o, ptr68 p))) off rem pb =
+        (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux bytes relocs off rem pb).map
+          (List.map byte68)
+  | 0, _ => rfl
+  | rem + 1, off => by
+    unfold Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocBytesAux
+      Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux
+    cases Trusted.Sequence.get? bytes off with
+    | none => rfl
+    | some ob =>
+      rw [globalAllocBytesAux_parity bytes relocs pb rem (Nat.add off 1)]
+      cases Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux bytes relocs (Nat.add off 1) rem pb with
+      | none => rfl
+      | some rest =>
+        cases ob with
+        | none => rfl
+        | some b =>
+          rw [lookupRelocEntry_parity relocs off pb]
+          cases Nat.blt 0 pb with
+          | false => rfl
+          | true =>
+            cases Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocEntry relocs off pb with
+            | none => rfl
+            | some pair =>
+              rcases pair with ⟨ro, tp⟩
+              dsimp only [Option.map]
+              rw [readGlobalRelocOrigOffset_parity bytes ro pb tp]
+              rfl
+
+/-- **`V2026_06_01 ↔ V2026_08_01` lockstep parity for `body.globals` slice extraction (`globalAllocSliceToAbstractBytes`).**
+For any `CapturedAllocation`, offset, length, and pointer width, both dialects extract the exact
+same translated `AbstractByte` stream, MiniRust projection, and MiniRust provenance verdict. -/
+theorem globalAlloc_parity {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (alloc : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation)
+    (off len pb : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes (alloc68 alloc) off len pb =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc off len pb).map
+        (List.map byte68) ∧
+    (∀ bs, Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc off len pb = some bs →
+      V08.projBytes pv (bs.map byte68) = V06.projBytes pv bs ∧
+      mrProvM M (V08.projBytes pv (bs.map byte68)) = mrProvM M (V06.projBytes pv bs)) := by
+  refine ⟨?_, ?_⟩
+  · unfold Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes
+      Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc68
+    dsimp only
+    cases Nat.ble off (Trusted.Sequence.length alloc.bytes) with
+    | false => rfl
+    | true => exact globalAllocBytesAux_parity alloc.bytes alloc.relocations pb len off
+  · intro bs _
+    have hp := proj_parity pv bs
+    exact ⟨hp, by rw [hp]⟩
+
+/-- **`V2026_06_01 ↔ V2026_08_01` lockstep parity for `Kani#5205` `char` validity and encoding.** -/
+theorem kani5205_char_parity {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (c : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.isValidCharCode c =
+      Trusted.Rustc.V2026_06_01.MirSemantics.isValidCharCode c ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes c 4 =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4).map byte68 ∧
+    V08.projBytes pv (Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes c 4) =
+      V06.projBytes pv (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4) ∧
+    Interp.Type.decodeM (M := M) minirustCharType
+        (V08.projBytes pv (Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes c 4)) =
+      Interp.Type.decodeM (M := M) minirustCharType
+        (V06.projBytes pv (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4)) := by
+  have he : Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes c 4 =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4).map byte68 := rfl
+  have hp : V08.projBytes pv (Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes c 4) =
+      V06.projBytes pv (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4) := by
+    rw [he]; exact proj_parity pv _
+  exact ⟨rfl, he, hp, by rw [hp]⟩
+
+/-- Non-vacuous instantiations of `globalAlloc_parity` and `kani5205_char_parity`. -/
+theorem ep2_b3_parity_instance :
+    let alloc : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation :=
+      { allocId := 50, bytes := V06.leOptBytes 0x1000 8,
+        relocations := [(0, { allocId := 7, offsetBytes := 0x1000 })],
+        align := ⟨8⟩, mutability := .not }
+    Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes (alloc68 alloc) 0 8 8 =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc 0 8 8).map (List.map byte68) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.isValidCharCode 0xD800 =
+      Trusted.Rustc.V2026_06_01.MirSemantics.isValidCharCode 0xD800 ∧
+    Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (V08.projBytes tbProv (Trusted.Rustc.V2026_08_01.MirSemantics.encodePlainLittleEndianBytes 0xD800 4)) =
+      Interp.Type.decodeM (M := Interp.TBM) minirustCharType
+        (V06.projBytes tbProv (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes 0xD800 4)) := by
+  refine ⟨(globalAlloc_parity (M := Interp.TBM) tbProv _ 0 8 8).1,
+    (kani5205_char_parity (M := Interp.TBM) tbProv 0xD800).1,
+    (kani5205_char_parity (M := Interp.TBM) tbProv 0xD800).2.2.2⟩
+
 end Parity
 
 /-! ## Axiom, import-isolation, and non-triviality audit -/
@@ -5957,11 +6499,13 @@ elab "#assert_ptr_byte_coherence_mr_audit" : command => do
     "w_wide_swapped_halves", "w_wide_dyn", "w_kani5205_bool", "w_kani5205_char",
     "kani5205_char_divergence", "kani5205_char_divergence_instance",
     "kani5205_char_correspondence_M", "w_kani5205_char_enum_instance",
-    "globalAlloc_reloc_correspondence_M", "w_mr_global_reloc_and_copyMemory",
+    "globalAlloc_reloc_correspondence_M", "globalAlloc_misaligned_reloc_strips_M",
+    "w_mr_global_reloc_and_copyMemory",
     "w_kani5205_unaligned_and_maybeuninit",
     "coherent_decode_agreement_instance", "encode_roundtrip_instance",
     "rawCarrier_ptr_roundtrip_instance", "strip_laws_instance", "offset_splice_instance",
-    "wide_and_bool_instance", "ep2_b1_mr_non_vacuity_instances", "ep2_b2_mr_non_vacuity_instances" ]
+    "wide_and_bool_instance", "ep2_b1_mr_non_vacuity_instances", "ep2_b2_mr_non_vacuity_instances",
+    "ep2_b3_mr_non_vacuity_instances" ]
   let shared : List Lean.Name := [
     ``mrProvM_eq_some_iff, ``decodePtrProvenanceM_eq_some_iff, ``decodePtrM_eq,
     ``decodePtr_eq_M, ``decodePtrProvenance_eq_M, ``encodePtr_eq_M, ``encodePtrBytes_eq_M,
@@ -5970,7 +6514,8 @@ elab "#assert_ptr_byte_coherence_mr_audit" : command => do
     ``minirust_u8_decodeM, ``minirust_bool_uninit_decodeM, ``minirust_u32_decodeM,
     ``minirust_char_decodeM_eq, ``minirust_char_decodeM_iff, ``minirust_char_uninit_decodeM,
     ``tbProv_inj, ``bmProv_eq_iff, ``coherent_parity, ``encode_parity,
-    ``thinDecode_parity, ``lockstep_parity, ``w_lockstep_parity, ``lockstep_parity_instance ]
+    ``thinDecode_parity, ``lockstep_parity, ``w_lockstep_parity, ``lockstep_parity_instance,
+    ``globalAlloc_parity, ``kani5205_char_parity, ``ep2_b3_parity_instance ]
   let mut headline : Nat := 0
   for dialect in ["V06", "V08"] do
     for name in perDialect do

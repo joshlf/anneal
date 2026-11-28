@@ -52,36 +52,43 @@ wildcard available) and `pvCt` (CTFE `AllocId`, `offsetIsAddr = false`, tag-free
    `0 < ptrBytes ≤ 8` (in particular `4` and `8`), two normalized offsets have equal vendored
    `PointerFrag.bytes` iff they are equal.
 2. **Vendored `readPtr`, `clear`, `prepareCopy`, and `applyCopy`** (`readPtr8_runtime`,
-   `readPtr8_ctfe`, `readPtr4_runtime`, `readPtr4_ctfe`, `mem_qsort`, `clear_partial_mid_strips_8`,
-   `clear_partial_mid_strips_4`, `clear_partial_7bytes_strips_8`, `prepareCopy_applyCopy_intact_8`,
-   `prepareCopy_applyCopy_splice_p_p256`): kernel-checked closed forms of the unmodified vendored
-   `readPtr` / `inspectFragments` on symbolic fragments, PLUS propositional membership invariance
-   of Lean 4's `Array.qsort` (`mem_qsort`), directly proving partial-overwrite splitting through
-   vendored `ProvenanceMap.clear` and end-to-end bytewise copy / `p`+`p+256` splicing through
-   vendored `ProvenanceMap.prepareCopy` + `applyCopy` + `readPtr`!
+   `readPtr8_ctfe`, `readPtr4_runtime`, `readPtr4_ctfe`, `readPtr{8,4}_shifted_{runtime,ctfe}`,
+   `mem_qsort`, `clear_partial_mid_strips_{8,4}`, `clear_partial_7bytes_strips_8`,
+   `clear_partial_mid_strips_8_at`, `prepareCopy_applyCopy_intact_8`,
+   `prepareCopy_applyCopy_intact_{8,4}_symbolic`, `prepareCopy_applyCopy_splice_p_p256`,
+   `prepareCopy_applyCopy_splice_q_q256_4`, `prepareCopy_applyCopy_splice_{8,4}_symbolic`):
+   kernel-checked closed forms of the unmodified vendored `readPtr` / `inspectFragments` on
+   symbolic fragments (at offset `0` and arbitrary nonzero `base : Nat`), PLUS propositional
+   membership invariance of Lean 4's `Array.qsort` (`mem_qsort`), directly proving partial-overwrite
+   splitting through vendored `ProvenanceMap.clear` (at offset `0` and arbitrary `base : Nat`) and
+   end-to-end bytewise copy / offset splicing (for arbitrary symbolic `data : Array UInt8`, both
+   64-bit and 32-bit) through vendored `ProvenanceMap.prepareCopy` + `applyCopy` + `readPtr`!
 3. **Universal `Trusted` ↔ vendored `readPtr` correspondence over ALL byte streams** (`coh_iff8`,
-   `coh_iff4`, `readPtr8_runtime_corr`, `readPtr8_ctfe_corr`, `readPtr4_runtime_corr`,
-   `readPtr4_ctfe_corr`, AND the unrestricted all-bytes theorems `readPtr8_allBytes_runtime_corr`,
-   `readPtr8_allBytes_ctfe_corr`, `readPtr4_allBytes_runtime_corr`, `readPtr4_allBytes_ctfe_corr`
-   with explicit `↔` biconditionals): for **every** 8-byte (resp. 4-byte) `Trusted` stream —
-   whether fully fragmented, partially plain, all-plain, or containing `.uninit` bytes — the
-   vendored read of the translated state returns `.ok (some (pv allocId tag))` iff
-   `abstractBytesCoherentPtrProv? bytes = some _`, `.ok none` in runtime mode (and in CTFE mode
-   when fragment-free), and `.error (.readPartialPointer 0)` in CTFE mode whenever fragments are
-   present but incoherent.
-4. **Universal intact round-trips & wide pointers** (`intact_roundtrip_8`, `intact_roundtrip_4`,
-   `rawCarrier_ptr_roundtrip_8`, `rawCarrier_ptr_roundtrip_4`, `w_lm_wide_slice_and_str`,
-   `w_lm_wide_dyn`): thin 64-bit & 32-bit, union raw-byte carrier, and wide `&[u8]` / `*const [u8]`
-   / `&str` / `&dyn Trait` round-trips and adversarial stripping.
-5. **Three-way witnesses** (`w_lm_*`), each instantiating the universal theorems for both Miri
-   provenance kinds: intact round trip, all-zero reversal, reversal, swap, duplication, rotation,
-   `p` / `p + 4` and `p` / `p + 256` splices, mixed allocation, 32-bit intact / reversal /
-   splice, missing provenance and uninitialized bytes, misaligned cross-relocation reads and
-   32-bit non-bleed (`w_lm_misaligned`), wildcard behaviour (`w_lm_wildcard`), CTFE tag-blindness
-   (`w_lm_ctfe_tag_blind`), and `Kani#5205` (`miri_checkPrimitive_bool_iff`,
-   `miri_checkPrimitive_char_iff`, `kani5205_bool_validity_iff`, `kani5205_char_validity_iff`,
-   `w_lm_kani5205_trusted`, `w_lm_kani5205_miri`, `w_lm_kani5205_alloc_e2e`, `w_lm_kani5205_e2e`).
-6. **Lockstep parity** (`lm_lockstep_parity`) and the audit `#assert_ptr_byte_coherence_lm_audit`.
+   `coh_iff4`, `readPtr{8,4}_{runtime,ctfe}_corr`, `readPtr{8,4}_allBytes_{runtime,ctfe}_{corr,iff}`,
+   AND the arbitrary-base-offset twins `readPtr{8,4}_allBytes_at_{runtime,ctfe}_{corr,iff}`):
+   for **every** 8-byte (resp. 4-byte) `Trusted` stream — whether fully fragmented, partially
+   plain, all-plain, or containing `.uninit` bytes — at **any** base offset `base : Nat`
+   (`base + pb < 2^64`), the vendored read of the translated state returns `.ok (some (pv allocId tag))`
+   iff `abstractBytesCoherentPtrProv? bytes = some _`, `.ok none` in runtime mode (and in CTFE
+   mode when fragment-free), and `.error (.readPartialPointer base)` in CTFE mode whenever
+   fragments are present but incoherent.
+4. **Universal intact round-trips, wide pointers, `body.globals`, and `evalCopyMemory`**
+   (`intact_roundtrip_{8,4}`, `rawCarrier_ptr_roundtrip_{8,4}`, `w_lm_wide_slice_and_str`,
+   `w_lm_wide_dyn`, `globalAlloc_reloc_correspondence_{8,4}`, `w_lm_global_reloc_and_copyMemory`,
+   `w_lm_copyMemory_32`): thin 64-bit & 32-bit, union raw-byte carrier, wide `&[u8]` / `*const [u8]`
+   / `&str` / `&dyn Trait`, universal 64-bit & 32-bit `body.globals` relocations, and end-to-end
+   64-bit & 32-bit `evalCopyMemory` round-trips and adversarial stripping.
+5. **Three-way witnesses & non-vacuity** (`w_lm_*`, `ep2_b{1,2,3}_*`), each instantiating the
+   universal theorems for both Miri provenance kinds across all branches: intact round trip,
+   all-zero reversal, reversal, swap, duplication, rotation, `p` / `p + 4` and `p` / `p + 256`
+   splices, mixed allocation, 32-bit intact / reversal / splice, missing provenance and
+   uninitialized bytes, misaligned cross-relocation reads and 32-bit non-bleed (`w_lm_misaligned`),
+   wildcard behaviour (`w_lm_wildcard`), CTFE tag-blindness (`w_lm_ctfe_tag_blind`), and
+   `Kani#5205` (`miri_checkPrimitive_bool_iff`, `miri_checkPrimitive_char_iff`,
+   `kani5205_bool_validity_iff`, `kani5205_char_validity_iff`, `w_lm_kani5205_trusted`,
+   `w_lm_kani5205_miri`, `w_lm_kani5205_alloc_e2e`, `w_lm_kani5205_e2e`).
+6. **Lockstep parity** (`lm_lockstep_parity`, `lm_lockstep_parity_at`, `globalAlloc_parity`)
+   and the audit `#assert_ptr_byte_coherence_lm_audit`.
 
 ## Scoped divergences and scope
 
@@ -123,15 +130,19 @@ closed in Episode 1:
   pattern through an untyped place (`[u8; 1]`, `MaybeUninit<bool>`, `Unaligned<bool>`) and then
   read it at the typed `bool` / `char`, which is where `Trusted` must fault.
 
-What now prevents regression: `readPtr8_allBytes_{runtime,ctfe}_corr` and their 4-byte twins fix
-`Trusted`'s coherence verdict to the unmodified vendored fragment rule for **every** 4- and 8-byte
-stream (fragmented, plain, or uninit); `clear_partial_mid_strips_{8,4}` and
-`prepareCopy_applyCopy_{intact_8,splice_p_p256}` verify unmodified vendored `clear`, `prepareCopy`,
-and `applyCopy` directly via `mem_qsort`; `normOffset_image_inj` pins `origOffset` normalization to
-the vendored byte image; `intact_roundtrip_{8,4}` / `rawCarrier_ptr_roundtrip_{8,4}` /
-`w_lm_wide_*` pin thin, carrier, and wide round-trips; `kani5205_{bool,char}_validity_iff` and
-`w_lm_kani5205_{e2e,alloc_e2e}` pin read-time validity universally and end-to-end;
-`lm_lockstep_parity` pins `V2026_06_01 ↔ V2026_08_01`. Remaining scoped boundaries: `&dyn` vtable
+What now prevents regression: `readPtr{8,4}_allBytes_at_{runtime,ctfe}_{corr,iff}` (and their
+offset-`0` twins) fix `Trusted`'s coherence verdict to the unmodified vendored fragment rule for
+**every** 4- and 8-byte stream (fragmented, plain, or uninit) at **every** base offset;
+`clear_partial_mid_strips_{8,4}`, `clear_partial_mid_strips_8_at`, and
+`prepareCopy_applyCopy_{intact,splice}_{8,4}_symbolic` verify unmodified vendored `clear`,
+`prepareCopy`, and `applyCopy` directly via `mem_qsort` over arbitrary symbolic byte arrays;
+`normOffset_image_inj` pins `origOffset` normalization to the vendored byte image;
+`intact_roundtrip_{8,4}` / `rawCarrier_ptr_roundtrip_{8,4}` / `w_lm_wide_*` /
+`globalAlloc_reloc_correspondence_{8,4}` / `w_lm_global_reloc_and_copyMemory` / `w_lm_copyMemory_32`
+pin thin, carrier, wide, global-relocation, and 64-bit/32-bit `evalCopyMemory` round-trips;
+`kani5205_{bool,char}_validity_iff` and `w_lm_kani5205_{e2e,alloc_e2e}` pin read-time validity
+universally and end-to-end; `lm_lockstep_parity`, `lm_lockstep_parity_at`, and `globalAlloc_parity`
+pin `V2026_06_01 ↔ V2026_08_01`. Remaining scoped boundaries: `&dyn` vtable
 allocation identity (no vtable table in the `Trusted` IR / `Memory`), the `VariantsShape.multiple`
 per-variant `TypeLayout` schema, and the `Ptr2IntTransmutePolicy.strictUcg630Ub` write-time
 pointer-to-integer pin.
@@ -2005,6 +2016,288 @@ theorem prepareCopy_applyCopy_splice_q_q256_4 {Prov : Type} [DecidableEq Prov] [
   simp [hnw, hvne]
   cases PointerProvenance.offsetIsAddr (Prov := Prov) <;> simp [Size.ofBytes]
 
+/-- **Symbolic-`data` vendored `ProvenanceMap.prepareCopy` + `applyCopy` offset splice (64-bit).**
+For **any** non-wildcard provenance `prov` and **any** 16-byte buffer `data` (`data.size = 16`)
+whose two 8-byte pointer images differ at some byte position `j < 8` (including `p`/`p+256` where
+byte `0` is identical!), copying byte `0` of pointer 0 and bytes `1 .. 7` of pointer 1 through
+unmodified vendored `prepareCopy` + `applyCopy` strips provenance on vendored `readPtr 0 8`
+(`.ok none` in runtime mode, `.error (.readPartialPointer 0)` in CTFE mode). -/
+theorem prepareCopy_applyCopy_splice_8_symbolic {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (prov : Prov) (hnw : ¬ some prov = PointerProvenance.wildcard (Prov := Prov))
+    (data : Array UInt8) (hdata : data.size = 16)
+    (hdiff : ∃ j : Fin 8, data[j.val]'(by omega) ≠ data[8 + j.val]'(by omega)) :
+    ∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov), (Size.ofBytes 8, prov)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 8) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 9, Size.ofBytes 7⟩ data (Size.ofBytes 8) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 7⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 8) =
+        (if PointerProvenance.offsetIsAddr (Prov := Prov) then .ok none
+         else .error (.readPartialPointer (Size.ofBytes 0))) := by
+  have hsrc : ∃ src, ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov), (Size.ofBytes 8, prov)] = .ok src := by
+    unfold ProvenanceMap.fromPresortedPtrs
+    simp_miri_private Miri.Memory.ProvenanceMap Miri.Memory.ProvenanceMap.sortedKeys
+    simp [Size.ofBytes]
+  obtain ⟨src, hsrc_eq⟩ := hsrc
+  obtain ⟨hsp, hsf⟩ := fromPresortedPtrs_fields _ src hsrc_eq
+  let v0 : Vector UInt8 8 := Vector.ofFn fun idx =>
+    if hi : idx.val < 8 then data[idx.val]'(by omega) else 0
+  let v1 : Vector UInt8 8 := Vector.ofFn fun idx =>
+    if hi : idx.val < 8 then data[8 + idx.val]'(by omega) else 0
+  have hvne : ¬ (v1 = v0) := by
+    intro heq
+    obtain ⟨j, hne⟩ := hdiff
+    have hj : j.val < 8 := j.isLt
+    have := congrArg (fun v : Vector UInt8 8 => v[j.val]) heq
+    simp only [v0, v1, Vector.getElem_ofFn, hj, ↓reduceDIte] at this
+    exact hne this.symm
+  let c0 : ProvenanceCopy Prov := ⟨#[], #[(Size.ofBytes 0, ⟨0, prov, v0⟩)]⟩
+  let c1 : ProvenanceCopy Prov := ⟨#[], #[
+    (Size.ofBytes 0, ⟨1, prov, v1⟩), (Size.ofBytes 1, ⟨2, prov, v1⟩),
+    (Size.ofBytes 2, ⟨3, prov, v1⟩), (Size.ofBytes 3, ⟨4, prov, v1⟩),
+    (Size.ofBytes 4, ⟨5, prov, v1⟩), (Size.ofBytes 5, ⟨6, prov, v1⟩),
+    (Size.ofBytes 6, ⟨7, prov, v1⟩)]⟩
+  have hc0 : src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 8) = .ok c0 := by
+    unfold ProvenanceMap.prepareCopy
+    simp only [ProvenanceMap.rangePtrs, ProvenanceMap.rangeBytes, hsp, hsf]
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.rangeEnd,
+      Miri.Memory.ProvenanceMap.adjustedStart, Miri.Memory.ProvenanceMap.rangeEntries,
+      Miri.Memory.ProvenanceMap.subtractSize, Miri.Memory.ProvenanceMap.ptrFragments]
+    simp (config := { decide := true }) [allocRange, AllocRange.endExclusive, AllocRange.end,
+      Size.add, Size.sub, Size.ZERO, Size.ofBytes, Except.mapError, bind, Bind.bind, Except.bind,
+      pure, Pure.pure, Except.pure, hdata, c0, v0,
+      ← Array.forIn_toList, List.range', List.forIn_cons, List.forIn_nil]
+  have hc1 : src.prepareCopy ⟨Size.ofBytes 9, Size.ofBytes 7⟩ data (Size.ofBytes 8) = .ok c1 := by
+    unfold ProvenanceMap.prepareCopy
+    simp only [ProvenanceMap.rangePtrs, ProvenanceMap.rangeBytes, hsp, hsf]
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.rangeEnd,
+      Miri.Memory.ProvenanceMap.adjustedStart, Miri.Memory.ProvenanceMap.rangeEntries,
+      Miri.Memory.ProvenanceMap.subtractSize, Miri.Memory.ProvenanceMap.ptrFragments]
+    simp (config := { decide := true }) [allocRange, AllocRange.endExclusive, AllocRange.end,
+      Size.add, Size.sub, Size.ZERO, Size.ofBytes, Except.mapError, bind, Bind.bind, Except.bind,
+      pure, Pure.pure, Except.pure, hdata, c1, v1,
+      ← Array.forIn_toList, List.range', List.forIn_cons, List.forIn_nil]
+  have happ1 : ∃ dst1,
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      dst1.ptrs = #[] ∧
+      ∃ f1, dst1.byteFragments = some f1 ∧ ∀ e, e ∈ f1 ↔ e = (Size.ofBytes 0, ⟨0, prov, v0⟩) := by
+    unfold ProvenanceMap.applyCopy
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.checked,
+      Miri.Memory.ProvenanceMap.shiftedCopyOffset]
+    simp (config := { decide := true }) [c0, ProvenanceMap.new, Size.add, Size.mul, Size.ofBytes,
+      Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, EStateM.pure, EStateM.bind,
+      EStateM.get, EStateM.set, Std.Legacy.Range.forIn_eq_forIn_range', List.range',
+      -Array.forIn_toList, ← Array.forIn_toList, List.forIn_cons, List.forIn_nil]
+    intro s f
+    simp only [mem_miri_insertEntry, Array.not_mem_empty, false_and, false_or]
+    constructor <;> (intro h; simpa using h)
+  obtain ⟨dst1, hdst1, hp1, f1, hf1, hm1⟩ := happ1
+  have happ2 : ∃ dst2,
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 7⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.ptrs = #[] ∧
+      ∃ f2, dst2.byteFragments = some f2 ∧
+        (∀ e, e ∈ f2 ↔ e = (Size.ofBytes 0, ⟨0, prov, v0⟩) ∨
+          (∃ k, 1 ≤ k ∧ k < 8 ∧ e = (Size.ofBytes (UInt64.ofNat k), ⟨UInt8.ofNat k, prov, v1⟩))) := by
+    unfold ProvenanceMap.applyCopy
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.checked,
+      Miri.Memory.ProvenanceMap.shiftedCopyOffset]
+    simp (config := { decide := true }) [c1, hp1, hf1, Size.add, Size.mul, Size.ofBytes,
+      Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, EStateM.pure, EStateM.bind,
+      EStateM.get, EStateM.set, Std.Legacy.Range.forIn_eq_forIn_range', List.range',
+      -Array.forIn_toList, ← Array.forIn_toList, List.forIn_cons, List.forIn_nil]
+    intro s f
+    simp only [mem_miri_insertEntry, hm1]
+    constructor
+    · intro h
+      rcases h with ⟨⟨⟨⟨⟨⟨⟨h, _⟩ | h, _⟩ | h, _⟩ | h, _⟩ | h, _⟩ | h, _⟩ | h, _⟩ | h
+      · exact Or.inl (by simpa [Size.ofBytes] using h)
+      · exact Or.inr ⟨1, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+      · exact Or.inr ⟨2, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+      · exact Or.inr ⟨3, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+      · exact Or.inr ⟨4, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+      · exact Or.inr ⟨5, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+      · exact Or.inr ⟨6, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+      · exact Or.inr ⟨7, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+    · rintro (⟨hs, hf'⟩ | ⟨k, hk1, hk8, hs, hf'⟩)
+      · subst hs hf'; simp (config := { decide := true })
+      · subst hs hf'
+        have : k = 1 ∨ k = 2 ∨ k = 3 ∨ k = 4 ∨ k = 5 ∨ k = 6 ∨ k = 7 := by omega
+        rcases this with rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+          simp (config := { decide := true })
+  obtain ⟨dst2, hdst2, hp2, f2, hf2, hm2⟩ := happ2
+  refine ⟨src, c0, c1, dst1, dst2, hsrc_eq, hc0, hc1, hdst1, hdst2, ?_⟩
+  have hmem0 : (Size.ofBytes 0, ⟨0, prov, v0⟩) ∈ f2 := (hm2 _).mpr (Or.inl rfl)
+  have hmem1 : (Size.ofBytes 1, ⟨1, prov, v1⟩) ∈ f2 := (hm2 _).mpr (Or.inr ⟨1, by decide, by decide, rfl⟩)
+  have hnonempty : (f2.filter fun entry => decide (entry.1.bytes < 8)).isEmpty = false :=
+    array_filter_isEmpty_false_of_mem f2 _ _ hmem0 rfl
+  have hfind0 : f2.find? (fun entry => entry.1.bytes == 0) = some (Size.ofBytes 0, ⟨0, prov, v0⟩) := by
+    refine array_find?_eq_some_of_unique f2 _ _ hmem0 rfl ?_
+    intro b hb hbp
+    rcases (hm2 b).mp hb with rfl | ⟨k, hk1, hk8, rfl⟩
+    · rfl
+    · simp only [Size.ofBytes, beq_iff_eq] at hbp
+      have := congrArg UInt64.toNat hbp; simp [UInt64.toNat_ofNat'] at this; omega
+  have hfind1 : f2.find? (fun entry => entry.1.bytes == 1) = some (Size.ofBytes 1, ⟨1, prov, v1⟩) := by
+    refine array_find?_eq_some_of_unique f2 _ _ hmem1 rfl ?_
+    intro b hb hbp
+    rcases (hm2 b).mp hb with rfl | ⟨k, hk1, hk8, rfl⟩
+    · simp only [Size.ofBytes, beq_iff_eq] at hbp; exact absurd hbp (by decide)
+    · have hk : k = 1 := by
+        simp only [Size.ofBytes, beq_iff_eq] at hbp
+        have := congrArg UInt64.toNat hbp; simp [UInt64.toNat_ofNat'] at this; omega
+      subst hk; rfl
+  unfold ProvenanceMap.readPtr
+  delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.inspectFragments]
+  simp only [ProvenanceMap.getPtr, ProvenanceMap.rangePtrs, ProvenanceMap.rangeBytes,
+    ProvenanceMap.getByte, hp2, hf2]
+  delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.adjustedStart,
+    Miri.Memory.ProvenanceMap.rangeEnd, Miri.Memory.ProvenanceMap.rangeEntries]
+  simp (config := { decide := true }) [allocRange, AllocRange.endExclusive, AllocRange.end, Size.add,
+    Size.ofBytes, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure,
+    List.range', throw, throwThe, MonadExceptOf.throw]
+  rw [hnonempty, hfind0, hfind1]
+  simp [hnw, hvne]
+  cases PointerProvenance.offsetIsAddr (Prov := Prov) <;> simp [Size.ofBytes]
+
+/-- **Symbolic-`data` vendored `ProvenanceMap.prepareCopy` + `applyCopy` offset splice (32-bit).**
+For **any** non-wildcard provenance `prov` and **any** 8-byte buffer `data` (`data.size = 8`) whose
+two 4-byte pointer images differ at some byte position `j < 4`, copying byte `0` of pointer 0 and
+bytes `1 .. 3` of pointer 1 through unmodified vendored `prepareCopy` + `applyCopy` strips
+provenance on vendored `readPtr 0 4` (`.ok none` in runtime mode, `.error (.readPartialPointer 0)`
+in CTFE mode). -/
+theorem prepareCopy_applyCopy_splice_4_symbolic {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (prov : Prov) (hnw : ¬ some prov = PointerProvenance.wildcard (Prov := Prov))
+    (data : Array UInt8) (hdata : data.size = 8)
+    (hdiff : ∃ j : Fin 4, data[j.val]'(by omega) ≠ data[4 + j.val]'(by omega)) :
+    ∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov), (Size.ofBytes 4, prov)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 4) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 5, Size.ofBytes 3⟩ data (Size.ofBytes 4) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 3⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 4) =
+        (if PointerProvenance.offsetIsAddr (Prov := Prov) then .ok none
+         else .error (.readPartialPointer (Size.ofBytes 0))) := by
+  have hsrc : ∃ src, ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov), (Size.ofBytes 4, prov)] = .ok src := by
+    unfold ProvenanceMap.fromPresortedPtrs
+    simp_miri_private Miri.Memory.ProvenanceMap Miri.Memory.ProvenanceMap.sortedKeys
+    simp [Size.ofBytes]
+  obtain ⟨src, hsrc_eq⟩ := hsrc
+  obtain ⟨hsp, hsf⟩ := fromPresortedPtrs_fields _ src hsrc_eq
+  let v0 : Vector UInt8 8 := Vector.ofFn fun idx =>
+    if hi : idx.val < 4 then data[idx.val]'(by omega) else 0
+  let v1 : Vector UInt8 8 := Vector.ofFn fun idx =>
+    if hi : idx.val < 4 then data[4 + idx.val]'(by omega) else 0
+  have hvne : ¬ (v1 = v0) := by
+    intro heq
+    obtain ⟨j, hne⟩ := hdiff
+    have hj : j.val < 4 := j.isLt
+    have := congrArg (fun v : Vector UInt8 8 => v[j.val]) heq
+    simp only [v0, v1, Vector.getElem_ofFn, hj, ↓reduceDIte] at this
+    exact hne this.symm
+  let c0 : ProvenanceCopy Prov := ⟨#[], #[(Size.ofBytes 0, ⟨0, prov, v0⟩)]⟩
+  let c1 : ProvenanceCopy Prov := ⟨#[], #[
+    (Size.ofBytes 0, ⟨1, prov, v1⟩), (Size.ofBytes 1, ⟨2, prov, v1⟩),
+    (Size.ofBytes 2, ⟨3, prov, v1⟩)]⟩
+  have hc0 : src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 4) = .ok c0 := by
+    unfold ProvenanceMap.prepareCopy
+    simp only [ProvenanceMap.rangePtrs, ProvenanceMap.rangeBytes, hsp, hsf]
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.rangeEnd,
+      Miri.Memory.ProvenanceMap.adjustedStart, Miri.Memory.ProvenanceMap.rangeEntries,
+      Miri.Memory.ProvenanceMap.subtractSize, Miri.Memory.ProvenanceMap.ptrFragments]
+    simp (config := { decide := true }) [allocRange, AllocRange.endExclusive, AllocRange.end,
+      Size.add, Size.sub, Size.ZERO, Size.ofBytes, Except.mapError, bind, Bind.bind, Except.bind,
+      pure, Pure.pure, Except.pure, hdata, c0, v0,
+      ← Array.forIn_toList, List.range', List.forIn_cons, List.forIn_nil]
+  have hc1 : src.prepareCopy ⟨Size.ofBytes 5, Size.ofBytes 3⟩ data (Size.ofBytes 4) = .ok c1 := by
+    unfold ProvenanceMap.prepareCopy
+    simp only [ProvenanceMap.rangePtrs, ProvenanceMap.rangeBytes, hsp, hsf]
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.rangeEnd,
+      Miri.Memory.ProvenanceMap.adjustedStart, Miri.Memory.ProvenanceMap.rangeEntries,
+      Miri.Memory.ProvenanceMap.subtractSize, Miri.Memory.ProvenanceMap.ptrFragments]
+    simp (config := { decide := true }) [allocRange, AllocRange.endExclusive, AllocRange.end,
+      Size.add, Size.sub, Size.ZERO, Size.ofBytes, Except.mapError, bind, Bind.bind, Except.bind,
+      pure, Pure.pure, Except.pure, hdata, c1, v1,
+      ← Array.forIn_toList, List.range', List.forIn_cons, List.forIn_nil]
+    congr 1
+  have happ1 : ∃ dst1,
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      dst1.ptrs = #[] ∧
+      ∃ f1, dst1.byteFragments = some f1 ∧ ∀ e, e ∈ f1 ↔ e = (Size.ofBytes 0, ⟨0, prov, v0⟩) := by
+    unfold ProvenanceMap.applyCopy
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.checked,
+      Miri.Memory.ProvenanceMap.shiftedCopyOffset]
+    simp (config := { decide := true }) [c0, ProvenanceMap.new, Size.add, Size.mul, Size.ofBytes,
+      Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, EStateM.pure, EStateM.bind,
+      EStateM.get, EStateM.set, Std.Legacy.Range.forIn_eq_forIn_range', List.range',
+      -Array.forIn_toList, ← Array.forIn_toList, List.forIn_cons, List.forIn_nil]
+    intro s f
+    simp only [mem_miri_insertEntry, Array.not_mem_empty, false_and, false_or]
+    constructor <;> (intro h; simpa using h)
+  obtain ⟨dst1, hdst1, hp1, f1, hf1, hm1⟩ := happ1
+  have happ2 : ∃ dst2,
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 3⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.ptrs = #[] ∧
+      ∃ f2, dst2.byteFragments = some f2 ∧
+        (∀ e, e ∈ f2 ↔ e = (Size.ofBytes 0, ⟨0, prov, v0⟩) ∨
+          (∃ k, 1 ≤ k ∧ k < 4 ∧ e = (Size.ofBytes (UInt64.ofNat k), ⟨UInt8.ofNat k, prov, v1⟩))) := by
+    unfold ProvenanceMap.applyCopy
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.checked,
+      Miri.Memory.ProvenanceMap.shiftedCopyOffset]
+    simp (config := { decide := true }) [c1, hp1, hf1, Size.add, Size.mul, Size.ofBytes,
+      Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, EStateM.pure, EStateM.bind,
+      EStateM.get, EStateM.set, Std.Legacy.Range.forIn_eq_forIn_range', List.range',
+      -Array.forIn_toList, ← Array.forIn_toList, List.forIn_cons, List.forIn_nil]
+    intro s f
+    simp only [mem_miri_insertEntry, hm1]
+    constructor
+    · intro h
+      rcases h with ⟨⟨⟨h, _⟩ | h, _⟩ | h, _⟩ | h
+      · exact Or.inl (by simpa [Size.ofBytes] using h)
+      · exact Or.inr ⟨1, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+      · exact Or.inr ⟨2, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+      · exact Or.inr ⟨3, by decide, by decide, by simpa [Size.ofBytes] using h⟩
+    · rintro (⟨hs, hf'⟩ | ⟨k, hk1, hk4, hs, hf'⟩)
+      · subst hs hf'; simp (config := { decide := true })
+      · subst hs hf'
+        have : k = 1 ∨ k = 2 ∨ k = 3 := by omega
+        rcases this with rfl | rfl | rfl <;> simp (config := { decide := true })
+  obtain ⟨dst2, hdst2, hp2, f2, hf2, hm2⟩ := happ2
+  refine ⟨src, c0, c1, dst1, dst2, hsrc_eq, hc0, hc1, hdst1, hdst2, ?_⟩
+  have hmem0 : (Size.ofBytes 0, ⟨0, prov, v0⟩) ∈ f2 := (hm2 _).mpr (Or.inl rfl)
+  have hmem1 : (Size.ofBytes 1, ⟨1, prov, v1⟩) ∈ f2 := (hm2 _).mpr (Or.inr ⟨1, by decide, by decide, rfl⟩)
+  have hnonempty : (f2.filter fun entry => decide (entry.1.bytes < 4)).isEmpty = false :=
+    array_filter_isEmpty_false_of_mem f2 _ _ hmem0 rfl
+  have hfind0 : f2.find? (fun entry => entry.1.bytes == 0) = some (Size.ofBytes 0, ⟨0, prov, v0⟩) := by
+    refine array_find?_eq_some_of_unique f2 _ _ hmem0 rfl ?_
+    intro b hb hbp
+    rcases (hm2 b).mp hb with rfl | ⟨k, hk1, hk4, rfl⟩
+    · rfl
+    · simp only [Size.ofBytes, beq_iff_eq] at hbp
+      have := congrArg UInt64.toNat hbp; simp [UInt64.toNat_ofNat'] at this; omega
+  have hfind1 : f2.find? (fun entry => entry.1.bytes == 1) = some (Size.ofBytes 1, ⟨1, prov, v1⟩) := by
+    refine array_find?_eq_some_of_unique f2 _ _ hmem1 rfl ?_
+    intro b hb hbp
+    rcases (hm2 b).mp hb with rfl | ⟨k, hk1, hk4, rfl⟩
+    · simp only [Size.ofBytes, beq_iff_eq] at hbp; exact absurd hbp (by decide)
+    · have hk : k = 1 := by
+        simp only [Size.ofBytes, beq_iff_eq] at hbp
+        have := congrArg UInt64.toNat hbp; simp [UInt64.toNat_ofNat'] at this; omega
+      subst hk; rfl
+  unfold ProvenanceMap.readPtr
+  delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.inspectFragments]
+  simp only [ProvenanceMap.getPtr, ProvenanceMap.rangePtrs, ProvenanceMap.rangeBytes,
+    ProvenanceMap.getByte, hp2, hf2]
+  delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.adjustedStart,
+    Miri.Memory.ProvenanceMap.rangeEnd, Miri.Memory.ProvenanceMap.rangeEntries]
+  simp (config := { decide := true }) [allocRange, AllocRange.endExclusive, AllocRange.end, Size.add,
+    Size.ofBytes, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure,
+    List.range', throw, throwThe, MonadExceptOf.throw]
+  rw [hnonempty, hfind0, hfind1]
+  simp [hnw, hvne]
+  cases PointerProvenance.offsetIsAddr (Prov := Prov) <;> simp [Size.ofBytes]
+
 /-! ### Arbitrary nonzero read offset `base : Nat` laws over unmodified vendored `ProvenanceMap` -/
 
 /-- `4`-entry fragment state shifted to an arbitrary base byte offset `base : Nat`. -/
@@ -2290,6 +2583,188 @@ theorem readPtr_missing_byte_strips_at {Prov : Type} [DecidableEq Prov] [Pointer
         | none => rfl
         | some frag => cases r.snd <;> rfl)]
   cases PointerProvenance.offsetIsAddr (Prov := Prov) <;> simp [Size.ofBytes]
+
+private theorem u64_ofNat_le_of_le (a b : Nat) (hab : a ≤ b) (hb : b < 2 ^ 64) :
+    UInt64.ofNat a ≤ UInt64.ofNat b := by
+  simp only [UInt64.le_iff_toNat_le, UInt64.toNat_ofNat']
+  rw [Nat.mod_eq_of_lt (by omega : a < 2 ^ 64), Nat.mod_eq_of_lt hb]
+  exact hab
+
+/-- **Universal nonzero-offset symbolic-`data` vendored `ProvenanceMap.clear` mid-pointer partial
+overwrite (64-bit).** At **any** base offset `base : Nat` (`base + 8 < 2 ^ 64`), for **any**
+symbolic `data : Array UInt8` (`base + 8 ≤ data.size`) and **any** provenance `prov`, overwriting
+1 byte at `base + 1` of a whole-pointer entry at `base` splits it into exact surviving
+`PointerFrag`s at offsets `base + k` (`k ∈ {0, 2, 3, 4, 5, 6, 7}`), and subsequent unmodified
+vendored `ProvenanceMap.readPtr base 8` strips provenance in both runtime (`.ok none`) and CTFE
+(`.error (.readPartialPointer base)`) modes. -/
+theorem clear_partial_mid_strips_8_at {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (prov : Prov) (data : Array UInt8) (hdata : base + 8 ≤ data.size) :
+    ∃ pm pm',
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes (UInt64.ofNat base), prov)] = .ok pm ∧
+      ProvenanceMap.clear ⟨Size.ofBytes (UInt64.ofNat (base + 1)), Size.ofBytes 1⟩ data (Size.ofBytes 8) pm = .ok () pm' ∧
+      pm'.ptrs = #[] ∧
+      (∃ frags, pm'.byteFragments = some frags ∧
+        (∀ e, e ∈ frags ↔
+          ∃ k, k < 8 ∧ k ≠ 1 ∧
+            e = (Size.ofBytes (UInt64.ofNat (base + k)),
+                 ⟨UInt8.ofNat k, prov, Vector.ofFn fun idx =>
+                   if hi : idx.val < 8 then data[base + idx.val]'(by omega) else 0⟩))) ∧
+      pm'.readPtr (Size.ofBytes (UInt64.ofNat base)) (Size.ofBytes 8) =
+        (if PointerProvenance.offsetIsAddr (Prov := Prov) then .ok none
+         else .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) := by
+  have hex : ∃ pm, ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes (UInt64.ofNat base), prov)] = .ok pm := by
+    unfold ProvenanceMap.fromPresortedPtrs
+    simp_miri_private Miri.Memory.ProvenanceMap Miri.Memory.ProvenanceMap.sortedKeys
+    exact ⟨_, rfl⟩
+  obtain ⟨pm, hpm⟩ := hex
+  obtain ⟨hp, hf⟩ := fromPresortedPtrs_fields _ pm hpm
+  have hbase_toNat : (UInt64.ofNat base).toNat = base := by
+    simp only [UInt64.toNat_ofNat', Nat.mod_eq_of_lt (by omega : base < 2 ^ 64)]
+  have hb1_toNat : (UInt64.ofNat (base + 1)).toNat = base + 1 := by
+    simp only [UInt64.toNat_ofNat', Nat.mod_eq_of_lt (by omega : base + 1 < 2 ^ 64)]
+  have hre1 : (allocRange (Size.ofBytes (UInt64.ofNat (base + 1))) (Size.ofBytes 1)).endExclusive =
+      .ok (Size.ofBytes (UInt64.ofNat (base + 2))) := allocRange_endExclusive_ofNat (base + 1) 1 (by omega)
+  have hadd8 : (Size.ofBytes (UInt64.ofNat base)).add (Size.ofBytes 8) =
+      .ok (Size.ofBytes (UInt64.ofNat (base + 8))) := size_add_ofNat base 8 hbd
+  have hlt01 : UInt64.ofNat base < UInt64.ofNat (base + 1) := u64_ofNat_lt_of_lt base (base + 1) (by omega) (by omega)
+  have hlt02 : UInt64.ofNat base < UInt64.ofNat (base + 2) := u64_ofNat_lt_of_lt base (base + 2) (by omega) (by omega)
+  have hlt28 : UInt64.ofNat (base + 2) < UInt64.ofNat (base + 8) := u64_ofNat_lt_of_lt (base + 2) (base + 8) (by omega) hbd
+  have hleAdj : UInt64.ofNat ((base + 1) - 7) ≤ UInt64.ofNat base :=
+    u64_ofNat_le_of_le ((base + 1) - 7) base (by omega) (by omega)
+  have hpos : ∀ k, k < 8 → UInt64.ofNat base + UInt64.ofNat k = UInt64.ofNat (base + k) :=
+    fun k hk => u64_ofNat_add_eq base k (by omega)
+  have hp0 := hpos 0 (by decide)
+  have hp1 := hpos 1 (by decide)
+  have hp2 := hpos 2 (by decide)
+  have hp3 := hpos 3 (by decide)
+  have hp4 := hpos 4 (by decide)
+  have hp5 := hpos 5 (by decide)
+  have hp6 := hpos 6 (by decide)
+  have hp7 := hpos 7 (by decide)
+  have hnotlt : ∀ k, 1 ≤ k → k < 8 → ¬ (UInt64.ofNat (base + k) < UInt64.ofNat (base + 1)) := by
+    intro k hk1 hk8 h
+    simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_ofNat',
+      Nat.mod_eq_of_lt (by omega : base + k < 2 ^ 64),
+      Nat.mod_eq_of_lt (by omega : base + 1 < 2 ^ 64)] at h
+    omega
+  have hnotle2 : ∀ k, k < 2 → ¬ (UInt64.ofNat (base + 2) ≤ UInt64.ofNat (base + k)) := by
+    intro k hk2 h
+    simp only [UInt64.le_iff_toNat_le, UInt64.toNat_ofNat',
+      Nat.mod_eq_of_lt (by omega : base + k < 2 ^ 64),
+      Nat.mod_eq_of_lt (by omega : base + 2 < 2 ^ 64)] at h
+    omega
+  have hle2 : ∀ k, 2 ≤ k → k < 8 → UInt64.ofNat (base + 2) ≤ UInt64.ofNat (base + k) :=
+    fun k hk2 hk8 => u64_ofNat_le_of_le (base + 2) (base + k) (by omega) (by omega)
+  have hr8 : List.range' 0 8 1 = [0, 1, 2, 3, 4, 5, 6, 7] := rfl
+  have hs8 : (8 : UInt64).toNat = 8 := rfl
+  have hbound : base + 8 ≤ data.size := hdata
+  let vec : Vector UInt8 8 := Vector.ofFn fun idx =>
+    if hi : idx.val < 8 then data[base + idx.val]'(by omega) else 0
+  have hclear : ∃ pm',
+      ProvenanceMap.clear ⟨Size.ofBytes (UInt64.ofNat (base + 1)), Size.ofBytes 1⟩ data (Size.ofBytes 8) pm = .ok () pm' ∧
+      pm'.ptrs = #[] ∧
+      (∃ frags, pm'.byteFragments = some frags ∧
+        (∀ e, e ∈ frags ↔
+          ∃ k, k < 8 ∧ k ≠ 1 ∧ e = (Size.ofBytes (UInt64.ofNat (base + k)), ⟨UInt8.ofNat k, prov, vec⟩))) := by
+    have hre1_mk : ({ start := Size.mk (UInt64.ofNat (base + 1)), size := Size.mk 1 } : AllocRange).endExclusive =
+        .ok (Size.mk (UInt64.ofNat (base + 2))) := hre1
+    have hadd8_mk : (Size.mk (UInt64.ofNat base)).add (Size.mk 8) =
+        .ok (Size.mk (UInt64.ofNat (base + 8))) := hadd8
+    have h8_lt : ¬ ((8 : UInt64) < 8) := by decide
+    have h1_0 : ((1 : UInt64) == 0) = false := rfl
+    have h8_0 : ((8 : UInt64) == 0) = false := rfl
+    have h8m1 : 8 - 1 = 7 := rfl
+    have hne_s : (#[(Size.mk (UInt64.ofNat base), prov)]).isEmpty = false := rfl
+    have hget0 : (#[(Size.mk (UInt64.ofNat base), prov)])[0]? =
+        some (Size.mk (UInt64.ofNat base), prov) := rfl
+    have hback : (#[(Size.mk (UInt64.ofNat base), prov)]).back? =
+        some (Size.mk (UInt64.ofNat base), prov) := rfl
+    have hnotle2_0 : ¬ (UInt64.ofNat (base + 2) ≤ UInt64.ofNat base) := by
+      simpa using hnotle2 0 (by decide)
+    have hfil1 : (#[(Size.mk (UInt64.ofNat base), prov)].filter fun entry =>
+        decide (UInt64.ofNat (base + 1 - 7) ≤ entry.1.bytes) &&
+        decide (entry.1.bytes < UInt64.ofNat (base + 2))) =
+        #[(Size.mk (UInt64.ofNat base), prov)] := by
+      apply Array.toList_inj.mp
+      simp only [Array.toList_filter, List.filter_cons, List.filter_nil,
+        decide_eq_true hleAdj, decide_eq_true hlt02, Bool.and_self, ↓reduceIte]
+    have hrem1 : (#[(Size.mk (UInt64.ofNat base), prov)].filter fun entry =>
+        !(decide (UInt64.ofNat (base + 1 - 7) ≤ entry.1.bytes) &&
+          decide (entry.1.bytes < UInt64.ofNat (base + 2)))) = #[] := by
+      apply Array.toList_inj.mp
+      simp only [Array.toList_filter, List.filter_cons, List.filter_nil,
+        decide_eq_true hleAdj, decide_eq_true hlt02, Bool.and_self, Bool.not_true,
+        Bool.false_eq_true, ↓reduceIte]
+    unfold ProvenanceMap.clear
+    simp only [ProvenanceMap.rangePtrs]
+    delta_miri_private Miri.Memory.ProvenanceMap [Miri.Memory.ProvenanceMap.checked,
+      Miri.Memory.ProvenanceMap.rangeEnd, Miri.Memory.ProvenanceMap.adjustedStart,
+      Miri.Memory.ProvenanceMap.rangeEntries, Miri.Memory.ProvenanceMap.removeEntries,
+      Miri.Memory.ProvenanceMap.ptrFragments]
+    simp only [Size.ofBytes, h1_0, h8_0, hs8, h8m1, h8_lt, hb1_toNat, hre1_mk, hadd8_mk,
+      hf, Option.map_none, hp,
+      Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure,
+      EStateM.bind, EStateM.pure, EStateM.get, EStateM.set, Bool.false_eq_true, ↓reduceIte,
+      hfil1, hrem1, hne_s, hget0, hback,
+      hlt01, hlt28, gt_iff_lt, hbase_toNat, hbound, ↓reduceDIte,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size,
+      Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one, hr8, List.forIn_cons, List.forIn_nil,
+      hp0, hp1, hp2, hp3, hp4, hp5, hp6, hp7, Nat.add_zero, decide_true,
+      decide_eq_true hlt01, decide_eq_false (hnotlt 1 (by decide) (by decide)),
+      decide_eq_false (hnotlt 2 (by decide) (by decide)), decide_eq_false (hnotlt 3 (by decide) (by decide)),
+      decide_eq_false (hnotlt 4 (by decide) (by decide)), decide_eq_false (hnotlt 5 (by decide) (by decide)),
+      decide_eq_false (hnotlt 6 (by decide) (by decide)), decide_eq_false (hnotlt 7 (by decide) (by decide)),
+      decide_eq_false hnotle2_0, decide_eq_false (hnotle2 1 (by decide)),
+      decide_eq_true (hle2 2 (by decide) (by decide)), decide_eq_true (hle2 3 (by decide) (by decide)),
+      decide_eq_true (hle2 4 (by decide) (by decide)), decide_eq_true (hle2 5 (by decide) (by decide)),
+      decide_eq_true (hle2 6 (by decide) (by decide)), decide_eq_true (hle2 7 (by decide) (by decide)),
+      Array.foldl_push, Array.foldl_empty,
+      Option.getD_some, Option.getD_none]
+    refine ⟨_, rfl, rfl, _, rfl, ?_⟩
+    intro ⟨s, f⟩
+    simp only [mem_miri_insertEntry, Array.not_mem_empty, false_and, false_or,
+      Prod.mk.injEq, Size.mk.injEq, PointerFrag.mk.injEq]
+    constructor
+    · intro h
+      rcases h with ⟨⟨⟨⟨⟨⟨h, _⟩ | h, _⟩ | h, _⟩ | h, _⟩ | h, _⟩ | h, _⟩ | h
+      · exact ⟨0, by decide, by decide, by rcases h with ⟨rfl, rfl, rfl, rfl⟩; simp [Size.ofBytes, vec]⟩
+      · exact ⟨2, by decide, by decide, by rcases h with ⟨rfl, rfl, rfl, rfl⟩; simp [Size.ofBytes, vec]⟩
+      · exact ⟨3, by decide, by decide, by rcases h with ⟨rfl, rfl, rfl, rfl⟩; simp [Size.ofBytes, vec]⟩
+      · exact ⟨4, by decide, by decide, by rcases h with ⟨rfl, rfl, rfl, rfl⟩; simp [Size.ofBytes, vec]⟩
+      · exact ⟨5, by decide, by decide, by rcases h with ⟨rfl, rfl, rfl, rfl⟩; simp [Size.ofBytes, vec]⟩
+      · exact ⟨6, by decide, by decide, by rcases h with ⟨rfl, rfl, rfl, rfl⟩; simp [Size.ofBytes, vec]⟩
+      · exact ⟨7, by decide, by decide, by rcases h with ⟨rfl, rfl, rfl, rfl⟩; simp [Size.ofBytes, vec]⟩
+    · rintro ⟨k, hk, hne1, hs, hf'⟩
+      subst hs; subst hf'
+      have : k = 0 ∨ k = 2 ∨ k = 3 ∨ k = 4 ∨ k = 5 ∨ k = 6 ∨ k = 7 := by omega
+      rcases this with rfl | rfl | rfl | rfl | rfl | rfl | rfl
+      · refine Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inl ⟨⟨rfl, rfl⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩ <;>
+          exact u64_ofNat_ne_of_ne _ _ (by omega) (by omega) (by omega)
+      · refine Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inr ⟨rfl, rfl⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩ <;>
+          exact u64_ofNat_ne_of_ne _ _ (by omega) (by omega) (by omega)
+      · refine Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inr ⟨rfl, rfl⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩ <;>
+          exact u64_ofNat_ne_of_ne _ _ (by omega) (by omega) (by omega)
+      · refine Or.inl ⟨Or.inl ⟨Or.inl ⟨Or.inr ⟨rfl, rfl⟩, ?_⟩, ?_⟩, ?_⟩ <;>
+          exact u64_ofNat_ne_of_ne _ _ (by omega) (by omega) (by omega)
+      · refine Or.inl ⟨Or.inl ⟨Or.inr ⟨rfl, rfl⟩, ?_⟩, ?_⟩ <;>
+          exact u64_ofNat_ne_of_ne _ _ (by omega) (by omega) (by omega)
+      · refine Or.inl ⟨Or.inr ⟨rfl, rfl⟩, ?_⟩
+        exact u64_ofNat_ne_of_ne _ _ (by omega) (by omega) (by omega)
+      · exact Or.inr ⟨rfl, rfl⟩
+  obtain ⟨pm', hcl, hptrs', frags, hfrags, hmem⟩ := hclear
+  refine ⟨pm, pm', hpm, hcl, hptrs', ⟨frags, hfrags, hmem⟩, ?_⟩
+  have hmem0 : (Size.ofBytes (UInt64.ofNat base), ⟨0, prov, vec⟩) ∈ frags :=
+    (hmem _).mpr ⟨0, by decide, by decide, rfl⟩
+  have hlt08 := u64_ofNat_lt_of_lt base (base + 8) (by omega) hbd
+  have hmiss1 : ∀ e ∈ frags, e.1.bytes ≠ UInt64.ofNat (base + 1) := by
+    intro e he hbeq
+    obtain ⟨k, hk, hne1, rfl⟩ := (hmem e).mp he
+    exact u64_ofNat_ne_of_ne (base + k) (base + 1) (by omega) (by omega) (by omega) hbeq
+  exact readPtr_missing_byte_strips_at base 8 (by decide) (by decide) hbd
+    pm' frags hptrs' hfrags
+    ⟨_, hmem0, UInt64.le_refl _, hlt08⟩
+    ⟨1, by decide, hmiss1⟩
 
 private theorem inspectFragments_fe4At {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
     (base : Nat) (hbd : base + 4 < 2 ^ 64)
@@ -4514,6 +4989,88 @@ theorem readPtr8_allBytes_at_ctfe_corr {Prov : Type} [DecidableEq Prov] [Pointer
         pm (trEntriesAux pv base bs).toArray hptrs hfrags ⟨_, hmemj, hgej, hltj⟩ ⟨k, by omega, hmiss⟩
       simpa [hoff] using hread
 
+/-- **Explicit arbitrary-offset runtime biconditional (4-byte pointers).** -/
+theorem readPtr4_allBytes_at_runtime_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = true)
+    (base : Nat) (hbd : base + 4 < 2 ^ 64)
+    (bs : List AbstractByte) (hlen : bs.length = 4)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 4 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 = .ok (some p)) ∧
+    (abstractBytesCoherentPtrProv? bs = none ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 = .ok none) := by
+  rw [readPtr4_allBytes_at_runtime_corr pv hoff base hbd bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs <;> simp
+
+/-- **Explicit arbitrary-offset CTFE biconditional (4-byte pointers).** -/
+theorem readPtr4_allBytes_at_ctfe_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (base : Nat) (hbd : base + 4 < 2 ^ 64)
+    (bs : List AbstractByte) (hlen : bs.length = 4)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 4 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = true) ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 =
+        .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = false) ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 = .ok none) := by
+  rw [readPtr4_allBytes_at_ctfe_corr pv hoff base hbd bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs with
+  | none => cases abstractBytesHaveProv bs <;> simp
+  | some f => cases abstractBytesHaveProv bs <;> simp
+
+/-- **Explicit arbitrary-offset runtime biconditional (8-byte pointers).** -/
+theorem readPtr8_allBytes_at_runtime_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = true)
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (bs : List AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok (some p)) ∧
+    (abstractBytesCoherentPtrProv? bs = none ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok none) := by
+  rw [readPtr8_allBytes_at_runtime_corr pv hoff base hbd bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs <;> simp
+
+/-- **Explicit arbitrary-offset CTFE biconditional (8-byte pointers).** -/
+theorem readPtr8_allBytes_at_ctfe_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (bs : List AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = true) ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 =
+        .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = false) ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok none) := by
+  rw [readPtr8_allBytes_at_ctfe_corr pv hoff base hbd bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs with
+  | none => cases abstractBytesHaveProv bs <;> simp
+  | some f => cases abstractBytesHaveProv bs <;> simp
+
 /-- Helper: decoding LE bits of `encodePtrBytesAux` yields `bits % 256 ^ n`. -/
 theorem decodeLittleEndianBits_encodePtrBytesAux (a t o pb : Nat) :
     ∀ (n bits idx : Nat),
@@ -5525,6 +6082,270 @@ theorem ep2_b2_iff_non_vacuity_instances :
       (by decide) (by decide) (by decide)).1,
     (globalAlloc_reloc_correspondence_4 51 ⟨4⟩ .not { allocId := 9, offsetBytes := 0x1000 } 0x1000
       (by decide) (by decide) (by decide)).1⟩
+
+def wPtr32L : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 0xFFFFFFFF⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+def wArr4U8L : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨1⟩ 4, variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+def wCopyLayouts32 : LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true,
+    entries := [wUnitL, wU8L, wBoolL, wCharL, wU32L, wPtr32L, wArr4U8L] }
+def wTyRawPtr32C : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 5 }
+def wTyRef32C : Ty := { kind := .ref .not (.uint .u8), layoutIdx := 5 }
+def wTyArr4U8C : Ty := { kind := .array (.uint .u8) 4, layoutIdx := 6 }
+def wCopyMem32 : Memory :=
+  { emptyMemory with
+    borrows := [
+      { tag := 20, targetLocal := 0, targetProjection := [], perm := .frozen, rangeOffset := 0, rangeLen := 4 },
+      { tag := 21, targetLocal := 1, targetProjection := [], perm := .active, rangeOffset := 0, rangeLen := 4 }
+    ] }
+def wCopyStep32 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) (sOff dOff n : Nat) :
+    Option LocalSlot :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory { frame := { blockIdx := 0, stmtIdx := 0, locals := l }, memory := wCopyMem32 }
+      l decls wCopyLayouts32 ⟨20, sOff⟩ ⟨21, dOff⟩ n with
+  | .ok (_ :: dst' :: _, _) => some dst'
+  | _ => none
+def wCopyRead32 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) (sOff dOff n : Nat) :
+    Option (Option Value) :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory { frame := { blockIdx := 0, stmtIdx := 0, locals := l }, memory := wCopyMem32 }
+      l decls wCopyLayouts32 ⟨20, sOff⟩ ⟨21, dOff⟩ n with
+  | .ok (l', _) =>
+    match evalOperand l' (.copy ⟨1, []⟩) [] [] wCopyLayouts32 [] decls with
+    | .ok v _ => some (some v)
+    | .ub => some none
+    | .unsupported => none
+  | _ => none
+
+/-- **32-bit end-to-end `evalCopyMemory` correspondence (`Trusted` ↔ unmodified vendored
+`Miri.Memory.ProvenanceMap`, runtime & CTFE).** Intact 4-byte copy, 2+2 swapped halves, and 1+3
+`q`/`q+256` splice all agree between `Trusted.evalCopyMemory` + `evalOperand` and unmodified
+vendored `ProvenanceMap.readPtr 0 4`. -/
+theorem w_lm_copyMemory_32 :
+    let q : ProvenancePtr := { allocId := 9, offsetBytes := 0x1000 }
+    let q256 : ProvenancePtr := { allocId := 9, offsetBytes := 0x1100 }
+    (∃ vIntact bsIntact,
+      wCopyRead32 wTyRawPtr32C wTyRef32C (.init (.ptr q 4)) .uninit 0 0 4 = some (some (.ptr ⟨9, 0x1000⟩ 4)) ∧
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q 4)) .uninit 0 0 4 = some (.init vIntact) ∧
+      encodeUntypedValueToBytes defaultCodecFuel vIntact = some bsIntact ∧
+      trRead (trEntries pvRt bsIntact) 0 4 = .ok (some (pvRt 9 9)) ∧
+      trRead (trEntries pvCt bsIntact) 0 4 = .ok (some (pvCt 9 9))) ∧
+    (∃ s1 vSwap bsSwap,
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q 4)) .uninit 0 2 2 = some s1 ∧
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q 4)) s1 2 0 2 = some (.init vSwap) ∧
+      wCopyRead32 wTyArr4U8C wTyRawPtr32C (.init vSwap) .uninit 0 0 4 = some (some (.scalar ⟨0x10000000, 4⟩)) ∧
+      wCopyRead32 wTyArr4U8C wTyRef32C (.init vSwap) .uninit 0 0 4 = some none ∧
+      encodeUntypedValueToBytes defaultCodecFuel vSwap = some bsSwap ∧
+      trRead (trEntries pvRt bsSwap) 0 4 = .ok none ∧
+      trRead (trEntries pvCt bsSwap) 0 4 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    (∃ s1 vSplice bsSplice,
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q 4)) .uninit 0 0 1 = some s1 ∧
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q256 4)) s1 1 1 3 = some (.init vSplice) ∧
+      wCopyRead32 wTyArr4U8C wTyRawPtr32C (.init vSplice) .uninit 0 0 4 = some (some (.scalar ⟨0x1100, 4⟩)) ∧
+      wCopyRead32 wTyArr4U8C wTyRef32C (.init vSplice) .uninit 0 0 4 = some none ∧
+      encodeUntypedValueToBytes defaultCodecFuel vSplice = some bsSplice ∧
+      trRead (trEntries pvRt bsSplice) 0 4 = .ok none ∧
+      trRead (trEntries pvCt bsSplice) 0 4 = .error (.readPartialPointer (Size.ofBytes 0))) := by
+  refine ⟨?_, ?_, ?_⟩
+  · refine ⟨_, lQ, rfl, rfl, rfl, ?_, ?_⟩ <;>
+      (simp only [lQ, encodePtrBytes, encodePtrBytesAux, normPtrByteOffset,
+        trEntries, trEntriesAux, fragOf, mkFrag, Nat.reduceAdd, Nat.reducePow, Nat.reduceMod]
+       lm_trread; lm_open; lm_close)
+  · refine ⟨_, _, lQ.drop 2 ++ lQ.take 2, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩ <;>
+      (simp only [lQ, encodePtrBytes, encodePtrBytesAux, normPtrByteOffset,
+        List.drop, List.take, List.cons_append, List.nil_append,
+        trEntries, trEntriesAux, fragOf, mkFrag, Nat.reduceAdd, Nat.reducePow, Nat.reduceMod]
+       lm_trread; lm_open; lm_close)
+  · refine ⟨_, _, lQ.take 1 ++ lQ256.drop 1, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩ <;>
+      (simp only [lQ, lQ256, encodePtrBytes, encodePtrBytesAux, normPtrByteOffset,
+        List.drop, List.take, List.cons_append, List.nil_append,
+        trEntries, trEntriesAux, fragOf, mkFrag, Nat.reduceAdd, Nat.reducePow, Nat.reduceMod]
+       lm_trread; lm_open; lm_close)
+
+/-- **Non-vacuous B3 instantiations across ALL THREE CTFE branches and BOTH runtime branches at
+nonzero base offsets (`base = 16` for 8B, `base = 4` for 4B), PLUS concrete instantiations of
+`prepareCopy_applyCopy_splice_{8,4}_symbolic` and `clear_partial_mid_strips_8_at` (`base = 16`).** -/
+theorem ep2_b3_non_vacuity_instances :
+    (((∃ f, abstractBytesCoherentPtrProv? lP = some f) ↔ ∃ p, trRead (trEntriesAt pvCt 16 lP) 16 8 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? lP = none ∧ abstractBytesHaveProv lP = true) ↔
+       trRead (trEntriesAt pvCt 16 lP) 16 8 = .error (.readPartialPointer (Size.ofBytes 16))) ∧
+     ((abstractBytesCoherentPtrProv? lP = none ∧ abstractBytesHaveProv lP = false) ↔
+       trRead (trEntriesAt pvCt 16 lP) 16 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? (lP.take 1 ++ lP256.drop 1) = some f) ↔
+       ∃ p, trRead (trEntriesAt pvCt 16 (lP.take 1 ++ lP256.drop 1)) 16 8 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? (lP.take 1 ++ lP256.drop 1) = none ∧
+         abstractBytesHaveProv (lP.take 1 ++ lP256.drop 1) = true) ↔
+       trRead (trEntriesAt pvCt 16 (lP.take 1 ++ lP256.drop 1)) 16 8 = .error (.readPartialPointer (Size.ofBytes 16))) ∧
+     ((abstractBytesCoherentPtrProv? (lP.take 1 ++ lP256.drop 1) = none ∧
+         abstractBytesHaveProv (lP.take 1 ++ lP256.drop 1) = false) ↔
+       trRead (trEntriesAt pvCt 16 (lP.take 1 ++ lP256.drop 1)) 16 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = some f) ↔
+       ∃ p, trRead (trEntriesAt pvCt 16 (encodePlainLittleEndianBytes 0x1000 8)) 16 8 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = none ∧
+         abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 8) = true) ↔
+       trRead (trEntriesAt pvCt 16 (encodePlainLittleEndianBytes 0x1000 8)) 16 8 = .error (.readPartialPointer (Size.ofBytes 16))) ∧
+     ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = none ∧
+         abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 8) = false) ↔
+       trRead (trEntriesAt pvCt 16 (encodePlainLittleEndianBytes 0x1000 8)) 16 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? lQ = some f) ↔ ∃ p, trRead (trEntriesAt pvCt 4 lQ) 4 4 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? lQ = none ∧ abstractBytesHaveProv lQ = true) ↔
+       trRead (trEntriesAt pvCt 4 lQ) 4 4 = .error (.readPartialPointer (Size.ofBytes 4))) ∧
+     ((abstractBytesCoherentPtrProv? lQ = none ∧ abstractBytesHaveProv lQ = false) ↔
+       trRead (trEntriesAt pvCt 4 lQ) 4 4 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? (lQ.take 1 ++ lQ256.drop 1) = some f) ↔
+       ∃ p, trRead (trEntriesAt pvCt 4 (lQ.take 1 ++ lQ256.drop 1)) 4 4 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? (lQ.take 1 ++ lQ256.drop 1) = none ∧
+         abstractBytesHaveProv (lQ.take 1 ++ lQ256.drop 1) = true) ↔
+       trRead (trEntriesAt pvCt 4 (lQ.take 1 ++ lQ256.drop 1)) 4 4 = .error (.readPartialPointer (Size.ofBytes 4))) ∧
+     ((abstractBytesCoherentPtrProv? (lQ.take 1 ++ lQ256.drop 1) = none ∧
+         abstractBytesHaveProv (lQ.take 1 ++ lQ256.drop 1) = false) ↔
+       trRead (trEntriesAt pvCt 4 (lQ.take 1 ++ lQ256.drop 1)) 4 4 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? lP = some f) ↔ ∃ p, trRead (trEntriesAt pvRt 16 lP) 16 8 = .ok (some p)) ∧
+     (abstractBytesCoherentPtrProv? lP = none ↔ trRead (trEntriesAt pvRt 16 lP) 16 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? lQ.reverse = some f) ↔ ∃ p, trRead (trEntriesAt pvRt 4 lQ.reverse) 4 4 = .ok (some p)) ∧
+     (abstractBytesCoherentPtrProv? lQ.reverse = none ↔ trRead (trEntriesAt pvRt 4 lQ.reverse) 4 4 = .ok none)) ∧
+    (∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, pvRt 7 7), (Size.ofBytes 8, pvRt 7 7)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩
+        #[0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0, 0, 0, 0, 0, 0] (Size.ofBytes 8) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 9, Size.ofBytes 7⟩
+        #[0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0, 0, 0, 0, 0, 0] (Size.ofBytes 8) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 7⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 8) = .ok none) ∧
+    (∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, pvCt 9 9), (Size.ofBytes 4, pvCt 9 9)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ #[0x00, 0x10, 0, 0, 0x00, 0x11, 0, 0] (Size.ofBytes 4) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 5, Size.ofBytes 3⟩ #[0x00, 0x10, 0, 0, 0x00, 0x11, 0, 0] (Size.ofBytes 4) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 3⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 4) = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    (∃ pm pm',
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 16, pvCt 7 7)] = .ok pm ∧
+      ProvenanceMap.clear ⟨Size.ofBytes 17, Size.ofBytes 1⟩ (Array.replicate 24 0) (Size.ofBytes 8) pm = .ok () pm' ∧
+      pm'.ptrs = #[] ∧
+      pm'.readPtr (Size.ofBytes 16) (Size.ofBytes 8) = .error (.readPartialPointer (Size.ofBytes 16))) := by
+  have hwfP : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), lP[i]? = some (.init v (some f)) → WF 8 f := by
+    intro i v f hi; obtain ⟨_, _, hv, _, hwf⟩ := encodePtrBytes_wf 0x1000 8 7 7 i _ hi
+    injection hv with _ h; injection h with h; subst h; exact hwf
+  have hnwPRt : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), lP[i]? = some (.init v (some f)) →
+      ¬ some (pvRt f.allocId f.tag) = PointerProvenance.wildcard := by
+    intro i v f hi; obtain ⟨_, _, hv, hf, _⟩ := encodePtrBytes_wf 0x1000 8 7 7 i _ hi
+    injection hv with _ h; injection h with h; subst h; subst hf
+    exact pvRt_ne_wildcard 7 7 (by decide) (by decide)
+  have hinjP : ∀ {Prov : Type} (pv : Nat → Nat → Prov) (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      lP[i]? = some (.init vi (some fi)) → lP[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag := by
+    intro Prov pv i j vi vj fi fj hi hj _
+    obtain ⟨_, _, hvi, hfi, _⟩ := encodePtrBytes_wf 0x1000 8 7 7 i _ hi
+    obtain ⟨_, _, hvj, hfj, _⟩ := encodePtrBytes_wf 0x1000 8 7 7 j _ hj
+    injection hvi with _ hi'; injection hi' with hi'; subst hi'; subst hfi
+    injection hvj with _ hj'; injection hj' with hj'; subst hj'; subst hfj
+    exact ⟨rfl, rfl⟩
+  have hwfQ : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), lQ[i]? = some (.init v (some f)) → WF 4 f := by
+    intro i v f hi; obtain ⟨_, _, hv, _, hwf⟩ := encodePtrBytes_wf 0x1000 4 9 9 i _ hi
+    injection hv with _ h; injection h with h; subst h; exact hwf
+  have hinjQ : ∀ {Prov : Type} (pv : Nat → Nat → Prov) (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      lQ[i]? = some (.init vi (some fi)) → lQ[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag := by
+    intro Prov pv i j vi vj fi fj hi hj _
+    obtain ⟨_, _, hvi, hfi, _⟩ := encodePtrBytes_wf 0x1000 4 9 9 i _ hi
+    obtain ⟨_, _, hvj, hfj, _⟩ := encodePtrBytes_wf 0x1000 4 9 9 j _ hj
+    injection hvi with _ hi'; injection hi' with hi'; subst hi'; subst hfi
+    injection hvj with _ hj'; injection hj' with hj'; subst hj'; subst hfj
+    exact ⟨rfl, rfl⟩
+  have hwfSpl8 : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag),
+      (lP.take 1 ++ lP256.drop 1)[i]? = some (.init v (some f)) → WF 8 f := by
+    intro i v f hi
+    match i, hi with
+    | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h =>
+      injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, by decide, by decide⟩
+    | _ + 8, h => cases h
+  have hinjSpl8 : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      (lP.take 1 ++ lP256.drop 1)[i]? = some (.init vi (some fi)) →
+      (lP.take 1 ++ lP256.drop 1)[j]? = some (.init vj (some fj)) →
+      pvCt fi.allocId fi.tag = pvCt fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag := by
+    intro i j vi vj fi fj hi hj _
+    have hi' : fi.allocId = 7 ∧ fi.tag = 7 := by
+      match i, hi with
+      | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h =>
+        injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+      | _ + 8, h => cases h
+    have hj' : fj.allocId = 7 ∧ fj.tag = 7 := by
+      match j, hj with
+      | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h =>
+        injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+      | _ + 8, h => cases h
+    exact ⟨hi'.1.trans hj'.1.symm, hi'.2.trans hj'.2.symm⟩
+  have hwfSpl4 : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag),
+      (lQ.take 1 ++ lQ256.drop 1)[i]? = some (.init v (some f)) → WF 4 f := by
+    intro i v f hi
+    match i, hi with
+    | 0, h | 1, h | 2, h | 3, h =>
+      injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, by decide, by decide⟩
+    | _ + 4, h => cases h
+  have hinjSpl4 : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      (lQ.take 1 ++ lQ256.drop 1)[i]? = some (.init vi (some fi)) →
+      (lQ.take 1 ++ lQ256.drop 1)[j]? = some (.init vj (some fj)) →
+      pvCt fi.allocId fi.tag = pvCt fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag := by
+    intro i j vi vj fi fj hi hj _
+    have hi' : fi.allocId = 9 ∧ fi.tag = 9 := by
+      match i, hi with
+      | 0, h | 1, h | 2, h | 3, h =>
+        injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+      | _ + 4, h => cases h
+    have hj' : fj.allocId = 9 ∧ fj.tag = 9 := by
+      match j, hj with
+      | 0, h | 1, h | 2, h | 3, h =>
+        injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+      | _ + 4, h => cases h
+    exact ⟨hi'.1.trans hj'.1.symm, hi'.2.trans hj'.2.symm⟩
+  obtain ⟨pm, pm', hpm, hcl, hptrs, _, hread⟩ :=
+    clear_partial_mid_strips_8_at 16 (by decide) (pvCt 7 7) (Array.replicate 24 0) (by decide)
+  refine ⟨
+    readPtr8_allBytes_at_ctfe_iff pvCt rfl 16 (by decide) lP rfl hwfP (fun _ _ _ _ hw => by cases hw) (hinjP pvCt),
+    readPtr8_allBytes_at_ctfe_iff pvCt rfl 16 (by decide) (lP.take 1 ++ lP256.drop 1) rfl hwfSpl8 (fun _ _ _ _ hw => by cases hw) hinjSpl8,
+    readPtr8_allBytes_at_ctfe_iff pvCt rfl 16 (by decide) (encodePlainLittleEndianBytes 0x1000 8) rfl
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h)
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h)
+      (by intro i _ _ _ _ _ hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h),
+    readPtr4_allBytes_at_ctfe_iff pvCt rfl 4 (by decide) lQ rfl hwfQ (fun _ _ _ _ hw => by cases hw) (hinjQ pvCt),
+    readPtr4_allBytes_at_ctfe_iff pvCt rfl 4 (by decide) (lQ.take 1 ++ lQ256.drop 1) rfl hwfSpl4 (fun _ _ _ _ hw => by cases hw) hinjSpl4,
+    readPtr8_allBytes_at_runtime_iff pvRt rfl 16 (by decide) lP rfl hwfP hnwPRt (hinjP pvRt),
+    readPtr4_allBytes_at_runtime_iff pvRt rfl 4 (by decide) lQ.reverse rfl
+      (by intro i v f hi; match i, hi with
+        | 0, h | 1, h | 2, h | 3, h => injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, by decide, by decide⟩
+        | _ + 4, h => cases h)
+      (by intro i v f hi; match i, hi with
+        | 0, h | 1, h | 2, h | 3, h => injection h with h; injection h with _ h; injection h with h; subst h; decide
+        | _ + 4, h => cases h)
+      (by intro i j vi vj fi fj hi hj _
+          have hi' : fi.allocId = 9 ∧ fi.tag = 9 := by
+            match i, hi with
+            | 0, h | 1, h | 2, h | 3, h => injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+            | _ + 4, h => cases h
+          have hj' : fj.allocId = 9 ∧ fj.tag = 9 := by
+            match j, hj with
+            | 0, h | 1, h | 2, h | 3, h => injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+            | _ + 4, h => cases h
+          exact ⟨hi'.1.trans hj'.1.symm, hi'.2.trans hj'.2.symm⟩),
+    prepareCopy_applyCopy_splice_8_symbolic (pvRt 7 7) (pvRt_ne_wildcard 7 7 (by decide) (by decide))
+      #[0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0, 0, 0, 0, 0, 0] rfl ⟨⟨1, by decide⟩, by decide⟩,
+    prepareCopy_applyCopy_splice_4_symbolic (pvCt 9 9) (fun hw => by cases hw)
+      #[0x00, 0x10, 0, 0, 0x00, 0x11, 0, 0] rfl ⟨⟨1, by decide⟩, by decide⟩,
+    ⟨pm, pm', hpm, hcl, hptrs, hread⟩⟩
 
 end WideAndKani
 
@@ -7228,6 +8049,88 @@ theorem readPtr8_allBytes_at_ctfe_corr {Prov : Type} [DecidableEq Prov] [Pointer
         pm (trEntriesAux pv base bs).toArray hptrs hfrags ⟨_, hmemj, hgej, hltj⟩ ⟨k, by omega, hmiss⟩
       simpa [hoff] using hread
 
+/-- **Explicit arbitrary-offset runtime biconditional (4-byte pointers).** -/
+theorem readPtr4_allBytes_at_runtime_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = true)
+    (base : Nat) (hbd : base + 4 < 2 ^ 64)
+    (bs : List AbstractByte) (hlen : bs.length = 4)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 4 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 = .ok (some p)) ∧
+    (abstractBytesCoherentPtrProv? bs = none ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 = .ok none) := by
+  rw [readPtr4_allBytes_at_runtime_corr pv hoff base hbd bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs <;> simp
+
+/-- **Explicit arbitrary-offset CTFE biconditional (4-byte pointers).** -/
+theorem readPtr4_allBytes_at_ctfe_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (base : Nat) (hbd : base + 4 < 2 ^ 64)
+    (bs : List AbstractByte) (hlen : bs.length = 4)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 4 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = true) ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 =
+        .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = false) ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 4 = .ok none) := by
+  rw [readPtr4_allBytes_at_ctfe_corr pv hoff base hbd bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs with
+  | none => cases abstractBytesHaveProv bs <;> simp
+  | some f => cases abstractBytesHaveProv bs <;> simp
+
+/-- **Explicit arbitrary-offset runtime biconditional (8-byte pointers).** -/
+theorem readPtr8_allBytes_at_runtime_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = true)
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (bs : List AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok (some p)) ∧
+    (abstractBytesCoherentPtrProv? bs = none ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok none) := by
+  rw [readPtr8_allBytes_at_runtime_corr pv hoff base hbd bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs <;> simp
+
+/-- **Explicit arbitrary-offset CTFE biconditional (8-byte pointers).** -/
+theorem readPtr8_allBytes_at_ctfe_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (bs : List AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = true) ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 =
+        .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = false) ↔
+      trRead (trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok none) := by
+  rw [readPtr8_allBytes_at_ctfe_corr pv hoff base hbd bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs with
+  | none => cases abstractBytesHaveProv bs <;> simp
+  | some f => cases abstractBytesHaveProv bs <;> simp
+
 /-- Helper: decoding LE bits of `encodePtrBytesAux` yields `bits % 256 ^ n`. -/
 theorem decodeLittleEndianBits_encodePtrBytesAux (a t o pb : Nat) :
     ∀ (n bits idx : Nat),
@@ -8220,6 +9123,270 @@ theorem ep2_b2_iff_non_vacuity_instances :
     (globalAlloc_reloc_correspondence_4 51 ⟨4⟩ .not { allocId := 9, offsetBytes := 0x1000 } 0x1000
       (by decide) (by decide) (by decide)).1⟩
 
+def wPtr32L : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨4⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨0, 0xFFFFFFFF⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false, fieldLayouts := [] }
+def wArr4U8L : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .array ⟨1⟩ 4, variants := .single 0, isUninhabited := false, fieldLayouts := [1] }
+def wCopyLayouts32 : LayoutTable :=
+  { pointerBits := 32, isLittleEndian := true,
+    entries := [wUnitL, wU8L, wBoolL, wCharL, wU32L, wPtr32L, wArr4U8L] }
+def wTyRawPtr32C : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 5 }
+def wTyRef32C : Ty := { kind := .ref .not (.uint .u8), layoutIdx := 5 }
+def wTyArr4U8C : Ty := { kind := .array (.uint .u8) 4, layoutIdx := 6 }
+def wCopyMem32 : Memory :=
+  { emptyMemory with
+    borrows := [
+      { tag := 20, targetLocal := 0, targetProjection := [], perm := .frozen, rangeOffset := 0, rangeLen := 4 },
+      { tag := 21, targetLocal := 1, targetProjection := [], perm := .active, rangeOffset := 0, rangeLen := 4 }
+    ] }
+def wCopyStep32 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) (sOff dOff n : Nat) :
+    Option LocalSlot :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory { frame := { blockIdx := 0, stmtIdx := 0, locals := l }, memory := wCopyMem32 }
+      l decls wCopyLayouts32 ⟨20, sOff⟩ ⟨21, dOff⟩ n with
+  | .ok (_ :: dst' :: _, _) => some dst'
+  | _ => none
+def wCopyRead32 (srcTy dstTy : Ty) (srcSlot dstSlot : LocalSlot) (sOff dOff n : Nat) :
+    Option (Option Value) :=
+  let decls : List LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match evalCopyMemory { frame := { blockIdx := 0, stmtIdx := 0, locals := l }, memory := wCopyMem32 }
+      l decls wCopyLayouts32 ⟨20, sOff⟩ ⟨21, dOff⟩ n with
+  | .ok (l', _) =>
+    match evalOperand l' (.copy ⟨1, []⟩) [] [] wCopyLayouts32 [] decls with
+    | .ok v _ => some (some v)
+    | .ub => some none
+    | .unsupported => none
+  | _ => none
+
+/-- **32-bit end-to-end `evalCopyMemory` correspondence (`Trusted` ↔ unmodified vendored
+`Miri.Memory.ProvenanceMap`, runtime & CTFE).** Intact 4-byte copy, 2+2 swapped halves, and 1+3
+`q`/`q+256` splice all agree between `Trusted.evalCopyMemory` + `evalOperand` and unmodified
+vendored `ProvenanceMap.readPtr 0 4`. -/
+theorem w_lm_copyMemory_32 :
+    let q : ProvenancePtr := { allocId := 9, offsetBytes := 0x1000 }
+    let q256 : ProvenancePtr := { allocId := 9, offsetBytes := 0x1100 }
+    (∃ vIntact bsIntact,
+      wCopyRead32 wTyRawPtr32C wTyRef32C (.init (.ptr q 4)) .uninit 0 0 4 = some (some (.ptr ⟨9, 0x1000⟩ 4)) ∧
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q 4)) .uninit 0 0 4 = some (.init vIntact) ∧
+      encodeUntypedValueToBytes defaultCodecFuel vIntact = some bsIntact ∧
+      trRead (trEntries pvRt bsIntact) 0 4 = .ok (some (pvRt 9 9)) ∧
+      trRead (trEntries pvCt bsIntact) 0 4 = .ok (some (pvCt 9 9))) ∧
+    (∃ s1 vSwap bsSwap,
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q 4)) .uninit 0 2 2 = some s1 ∧
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q 4)) s1 2 0 2 = some (.init vSwap) ∧
+      wCopyRead32 wTyArr4U8C wTyRawPtr32C (.init vSwap) .uninit 0 0 4 = some (some (.scalar ⟨0x10000000, 4⟩)) ∧
+      wCopyRead32 wTyArr4U8C wTyRef32C (.init vSwap) .uninit 0 0 4 = some none ∧
+      encodeUntypedValueToBytes defaultCodecFuel vSwap = some bsSwap ∧
+      trRead (trEntries pvRt bsSwap) 0 4 = .ok none ∧
+      trRead (trEntries pvCt bsSwap) 0 4 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    (∃ s1 vSplice bsSplice,
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q 4)) .uninit 0 0 1 = some s1 ∧
+      wCopyStep32 wTyRawPtr32C wTyArr4U8C (.init (.ptr q256 4)) s1 1 1 3 = some (.init vSplice) ∧
+      wCopyRead32 wTyArr4U8C wTyRawPtr32C (.init vSplice) .uninit 0 0 4 = some (some (.scalar ⟨0x1100, 4⟩)) ∧
+      wCopyRead32 wTyArr4U8C wTyRef32C (.init vSplice) .uninit 0 0 4 = some none ∧
+      encodeUntypedValueToBytes defaultCodecFuel vSplice = some bsSplice ∧
+      trRead (trEntries pvRt bsSplice) 0 4 = .ok none ∧
+      trRead (trEntries pvCt bsSplice) 0 4 = .error (.readPartialPointer (Size.ofBytes 0))) := by
+  refine ⟨?_, ?_, ?_⟩
+  · refine ⟨_, lQ, rfl, rfl, rfl, ?_, ?_⟩ <;>
+      (simp only [lQ, encodePtrBytes, encodePtrBytesAux, normPtrByteOffset,
+        trEntries, trEntriesAux, fragOf, mkFrag, Nat.reduceAdd, Nat.reducePow, Nat.reduceMod]
+       lm_trread; lm_open; lm_close)
+  · refine ⟨_, _, lQ.drop 2 ++ lQ.take 2, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩ <;>
+      (simp only [lQ, encodePtrBytes, encodePtrBytesAux, normPtrByteOffset,
+        List.drop, List.take, List.cons_append, List.nil_append,
+        trEntries, trEntriesAux, fragOf, mkFrag, Nat.reduceAdd, Nat.reducePow, Nat.reduceMod]
+       lm_trread; lm_open; lm_close)
+  · refine ⟨_, _, lQ.take 1 ++ lQ256.drop 1, rfl, rfl, rfl, rfl, rfl, ?_, ?_⟩ <;>
+      (simp only [lQ, lQ256, encodePtrBytes, encodePtrBytesAux, normPtrByteOffset,
+        List.drop, List.take, List.cons_append, List.nil_append,
+        trEntries, trEntriesAux, fragOf, mkFrag, Nat.reduceAdd, Nat.reducePow, Nat.reduceMod]
+       lm_trread; lm_open; lm_close)
+
+/-- **Non-vacuous B3 instantiations across ALL THREE CTFE branches and BOTH runtime branches at
+nonzero base offsets (`base = 16` for 8B, `base = 4` for 4B), PLUS concrete instantiations of
+`prepareCopy_applyCopy_splice_{8,4}_symbolic` and `clear_partial_mid_strips_8_at` (`base = 16`).** -/
+theorem ep2_b3_non_vacuity_instances :
+    (((∃ f, abstractBytesCoherentPtrProv? lP = some f) ↔ ∃ p, trRead (trEntriesAt pvCt 16 lP) 16 8 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? lP = none ∧ abstractBytesHaveProv lP = true) ↔
+       trRead (trEntriesAt pvCt 16 lP) 16 8 = .error (.readPartialPointer (Size.ofBytes 16))) ∧
+     ((abstractBytesCoherentPtrProv? lP = none ∧ abstractBytesHaveProv lP = false) ↔
+       trRead (trEntriesAt pvCt 16 lP) 16 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? (lP.take 1 ++ lP256.drop 1) = some f) ↔
+       ∃ p, trRead (trEntriesAt pvCt 16 (lP.take 1 ++ lP256.drop 1)) 16 8 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? (lP.take 1 ++ lP256.drop 1) = none ∧
+         abstractBytesHaveProv (lP.take 1 ++ lP256.drop 1) = true) ↔
+       trRead (trEntriesAt pvCt 16 (lP.take 1 ++ lP256.drop 1)) 16 8 = .error (.readPartialPointer (Size.ofBytes 16))) ∧
+     ((abstractBytesCoherentPtrProv? (lP.take 1 ++ lP256.drop 1) = none ∧
+         abstractBytesHaveProv (lP.take 1 ++ lP256.drop 1) = false) ↔
+       trRead (trEntriesAt pvCt 16 (lP.take 1 ++ lP256.drop 1)) 16 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = some f) ↔
+       ∃ p, trRead (trEntriesAt pvCt 16 (encodePlainLittleEndianBytes 0x1000 8)) 16 8 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = none ∧
+         abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 8) = true) ↔
+       trRead (trEntriesAt pvCt 16 (encodePlainLittleEndianBytes 0x1000 8)) 16 8 = .error (.readPartialPointer (Size.ofBytes 16))) ∧
+     ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = none ∧
+         abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 8) = false) ↔
+       trRead (trEntriesAt pvCt 16 (encodePlainLittleEndianBytes 0x1000 8)) 16 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? lQ = some f) ↔ ∃ p, trRead (trEntriesAt pvCt 4 lQ) 4 4 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? lQ = none ∧ abstractBytesHaveProv lQ = true) ↔
+       trRead (trEntriesAt pvCt 4 lQ) 4 4 = .error (.readPartialPointer (Size.ofBytes 4))) ∧
+     ((abstractBytesCoherentPtrProv? lQ = none ∧ abstractBytesHaveProv lQ = false) ↔
+       trRead (trEntriesAt pvCt 4 lQ) 4 4 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? (lQ.take 1 ++ lQ256.drop 1) = some f) ↔
+       ∃ p, trRead (trEntriesAt pvCt 4 (lQ.take 1 ++ lQ256.drop 1)) 4 4 = .ok (some p)) ∧
+     ((abstractBytesCoherentPtrProv? (lQ.take 1 ++ lQ256.drop 1) = none ∧
+         abstractBytesHaveProv (lQ.take 1 ++ lQ256.drop 1) = true) ↔
+       trRead (trEntriesAt pvCt 4 (lQ.take 1 ++ lQ256.drop 1)) 4 4 = .error (.readPartialPointer (Size.ofBytes 4))) ∧
+     ((abstractBytesCoherentPtrProv? (lQ.take 1 ++ lQ256.drop 1) = none ∧
+         abstractBytesHaveProv (lQ.take 1 ++ lQ256.drop 1) = false) ↔
+       trRead (trEntriesAt pvCt 4 (lQ.take 1 ++ lQ256.drop 1)) 4 4 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? lP = some f) ↔ ∃ p, trRead (trEntriesAt pvRt 16 lP) 16 8 = .ok (some p)) ∧
+     (abstractBytesCoherentPtrProv? lP = none ↔ trRead (trEntriesAt pvRt 16 lP) 16 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? lQ.reverse = some f) ↔ ∃ p, trRead (trEntriesAt pvRt 4 lQ.reverse) 4 4 = .ok (some p)) ∧
+     (abstractBytesCoherentPtrProv? lQ.reverse = none ↔ trRead (trEntriesAt pvRt 4 lQ.reverse) 4 4 = .ok none)) ∧
+    (∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, pvRt 7 7), (Size.ofBytes 8, pvRt 7 7)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩
+        #[0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0, 0, 0, 0, 0, 0] (Size.ofBytes 8) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 9, Size.ofBytes 7⟩
+        #[0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0, 0, 0, 0, 0, 0] (Size.ofBytes 8) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 7⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 8) = .ok none) ∧
+    (∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, pvCt 9 9), (Size.ofBytes 4, pvCt 9 9)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ #[0x00, 0x10, 0, 0, 0x00, 0x11, 0, 0] (Size.ofBytes 4) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 5, Size.ofBytes 3⟩ #[0x00, 0x10, 0, 0, 0x00, 0x11, 0, 0] (Size.ofBytes 4) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 3⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 4) = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    (∃ pm pm',
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 16, pvCt 7 7)] = .ok pm ∧
+      ProvenanceMap.clear ⟨Size.ofBytes 17, Size.ofBytes 1⟩ (Array.replicate 24 0) (Size.ofBytes 8) pm = .ok () pm' ∧
+      pm'.ptrs = #[] ∧
+      pm'.readPtr (Size.ofBytes 16) (Size.ofBytes 8) = .error (.readPartialPointer (Size.ofBytes 16))) := by
+  have hwfP : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), lP[i]? = some (.init v (some f)) → WF 8 f := by
+    intro i v f hi; obtain ⟨_, _, hv, _, hwf⟩ := encodePtrBytes_wf 0x1000 8 7 7 i _ hi
+    injection hv with _ h; injection h with h; subst h; exact hwf
+  have hnwPRt : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), lP[i]? = some (.init v (some f)) →
+      ¬ some (pvRt f.allocId f.tag) = PointerProvenance.wildcard := by
+    intro i v f hi; obtain ⟨_, _, hv, hf, _⟩ := encodePtrBytes_wf 0x1000 8 7 7 i _ hi
+    injection hv with _ h; injection h with h; subst h; subst hf
+    exact pvRt_ne_wildcard 7 7 (by decide) (by decide)
+  have hinjP : ∀ {Prov : Type} (pv : Nat → Nat → Prov) (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      lP[i]? = some (.init vi (some fi)) → lP[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag := by
+    intro Prov pv i j vi vj fi fj hi hj _
+    obtain ⟨_, _, hvi, hfi, _⟩ := encodePtrBytes_wf 0x1000 8 7 7 i _ hi
+    obtain ⟨_, _, hvj, hfj, _⟩ := encodePtrBytes_wf 0x1000 8 7 7 j _ hj
+    injection hvi with _ hi'; injection hi' with hi'; subst hi'; subst hfi
+    injection hvj with _ hj'; injection hj' with hj'; subst hj'; subst hfj
+    exact ⟨rfl, rfl⟩
+  have hwfQ : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), lQ[i]? = some (.init v (some f)) → WF 4 f := by
+    intro i v f hi; obtain ⟨_, _, hv, _, hwf⟩ := encodePtrBytes_wf 0x1000 4 9 9 i _ hi
+    injection hv with _ h; injection h with h; subst h; exact hwf
+  have hinjQ : ∀ {Prov : Type} (pv : Nat → Nat → Prov) (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      lQ[i]? = some (.init vi (some fi)) → lQ[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag := by
+    intro Prov pv i j vi vj fi fj hi hj _
+    obtain ⟨_, _, hvi, hfi, _⟩ := encodePtrBytes_wf 0x1000 4 9 9 i _ hi
+    obtain ⟨_, _, hvj, hfj, _⟩ := encodePtrBytes_wf 0x1000 4 9 9 j _ hj
+    injection hvi with _ hi'; injection hi' with hi'; subst hi'; subst hfi
+    injection hvj with _ hj'; injection hj' with hj'; subst hj'; subst hfj
+    exact ⟨rfl, rfl⟩
+  have hwfSpl8 : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag),
+      (lP.take 1 ++ lP256.drop 1)[i]? = some (.init v (some f)) → WF 8 f := by
+    intro i v f hi
+    match i, hi with
+    | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h =>
+      injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, by decide, by decide⟩
+    | _ + 8, h => cases h
+  have hinjSpl8 : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      (lP.take 1 ++ lP256.drop 1)[i]? = some (.init vi (some fi)) →
+      (lP.take 1 ++ lP256.drop 1)[j]? = some (.init vj (some fj)) →
+      pvCt fi.allocId fi.tag = pvCt fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag := by
+    intro i j vi vj fi fj hi hj _
+    have hi' : fi.allocId = 7 ∧ fi.tag = 7 := by
+      match i, hi with
+      | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h =>
+        injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+      | _ + 8, h => cases h
+    have hj' : fj.allocId = 7 ∧ fj.tag = 7 := by
+      match j, hj with
+      | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h =>
+        injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+      | _ + 8, h => cases h
+    exact ⟨hi'.1.trans hj'.1.symm, hi'.2.trans hj'.2.symm⟩
+  have hwfSpl4 : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag),
+      (lQ.take 1 ++ lQ256.drop 1)[i]? = some (.init v (some f)) → WF 4 f := by
+    intro i v f hi
+    match i, hi with
+    | 0, h | 1, h | 2, h | 3, h =>
+      injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, by decide, by decide⟩
+    | _ + 4, h => cases h
+  have hinjSpl4 : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      (lQ.take 1 ++ lQ256.drop 1)[i]? = some (.init vi (some fi)) →
+      (lQ.take 1 ++ lQ256.drop 1)[j]? = some (.init vj (some fj)) →
+      pvCt fi.allocId fi.tag = pvCt fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag := by
+    intro i j vi vj fi fj hi hj _
+    have hi' : fi.allocId = 9 ∧ fi.tag = 9 := by
+      match i, hi with
+      | 0, h | 1, h | 2, h | 3, h =>
+        injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+      | _ + 4, h => cases h
+    have hj' : fj.allocId = 9 ∧ fj.tag = 9 := by
+      match j, hj with
+      | 0, h | 1, h | 2, h | 3, h =>
+        injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+      | _ + 4, h => cases h
+    exact ⟨hi'.1.trans hj'.1.symm, hi'.2.trans hj'.2.symm⟩
+  obtain ⟨pm, pm', hpm, hcl, hptrs, _, hread⟩ :=
+    clear_partial_mid_strips_8_at 16 (by decide) (pvCt 7 7) (Array.replicate 24 0) (by decide)
+  refine ⟨
+    readPtr8_allBytes_at_ctfe_iff pvCt rfl 16 (by decide) lP rfl hwfP (fun _ _ _ _ hw => by cases hw) (hinjP pvCt),
+    readPtr8_allBytes_at_ctfe_iff pvCt rfl 16 (by decide) (lP.take 1 ++ lP256.drop 1) rfl hwfSpl8 (fun _ _ _ _ hw => by cases hw) hinjSpl8,
+    readPtr8_allBytes_at_ctfe_iff pvCt rfl 16 (by decide) (encodePlainLittleEndianBytes 0x1000 8) rfl
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h)
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h)
+      (by intro i _ _ _ _ _ hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h),
+    readPtr4_allBytes_at_ctfe_iff pvCt rfl 4 (by decide) lQ rfl hwfQ (fun _ _ _ _ hw => by cases hw) (hinjQ pvCt),
+    readPtr4_allBytes_at_ctfe_iff pvCt rfl 4 (by decide) (lQ.take 1 ++ lQ256.drop 1) rfl hwfSpl4 (fun _ _ _ _ hw => by cases hw) hinjSpl4,
+    readPtr8_allBytes_at_runtime_iff pvRt rfl 16 (by decide) lP rfl hwfP hnwPRt (hinjP pvRt),
+    readPtr4_allBytes_at_runtime_iff pvRt rfl 4 (by decide) lQ.reverse rfl
+      (by intro i v f hi; match i, hi with
+        | 0, h | 1, h | 2, h | 3, h => injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, by decide, by decide⟩
+        | _ + 4, h => cases h)
+      (by intro i v f hi; match i, hi with
+        | 0, h | 1, h | 2, h | 3, h => injection h with h; injection h with _ h; injection h with h; subst h; decide
+        | _ + 4, h => cases h)
+      (by intro i j vi vj fi fj hi hj _
+          have hi' : fi.allocId = 9 ∧ fi.tag = 9 := by
+            match i, hi with
+            | 0, h | 1, h | 2, h | 3, h => injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+            | _ + 4, h => cases h
+          have hj' : fj.allocId = 9 ∧ fj.tag = 9 := by
+            match j, hj with
+            | 0, h | 1, h | 2, h | 3, h => injection h with h; injection h with _ h; injection h with h; subst h; exact ⟨rfl, rfl⟩
+            | _ + 4, h => cases h
+          exact ⟨hi'.1.trans hj'.1.symm, hi'.2.trans hj'.2.symm⟩),
+    prepareCopy_applyCopy_splice_8_symbolic (pvRt 7 7) (pvRt_ne_wildcard 7 7 (by decide) (by decide))
+      #[0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0x11, 0, 0, 0, 0, 0, 0] rfl ⟨⟨1, by decide⟩, by decide⟩,
+    prepareCopy_applyCopy_splice_4_symbolic (pvCt 9 9) (fun hw => by cases hw)
+      #[0x00, 0x10, 0, 0, 0x00, 0x11, 0, 0] rfl ⟨⟨1, by decide⟩, by decide⟩,
+    ⟨pm, pm', hpm, hcl, hptrs, hread⟩⟩
+
 end WideAndKani
 
 /-- Non-vacuous instantiations of `readPtr8_allBytes_ctfe_iff` and `readPtr4_allBytes_ctfe_iff`
@@ -8355,6 +9522,157 @@ theorem lm_lockstep_parity_at_instance :
       trRead (V06.trEntriesAt pvRt 16 V06.lP) 16 8 :=
   lm_lockstep_parity_at pvRt 16 V06.lP 16 8
 
+/-- Identity translation of `ProvenancePtr` from `V2026_06_01` to `V2026_08_01`. -/
+def ptr68 (p : Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr) :
+    Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr :=
+  ⟨p.allocId, p.offsetBytes⟩
+
+/-- Identity translation of `Mutability` from `V2026_06_01` to `V2026_08_01`. -/
+def mut68 : Trusted.Rustc.V2026_06_01.MirAst.Mutability →
+    Trusted.Rustc.V2026_08_01.MirAst.Mutability
+  | .not => .not
+  | .mut => .mut
+
+/-- Identity translation of `CapturedAllocation` from `V2026_06_01` to `V2026_08_01`. -/
+def alloc68 (a : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation) :
+    Trusted.Rustc.V2026_08_01.MirAst.CapturedAllocation :=
+  { allocId := a.allocId, bytes := a.bytes,
+    relocations := a.relocations.map (fun (o, p) => (o, ptr68 p)),
+    align := ⟨a.align.bytes⟩, mutability := mut68 a.mutability }
+
+theorem scalarModulus_parity :
+    ∀ n : Nat, Trusted.Rustc.V2026_08_01.MirSemantics.scalarModulus n =
+      Trusted.Rustc.V2026_06_01.MirSemantics.scalarModulus n
+  | 0 => rfl
+  | n + 1 => congrArg (Nat.mul 256) (scalarModulus_parity n)
+
+theorem lookupRelocEntry_parity
+    (relocs : List (Nat × Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr))
+    (off pb : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.lookupRelocEntry
+        (relocs.map (fun (o, p) => (o, ptr68 p))) off pb =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocEntry relocs off pb).map
+        (fun (o, p) => (o, ptr68 p)) := by
+  induction relocs with
+  | nil => rfl
+  | cons hd tl ih =>
+    rcases hd with ⟨ro, tp⟩
+    unfold Trusted.Rustc.V2026_08_01.MirSemantics.lookupRelocEntry
+      Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocEntry
+    dsimp only [List.map]
+    cases Bool.and (Nat.ble ro off) (Bool.not (Nat.ble (Nat.add ro pb) off)) with
+    | true => rfl
+    | false => exact ih
+
+theorem readGlobalRelocOrigOffset_parity (bytes : List (Option UInt8)) (relocOff pb : Nat)
+    (tp : Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.readGlobalRelocOrigOffset bytes relocOff pb (ptr68 tp) =
+      Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset bytes relocOff pb tp := by
+  have hread : ∀ (rem off : Nat),
+      Trusted.Rustc.V2026_08_01.MirSemantics.readGlobalRelocOrigOffset.readLe bytes off rem =
+        Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset.readLe bytes off rem := by
+    intro rem
+    induction rem with
+    | zero => intro _; rfl
+    | succ r ih =>
+      intro off
+      unfold Trusted.Rustc.V2026_08_01.MirSemantics.readGlobalRelocOrigOffset.readLe
+        Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset.readLe
+      cases Trusted.Sequence.get? bytes off with
+      | none => rfl
+      | some ob =>
+        cases ob with
+        | none => rfl
+        | some b =>
+          dsimp only
+          rw [ih (Nat.add off 1)]
+          cases Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset.readLe bytes (Nat.add off 1) r <;> rfl
+  unfold Trusted.Rustc.V2026_08_01.MirSemantics.readGlobalRelocOrigOffset
+    Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset
+  rw [hread pb relocOff]
+  have hnorm : ∀ x, Trusted.Rustc.V2026_08_01.MirSemantics.normPtrByteOffset pb x =
+      Trusted.Rustc.V2026_06_01.MirSemantics.normPtrByteOffset pb x := by
+    intro x
+    unfold Trusted.Rustc.V2026_08_01.MirSemantics.normPtrByteOffset
+      Trusted.Rustc.V2026_06_01.MirSemantics.normPtrByteOffset
+    rw [scalarModulus_parity]
+  cases Trusted.Rustc.V2026_06_01.MirSemantics.readGlobalRelocOrigOffset.readLe bytes relocOff pb with
+  | some bits => exact hnorm bits
+  | none => exact hnorm tp.offsetBytes
+
+theorem globalAllocBytesAux_parity (bytes : List (Option UInt8))
+    (relocs : List (Nat × Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr)) (pb : Nat) :
+    ∀ (rem off : Nat),
+      Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocBytesAux bytes
+          (relocs.map (fun (o, p) => (o, ptr68 p))) off rem pb =
+        (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux bytes relocs off rem pb).map
+          (List.map byte68)
+  | 0, _ => rfl
+  | rem + 1, off => by
+    unfold Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocBytesAux
+      Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux
+    cases Trusted.Sequence.get? bytes off with
+    | none => rfl
+    | some ob =>
+      rw [globalAllocBytesAux_parity bytes relocs pb rem (Nat.add off 1)]
+      cases Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocBytesAux bytes relocs (Nat.add off 1) rem pb with
+      | none => rfl
+      | some rest =>
+        cases ob with
+        | none => rfl
+        | some b =>
+          rw [lookupRelocEntry_parity relocs off pb]
+          cases Nat.blt 0 pb with
+          | false => rfl
+          | true =>
+            cases Trusted.Rustc.V2026_06_01.MirSemantics.lookupRelocEntry relocs off pb with
+            | none => rfl
+            | some pair =>
+              rcases pair with ⟨ro, tp⟩
+              dsimp only [Option.map]
+              rw [readGlobalRelocOrigOffset_parity bytes ro pb tp]
+              rfl
+
+/-- **`V2026_06_01 ↔ V2026_08_01` lockstep parity for `body.globals` slice extraction and vendored
+`ProvenanceMap.readPtr` at every base offset.** -/
+theorem globalAlloc_parity {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (base : Nat)
+    (alloc : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation)
+    (off len pb : Nat) (rdOff rdLen : UInt64) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes (alloc68 alloc) off len pb =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc off len pb).map
+        (List.map byte68) ∧
+    (∀ bs, Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc off len pb = some bs →
+      V08.trEntriesAt pv base (bs.map byte68) = V06.trEntriesAt pv base bs ∧
+      trRead (V08.trEntriesAt pv base (bs.map byte68)) rdOff rdLen =
+        trRead (V06.trEntriesAt pv base bs) rdOff rdLen) := by
+  refine ⟨?_, ?_⟩
+  · unfold Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes
+      Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc68
+    dsimp only
+    cases Nat.ble off (Trusted.Sequence.length alloc.bytes) with
+    | false => rfl
+    | true => exact globalAllocBytesAux_parity alloc.bytes alloc.relocations pb len off
+  · intro bs _
+    exact lm_lockstep_parity_at pv base bs rdOff rdLen
+
+/-- Non-vacuous instantiation of `globalAlloc_parity` at `base = 16` (64-bit) and `base = 4` (32-bit). -/
+theorem globalAlloc_parity_instance :
+    let alloc8 : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation :=
+      { allocId := 50, bytes := V06.leOptBytes 0x1000 8,
+        relocations := [(0, { allocId := 7, offsetBytes := 0x1000 })],
+        align := ⟨8⟩, mutability := .not }
+    let alloc4 : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation :=
+      { allocId := 51, bytes := V06.leOptBytes 0x1000 4,
+        relocations := [(0, { allocId := 9, offsetBytes := 0x1000 })],
+        align := ⟨4⟩, mutability := .not }
+    Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes (alloc68 alloc8) 0 8 8 =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc8 0 8 8).map (List.map byte68) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes (alloc68 alloc4) 0 4 4 =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc4 0 4 4).map (List.map byte68) :=
+  ⟨(globalAlloc_parity pvRt 16 _ 0 8 8 16 8).1,
+   (globalAlloc_parity pvCt 4 _ 0 4 4 4 4).1⟩
+
 end Parity
 
 /-! ## Axiom, import-isolation, and non-triviality audit -/
@@ -8406,6 +9724,8 @@ elab "#assert_ptr_byte_coherence_lm_audit" : command => do
     "readPtr4_allBytes_runtime_corr", "readPtr4_allBytes_ctfe_corr",
     "readPtr8_allBytes_at_runtime_corr", "readPtr8_allBytes_at_ctfe_corr",
     "readPtr4_allBytes_at_runtime_corr", "readPtr4_allBytes_at_ctfe_corr",
+    "readPtr8_allBytes_at_runtime_iff", "readPtr8_allBytes_at_ctfe_iff",
+    "readPtr4_allBytes_at_runtime_iff", "readPtr4_allBytes_at_ctfe_iff",
     "readPtr8_allBytes_runtime_iff", "readPtr4_allBytes_runtime_iff",
     "readPtr8_allBytes_ctfe_iff", "readPtr4_allBytes_ctfe_iff", "readPtr_allBytes_ctfe_iff_instance",
     "intact_roundtrip_8", "intact_roundtrip_4",
@@ -8413,19 +9733,22 @@ elab "#assert_ptr_byte_coherence_lm_audit" : command => do
     "w_lm_wide_slice_and_str", "w_lm_wide_dyn",
     "kani5205_bool_validity_iff", "kani5205_char_validity_iff", "w_lm_kani5205_e2e",
     "globalAlloc_reloc_correspondence_8", "globalAlloc_reloc_correspondence_4",
-    "w_lm_global_reloc_and_copyMemory",
+    "w_lm_global_reloc_and_copyMemory", "w_lm_copyMemory_32",
     "w_lm_intact", "w_lm_zero_reversal", "w_lm_reversal", "w_lm_swap01", "w_lm_dup_head",
     "w_lm_rotate", "w_lm_splice_p_p4", "w_lm_splice_p_p256", "w_lm_mixed_alloc", "w_lm_intact32",
     "w_lm_reversal32", "w_lm_splice32_q_q256", "w_lm_missing_and_uninit", "w_lm_kani5205_trusted",
-    "normOffset_image_inj_instance", "ep2_b1_non_vacuity_instances", "ep2_b2_iff_non_vacuity_instances" ]
+    "normOffset_image_inj_instance", "ep2_b1_non_vacuity_instances", "ep2_b2_iff_non_vacuity_instances",
+    "ep2_b3_non_vacuity_instances" ]
   let shared : List Lean.Name := [
     ``ptrImage_inj, ``readPtr8_runtime, ``readPtr8_ctfe, ``readPtr4_runtime, ``readPtr4_ctfe,
     ``readPtr8_shifted_runtime, ``readPtr8_shifted_ctfe, ``readPtr4_shifted_runtime, ``readPtr4_shifted_ctfe,
     ``mem_qsort, ``pvRt_inj, ``pvRt_ne_wildcard,
     ``clear_partial_mid_strips_8, ``clear_partial_mid_strips_4, ``clear_partial_7bytes_strips_8,
+    ``clear_partial_mid_strips_8_at,
     ``prepareCopy_applyCopy_intact_8, ``prepareCopy_applyCopy_splice_p_p256,
     ``prepareCopy_applyCopy_intact_8_symbolic, ``prepareCopy_applyCopy_intact_4_symbolic,
     ``prepareCopy_applyCopy_splice_q_q256_4,
+    ``prepareCopy_applyCopy_splice_8_symbolic, ``prepareCopy_applyCopy_splice_4_symbolic,
     ``trRead_empty, ``trRead_empty_at, ``readPtr_missing_byte_strips, ``readPtr_missing_byte_strips_at,
     ``readPtr4_missing_byte_strips, ``readPtr8_missing_byte_strips,
     ``w_lm_ctfe_tag_blind, ``miri_checkPrimitive_bool_iff, ``miri_checkPrimitive_char_iff,
@@ -8433,7 +9756,8 @@ elab "#assert_ptr_byte_coherence_lm_audit" : command => do
     ``w_lm_missing_miri_rt, ``w_lm_missing_miri_ct, ``w_lm_misaligned, ``w_lm_wildcard,
     ``w_lm_kani5205_miri, ``pm_w1_whole_pointer_path_only, ``coherent_parity,
     ``lm_lockstep_parity, ``lm_lockstep_parity_instance,
-    ``lm_lockstep_parity_at, ``lm_lockstep_parity_at_instance ]
+    ``lm_lockstep_parity_at, ``lm_lockstep_parity_at_instance,
+    ``globalAlloc_parity, ``globalAlloc_parity_instance ]
   let mut headline : Nat := 0
   for dialect in ["V06", "V08"] do
     for name in perDialect do

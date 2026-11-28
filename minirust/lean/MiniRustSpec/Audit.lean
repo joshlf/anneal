@@ -19235,6 +19235,9 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.lockstep_parity
   MiniRustSpec.PtrByteCoherenceMR.w_lockstep_parity
   MiniRustSpec.PtrByteCoherenceMR.lockstep_parity_instance
+  MiniRustSpec.PtrByteCoherenceMR.globalAlloc_parity
+  MiniRustSpec.PtrByteCoherenceMR.kani5205_char_parity
+  MiniRustSpec.PtrByteCoherenceMR.ep2_b3_parity_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent?_eq_some_iff
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement
   MiniRustSpec.PtrByteCoherenceMR.V06.trusted_coherent_implies_minirust_retains
@@ -19298,6 +19301,7 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.kani5205_char_correspondence_M
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_char_enum_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.globalAlloc_reloc_correspondence_M
+  MiniRustSpec.PtrByteCoherenceMR.V06.globalAlloc_misaligned_reloc_strips_M
   MiniRustSpec.PtrByteCoherenceMR.V06.w_mr_global_reloc_and_copyMemory
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement_instance
@@ -19308,6 +19312,7 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.wide_and_bool_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.ep2_b1_mr_non_vacuity_instances
   MiniRustSpec.PtrByteCoherenceMR.V06.ep2_b2_mr_non_vacuity_instances
+  MiniRustSpec.PtrByteCoherenceMR.V06.ep2_b3_mr_non_vacuity_instances
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent?_eq_some_iff
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement
   MiniRustSpec.PtrByteCoherenceMR.V08.trusted_coherent_implies_minirust_retains
@@ -19371,6 +19376,7 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.kani5205_char_correspondence_M
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_char_enum_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.globalAlloc_reloc_correspondence_M
+  MiniRustSpec.PtrByteCoherenceMR.V08.globalAlloc_misaligned_reloc_strips_M
   MiniRustSpec.PtrByteCoherenceMR.V08.w_mr_global_reloc_and_copyMemory
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement_instance
@@ -19381,6 +19387,7 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.wide_and_bool_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.ep2_b1_mr_non_vacuity_instances
   MiniRustSpec.PtrByteCoherenceMR.V08.ep2_b2_mr_non_vacuity_instances
+  MiniRustSpec.PtrByteCoherenceMR.V08.ep2_b3_mr_non_vacuity_instances
 
 #check_theorem_deps "[PTR-BYTE-COHERENCE-AUDIT]"
   MiniRustSpec.PtrByteCoherenceMR.mrProvM_eq_some_iff
@@ -19416,6 +19423,9 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.lockstep_parity
   MiniRustSpec.PtrByteCoherenceMR.w_lockstep_parity
   MiniRustSpec.PtrByteCoherenceMR.lockstep_parity_instance
+  MiniRustSpec.PtrByteCoherenceMR.globalAlloc_parity
+  MiniRustSpec.PtrByteCoherenceMR.kani5205_char_parity
+  MiniRustSpec.PtrByteCoherenceMR.ep2_b3_parity_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent?_eq_some_iff
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement
   MiniRustSpec.PtrByteCoherenceMR.V06.trusted_coherent_implies_minirust_retains
@@ -19479,6 +19489,7 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.kani5205_char_correspondence_M
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_char_enum_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.globalAlloc_reloc_correspondence_M
+  MiniRustSpec.PtrByteCoherenceMR.V06.globalAlloc_misaligned_reloc_strips_M
   MiniRustSpec.PtrByteCoherenceMR.V06.w_mr_global_reloc_and_copyMemory
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement_instance
@@ -19489,6 +19500,7 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.wide_and_bool_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.ep2_b1_mr_non_vacuity_instances
   MiniRustSpec.PtrByteCoherenceMR.V06.ep2_b2_mr_non_vacuity_instances
+  MiniRustSpec.PtrByteCoherenceMR.V06.ep2_b3_mr_non_vacuity_instances
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent?_eq_some_iff
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement
   MiniRustSpec.PtrByteCoherenceMR.V08.trusted_coherent_implies_minirust_retains
@@ -19552,6 +19564,7 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.kani5205_char_correspondence_M
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_char_enum_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.globalAlloc_reloc_correspondence_M
+  MiniRustSpec.PtrByteCoherenceMR.V08.globalAlloc_misaligned_reloc_strips_M
   MiniRustSpec.PtrByteCoherenceMR.V08.w_mr_global_reloc_and_copyMemory
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement_instance
@@ -19562,6 +19575,7 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.wide_and_bool_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.ep2_b1_mr_non_vacuity_instances
   MiniRustSpec.PtrByteCoherenceMR.V08.ep2_b2_mr_non_vacuity_instances
+  MiniRustSpec.PtrByteCoherenceMR.V08.ep2_b3_mr_non_vacuity_instances
 
 -- Explicit statement-type pins for key MiniRustSpec.PtrByteCoherenceMR theorems
 -- (matching LeanMiriSpec/Audit.lean statement-pin rigor across V06 & V08):
@@ -19625,6 +19639,123 @@ example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
       MiniRustSpec.PtrByteCoherenceMR.mrProvM M
         (MiniRustSpec.PtrByteCoherenceMR.V06.projBytes pv bs) :=
   MiniRustSpec.PtrByteCoherenceMR.lockstep_parity (M := M) pv isRef pb bs
+
+example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
+    (pv : Nat → Nat → MiniRustSpec.Gen.Memory.Provenance M)
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte)
+    (f : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag) (isRef : Bool) (hlen : bs.length = 8)
+    (h : Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? bs = some f)
+    (hw : f.ptrBytes = 8) :
+    ∃ data, MiniRustSpec.PtrByteCoherenceMR.V06.trData bs = some data ∧
+      MiniRustSpec.PtrByteCoherenceMR.V06.thinDecode isRef 8 bs =
+        some (.ptr { allocId := f.allocId, offsetBytes := MiniRustSpec.Interp.leValue data } 8) ∧
+      MiniRustSpec.Interp.decodePtrM (M := M) (MiniRustSpec.PtrByteCoherenceMR.V06.projBytes pv bs) =
+        .ok (some { addr := ((MiniRustSpec.Interp.leValue data : Nat) : Int),
+                    provenance := some (pv f.allocId f.tag) }) :=
+  MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement (M := M) pv bs f isRef hlen h hw
+
+example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
+    (pv : Nat → Nat → MiniRustSpec.Gen.Memory.Provenance M)
+    (bs : List Trusted.Rustc.V2026_08_01.MirSemantics.AbstractByte)
+    (f : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag) (isRef : Bool) (hlen : bs.length = 8)
+    (h : Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? bs = some f)
+    (hw : f.ptrBytes = 8) :
+    ∃ data, MiniRustSpec.PtrByteCoherenceMR.V08.trData bs = some data ∧
+      MiniRustSpec.PtrByteCoherenceMR.V08.thinDecode isRef 8 bs =
+        some (.ptr { allocId := f.allocId, offsetBytes := MiniRustSpec.Interp.leValue data } 8) ∧
+      MiniRustSpec.Interp.decodePtrM (M := M) (MiniRustSpec.PtrByteCoherenceMR.V08.projBytes pv bs) =
+        .ok (some { addr := ((MiniRustSpec.Interp.leValue data : Nat) : Int),
+                    provenance := some (pv f.allocId f.tag) }) :=
+  MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement (M := M) pv bs f isRef hlen h hw
+
+example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
+    (pv : Nat → Nat → MiniRustSpec.Gen.Memory.Provenance M)
+    (hinj : ∀ a t a' t', pv a t = pv a' t' → a = a' ∧ t = t')
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte)
+    (p : MiniRustSpec.Gen.Memory.Provenance M)
+    (hmr : MiniRustSpec.PtrByteCoherenceMR.mrProvM M (MiniRustSpec.PtrByteCoherenceMR.V06.projBytes pv bs) = some p) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? bs = none ↔
+      ∃ (i j : Nat) (vi vj : UInt8) (fi fj : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+        bs[i]? = some (.init vi (some fi)) ∧ bs[j]? = some (.init vj (some fj)) ∧
+        (fi.origOffset ≠ fj.origOffset ∨ fi.ptrBytes ≠ fj.ptrBytes ∨ fi.ptrBytes ≠ bs.length) :=
+  MiniRustSpec.PtrByteCoherenceMR.V06.converse_gap_iff (M := M) pv hinj bs p hmr
+
+example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
+    (pv : Nat → Nat → MiniRustSpec.Gen.Memory.Provenance M)
+    (hinj : ∀ a t a' t', pv a t = pv a' t' → a = a' ∧ t = t')
+    (bs : List Trusted.Rustc.V2026_08_01.MirSemantics.AbstractByte)
+    (p : MiniRustSpec.Gen.Memory.Provenance M)
+    (hmr : MiniRustSpec.PtrByteCoherenceMR.mrProvM M (MiniRustSpec.PtrByteCoherenceMR.V08.projBytes pv bs) = some p) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? bs = none ↔
+      ∃ (i j : Nat) (vi vj : UInt8) (fi fj : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+        bs[i]? = some (.init vi (some fi)) ∧ bs[j]? = some (.init vj (some fj)) ∧
+        (fi.origOffset ≠ fj.origOffset ∨ fi.ptrBytes ≠ fj.ptrBytes ∨ fi.ptrBytes ≠ bs.length) :=
+  MiniRustSpec.PtrByteCoherenceMR.V08.converse_gap_iff (M := M) pv hinj bs p hmr
+
+example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
+    (pv : Nat → Nat → MiniRustSpec.Gen.Memory.Provenance M)
+    (gId : Nat) (al : Trusted.Rustc.V2026_06_01.Layout.Align)
+    (mutbl : Trusted.Rustc.V2026_06_01.MirAst.Mutability)
+    (targetPtr : Trusted.Rustc.V2026_06_01.MirAst.ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 64) :
+    let alloc : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation :=
+      { allocId := gId, bytes := MiniRustSpec.PtrByteCoherenceMR.V06.leOptBytes addr 8,
+        relocations := [(0, targetPtr)], align := al, mutability := mutbl }
+    let bs := Trusted.Rustc.V2026_06_01.MirSemantics.encodePtrBytes addr 8 targetPtr.allocId targetPtr.tag
+    Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs ∧
+    MiniRustSpec.Interp.encodePtrM (M := M) ⟨(addr : Int), some (pv targetPtr.allocId targetPtr.tag)⟩ =
+      .ok (MiniRustSpec.PtrByteCoherenceMR.V06.projBytes pv bs) ∧
+    MiniRustSpec.Interp.decodePtrM (M := M) (MiniRustSpec.PtrByteCoherenceMR.V06.projBytes pv bs) =
+      .ok (some ⟨(addr : Int), some (pv targetPtr.allocId targetPtr.tag)⟩) ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] alloc 0 8 []
+        MiniRustSpec.PtrByteCoherenceMR.V06.wLayouts (some MiniRustSpec.PtrByteCoherenceMR.V06.wTyRawPtrU8) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] alloc 0 8 []
+        MiniRustSpec.PtrByteCoherenceMR.V06.wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead [] alloc 0 8 []
+        MiniRustSpec.PtrByteCoherenceMR.V06.wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub :=
+  MiniRustSpec.PtrByteCoherenceMR.V06.globalAlloc_reloc_correspondence_M (M := M) pv gId al mutbl targetPtr addr haddr
+
+example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
+    (pv : Nat → Nat → MiniRustSpec.Gen.Memory.Provenance M)
+    (gId : Nat) (al : Trusted.Rustc.V2026_08_01.Layout.Align)
+    (mutbl : Trusted.Rustc.V2026_08_01.MirAst.Mutability)
+    (targetPtr : Trusted.Rustc.V2026_08_01.MirAst.ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 64) :
+    let alloc : Trusted.Rustc.V2026_08_01.MirAst.CapturedAllocation :=
+      { allocId := gId, bytes := MiniRustSpec.PtrByteCoherenceMR.V08.leOptBytes addr 8,
+        relocations := [(0, targetPtr)], align := al, mutability := mutbl }
+    let bs := Trusted.Rustc.V2026_08_01.MirSemantics.encodePtrBytes addr 8 targetPtr.allocId targetPtr.tag
+    Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs ∧
+    MiniRustSpec.Interp.encodePtrM (M := M) ⟨(addr : Int), some (pv targetPtr.allocId targetPtr.tag)⟩ =
+      .ok (MiniRustSpec.PtrByteCoherenceMR.V08.projBytes pv bs) ∧
+    MiniRustSpec.Interp.decodePtrM (M := M) (MiniRustSpec.PtrByteCoherenceMR.V08.projBytes pv bs) =
+      .ok (some ⟨(addr : Int), some (pv targetPtr.allocId targetPtr.tag)⟩) ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] alloc 0 8 []
+        MiniRustSpec.PtrByteCoherenceMR.V08.wLayouts (some MiniRustSpec.PtrByteCoherenceMR.V08.wTyRawPtrU8) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] alloc 0 8 []
+        MiniRustSpec.PtrByteCoherenceMR.V08.wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead [] alloc 0 8 []
+        MiniRustSpec.PtrByteCoherenceMR.V08.wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub :=
+  MiniRustSpec.PtrByteCoherenceMR.V08.globalAlloc_reloc_correspondence_M (M := M) pv gId al mutbl targetPtr addr haddr
+
+example {M : Type} [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
+    (pv : Nat → Nat → MiniRustSpec.Gen.Memory.Provenance M)
+    (alloc : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation) (off len pb : Nat) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes
+        (MiniRustSpec.PtrByteCoherenceMR.alloc68 alloc) off len pb =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc off len pb).map
+        (List.map MiniRustSpec.PtrByteCoherenceMR.byte68) ∧
+    (∀ bs, Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc off len pb = some bs →
+      MiniRustSpec.PtrByteCoherenceMR.V08.projBytes pv (bs.map MiniRustSpec.PtrByteCoherenceMR.byte68) =
+        MiniRustSpec.PtrByteCoherenceMR.V06.projBytes pv bs ∧
+      MiniRustSpec.PtrByteCoherenceMR.mrProvM M
+          (MiniRustSpec.PtrByteCoherenceMR.V08.projBytes pv (bs.map MiniRustSpec.PtrByteCoherenceMR.byte68)) =
+        MiniRustSpec.PtrByteCoherenceMR.mrProvM M (MiniRustSpec.PtrByteCoherenceMR.V06.projBytes pv bs)) :=
+  MiniRustSpec.PtrByteCoherenceMR.globalAlloc_parity (M := M) pv alloc off len pb
 
 #assert_minirustspec_import_isolation
 
