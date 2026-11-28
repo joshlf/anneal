@@ -45,8 +45,10 @@ Unifies Anneal's four certificate-checked subsystems under `Anneal.Hybrid`
    `gateVerdict`), and indexed-to-MIR arithmetic bridges from `natCutIdxGate`
    directly to `evalScalarBinOp` overflow/underflow freedom.
    Both pillars also run under `foldStreamPrefix` as prefix-safe obligation
-   streams (`obligationChunkGate`): the emitted obligations are a prefix of
-   the input and every one of them holds.
+   streams (`obligationChunkGate`), and arbitrary-output gates including
+   Pillar 4 (`blockOptGate`) run under `foldStreamPrefix` via
+   `transformChunkGate` / `gateComapY` (unifying all four pillars under
+   `foldStreamPrefix`).
 3. **Pillar 3 (`Anneal.CanonicalDiode`):** wraps any lawful `CanonicalDiode`
    with a sound equality check as `canonicalDiodeChunkGate` plugged into
    `Anneal.Hybrid.foldStreamPrefix`, proving strict canonical image on all
@@ -1706,6 +1708,175 @@ theorem obligationStream_complete {X W E : Type} {P : X → Prop}
     dsimp only
     rw [obligationStream_complete g beqX hBeq hBeqRefl certOf eMissing us
       (fun x hMem => hAll x (List.Mem.tail _ hMem))]
+
+/-- Re-index ANY gate (arbitrary output type `Y`) along `f : X' → X`, for
+instance mapping block identifiers to `SourceBlockUnit`s for Pillar 4. -/
+def gateComapY {X X' Y W : Type} {Spec : X → Y → Prop} (f : X' → X)
+    (g : CertifiedGate X Y W (fun _ => True) Spec) :
+    CertifiedGate X' Y W (fun _ => True) (fun x' y => Spec (f x') y) where
+  maxWitness := fun x' => g.maxWitness (f x')
+  wSize := g.wSize
+  check := fun x' y w => g.check (f x') y w
+  sound := fun x' y w _ hCap hChk => g.sound (f x') y w True.intro hCap hChk
+
+/-- Lift ANY gate `CertifiedGate X Y W (fun _ => True) Spec` (including
+Pillar 4's `blockOptGate`, whose output is `CompiledBlockUnit`) to a
+prefix-safe streaming chunk gate under `foldStreamPrefix`. Each emitted pair
+`(x, y)` satisfies `Spec x y`, and `beqX` ensures the emitted key matches the
+consumed input `x` (so re-indexing by block id needs only `Nat.beq`). -/
+def transformChunkGate {X Y W : Type} {Spec : X → Y → Prop}
+    (g : CertifiedGate X Y W (fun _ => True) Spec)
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y) :
+    CertifiedGate (Unit × X) (Unit × (X × Y)) W (fun _ => True)
+      (fun _ sxy => True ∧ Spec sxy.2.1 sxy.2.2) where
+  maxWitness := fun sx => g.maxWitness sx.2
+  wSize := g.wSize
+  check := fun sx sxy w => beqX sxy.2.1 sx.2 && g.check sx.2 sxy.2.2 w
+  sound := by
+    intro sx sxy w _ hCap hChk
+    have hEq : sxy.2.1 = sx.2 := hBeq _ _ (bool_and_left hChk)
+    rw [hEq]
+    exact ⟨True.intro,
+      g.sound sx.2 sxy.2.2 w True.intro hCap (bool_and_right hChk)⟩
+
+/-- Any chunk `transformChunkGate` accepts carries the exact consumed input
+key `x` together with an output `y` and witness `w` accepted by `g`. -/
+theorem transformChunkGate_ok {X Y W E : Type} {Spec : X → Y → Prop}
+    (g : CertifiedGate X Y W (fun _ => True) Spec)
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y) (x : X)
+    (raw : RawOutcome E (Unit × (X × Y)) W) (sxy : Unit × (X × Y))
+    (hOk : evalGate (transformChunkGate g beqX hBeq) ((), x) raw = .ok sxy) :
+    sxy.2.1 = x ∧
+      ∃ w, raw = .candidate sxy w ∧
+        gateCheckBounded g (x, sxy.2.2, w) = true := by
+  cases raw with
+  | trapped => cases hOk
+  | prodErr _ => cases hOk
+  | candidate c w =>
+    have h := (evalGate_candidate_ok_iff _ _ _ _ _).1 hOk
+    rw [h.1]
+    have hCap : g.wSize w ≤ g.maxWitness x := h.2.1
+    have hChk : (beqX c.2.1 x && g.check x c.2.2 w) = true := h.2.2
+    refine ⟨hBeq _ _ (bool_and_left hChk), w, rfl, ?_⟩
+    dsimp only [gateCheckBounded]
+    rw [Nat.ble_eq_true_of_le hCap, bool_and_right hChk]
+    rfl
+
+/-- Every `(x, y)` pair emitted by `foldStreamPrefix` through
+`transformChunkGate` satisfies `Spec x y`, even when the stream halts early
+(`foldStreamPrefix_all_emitted_valid`). -/
+theorem transformStream_all_emitted_valid {X Y W E : Type}
+    {Spec : X → Y → Prop} (g : CertifiedGate X Y W (fun _ => True) Spec)
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y)
+    (pChunk : Unit → X → RawOutcome E (Unit × (X × Y)) W) (us : List X) :
+    ∀ xy, xy ∈ (foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun p => Spec p.1 p.2)
+      (transformChunkGate g beqX hBeq) pChunk () us).1 →
+      Spec xy.1 xy.2 :=
+  foldStreamPrefix_all_emitted_valid (AccInv := fun _ => True)
+    (ValidChunk := fun p => Spec p.1 p.2)
+    (transformChunkGate g beqX hBeq) pChunk us () True.intro
+
+/-- Exact shape of the transform stream for ANY producer: the emitted keys
+`res.1.map Prod.fst` form a prefix of `us`; `res.2 = none` implies all inputs
+were consumed; and `res.2 = some e` implies the stream stopped at the first
+unemitted input, which `transformChunkGate` rejected with `e`. -/
+theorem transformStream_emitted_prefix {X Y W E : Type} {Spec : X → Y → Prop}
+    (g : CertifiedGate X Y W (fun _ => True) Spec)
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y)
+    (pChunk : Unit → X → RawOutcome E (Unit × (X × Y)) W) :
+    ∀ us : List X, ∃ rest : List X,
+      us = ((foldStreamPrefix (AccInv := fun _ => True)
+        (ValidChunk := fun p => Spec p.1 p.2)
+        (transformChunkGate g beqX hBeq) pChunk () us).1.map Prod.fst) ++
+        rest ∧
+      ((foldStreamPrefix (AccInv := fun _ => True)
+        (ValidChunk := fun p => Spec p.1 p.2)
+        (transformChunkGate g beqX hBeq) pChunk () us).2 = none →
+        rest = []) ∧
+      (∀ e, (foldStreamPrefix (AccInv := fun _ => True)
+        (ValidChunk := fun p => Spec p.1 p.2)
+        (transformChunkGate g beqX hBeq) pChunk () us).2 = some e →
+        ∃ u rest', rest = u :: rest' ∧
+          evalGate (transformChunkGate g beqX hBeq) ((), u) (pChunk () u) =
+            .error e)
+  | [] => by
+    refine ⟨[], rfl, fun _ => rfl, fun e h => ?_⟩
+    have h' : (none : Option (HybridErr E)) = some e := h
+    nomatch h'
+  | u :: us => by
+    have ih := transformStream_emitted_prefix g beqX hBeq pChunk us
+    rw [foldStreamPrefix_cons]
+    cases hEv : evalGate (transformChunkGate g beqX hBeq) ((), u)
+        (pChunk () u) with
+    | error err =>
+      dsimp only
+      refine ⟨u :: us, rfl, (fun h => nomatch h), fun e h => ?_⟩
+      injection h with h
+      rw [← h]
+      exact ⟨u, us, rfl, hEv⟩
+    | ok sxy =>
+      have hSame := (transformChunkGate_ok g beqX hBeq u (pChunk () u) sxy
+        hEv).1
+      cases sxy with
+      | mk s xy =>
+        cases s
+        dsimp only at hSame ⊢
+        have ⟨rest, hSplit, hNone, hSome⟩ := ih
+        refine ⟨rest, ?_, hNone, hSome⟩
+        dsimp only [List.map]
+        rw [hSame]
+        exact congrArg (List.cons u) hSplit
+
+/-- Table-backed producer for arbitrary-output transform streams (such as
+Pillar 4's `blockOptGate`). -/
+def transformTableProducer {X Y W E : Type} (entryOf : X → Option (Y × W))
+    (eMissing : E) : Unit → X → RawOutcome E (Unit × (X × Y)) W :=
+  fun _ x =>
+    match entryOf x with
+    | none => .prodErr eMissing
+    | some (y, w) => .candidate ((), (x, y)) w
+
+/-- Completeness for `transformChunkGate`: whenever every input in `us` has a
+table entry accepted by `g`, the stream completes with `err = none` and emits
+exactly one certified pair per input key in order. -/
+theorem transformStream_complete {X Y W E : Type} {Spec : X → Y → Prop}
+    (g : CertifiedGate X Y W (fun _ => True) Spec)
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y)
+    (hBeqRefl : ∀ x, beqX x x = true) (entryOf : X → Option (Y × W))
+    (eMissing : E) :
+    ∀ us : List X,
+      (∀ x, x ∈ us → ∃ y w, entryOf x = some (y, w) ∧
+        gateCheckBounded g (x, y, w) = true) →
+      let res := foldStreamPrefix (AccInv := fun _ => True)
+        (ValidChunk := fun p => Spec p.1 p.2)
+        (transformChunkGate g beqX hBeq)
+        (transformTableProducer entryOf eMissing) () us
+      res.2 = none ∧ res.1.map Prod.fst = us
+  | [], _ => ⟨rfl, rfl⟩
+  | u :: us, hAll => by
+    have ⟨y, w, hEnt, hChk⟩ := hAll u (List.Mem.head _)
+    have hChk' : (Nat.ble (g.wSize w) (g.maxWitness u) && g.check u y w) =
+        true := hChk
+    have hCheck : (beqX u u && g.check u y w) = true := by
+      rw [hBeqRefl u, bool_and_right hChk']
+      rfl
+    have hEv :
+        evalGate (transformChunkGate g beqX hBeq) ((), u)
+          (transformTableProducer entryOf eMissing () u) =
+          .ok ((), (u, y)) := by
+      dsimp only [transformTableProducer]
+      rw [hEnt]
+      exact (evalGate_candidate_ok_iff
+        (transformChunkGate g beqX hBeq) ((), u) ((), (u, y)) w
+        ((), (u, y))).2
+        ⟨rfl, Nat.le_of_ble_eq_true (bool_and_left hChk'), hCheck⟩
+    have ih := transformStream_complete g beqX hBeq hBeqRefl entryOf eMissing
+      us (fun x hMem => hAll x (List.Mem.tail _ hMem))
+    dsimp only at ih ⊢
+    rw [foldStreamPrefix_cons, hEv]
+    dsimp only [List.map]
+    exact ⟨ih.1, congrArg (List.cons u) ih.2⟩
 
 /-! ## Pillar 4: `Anneal.Backend.CtxFact` <-> `OverflowTrapRefinement` -/
 
@@ -3712,7 +3883,8 @@ theorem u64_sub_blockOptGate_cut_to_stepMirState_wrapping
   nomatch h
 
 /-- Fully chained capstone for `u64` addition through `natCutIdxGate` AND ANY
-accepted `blockOptGate` `BoolCertCut`. -/
+accepted `blockOptGate` `BoolCertCut` (including Layer 1A bidirectional
+`ITree.toPartial` equivalence). -/
 theorem u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState
     (maxSteps maxStepsPerNode : Nat)
     (hyps : List NatCutIneq) (lhsExpr rhsExpr : NatLinExpr)
@@ -3739,7 +3911,15 @@ theorem u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState
               (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))))
           (classifyMirExecState .abort
             (runMirCall (mkUncheckedArithBody .u64 .add) 2
-              (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))))) :=
+              (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env)))) ∧
+       (mirCallTree (mkUncheckedArithBody .u64 .add)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ≤
+         (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ∧
+       (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ≤
+         (mirCallTree (mkUncheckedArithBody .u64 .add)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial) :=
   hypsImp_concl_mono (fun hDen => by
     have hSumLt :
         lhsExpr.eval env + rhsExpr.eval env < modPow2 (uintWidth .u64) :=
@@ -3748,14 +3928,34 @@ theorem u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState
       Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hSumLt
     have hRhsLt : rhsExpr.eval env < modPow2 (uintWidth .u64) :=
       Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hSumLt
-    exact u64_add_blockOptGate_cut_to_stepMirState maxStepsPerNode dagSteps
-      hBlock _ _ hLhsLt hRhsLt
-      ((sourceEntryPre_u64CheckedAdd_iff _ _ hLhsLt hRhsLt).2 hSumLt))
+    have hEntry := (sourceEntryPre_u64CheckedAdd_iff _ _ hLhsLt hRhsLt).2 hSumLt
+    have hOk := runMirCall_checked_add_ok .u64 .abort _ _ hSumLt
+    dsimp only [PanicStrategy.toUnwindAction] at hOk
+    have hDef :
+        classifyMirExecStateExact
+          (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+            (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))) ≠ .ub := by
+      rw [hOk]
+      intro h
+      nomatch h
+    have hEq := u64_add_blockOptGate_cut_to_stepMirState maxStepsPerNode
+      dagSteps hBlock _ _ hLhsLt hRhsLt hEntry
+    have hTree :=
+      blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
+        maxStepsPerNode u64CheckedAddSrc u64UncheckedAddOpt dagSteps hBlock
+        (env2 (lhsExpr.eval env) (rhsExpr.eval env)) hEntry
+        (u64CheckedAddSrc_corresponds_stepMirState _ _ hLhsLt hRhsLt)
+        (u64UncheckedAddOpt_corresponds_stepMirState _ _ hLhsLt hRhsLt) hDef
+        (fun _ _ _ _ hS hT =>
+          (canonMem_checked_add _ _ hS).trans
+            (canonMem_unchecked_add _ _ hT).symm)
+    exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩)
     (natCutIdxGate_discharges_uint_add_no_overflow maxSteps .u64 hyps lhsExpr
       rhsExpr cutSteps hIdx env [] canonInitMemory)
 
 /-- Fully chained capstone for certified `u64` subtraction through
-`natCutIdxGate` AND ANY accepted `blockOptGate` `BoolCertCut`. -/
+`natCutIdxGate` AND ANY accepted `blockOptGate` `BoolCertCut` (including
+Layer 1A bidirectional `ITree.toPartial` equivalence). -/
 theorem u64_sub_natCutIdx_and_blockOpt_cuts_to_stepMirState
     (maxSteps maxStepsPerNode : Nat)
     (hyps : List NatCutIneq) (lhsExpr rhsExpr : NatLinExpr)
@@ -3785,15 +3985,42 @@ theorem u64_sub_natCutIdx_and_blockOpt_cuts_to_stepMirState
               (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))))
           (classifyMirExecState .abort
             (runMirCall (mkUncheckedArithBody .u64 .sub) 2
-              (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))))) :=
+              (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env)))) ∧
+       (mirCallTree (mkUncheckedArithBody .u64 .sub)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ≤
+         (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ∧
+       (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ≤
+         (mirCallTree (mkUncheckedArithBody .u64 .sub)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial) :=
   hypsImp_concl_mono (fun hDen => by
     have hLhsLt : lhsExpr.eval env < modPow2 (uintWidth .u64) := hDen.1
     have hLe : rhsExpr.eval env ≤ lhsExpr.eval env := hDen.2.1
     have hRhsLt : rhsExpr.eval env < modPow2 (uintWidth .u64) :=
       Nat.lt_of_le_of_lt hLe hLhsLt
-    exact u64_sub_blockOptGate_cut_to_stepMirState maxStepsPerNode dagSteps
-      hBlock _ _ hLhsLt hRhsLt
-      ((sourceEntryPre_u64CheckedSub_iff _ _ hLhsLt hRhsLt).2 hLe))
+    have hEntry := (sourceEntryPre_u64CheckedSub_iff _ _ hLhsLt hRhsLt).2 hLe
+    have hOk := runMirCall_checked_sub_ok .u64 .abort _ _ hLhsLt hRhsLt hLe
+    dsimp only [PanicStrategy.toUnwindAction] at hOk
+    have hDef :
+        classifyMirExecStateExact
+          (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+            (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))) ≠ .ub := by
+      rw [hOk]
+      intro h
+      nomatch h
+    have hEq := u64_sub_blockOptGate_cut_to_stepMirState maxStepsPerNode
+      dagSteps hBlock _ _ hLhsLt hRhsLt hEntry
+    have hTree :=
+      blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
+        maxStepsPerNode u64CheckedSubSrc u64UncheckedSubOpt dagSteps hBlock
+        (env2 (lhsExpr.eval env) (rhsExpr.eval env)) hEntry
+        (u64CheckedSubSrc_corresponds_stepMirState _ _ hLhsLt hRhsLt)
+        (u64UncheckedSubOpt_corresponds_stepMirState _ _ hLhsLt hRhsLt) hDef
+        (fun _ _ _ _ hS hT =>
+          (canonMem_checked_sub _ _ hLhsLt hRhsLt hS).trans
+            (canonMem_unchecked_sub _ _ hLhsLt hT).symm)
+    exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩)
     (natCutIdxGate_discharges_uint_sub_no_underflow_certified maxSteps .u64
       hyps lhsExpr rhsExpr stepsLe stepsRange hIdxLe hIdxRange
       env [] canonInitMemory)
@@ -3939,8 +4166,8 @@ theorem u64_subNuw_to_subWrap_asymmetric_ub_transport (a b : Nat)
 
 /-- Fully chained capstone for `u64` addition through BOTH gates: a
 `farkasMirGate` `BoolCertCut` discharges the `CtxFact` entry precondition, and
-ANY `blockOptGate` `BoolCertCut` then transports the guard elision to the real
-`stepMirState` runs. -/
+ANY `blockOptGate` `BoolCertCut` then transports the guard elision to real
+`stepMirState` and Layer 1A bidirectional `ITree.toPartial` equivalence. -/
 theorem u64_add_farkas_and_blockOpt_cuts_to_stepMirState
     (maxSteps maxStepsPerNode : Nat)
     (hyps : List NatCutIneq) (lhsExpr rhsExpr : NatLinExpr)
@@ -3966,7 +4193,15 @@ theorem u64_add_farkas_and_blockOpt_cuts_to_stepMirState
               (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))))
           (classifyMirExecState .abort
             (runMirCall (mkUncheckedArithBody .u64 .add) 2
-              (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))))) :=
+              (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env)))) ∧
+       (mirCallTree (mkUncheckedArithBody .u64 .add)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ≤
+         (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ∧
+       (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ≤
+         (mirCallTree (mkUncheckedArithBody .u64 .add)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial) :=
   hypsImp_concl_mono (fun hDen => by
     have hSumLt :
         lhsExpr.eval env + rhsExpr.eval env < modPow2 (uintWidth .u64) :=
@@ -3975,9 +4210,28 @@ theorem u64_add_farkas_and_blockOpt_cuts_to_stepMirState
       Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hSumLt
     have hRhsLt : rhsExpr.eval env < modPow2 (uintWidth .u64) :=
       Nat.lt_of_le_of_lt (Nat.le_add_left _ _) hSumLt
-    exact u64_add_blockOptGate_cut_to_stepMirState maxStepsPerNode steps
-      hBlock _ _ hLhsLt hRhsLt
-      ((sourceEntryPre_u64CheckedAdd_iff _ _ hLhsLt hRhsLt).2 hSumLt))
+    have hEntry := (sourceEntryPre_u64CheckedAdd_iff _ _ hLhsLt hRhsLt).2 hSumLt
+    have hOk := runMirCall_checked_add_ok .u64 .abort _ _ hSumLt
+    dsimp only [PanicStrategy.toUnwindAction] at hOk
+    have hDef :
+        classifyMirExecStateExact
+          (runMirCall (mkCheckedArithBody .u64 .add .terminate) 6
+            (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))) ≠ .ub := by
+      rw [hOk]
+      intro h
+      nomatch h
+    have hEq := u64_add_blockOptGate_cut_to_stepMirState maxStepsPerNode steps
+      hBlock _ _ hLhsLt hRhsLt hEntry
+    have hTree :=
+      blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
+        maxStepsPerNode u64CheckedAddSrc u64UncheckedAddOpt steps hBlock
+        (env2 (lhsExpr.eval env) (rhsExpr.eval env)) hEntry
+        (u64CheckedAddSrc_corresponds_stepMirState _ _ hLhsLt hRhsLt)
+        (u64UncheckedAddOpt_corresponds_stepMirState _ _ hLhsLt hRhsLt) hDef
+        (fun _ _ _ _ hS hT =>
+          (canonMem_checked_add _ _ hS).trans
+            (canonMem_unchecked_add _ _ hT).symm)
+    exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩)
     (farkasMirGate_cut_sound maxSteps
       (.uintAddNoOverflow .u64 hyps lhsExpr rhsExpr) cert hFarkas
       env [] canonInitMemory)
@@ -3985,7 +4239,8 @@ theorem u64_add_farkas_and_blockOpt_cuts_to_stepMirState
 /-- Fully chained capstone for certified `u64` subtraction through BOTH
 gates: a `farkasMirGate` `BoolCertCut` discharges the `CtxFact` entry
 precondition, and ANY `blockOptGate` `BoolCertCut` then transports the guard
-elision to the real `stepMirState` runs. -/
+elision to real `stepMirState` and Layer 1A bidirectional `ITree.toPartial`
+equivalence. -/
 theorem u64_sub_farkas_and_blockOpt_cuts_to_stepMirState
     (maxSteps maxStepsPerNode : Nat)
     (hyps : List NatCutIneq) (lhsExpr rhsExpr : NatLinExpr)
@@ -4011,15 +4266,42 @@ theorem u64_sub_farkas_and_blockOpt_cuts_to_stepMirState
               (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))))
           (classifyMirExecState .abort
             (runMirCall (mkUncheckedArithBody .u64 .sub) 2
-              (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))))) :=
+              (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env)))) ∧
+       (mirCallTree (mkUncheckedArithBody .u64 .sub)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ≤
+         (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ∧
+       (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial ≤
+         (mirCallTree (mkUncheckedArithBody .u64 .sub)
+           (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))).toPartial) :=
   hypsImp_concl_mono (fun hDen => by
     have hLhsLt : lhsExpr.eval env < modPow2 (uintWidth .u64) := hDen.1
     have hLe : rhsExpr.eval env ≤ lhsExpr.eval env := hDen.2.1
     have hRhsLt : rhsExpr.eval env < modPow2 (uintWidth .u64) :=
       Nat.lt_of_le_of_lt hLe hLhsLt
-    exact u64_sub_blockOptGate_cut_to_stepMirState maxStepsPerNode steps
-      hBlock _ _ hLhsLt hRhsLt
-      ((sourceEntryPre_u64CheckedSub_iff _ _ hLhsLt hRhsLt).2 hLe))
+    have hEntry := (sourceEntryPre_u64CheckedSub_iff _ _ hLhsLt hRhsLt).2 hLe
+    have hOk := runMirCall_checked_sub_ok .u64 .abort _ _ hLhsLt hRhsLt hLe
+    dsimp only [PanicStrategy.toUnwindAction] at hOk
+    have hDef :
+        classifyMirExecStateExact
+          (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+            (uintArgs2 .u64 (lhsExpr.eval env) (rhsExpr.eval env))) ≠ .ub := by
+      rw [hOk]
+      intro h
+      nomatch h
+    have hEq := u64_sub_blockOptGate_cut_to_stepMirState maxStepsPerNode steps
+      hBlock _ _ hLhsLt hRhsLt hEntry
+    have hTree :=
+      blockOptGate_cut_transports_to_mirCallTree_toPartial_equiv
+        maxStepsPerNode u64CheckedSubSrc u64UncheckedSubOpt steps hBlock
+        (env2 (lhsExpr.eval env) (rhsExpr.eval env)) hEntry
+        (u64CheckedSubSrc_corresponds_stepMirState _ _ hLhsLt hRhsLt)
+        (u64UncheckedSubOpt_corresponds_stepMirState _ _ hLhsLt hRhsLt) hDef
+        (fun _ _ _ _ hS hT =>
+          (canonMem_checked_sub _ _ hLhsLt hRhsLt hS).trans
+            (canonMem_unchecked_sub _ _ hLhsLt hT).symm)
+    exact ⟨hEq.1, hEq.2, hTree.1, hTree.2⟩)
     (farkasMirGate_cut_sound maxSteps
       (.uintSubNoUnderflowCertified .u64 hyps lhsExpr rhsExpr) cert hFarkas
       env [] canonInitMemory)

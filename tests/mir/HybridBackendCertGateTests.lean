@@ -806,6 +806,117 @@ theorem test_obligation_stream_prefix_safe :
     hHold 1 (List.Mem.tail _ (List.Mem.head _)),
     hHold 2 (List.Mem.tail _ (List.Mem.tail _ (List.Mem.head _)))⟩
 
+/-- Pillar 4 (`blockOptGate`) block stream under `foldStreamPrefix` via
+`transformChunkGate` + `gateComapY`: blocks `0..2` carry `.proven` facts and
+valid certificates; block `3` has only a `.fuzz` candidate. -/
+def backendStreamSrc : Nat → SourceBlockUnit
+  | 0 => u64CheckedAddSrc
+  | 1 => u64CheckedSubSrc
+  | 2 => paddingSrc
+  | _ => u64CheckedAddSrcAt .fuzz
+
+def backendStreamTable : Nat → Option (CompiledBlockUnit × List DagStep)
+  | 0 =>
+    some (u64UncheckedAddOpt, [.refl 0, .biRule (.promoteAddNuw 0) [0, 1] 2 3])
+  | 1 => some (u64UncheckedSubOpt, u64CheckedSubToUncheckedSteps)
+  | 2 => some (paddingOpt, paddingSteps)
+  | _ => some (u64UncheckedAddOpt, u64CheckedAddToUncheckedSteps)
+
+noncomputable def backendStreamGate :=
+  transformChunkGate (gateComapY backendStreamSrc (blockOptGate 4)) Nat.beq
+    (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+
+/-- Prefix-safe Pillar 4 (`blockOptGate`) stream under `foldStreamPrefix`:
+valid blocks `[0, 1, 2]` complete with every emitted pair proven to refine its
+source block; a `.fuzz`-only block `3` halts mid-stream without emitting block
+`3` or any trailing block; and an adversarial producer trying to replay block
+`0`'s valid certificate for block `1` halts immediately at block `1`. -/
+theorem test_backend_transform_stream_prefix_safe :
+    -- Complete valid stream `[0, 1, 2]`
+    (Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun p : Nat × CompiledBlockUnit =>
+        SemRefinesUnder (SourceEntryPre (backendStreamSrc p.1))
+          (evalSourceBlockUnit (backendStreamSrc p.1))
+          (evalCompiledBlockUnit p.2))
+      backendStreamGate (transformTableProducer backendStreamTable ()) ()
+      [0, 1, 2]).2 = none ∧
+    ((Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun p : Nat × CompiledBlockUnit =>
+        SemRefinesUnder (SourceEntryPre (backendStreamSrc p.1))
+          (evalSourceBlockUnit (backendStreamSrc p.1))
+          (evalCompiledBlockUnit p.2))
+      backendStreamGate (transformTableProducer backendStreamTable ()) ()
+      [0, 1, 2]).1.map Prod.fst) = [0, 1, 2] ∧
+    -- `.fuzz` block `3` halts mid-stream with `.rejectedByChecker`
+    (Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun p : Nat × CompiledBlockUnit =>
+        SemRefinesUnder (SourceEntryPre (backendStreamSrc p.1))
+          (evalSourceBlockUnit (backendStreamSrc p.1))
+          (evalCompiledBlockUnit p.2))
+      backendStreamGate (transformTableProducer backendStreamTable ()) ()
+      [0, 1, 3, 2]).2 = some .rejectedByChecker ∧
+    ((Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun p : Nat × CompiledBlockUnit =>
+        SemRefinesUnder (SourceEntryPre (backendStreamSrc p.1))
+          (evalSourceBlockUnit (backendStreamSrc p.1))
+          (evalCompiledBlockUnit p.2))
+      backendStreamGate (transformTableProducer backendStreamTable ()) ()
+      [0, 1, 3, 2]).1.map Prod.fst) = [0, 1] ∧
+    -- Adversarial replay of block `0` for every block halts at block `1`
+    ((Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun p : Nat × CompiledBlockUnit =>
+        SemRefinesUnder (SourceEntryPre (backendStreamSrc p.1))
+          (evalSourceBlockUnit (backendStreamSrc p.1))
+          (evalCompiledBlockUnit p.2))
+      backendStreamGate
+      (fun _ _ => .candidate (E := Unit) ((), (0, u64UncheckedAddOpt))
+        [.refl 0, .biRule (.promoteAddNuw 0) [0, 1] 2 3])
+      () [0, 1, 2]).1.map Prod.fst) = [0] ∧
+    -- Every emitted pair in `[0, 1, 2]` satisfies `SemRefinesUnder`
+    SemRefinesUnder (SourceEntryPre u64CheckedAddSrc)
+      (evalSourceBlockUnit u64CheckedAddSrc)
+      (evalCompiledBlockUnit u64UncheckedAddOpt) ∧
+    SemRefinesUnder (SourceEntryPre paddingSrc)
+      (evalSourceBlockUnit paddingSrc)
+      (evalCompiledBlockUnit paddingOpt) := by
+  have hComp :=
+    transformStream_complete (E := Unit)
+      (gateComapY backendStreamSrc (blockOptGate 4)) Nat.beq
+      (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+      Anneal.InitLemmas.nat_beq_refl backendStreamTable () [0, 1, 2]
+      (fun x hMem => by
+        cases hMem with
+        | head => exact ⟨_, _, rfl, rfl⟩
+        | tail _ h1 =>
+          cases h1 with
+          | head => exact ⟨_, _, rfl, rfl⟩
+          | tail _ h2 =>
+            cases h2 with
+            | head => exact ⟨_, _, rfl, rfl⟩
+            | tail _ h3 => cases h3)
+  have hValid :=
+    transformStream_all_emitted_valid (E := Unit)
+      (gateComapY backendStreamSrc (blockOptGate 4)) Nat.beq
+      (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+      (transformTableProducer backendStreamTable ()) [0, 1, 2]
+  have hRes :
+      (Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+        (ValidChunk := fun p : Nat × CompiledBlockUnit =>
+          SemRefinesUnder (SourceEntryPre (backendStreamSrc p.1))
+            (evalSourceBlockUnit (backendStreamSrc p.1))
+            (evalCompiledBlockUnit p.2))
+        backendStreamGate (transformTableProducer backendStreamTable ()) ()
+        [0, 1, 2]).1 =
+        [ (0, u64UncheckedAddOpt),
+          (1, u64UncheckedSubOpt),
+          (2, paddingOpt) ] := rfl
+  dsimp only [backendStreamGate] at hRes
+  rw [hRes] at hValid
+  exact ⟨hComp.1, hComp.2, rfl, rfl, rfl,
+    hValid (0, u64UncheckedAddOpt) (List.Mem.head _),
+    hValid (2, paddingOpt)
+      (List.Mem.tail _ (List.Mem.tail _ (List.Mem.head _)))⟩
+
 /-! ## 4. `Anneal.Backend` + `OverflowTrapRefinement` End-to-End & Negatives -/
 
 /-- End-to-end `u64` addition and subtraction checked-to-unchecked refinement
@@ -1018,7 +1129,16 @@ theorem test_backend_cert_transport_to_stepMirState
           (uintArgs2 .u64 c d)))
       (classifyMirExecStateExact
         (runMirCall (mkUncheckedArithBody .u64 .sub) 2
-          (uintArgs2 .u64 c d))) := by
+          (uintArgs2 .u64 c d))) ∧
+    -- Bidirectional `ITree.toPartial` equivalence from all 4 two-gate capstones
+    (mirCallTree (mkCheckedArithBody .u64 .add .terminate)
+        (uintArgs2 .u64 a b)).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .add)
+        (uintArgs2 .u64 a b)).toPartial ∧
+    (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 c d)).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 c d)).toPartial := by
   have hBig : 2000 < modPow2 (uintWidth .u64) := by decide
   have haLt : a < modPow2 (uintWidth .u64) :=
     Nat.lt_of_le_of_lt ha (Nat.lt_trans (by decide) hBig)
@@ -1077,7 +1197,8 @@ theorem test_backend_cert_transport_to_stepMirState
       (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
       (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
       [c, d] hcd hc
-  exact ⟨hAdd.1, hAdd.2, hAddWrap.1, hSub.1, hSubWrap.2, hAddIdx.1, hSubIdx.1⟩
+  exact ⟨hAdd.1, hAdd.2.1, hAddWrap.1, hSub.1, hSubWrap.2, hAddIdx.1, hSubIdx.1,
+    hAdd.2.2.2, hSubIdx.2.2.2⟩
 
 /-- Genuinely asymmetric `.ub ⊑ .ret` certificate transport through
 `blockOptGate` to `stepMirState` and `ITree.toPartial`, plus the relational
@@ -1567,7 +1688,7 @@ run_cmd do
   -- uses. A count that is merely a floor goes stale as soon as declarations
   -- are added; an exact pin cannot drift in either direction.
   let auditModule (mod : Name)
-      (allowed expected : List Name) (minThms minDefs : Nat) :
+      (allowed expected : List Name) (expThms expDefs expOther : Nat) :
       CommandElabM String := do
     let some idx := env.getModuleIdx? mod
       | throwError "audit: module {mod} is not imported"
@@ -1588,37 +1709,32 @@ run_cmd do
         nDef := nDef + 1
       else
         nOther := nOther + 1
-    if nThm < minThms then
-      throwError "audit: floor in {mod}: {nThm} thms < {minThms}"
-    if nDef < minDefs then
-      throwError "audit: floor in {mod}: {nDef} defs < {minDefs}"
-    if nThm != minThms || nDef != minDefs then
-      throwError "audit: {mod} count drift: thms={nThm}, defs={nDef}"
+    if nThm != expThms || nDef != expDefs || nOther != expOther then
+      throwError
+        "audit: {mod} count drift: thms={nThm}, defs={nDef}, aux={nOther}"
     unless sameSet used expected do
       throwError "audit: {mod} uses axioms {used}, expected {expected}"
     return s!"{mod}: {nThm} thms, {nDef} defs, {nOther} aux, axioms={used}"
-  -- All counts are exact pins: the eight Episode 1 modules and the verbatim
-  -- `Backend.Canaries` port are frozen, and `HybridCertBridgesV2026` is
-  -- updated deliberately whenever declarations are added or removed.
-  let r1 ← auditModule `Anneal.Hybrid propextOnly propextOnly 120 269
+  -- All counts (theorems, definitions, and auxiliaries) are exact pins.
+  let r1 ← auditModule `Anneal.Hybrid propextOnly propextOnly 120 269 59
   let r2 ←
-    auditModule `Anneal.Hybrid.Canaries propextOnly propextOnly 65 70
+    auditModule `Anneal.Hybrid.Canaries propextOnly propextOnly 65 70 3
   let r3 ←
-    auditModule `Anneal.Backend.Rules propextOnly propextOnly 95 316
+    auditModule `Anneal.Backend.Rules propextOnly propextOnly 95 316 47
   let r4 ←
-    auditModule `Anneal.Backend.CtxFact propextOnly propextOnly 52 150
+    auditModule `Anneal.Backend.CtxFact propextOnly propextOnly 52 150 25
   let r5 ←
     auditModule `Anneal.Backend.CongruenceDagCtx propextOnly
-      propextOnly 46 104
+      propextOnly 46 104 14
   let r6 ←
     auditModule `Anneal.Backend.PassRefines propextOnly propextOnly
-      23 66
-  let r7 ← auditModule `Anneal.Backend propextOnly [] 0 0
+      23 66 12
+  let r7 ← auditModule `Anneal.Backend propextOnly [] 0 0 0
   let r8 ←
-    auditModule `Anneal.Backend.Canaries propextOnly propextOnly 30 64
+    auditModule `Anneal.Backend.Canaries propextOnly propextOnly 30 64 0
   let r9 ←
     auditModule `Anneal.HybridCertBridgesV2026 constructive constructive
-      182 240
+      188 256 4
   -- Enforce an EXACT duplicate-free `Quot.sound` allowlist on
   -- `Anneal.HybridCertBridgesV2026`: every non-allowlisted constant must be
   -- `<= [propext]` (only exact allowlisted theorems and their direct
@@ -1632,6 +1748,10 @@ run_cmd do
       ``u64_sub_farkasMirGate_to_stepMirState_bridge,
       ``u64_add_natCutIdxGate_to_stepMirState_bridge,
       ``u64_sub_natCutIdxGate_to_stepMirState_bridge,
+      ``u64_add_farkas_and_blockOpt_cuts_to_stepMirState,
+      ``u64_sub_farkas_and_blockOpt_cuts_to_stepMirState,
+      ``u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState,
+      ``u64_sub_natCutIdx_and_blockOpt_cuts_to_stepMirState,
       ``u64_addNuw_to_addWrap_asymmetric_ub_transport,
       ``u64_subNuw_to_subWrap_asymmetric_ub_transport,
       ``u64_add_blockOptGate_cut_to_stepMirState_env,
@@ -1746,6 +1866,7 @@ run_cmd do
     [ ``test_backend_overflowTrap_e2e_add_sub,
       ``test_backend_blockOptGate_mirRefines_and_alt_bridges,
       ``test_backend_and_trap_negative_counterexamples,
+      ``test_backend_cert_transport_to_stepMirState,
       ``test_backend_asymmetric_ub_transport,
       ``test_backend_every_environment_transport,
       ``test_backend_unchecked_sub_any_environment ]
@@ -1775,7 +1896,7 @@ run_cmd do
   for tq in testQuotAllowed do
     unless testQuotActual.contains tq do
       throwError "audit: stale testQuotAllowed entry {tq}"
-  if testThms != 27 || testDefs != 52 then
+  if testThms != 28 || testDefs != 55 then
     throwError "audit: test count drift: thms={testThms}, defs={testDefs}"
   let rT :=
     s!"test module: {testThms} thms, {testDefs} defs, axioms={testUsed}, " ++
@@ -1809,7 +1930,11 @@ run_cmd do
       ``obligationChunkGate_ok,
       ``obligationStream_all_emitted_hold,
       ``obligationStream_emitted_prefix,
-      ``obligationStream_complete ]
+      ``obligationStream_complete,
+      ``transformChunkGate_ok,
+      ``transformStream_all_emitted_valid,
+      ``transformStream_emitted_prefix,
+      ``transformStream_complete ]
   expectAxioms propextOnly
     [ ``natCutIdxGate_cut_sound,
       ``intCutIdxGate_cut_sound,
@@ -1846,10 +1971,6 @@ run_cmd do
       ``u64_add_blockOptGate_cut_to_stepMirState_wrapping,
       ``u64_sub_blockOptGate_cut_to_stepMirState,
       ``u64_sub_blockOptGate_cut_to_stepMirState_wrapping,
-      ``u64_add_farkas_and_blockOpt_cuts_to_stepMirState,
-      ``u64_sub_farkas_and_blockOpt_cuts_to_stepMirState,
-      ``u64_add_natCutIdx_and_blockOpt_cuts_to_stepMirState,
-      ``u64_sub_natCutIdx_and_blockOpt_cuts_to_stepMirState,
       ``neg_u64_add_unproven_elision_never_certified,
       ``neg_u64_sub_unproven_elision_never_certified,
       ``neg_u64_add_overflow_stepMirState_matrix,
@@ -1884,6 +2005,10 @@ run_cmd do
 #print axioms obligationStream_all_emitted_hold
 #print axioms obligationStream_emitted_prefix
 #print axioms obligationStream_complete
+#print axioms transformChunkGate_ok
+#print axioms transformStream_all_emitted_valid
+#print axioms transformStream_emitted_prefix
+#print axioms transformStream_complete
 #print axioms mirOptExactOutcomeRefines_exec_iff_on_u64
 #print axioms semRefinesUnder_preserves_mirOptRefines_asymmetric
 #print axioms blockOptGate_cut_preserves_mirRefines
@@ -1920,6 +2045,7 @@ run_cmd do
 #print axioms test_backend_every_environment_transport
 #print axioms test_backend_unchecked_sub_any_environment
 #print axioms test_obligation_stream_prefix_safe
+#print axioms test_backend_transform_stream_prefix_safe
 #print axioms test_backend_outcome_bridge_faithful
 #print axioms test_farkasMir_edge_weight_bounds
 #print axioms test_backend_unproven_tier_elision_never_certified
