@@ -19212,6 +19212,17 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.encodePtrM_of_encode
   MiniRustSpec.PtrByteCoherenceMR.encodePtr_of_encode
   MiniRustSpec.PtrByteCoherenceMR.endianness_encode_ptr
+  MiniRustSpec.PtrByteCoherenceMR.encodeIntM_usize_of_encode
+  MiniRustSpec.PtrByteCoherenceMR.encodeIntM_usize
+  MiniRustSpec.PtrByteCoherenceMR.encodeWidePtrM_slice_of_encode
+  MiniRustSpec.PtrByteCoherenceMR.encodeWidePtrM_slice_eq
+  MiniRustSpec.PtrByteCoherenceMR.encodeWidePtrM_dyn_of_encode
+  MiniRustSpec.PtrByteCoherenceMR.encodeWidePtrM_dyn_eq
+  MiniRustSpec.PtrByteCoherenceMR.decodeWidePtrM_slice_eq
+  MiniRustSpec.PtrByteCoherenceMR.decodeWidePtrM_dyn_eq
+  MiniRustSpec.PtrByteCoherenceMR.minirust_bool_decodeM_iff
+  MiniRustSpec.PtrByteCoherenceMR.minirust_u8_decodeM
+  MiniRustSpec.PtrByteCoherenceMR.minirust_bool_uninit_decodeM
   MiniRustSpec.PtrByteCoherenceMR.tbProv_inj
   MiniRustSpec.PtrByteCoherenceMR.bmProv_eq_iff
   MiniRustSpec.PtrByteCoherenceMR.coherent_parity
@@ -19227,11 +19238,13 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.converse_gap_iff
   MiniRustSpec.PtrByteCoherenceMR.V06.offset_splice_trusted_strips
   MiniRustSpec.PtrByteCoherenceMR.V06.offset_splice_minirust_retains
+  MiniRustSpec.PtrByteCoherenceMR.V06.offset_splice_decode_divergence
   MiniRustSpec.PtrByteCoherenceMR.V06.permuted_strips_trusted
   MiniRustSpec.PtrByteCoherenceMR.V06.permuted_strips_minirust
   MiniRustSpec.PtrByteCoherenceMR.V06.reversal_strips
   MiniRustSpec.PtrByteCoherenceMR.V06.swap01_strips
   MiniRustSpec.PtrByteCoherenceMR.V06.dupHead_strips
+  MiniRustSpec.PtrByteCoherenceMR.V06.w1_transforms_decode_strips
   MiniRustSpec.PtrByteCoherenceMR.V06.mixed_provenance_strips_trusted
   MiniRustSpec.PtrByteCoherenceMR.V06.mixed_provenance_strips_minirust
   MiniRustSpec.PtrByteCoherenceMR.V06.missing_provenance_strips_trusted
@@ -19246,14 +19259,25 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.decodePtrBytesNoForge_thin
   MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutPtr_coherent
   MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutPtr_incoherent
+  MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutPtr_union_coherent
+  MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutPtr_union_incoherent
+  MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutNonPtr_strictUb_rejects_prov
   MiniRustSpec.PtrByteCoherenceMR.V06.encodeUntyped_ptr
+  MiniRustSpec.PtrByteCoherenceMR.V06.encodeValueToBytes_thinPtr
   MiniRustSpec.PtrByteCoherenceMR.V06.rawCarrier_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V06.rawCarrier_ptr_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V06.decodePtrBytesNoForge_slice
   MiniRustSpec.PtrByteCoherenceMR.V06.decodePtrBytesNoForge_str
+  MiniRustSpec.PtrByteCoherenceMR.V06.decodePtrBytesNoForge_dyn
   MiniRustSpec.PtrByteCoherenceMR.V06.slice_meta_with_provenance_rejected
+  MiniRustSpec.PtrByteCoherenceMR.V06.encodeWidePtrM_slice_proj
+  MiniRustSpec.PtrByteCoherenceMR.V06.encodeWidePtrM_dyn_proj
+  MiniRustSpec.PtrByteCoherenceMR.V06.coherent_wide_slice_decode_agreement
+  MiniRustSpec.PtrByteCoherenceMR.V06.coherent_wide_dyn_decode_agreement
+  MiniRustSpec.PtrByteCoherenceMR.V06.swapped_wide_slice_div
   MiniRustSpec.PtrByteCoherenceMR.V06.minirust_bool_invalid
   MiniRustSpec.PtrByteCoherenceMR.V06.minirust_u8_valid
+  MiniRustSpec.PtrByteCoherenceMR.V06.kani5205_bool_correspondence_M
   MiniRustSpec.PtrByteCoherenceMR.V06.w_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V06.w_ucg558_w1
   MiniRustSpec.PtrByteCoherenceMR.V06.w_mixed_missing_uninit
@@ -19265,12 +19289,14 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.w_wide_dyn
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_bool
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_char
+  MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.encode_roundtrip_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.rawCarrier_ptr_roundtrip_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.strip_laws_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.offset_splice_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.wide_and_bool_instance
+  MiniRustSpec.PtrByteCoherenceMR.V06.ep2_b1_mr_non_vacuity_instances
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent?_eq_some_iff
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement
   MiniRustSpec.PtrByteCoherenceMR.V08.trusted_coherent_implies_minirust_retains
@@ -19278,11 +19304,13 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.converse_gap_iff
   MiniRustSpec.PtrByteCoherenceMR.V08.offset_splice_trusted_strips
   MiniRustSpec.PtrByteCoherenceMR.V08.offset_splice_minirust_retains
+  MiniRustSpec.PtrByteCoherenceMR.V08.offset_splice_decode_divergence
   MiniRustSpec.PtrByteCoherenceMR.V08.permuted_strips_trusted
   MiniRustSpec.PtrByteCoherenceMR.V08.permuted_strips_minirust
   MiniRustSpec.PtrByteCoherenceMR.V08.reversal_strips
   MiniRustSpec.PtrByteCoherenceMR.V08.swap01_strips
   MiniRustSpec.PtrByteCoherenceMR.V08.dupHead_strips
+  MiniRustSpec.PtrByteCoherenceMR.V08.w1_transforms_decode_strips
   MiniRustSpec.PtrByteCoherenceMR.V08.mixed_provenance_strips_trusted
   MiniRustSpec.PtrByteCoherenceMR.V08.mixed_provenance_strips_minirust
   MiniRustSpec.PtrByteCoherenceMR.V08.missing_provenance_strips_trusted
@@ -19297,14 +19325,25 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.decodePtrBytesNoForge_thin
   MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutPtr_coherent
   MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutPtr_incoherent
+  MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutPtr_union_coherent
+  MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutPtr_union_incoherent
+  MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutNonPtr_strictUb_rejects_prov
   MiniRustSpec.PtrByteCoherenceMR.V08.encodeUntyped_ptr
+  MiniRustSpec.PtrByteCoherenceMR.V08.encodeValueToBytes_thinPtr
   MiniRustSpec.PtrByteCoherenceMR.V08.rawCarrier_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V08.rawCarrier_ptr_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V08.decodePtrBytesNoForge_slice
   MiniRustSpec.PtrByteCoherenceMR.V08.decodePtrBytesNoForge_str
+  MiniRustSpec.PtrByteCoherenceMR.V08.decodePtrBytesNoForge_dyn
   MiniRustSpec.PtrByteCoherenceMR.V08.slice_meta_with_provenance_rejected
+  MiniRustSpec.PtrByteCoherenceMR.V08.encodeWidePtrM_slice_proj
+  MiniRustSpec.PtrByteCoherenceMR.V08.encodeWidePtrM_dyn_proj
+  MiniRustSpec.PtrByteCoherenceMR.V08.coherent_wide_slice_decode_agreement
+  MiniRustSpec.PtrByteCoherenceMR.V08.coherent_wide_dyn_decode_agreement
+  MiniRustSpec.PtrByteCoherenceMR.V08.swapped_wide_slice_div
   MiniRustSpec.PtrByteCoherenceMR.V08.minirust_bool_invalid
   MiniRustSpec.PtrByteCoherenceMR.V08.minirust_u8_valid
+  MiniRustSpec.PtrByteCoherenceMR.V08.kani5205_bool_correspondence_M
   MiniRustSpec.PtrByteCoherenceMR.V08.w_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V08.w_ucg558_w1
   MiniRustSpec.PtrByteCoherenceMR.V08.w_mixed_missing_uninit
@@ -19316,12 +19355,14 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.w_wide_dyn
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_bool
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_char
+  MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.encode_roundtrip_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.rawCarrier_ptr_roundtrip_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.strip_laws_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.offset_splice_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.wide_and_bool_instance
+  MiniRustSpec.PtrByteCoherenceMR.V08.ep2_b1_mr_non_vacuity_instances
 
 #check_theorem_deps "[PTR-BYTE-COHERENCE-AUDIT]"
   MiniRustSpec.PtrByteCoherenceMR.mrProvM_eq_some_iff
@@ -19334,6 +19375,17 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.encodePtrM_of_encode
   MiniRustSpec.PtrByteCoherenceMR.encodePtr_of_encode
   MiniRustSpec.PtrByteCoherenceMR.endianness_encode_ptr
+  MiniRustSpec.PtrByteCoherenceMR.encodeIntM_usize_of_encode
+  MiniRustSpec.PtrByteCoherenceMR.encodeIntM_usize
+  MiniRustSpec.PtrByteCoherenceMR.encodeWidePtrM_slice_of_encode
+  MiniRustSpec.PtrByteCoherenceMR.encodeWidePtrM_slice_eq
+  MiniRustSpec.PtrByteCoherenceMR.encodeWidePtrM_dyn_of_encode
+  MiniRustSpec.PtrByteCoherenceMR.encodeWidePtrM_dyn_eq
+  MiniRustSpec.PtrByteCoherenceMR.decodeWidePtrM_slice_eq
+  MiniRustSpec.PtrByteCoherenceMR.decodeWidePtrM_dyn_eq
+  MiniRustSpec.PtrByteCoherenceMR.minirust_bool_decodeM_iff
+  MiniRustSpec.PtrByteCoherenceMR.minirust_u8_decodeM
+  MiniRustSpec.PtrByteCoherenceMR.minirust_bool_uninit_decodeM
   MiniRustSpec.PtrByteCoherenceMR.tbProv_inj
   MiniRustSpec.PtrByteCoherenceMR.bmProv_eq_iff
   MiniRustSpec.PtrByteCoherenceMR.coherent_parity
@@ -19349,11 +19401,13 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.converse_gap_iff
   MiniRustSpec.PtrByteCoherenceMR.V06.offset_splice_trusted_strips
   MiniRustSpec.PtrByteCoherenceMR.V06.offset_splice_minirust_retains
+  MiniRustSpec.PtrByteCoherenceMR.V06.offset_splice_decode_divergence
   MiniRustSpec.PtrByteCoherenceMR.V06.permuted_strips_trusted
   MiniRustSpec.PtrByteCoherenceMR.V06.permuted_strips_minirust
   MiniRustSpec.PtrByteCoherenceMR.V06.reversal_strips
   MiniRustSpec.PtrByteCoherenceMR.V06.swap01_strips
   MiniRustSpec.PtrByteCoherenceMR.V06.dupHead_strips
+  MiniRustSpec.PtrByteCoherenceMR.V06.w1_transforms_decode_strips
   MiniRustSpec.PtrByteCoherenceMR.V06.mixed_provenance_strips_trusted
   MiniRustSpec.PtrByteCoherenceMR.V06.mixed_provenance_strips_minirust
   MiniRustSpec.PtrByteCoherenceMR.V06.missing_provenance_strips_trusted
@@ -19368,14 +19422,25 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.decodePtrBytesNoForge_thin
   MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutPtr_coherent
   MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutPtr_incoherent
+  MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutPtr_union_coherent
+  MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutPtr_union_incoherent
+  MiniRustSpec.PtrByteCoherenceMR.V06.scalarLayoutNonPtr_strictUb_rejects_prov
   MiniRustSpec.PtrByteCoherenceMR.V06.encodeUntyped_ptr
+  MiniRustSpec.PtrByteCoherenceMR.V06.encodeValueToBytes_thinPtr
   MiniRustSpec.PtrByteCoherenceMR.V06.rawCarrier_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V06.rawCarrier_ptr_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V06.decodePtrBytesNoForge_slice
   MiniRustSpec.PtrByteCoherenceMR.V06.decodePtrBytesNoForge_str
+  MiniRustSpec.PtrByteCoherenceMR.V06.decodePtrBytesNoForge_dyn
   MiniRustSpec.PtrByteCoherenceMR.V06.slice_meta_with_provenance_rejected
+  MiniRustSpec.PtrByteCoherenceMR.V06.encodeWidePtrM_slice_proj
+  MiniRustSpec.PtrByteCoherenceMR.V06.encodeWidePtrM_dyn_proj
+  MiniRustSpec.PtrByteCoherenceMR.V06.coherent_wide_slice_decode_agreement
+  MiniRustSpec.PtrByteCoherenceMR.V06.coherent_wide_dyn_decode_agreement
+  MiniRustSpec.PtrByteCoherenceMR.V06.swapped_wide_slice_div
   MiniRustSpec.PtrByteCoherenceMR.V06.minirust_bool_invalid
   MiniRustSpec.PtrByteCoherenceMR.V06.minirust_u8_valid
+  MiniRustSpec.PtrByteCoherenceMR.V06.kani5205_bool_correspondence_M
   MiniRustSpec.PtrByteCoherenceMR.V06.w_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V06.w_ucg558_w1
   MiniRustSpec.PtrByteCoherenceMR.V06.w_mixed_missing_uninit
@@ -19387,12 +19452,14 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.w_wide_dyn
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_bool
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_char
+  MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.encode_roundtrip_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.rawCarrier_ptr_roundtrip_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.strip_laws_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.offset_splice_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.wide_and_bool_instance
+  MiniRustSpec.PtrByteCoherenceMR.V06.ep2_b1_mr_non_vacuity_instances
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent?_eq_some_iff
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement
   MiniRustSpec.PtrByteCoherenceMR.V08.trusted_coherent_implies_minirust_retains
@@ -19400,11 +19467,13 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.converse_gap_iff
   MiniRustSpec.PtrByteCoherenceMR.V08.offset_splice_trusted_strips
   MiniRustSpec.PtrByteCoherenceMR.V08.offset_splice_minirust_retains
+  MiniRustSpec.PtrByteCoherenceMR.V08.offset_splice_decode_divergence
   MiniRustSpec.PtrByteCoherenceMR.V08.permuted_strips_trusted
   MiniRustSpec.PtrByteCoherenceMR.V08.permuted_strips_minirust
   MiniRustSpec.PtrByteCoherenceMR.V08.reversal_strips
   MiniRustSpec.PtrByteCoherenceMR.V08.swap01_strips
   MiniRustSpec.PtrByteCoherenceMR.V08.dupHead_strips
+  MiniRustSpec.PtrByteCoherenceMR.V08.w1_transforms_decode_strips
   MiniRustSpec.PtrByteCoherenceMR.V08.mixed_provenance_strips_trusted
   MiniRustSpec.PtrByteCoherenceMR.V08.mixed_provenance_strips_minirust
   MiniRustSpec.PtrByteCoherenceMR.V08.missing_provenance_strips_trusted
@@ -19419,14 +19488,25 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.decodePtrBytesNoForge_thin
   MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutPtr_coherent
   MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutPtr_incoherent
+  MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutPtr_union_coherent
+  MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutPtr_union_incoherent
+  MiniRustSpec.PtrByteCoherenceMR.V08.scalarLayoutNonPtr_strictUb_rejects_prov
   MiniRustSpec.PtrByteCoherenceMR.V08.encodeUntyped_ptr
+  MiniRustSpec.PtrByteCoherenceMR.V08.encodeValueToBytes_thinPtr
   MiniRustSpec.PtrByteCoherenceMR.V08.rawCarrier_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V08.rawCarrier_ptr_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V08.decodePtrBytesNoForge_slice
   MiniRustSpec.PtrByteCoherenceMR.V08.decodePtrBytesNoForge_str
+  MiniRustSpec.PtrByteCoherenceMR.V08.decodePtrBytesNoForge_dyn
   MiniRustSpec.PtrByteCoherenceMR.V08.slice_meta_with_provenance_rejected
+  MiniRustSpec.PtrByteCoherenceMR.V08.encodeWidePtrM_slice_proj
+  MiniRustSpec.PtrByteCoherenceMR.V08.encodeWidePtrM_dyn_proj
+  MiniRustSpec.PtrByteCoherenceMR.V08.coherent_wide_slice_decode_agreement
+  MiniRustSpec.PtrByteCoherenceMR.V08.coherent_wide_dyn_decode_agreement
+  MiniRustSpec.PtrByteCoherenceMR.V08.swapped_wide_slice_div
   MiniRustSpec.PtrByteCoherenceMR.V08.minirust_bool_invalid
   MiniRustSpec.PtrByteCoherenceMR.V08.minirust_u8_valid
+  MiniRustSpec.PtrByteCoherenceMR.V08.kani5205_bool_correspondence_M
   MiniRustSpec.PtrByteCoherenceMR.V08.w_roundtrip
   MiniRustSpec.PtrByteCoherenceMR.V08.w_ucg558_w1
   MiniRustSpec.PtrByteCoherenceMR.V08.w_mixed_missing_uninit
@@ -19438,12 +19518,14 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.w_wide_dyn
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_bool
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_char
+  MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.encode_roundtrip_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.rawCarrier_ptr_roundtrip_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.strip_laws_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.offset_splice_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.wide_and_bool_instance
+  MiniRustSpec.PtrByteCoherenceMR.V08.ep2_b1_mr_non_vacuity_instances
 
 #assert_minirustspec_import_isolation
 

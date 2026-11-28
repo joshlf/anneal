@@ -445,6 +445,203 @@ theorem endianness_encode_ptr (addr : Nat) (h : addr < 2 ^ 64) :
   rw [ite_of_pos h1, h2]
   rfl
 
+theorem encodePtrBytesM_none_eq_map {M : Type} [Gen.Memory M] :
+    ∀ (data : List UInt8) (idx : Nat),
+      Interp.encodePtrBytesM (M := M) none idx data = data.map (fun b => .Init b none)
+  | [], _ => rfl
+  | b :: rest, idx => by
+      show Gen.AbstractByte.Init b none :: Interp.encodePtrBytesM (M := M) none (idx + 1) rest =
+        Gen.AbstractByte.Init b none :: rest.map (fun b => .Init b none)
+      rw [encodePtrBytesM_none_eq_map rest (idx + 1)]
+
+/-- `Type.encodeIntM usize` in terms of the encoded bytes (syntactic hypothesis so no proof
+unfolds `Endianness.encode` on a symbolic integer). -/
+theorem encodeIntM_usize_of_encode {M : Type} [Gen.Memory M] (n : Int) (data : List UInt8)
+    (h : Interp.Endianness.encode Interp.x86_64.ENDIANNESS LibSpecr.Signedness.Unsigned
+      Interp.x86_64.PTR_SIZE n = some data) :
+    Interp.Type.encodeIntM (M := M) Interp.IntType.usize_ty (.Int n) =
+      .ok (data.map (fun b => .Init b none)) := by
+  have hty : Interp.IntType.usize_ty = ⟨LibSpecr.Signedness.Unsigned, Interp.x86_64.PTR_SIZE⟩ := rfl
+  rw [hty]
+  unfold Interp.Type.encodeIntM
+  dsimp only
+  rw [h]
+  rfl
+
+/-- `Type.encodeIntM usize` on any valid 64-bit unsigned integer produces its plain
+little-endian bytes. -/
+theorem encodeIntM_usize (n : Nat) (h : n < 2 ^ 64) {M : Type} [Gen.Memory M] :
+    Interp.Type.encodeIntM (M := M) Interp.IntType.usize_ty (.Int (n : Int)) =
+      .ok ((Interp.leBytes n 8).map (fun b => .Init b none)) :=
+  encodeIntM_usize_of_encode (n : Int) (Interp.leBytes n 8) (endianness_encode_ptr n h)
+
+/-- Exact characterization of `Interp.encodeWidePtrM` for `.ElementCount` (slice / `str`). -/
+theorem encodeWidePtrM_slice_of_encode {M : Type} [Gen.Memory M]
+    (addr len : Int) (prov : Option (Gen.Memory.Provenance M)) (d₁ d₂ : List UInt8)
+    (h₁ : Interp.Endianness.encode Interp.x86_64.ENDIANNESS LibSpecr.Signedness.Unsigned
+      Interp.x86_64.PTR_SIZE addr = some d₁)
+    (h₂ : Interp.Endianness.encode Interp.x86_64.ENDIANNESS LibSpecr.Signedness.Unsigned
+      Interp.x86_64.PTR_SIZE len = some d₂) :
+    Interp.encodeWidePtrM (M := M) .ElementCount
+      { thin_pointer := { addr := addr, provenance := prov },
+        metadata := some (.ElementCount len) } =
+      .ok (Interp.encodePtrBytesM (M := M) prov 0 d₁ ++
+        Interp.encodePtrBytesM (M := M) none 0 d₂) := by
+  unfold Interp.encodeWidePtrM Interp.PointerMetaKind.encode_as_valueM
+  dsimp only [bind, Except.bind, pure, Except.pure]
+  rw [encodePtrM_of_encode _ d₁ h₁]
+  dsimp only [Except.bind]
+  rw [encodeIntM_usize_of_encode len d₂ h₂]
+  dsimp only [Except.bind]
+  rw [encodePtrBytesM_none_eq_map (M := M) d₂ 0]
+
+/-- Exact characterization of `Interp.encodeWidePtrM` for `.ElementCount` on 64-bit naturals. -/
+theorem encodeWidePtrM_slice_eq {M : Type} [Gen.Memory M]
+    (addr len : Nat) (prov : Option (Gen.Memory.Provenance M))
+    (ha : addr < 2 ^ 64) (hl : len < 2 ^ 64) :
+    Interp.encodeWidePtrM (M := M) .ElementCount
+      { thin_pointer := { addr := (addr : Int), provenance := prov },
+        metadata := some (.ElementCount (len : Int)) } =
+      .ok (Interp.encodePtrBytesM (M := M) prov 0 (Interp.leBytes addr 8) ++
+        Interp.encodePtrBytesM (M := M) none 0 (Interp.leBytes len 8)) :=
+  encodeWidePtrM_slice_of_encode (addr : Int) (len : Int) prov _ _
+    (endianness_encode_ptr addr ha) (endianness_encode_ptr len hl)
+
+/-- Exact characterization of `Interp.encodeWidePtrM` for `.VTablePointer` (`&dyn Trait`). -/
+theorem encodeWidePtrM_dyn_of_encode {M : Type} [Gen.Memory M] (tr : Gen.TraitName)
+    (addr vtAddr : Int) (prov vtProv : Option (Gen.Memory.Provenance M)) (d₁ d₂ : List UInt8)
+    (h₁ : Interp.Endianness.encode Interp.x86_64.ENDIANNESS LibSpecr.Signedness.Unsigned
+      Interp.x86_64.PTR_SIZE addr = some d₁)
+    (h₂ : Interp.Endianness.encode Interp.x86_64.ENDIANNESS LibSpecr.Signedness.Unsigned
+      Interp.x86_64.PTR_SIZE vtAddr = some d₂) :
+    Interp.encodeWidePtrM (M := M) (.VTablePointer tr)
+      { thin_pointer := { addr := addr, provenance := prov },
+        metadata := some (.VTablePointer { addr := vtAddr, provenance := vtProv }) } =
+      .ok (Interp.encodePtrBytesM (M := M) prov 0 d₁ ++
+        Interp.encodePtrBytesM (M := M) vtProv 0 d₂) := by
+  unfold Interp.encodeWidePtrM Interp.PointerMetaKind.encode_as_valueM
+  dsimp only [bind, Except.bind, pure, Except.pure]
+  rw [encodePtrM_of_encode _ d₁ h₁]
+  dsimp only [Except.bind]
+  rw [encodePtrM_of_encode _ d₂ h₂]
+
+/-- Exact characterization of `Interp.encodeWidePtrM` for `.VTablePointer` on 64-bit naturals. -/
+theorem encodeWidePtrM_dyn_eq {M : Type} [Gen.Memory M] (tr : Gen.TraitName)
+    (addr vtAddr : Nat) (prov vtProv : Option (Gen.Memory.Provenance M))
+    (ha : addr < 2 ^ 64) (hv : vtAddr < 2 ^ 64) :
+    Interp.encodeWidePtrM (M := M) (.VTablePointer tr)
+      { thin_pointer := { addr := (addr : Int), provenance := prov },
+        metadata := some (.VTablePointer { addr := (vtAddr : Int), provenance := vtProv }) } =
+      .ok (Interp.encodePtrBytesM (M := M) prov 0 (Interp.leBytes addr 8) ++
+        Interp.encodePtrBytesM (M := M) vtProv 0 (Interp.leBytes vtAddr 8)) :=
+  encodeWidePtrM_dyn_of_encode tr (addr : Int) (vtAddr : Int) prov vtProv _ _
+    (endianness_encode_ptr addr ha) (endianness_encode_ptr vtAddr hv)
+
+/-- Exact characterization of `Interp.decodeWidePtrM` for `.ElementCount` on 8+8 bytes. -/
+theorem decodeWidePtrM_slice_eq {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (d m : List (Gen.AbstractByte (Gen.Memory.Provenance M)))
+    (hd : d.length = 8) (hm : m.length = 8) :
+    Interp.decodeWidePtrM (M := M) .ElementCount (d ++ m) =
+      .ok (match d.mapM Interp.AbstractByte.dataM, m.mapM Interp.AbstractByte.dataM with
+        | some dd, some md =>
+          some (.Ptr {
+            thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int), provenance := mrProvM M d },
+            metadata := some (.ElementCount ((Interp.leValue md : Nat) : Int)) })
+        | _, _ => none) := by
+  have hlen : (d ++ m).length = 2 * Interp.x86_64.PTR_SIZE.bytes := by
+    rw [List.length_append, hd, hm]; rfl
+  have htake : (d ++ m).take Interp.x86_64.PTR_SIZE.bytes = d := by
+    have : Interp.x86_64.PTR_SIZE.bytes = d.length := hd.symm
+    rw [this, List.take_left]
+  have hdrop : (d ++ m).drop Interp.x86_64.PTR_SIZE.bytes = m := by
+    have : Interp.x86_64.PTR_SIZE.bytes = d.length := hd.symm
+    rw [this, List.drop_left]
+  unfold Interp.decodeWidePtrM
+  rw [ite_of_neg (fun h => h hlen), htake, hdrop]
+  simp only [bind, Except.bind, pure, Except.pure]
+  rw [decodePtrM_eq d hd]
+  cases hdm : d.mapM Interp.AbstractByte.dataM with
+  | none => rfl
+  | some dd =>
+    simp only [Option.map_some]
+    unfold Interp.decodeMetaFieldM Interp.Type.decodeIntM Interp.IntType.usize_ty
+    dsimp only
+    have hmne : ¬ (m.length ≠ Interp.x86_64.PTR_SIZE.bytes) := by
+      rw [hm]; exact fun h => h rfl
+    rw [ite_of_neg hmne]
+    cases hmm : m.mapM Interp.AbstractByte.dataM with
+    | none => rfl
+    | some md => rfl
+
+/-- Exact characterization of `Interp.decodeWidePtrM` for `.VTablePointer` on 8+8 bytes. -/
+theorem decodeWidePtrM_dyn_eq {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (tr : Gen.TraitName) (d m : List (Gen.AbstractByte (Gen.Memory.Provenance M)))
+    (hd : d.length = 8) (hm : m.length = 8) :
+    Interp.decodeWidePtrM (M := M) (.VTablePointer tr) (d ++ m) =
+      .ok (match d.mapM Interp.AbstractByte.dataM, m.mapM Interp.AbstractByte.dataM with
+        | some dd, some md =>
+          some (.Ptr {
+            thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int), provenance := mrProvM M d },
+            metadata := some (.VTablePointer {
+              addr := ((Interp.leValue md : Nat) : Int), provenance := mrProvM M m }) })
+        | _, _ => none) := by
+  have hlen : (d ++ m).length = 2 * Interp.x86_64.PTR_SIZE.bytes := by
+    rw [List.length_append, hd, hm]; rfl
+  have htake : (d ++ m).take Interp.x86_64.PTR_SIZE.bytes = d := by
+    have : Interp.x86_64.PTR_SIZE.bytes = d.length := hd.symm
+    rw [this, List.take_left]
+  have hdrop : (d ++ m).drop Interp.x86_64.PTR_SIZE.bytes = m := by
+    have : Interp.x86_64.PTR_SIZE.bytes = d.length := hd.symm
+    rw [this, List.drop_left]
+  unfold Interp.decodeWidePtrM
+  rw [ite_of_neg (fun h => h hlen), htake, hdrop]
+  simp only [bind, Except.bind, pure, Except.pure]
+  rw [decodePtrM_eq d hd]
+  cases hdm : d.mapM Interp.AbstractByte.dataM with
+  | none => rfl
+  | some dd =>
+    simp only [Option.map_some]
+    unfold Interp.decodeMetaFieldM
+    simp only [bind, Except.bind, pure, Except.pure]
+    rw [decodePtrM_eq m hm]
+    cases hmm : m.mapM Interp.AbstractByte.dataM with
+    | none => rfl
+    | some md => rfl
+
+/-- Polymorphic MiniRust `Type.decodeM .Bool` exact characterization across `BasicMemory` and
+`TreeBorrowsMemory`: accepts `0` (`false`) and `1` (`true`), rejects every other byte (`none`). -/
+theorem minirust_bool_decodeM_iff {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (v : UInt8) (fr : Option (Gen.ProvenanceFrag (Gen.Memory.Provenance M))) :
+    Interp.Type.decodeM (M := M) .Bool [.Init v fr] =
+      (if v = 0 then .ok (some (.Bool false))
+       else if v = 1 then .ok (some (.Bool true))
+       else .ok none) := by
+  by_cases h0 : v = 0
+  · subst h0; rfl
+  · by_cases h1 : v = 1
+    · subst h1; rfl
+    · rw [ite_of_neg h0, ite_of_neg h1]
+      rw [Interp.Type.decodeM]
+      · rfl
+      · intro x h; injection h with h _; injection h with hv _; exact h0 hv
+      · intro x h; injection h with h _; injection h with hv _; exact h1 hv
+
+/-- Polymorphic MiniRust `Type.decodeM (.Int u8)` accepts every initialized byte (`Kani#5205`). -/
+theorem minirust_u8_decodeM {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (v : UInt8) (fr : Option (Gen.ProvenanceFrag (Gen.Memory.Provenance M))) :
+    Interp.Type.decodeM (M := M) (.Int ⟨.Unsigned, ⟨1⟩⟩) [.Init v fr] =
+      .ok (some (.Int (v.toNat : Int))) := by
+  rw [Interp.Type.decodeM]
+  rfl
+
+/-- Polymorphic MiniRust `Type.decodeM .Bool` rejects `.Uninit`. -/
+theorem minirust_bool_uninit_decodeM {M : Type} [Gen.Memory M] [Interp.MemoryOps M] :
+    Interp.Type.decodeM (M := M) .Bool [.Uninit] = .ok none := by
+  rw [Interp.Type.decodeM]
+  · rfl
+  · intro _ h; cases h
+  · intro _ h; cases h
+
 end Shared
 
 /-! ## `V2026_06_01`: correspondence of `Trusted.Rustc.V2026_06_01.MirSemantics` with `MiniRustSpec.Interp` -/
@@ -452,6 +649,7 @@ end Shared
 namespace V06
 
 open Trusted.Sequence
+open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
 open Trusted.Rustc.V2026_06_01.MirSemantics
 
@@ -964,6 +1162,49 @@ theorem scalarLayoutPtr_incoherent (addrSpace : Nat)
   simp only [e2, hbits, h]
   cases wrappingRangeContains vr bits <;> rfl
 
+/-- `decodeScalarLayoutBytesNoForge` at a union pointer scalar layout on a coherent stream, for
+any positive pointer width `pb` (including 32-bit `4` and 64-bit `8`). -/
+theorem scalarLayoutPtr_union_coherent (addrSpace pb : Nat) (bs : List AbstractByte) (bits : Nat)
+    (f : PtrByteFrag) (policy : Ptr2IntTransmutePolicy) (h0 : 0 < pb) (hlen : bs.length = pb)
+    (hbits : decodeLittleEndianBits bs = some bits)
+    (h : abstractBytesCoherentPtrProv? bs = some f) (hw : f.ptrBytes = pb) :
+    decodeScalarLayoutBytesNoForge (.union (.pointer addrSpace)) bs policy pb =
+      some (.ptr { allocId := f.allocId, offsetBytes := bits } pb) := by
+  have hne : Nat.beq pb 0 = false := by cases pb with | zero => omega | succ _ => rfl
+  have e2 : Nat.beq (length bs) pb = true := (nat_beq_iff _ _).mpr hlen
+  have e3 : Nat.beq f.ptrBytes pb = true := (nat_beq_iff _ _).mpr hw
+  unfold decodeScalarLayoutBytesNoForge scalarLayoutByteWidth primitiveKindByteWidth
+  simp only [hne, e2, hbits, h, e3]
+
+/-- `decodeScalarLayoutBytesNoForge` at a union pointer scalar layout on an incoherent stream never
+forges provenance, for any positive pointer width `pb` (32-bit `4` or 64-bit `8`). -/
+theorem scalarLayoutPtr_union_incoherent (addrSpace pb : Nat) (bs : List AbstractByte) (bits : Nat)
+    (policy : Ptr2IntTransmutePolicy) (h0 : 0 < pb) (hlen : bs.length = pb)
+    (hbits : decodeLittleEndianBits bs = some bits)
+    (h : abstractBytesCoherentPtrProv? bs = none) :
+    decodeScalarLayoutBytesNoForge (.union (.pointer addrSpace)) bs policy pb =
+      some (.scalar ⟨bits, pb⟩) := by
+  have hne : Nat.beq pb 0 = false := by cases pb with | zero => omega | succ _ => rfl
+  have e2 : Nat.beq (length bs) pb = true := (nat_beq_iff _ _).mpr hlen
+  unfold decodeScalarLayoutBytesNoForge scalarLayoutByteWidth primitiveKindByteWidth
+  simp only [hne, e2, hbits, h]
+
+/-- **UCG#630 W5 law**: `decodeScalarLayoutBytesNoForge` under `.strictUcg630Ub` rejects any
+provenance-bearing byte stream at non-pointer integer scalar layouts (both `.initialized` and
+`.union`). -/
+theorem scalarLayoutNonPtr_strictUb_rejects_prov (bitWidth : Nat) (signed : Bool)
+    (vr : Trusted.Rustc.V2026_06_01.Layout.WrappingRange) (pb : Nat) (bs : List AbstractByte)
+    (hp : abstractBytesHaveProv bs = true) :
+    decodeScalarLayoutBytesNoForge (.initialized (.int bitWidth signed) vr) bs .strictUcg630Ub pb = none ∧
+    decodeScalarLayoutBytesNoForge (.union (.int bitWidth signed)) bs .strictUcg630Ub pb = none := by
+  constructor <;> (
+    unfold decodeScalarLayoutBytesNoForge
+    cases scalarLayoutByteWidth _ pb with
+    | none => rfl
+    | some sz =>
+      dsimp only
+      cases Nat.beq (length bs) sz <;> simp [hp])
+
 /-! ### §5. Exact encoding and intact round trips -/
 
 theorem proj_encodeAux {M : Type} [Gen.Memory M] (pv : Nat → Nat → Gen.Memory.Provenance M)
@@ -1030,6 +1271,30 @@ theorem encodeUntyped_ptr (fuel : Nat) (p : ProvenancePtr) (sz : Nat) (hsz : 0 <
   cases sz with
   | zero => omega
   | succ n => rfl
+
+/-- **`encodeValueToBytes` on thin pointers.** For any thin pointer type (`.rawPtr`, `.ref`,
+`.fnPtr`) at target pointer width `pb > 0`, `encodeValueToBytes` produces `encodePtrBytes`. -/
+theorem encodeValueToBytes_thinPtr (fuel : Nat) (layouts : LayoutTable) (ty : Ty)
+    (p : ProvenancePtr) (pb : Nat) (hpb : layoutPointerBytes layouts = pb) (h0 : 0 < pb)
+    (hty : (∃ m pt, ty.kind = .rawPtr m pt ∧ thinPointee pt = true) ∨
+           (∃ m pt, ty.kind = .ref m pt ∧ thinPointee pt = true) ∨
+           (∃ a r s ab, ty.kind = .fnPtr a r s ab)) :
+    encodeValueToBytes (fuel + 1) layouts ty (.ptr p pb) =
+      some (encodePtrBytes p.offsetBytes pb p.allocId p.tag) := by
+  obtain ⟨kind, lidx⟩ := ty
+  have hblt : Nat.blt 0 pb = true := by rw [Nat.blt_eq]; exact h0
+  have hnz : Nat.beq pb 0 = false := by cases pb with | zero => omega | succ _ => rfl
+  rcases hty with ⟨m, pt, hk, hthin⟩ | ⟨m, pt, hk, hthin⟩ | ⟨a, r, s, ab, hk⟩
+  · dsimp only at hk; subst hk
+    cases pt <;> first
+      | (cases hthin; done)
+      | (unfold encodeValueToBytes; rw [hpb]; simp [hblt, encodeScalarBytes, hnz, encodeLittleEndianBytes])
+  · dsimp only at hk; subst hk
+    cases pt <;> first
+      | (cases hthin; done)
+      | (unfold encodeValueToBytes; rw [hpb]; simp [hblt, encodeScalarBytes, hnz, encodeLittleEndianBytes])
+  · dsimp only at hk; subst hk
+    unfold encodeValueToBytes; rw [hpb]; simp [hblt, encodeScalarBytes, hnz, encodeLittleEndianBytes]
 
 theorem bits_encodeAux (a t o pb : Nat) :
     ∀ (n bits idx : Nat),
@@ -1229,6 +1494,46 @@ theorem dupHead_strips {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
   ⟨permuted_strips_trusted _ bits 8 a t 1 0 _ (by decide) rfl rfl,
    permuted_strips_minirust pv _ bits 8 a t 1 0 _ (by decide) rfl rfl⟩
 
+/-- **End-to-end decoder stripping (`UCG#558` W1)** for full reversal, byte-0/1 swap, and head
+duplication: `Trusted` decodes raw pointers to provenance-free `.scalar` and rejects references
+(`none`), while MiniRust `decodePtrM` returns `.ok (some ⟨addr, none⟩)`. -/
+theorem w1_transforms_decode_strips {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (bits a t : Nat) :
+    let bsRev := (encodePtrBytes bits 8 a t).reverse
+    let bsSwap := swap01 (encodePtrBytes bits 8 a t)
+    let bsDup := dupHead (encodePtrBytes bits 8 a t)
+    (∃ d, trData bsRev = some d ∧ thinDecode false 8 bsRev = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 bsRev = none ∧
+      Interp.decodePtrM (M := M) (projBytes pv bsRev) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none })) ∧
+    (∃ d, trData bsSwap = some d ∧ thinDecode false 8 bsSwap = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 bsSwap = none ∧
+      Interp.decodePtrM (M := M) (projBytes pv bsSwap) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none })) ∧
+    (∃ d, trData bsDup = some d ∧ thinDecode false 8 bsDup = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 bsDup = none ∧
+      Interp.decodePtrM (M := M) (projBytes pv bsDup) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none })) := by
+  intro bsRev bsSwap bsDup
+  have hstep : ∀ (bs : List AbstractByte) (data : List UInt8),
+      bs.length = 8 → trData bs = some data →
+      abstractBytesCoherentPtrProv? bs = none →
+      mrProvM M (projBytes pv bs) = none →
+      ∃ d, trData bs = some d ∧ thinDecode false 8 bs = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+        thinDecode true 8 bs = none ∧
+        Interp.decodePtrM (M := M) (projBytes pv bs) =
+          .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none }) := by
+    intro bs data hlen hd htr hmr
+    have hbits : decodeLittleEndianBits bs = some (Interp.leValue data) := by
+      rw [bits_eq_leValue, hd]; rfl
+    refine ⟨data, hd, thinDecode_raw_incoherent 8 bs _ (by decide) hlen hbits htr,
+      thinDecode_ref_incoherent 8 bs htr, ?_⟩
+    rw [decodePtrM_proj pv bs hlen, hd, hmr]; rfl
+  refine ⟨?_, ?_, ?_⟩
+  · exact hstep bsRev _ rfl rfl (reversal_strips (M := M) pv bits a t).1 (reversal_strips (M := M) pv bits a t).2
+  · exact hstep bsSwap _ rfl rfl (swap01_strips (M := M) pv bits a t).1 (swap01_strips (M := M) pv bits a t).2
+  · exact hstep bsDup _ rfl rfl (dupHead_strips (M := M) pv bits a t).1 (dupHead_strips (M := M) pv bits a t).2
+
 /-- **Mixed provenance** (`Trusted`): fragments of two allocations or two tags. -/
 theorem mixed_provenance_strips_trusted (bs : List AbstractByte) (i j : Nat) (vi vj : UInt8)
     (fi fj : PtrByteFrag)
@@ -1342,6 +1647,53 @@ theorem offset_splice_minirust_retains {M : Type} [Gen.Memory M] [Interp.MemoryO
         · obtain ⟨v, hv⟩ := encodePtrBytes_get bits₂ pb a t i b h
           subst hv
           exact ⟨v, rfl⟩
+
+/-- **End-to-end offset-splice decoder divergence (`DIV-MR-OFFSET-SPLICE`, `UCG#558` W2).**
+For any 8-byte same-provenance splice `bs` drawing each byte in-position from `bits₁` or `bits₂`
+(with at least one byte from each and `normPtrByteOffset 8 bits₁ ≠ normPtrByteOffset 8 bits₂`):
+`Trusted` strips provenance (`thinDecode false` → `.scalar`, `thinDecode true` → `none`), while
+MiniRust `decodePtrM` retains `some (pv a t)` on the exact same decoded address. -/
+theorem offset_splice_decode_divergence {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (bs : List AbstractByte)
+    (bits₁ bits₂ a t i j : Nat) (b₁ b₂ : AbstractByte) (hlen : bs.length = 8)
+    (hsel : ∀ (k : Nat) (b : AbstractByte), bs[k]? = some b →
+      (encodePtrBytes bits₁ 8 a t)[k]? = some b ∨ (encodePtrBytes bits₂ 8 a t)[k]? = some b)
+    (h₁ : bs[i]? = some b₁) (e₁ : (encodePtrBytes bits₁ 8 a t)[i]? = some b₁)
+    (h₂ : bs[j]? = some b₂) (e₂ : (encodePtrBytes bits₂ 8 a t)[j]? = some b₂)
+    (hne : normPtrByteOffset 8 bits₁ ≠ normPtrByteOffset 8 bits₂) :
+    ∃ data, trData bs = some data ∧
+      thinDecode false 8 bs = some (.scalar ⟨Interp.leValue data, 8⟩) ∧
+      thinDecode true 8 bs = none ∧
+      Interp.decodePtrM (M := M) (projBytes pv bs) =
+        .ok (some { addr := ((Interp.leValue data : Nat) : Int),
+                    provenance := some (pv a t) }) := by
+  have htr := offset_splice_trusted_strips bs bits₁ bits₂ 8 a t i j b₁ b₂ h₁ e₁ h₂ e₂ hne
+  have hneList : bs ≠ [] := by intro h; subst h; cases hlen
+  have hmr := offset_splice_minirust_retains (M := M) pv bs bits₁ bits₂ 8 a t hneList hsel
+  have hdata : ∃ data, trData bs = some data := by
+    have hall : ∀ (k : Nat) (b : AbstractByte), bs[k]? = some b → ∃ (v : UInt8) (pr : Option PtrByteFrag), b = .init v pr := by
+      intro k b hk
+      rcases hsel k b hk with h | h
+      · obtain ⟨v, hv⟩ := encodePtrBytes_get bits₁ 8 a t k b h; exact ⟨v, _, hv⟩
+      · obtain ⟨v, hv⟩ := encodePtrBytes_get bits₂ 8 a t k b h; exact ⟨v, _, hv⟩
+    have aux : ∀ (l : List AbstractByte),
+        (∀ (k : Nat) (b : AbstractByte), l[k]? = some b → ∃ (v : UInt8) (pr : Option PtrByteFrag), b = .init v pr) → ∃ d, trData l = some d := by
+      intro l
+      induction l with
+      | nil => intro _; exact ⟨[], rfl⟩
+      | cons x xs ih =>
+        intro hl
+        obtain ⟨v, pr, rfl⟩ := hl 0 x rfl
+        obtain ⟨d, hd⟩ := ih (fun k b hk => hl (k + 1) b hk)
+        exact ⟨v :: d, by show (trData xs).map (v :: ·) = _; rw [hd]; rfl⟩
+    exact aux bs hall
+  obtain ⟨data, hd⟩ := hdata
+  have hbits : decodeLittleEndianBits bs = some (Interp.leValue data) := by
+    rw [bits_eq_leValue, hd]; rfl
+  refine ⟨data, hd, thinDecode_raw_incoherent 8 bs _ (by decide) hlen hbits htr,
+    thinDecode_ref_incoherent 8 bs htr, ?_⟩
+  rw [decodePtrM_proj pv bs hlen, hd, hmr]
+  rfl
 
 /-- **Exact characterization of the refinement gap.** For an injective
 provenance embedding, whenever MiniRust retains provenance on the projected
@@ -1500,6 +1852,153 @@ theorem slice_meta_with_provenance_rejected (isRef : Bool) (elem : RigidTy)
   rw [hp]
   cases thinDecode isRef d.length d <;> cases decodeLittleEndianBits m <;> rfl
 
+/-- **Wide trait-object pointers (`&dyn Trait`, `*const dyn Trait`)**: both data and vtable halves
+decode through `thinDecode`. -/
+theorem decodePtrBytesNoForge_dyn (isRef : Bool) (tr : String) (d m : List AbstractByte)
+    (h0 : 0 < d.length) (hm : m.length = d.length) :
+    decodePtrBytesNoForge isRef (.dynamic tr) d.length (d ++ m) =
+      (match thinDecode isRef d.length d, thinDecode isRef d.length m with
+       | some dv, some mv => some (.aggregate 0 [dv, mv])
+       | _, _ => none) := by
+  have e1 : Nat.blt 0 d.length = true := by rw [Nat.blt_eq]; exact h0
+  have e2 : Nat.beq (length (d ++ m)) (Nat.add d.length d.length) = true :=
+    (nat_beq_iff _ _).mpr (by show (d ++ m).length = d.length + d.length; rw [List.length_append, hm])
+  have e3 : Nat.beq (length m) d.length = true := (nat_beq_iff _ _).mpr hm
+  unfold decodePtrBytesNoForge thinDecode
+  simp only [e1, e2, e3, take_append, drop_append]
+  cases decodeLittleEndianBits m <;> rfl
+
+/-- **Exact wide slice/`str` encoding correspondence.** MiniRust `encodeWidePtrM .ElementCount`
+produces the exact projection of `encodePtrBytes addr 8 a t ++ encodePlainLittleEndianBytes len 8`. -/
+theorem encodeWidePtrM_slice_proj {M : Type} [Gen.Memory M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (addr len a t : Nat)
+    (ha : addr < 2 ^ 64) (hl : len < 2 ^ 64) :
+    Interp.encodeWidePtrM (M := M) .ElementCount
+      { thin_pointer := { addr := (addr : Int), provenance := some (pv a t) },
+        metadata := some (.ElementCount (len : Int)) } =
+      .ok (projBytes pv (encodePtrBytes addr 8 a t ++ encodePlainLittleEndianBytes len 8)) := by
+  rw [encodeWidePtrM_slice_eq addr len (some (pv a t)) ha hl]
+  unfold projBytes
+  rw [List.map_append]
+  change Except.ok _ = Except.ok (projBytes pv (encodePtrBytes addr 8 a t) ++
+    projBytes pv (encodePlainLittleEndianBytes len 8))
+  rw [proj_encodePtrBytes (M := M) pv addr 8 a t, proj_plain_bytes (M := M) pv 8 len 0]
+
+/-- **Exact wide `&dyn Trait` encoding correspondence.** MiniRust `encodeWidePtrM (.VTablePointer tr)`
+produces the exact projection of `encodePtrBytes addr 8 a t ++ encodePtrBytes vtAddr 8 va vt`. -/
+theorem encodeWidePtrM_dyn_proj {M : Type} [Gen.Memory M] (tr : Gen.TraitName)
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (addr vtAddr a t va vt : Nat)
+    (ha : addr < 2 ^ 64) (hv : vtAddr < 2 ^ 64) :
+    Interp.encodeWidePtrM (M := M) (.VTablePointer tr)
+      { thin_pointer := { addr := (addr : Int), provenance := some (pv a t) },
+        metadata := some (.VTablePointer { addr := (vtAddr : Int), provenance := some (pv va vt) }) } =
+      .ok (projBytes pv (encodePtrBytes addr 8 a t ++ encodePtrBytes vtAddr 8 va vt)) := by
+  rw [encodeWidePtrM_dyn_eq tr addr vtAddr (some (pv a t)) (some (pv va vt)) ha hv]
+  unfold projBytes
+  rw [List.map_append]
+  change Except.ok _ = Except.ok (projBytes pv (encodePtrBytes addr 8 a t) ++
+    projBytes pv (encodePtrBytes vtAddr 8 va vt))
+  rw [proj_encodePtrBytes (M := M) pv addr 8 a t, proj_encodePtrBytes (M := M) pv vtAddr 8 va vt]
+
+/-- **Universal wide slice/`str` decode correspondence.** On any 8-byte coherent data half `d` and
+8-byte initialized provenance-free metadata half `m`, `Trusted` (`decodePtrBytesNoForge` for both
+`.slice elem` and `.str`) and MiniRust (`Interp.decodeWidePtrM .ElementCount`) decode identically. -/
+theorem coherent_wide_slice_decode_agreement {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (isRef : Bool) (elem : RigidTy)
+    (d m : List AbstractByte) (f : PtrByteFrag) (md : List UInt8)
+    (hd : d.length = 8) (hm : m.length = 8)
+    (hcoh : abstractBytesCoherentPtrProv? d = some f) (hw : f.ptrBytes = 8)
+    (hmd : trData m = some md) (hplain : abstractBytesHaveProv m = false) :
+    ∃ dd, trData d = some dd ∧
+      decodePtrBytesNoForge isRef (.slice elem) 8 (d ++ m) =
+        some (.aggregate 0 [.ptr { allocId := f.allocId, offsetBytes := Interp.leValue dd } 8,
+          .scalar ⟨Interp.leValue md, 8⟩]) ∧
+      decodePtrBytesNoForge isRef .str 8 (d ++ m) =
+        some (.aggregate 0 [.ptr { allocId := f.allocId, offsetBytes := Interp.leValue dd } 8,
+          .scalar ⟨Interp.leValue md, 8⟩]) ∧
+      Interp.decodeWidePtrM (M := M) .ElementCount (projBytes pv (d ++ m)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int),
+                            provenance := some (pv f.allocId f.tag) },
+          metadata := some (.ElementCount ((Interp.leValue md : Nat) : Int)) })) := by
+  obtain ⟨dd, hdd, hthin, _⟩ := coherent_decode_agreement (M := M) pv d f isRef hd hcoh hw
+  have hmbits : decodeLittleEndianBits m = some (Interp.leValue md) := by
+    rw [bits_eq_leValue, hmd]; rfl
+  have hmeta : sliceMetaDecode 8 m = some (.scalar ⟨Interp.leValue md, 8⟩) := by
+    unfold sliceMetaDecode; rw [hmbits, hplain]
+  have hproj : projBytes pv (d ++ m) = projBytes pv d ++ projBytes pv m := List.map_append
+  refine ⟨dd, hdd, ?_, ?_, ?_⟩
+  · have h := decodePtrBytesNoForge_slice isRef elem d m (by omega) (by omega)
+    rw [hd] at h; rw [h, hthin, hmeta]
+  · have h := decodePtrBytesNoForge_str isRef d m (by omega) (by omega)
+    rw [hd] at h; rw [h, hthin, hmeta]
+  · rw [hproj, decodeWidePtrM_slice_eq _ _ (by rw [projBytes_length, hd]) (by rw [projBytes_length, hm]),
+      proj_data, proj_data, hdd, hmd, trusted_coherent_implies_minirust_retains pv d f hcoh]
+
+/-- **Universal wide `&dyn Trait` decode correspondence.** On any 8-byte coherent data half `d` and
+8-byte coherent vtable half `m`, `Trusted` (`decodePtrBytesNoForge`) and MiniRust
+(`Interp.decodeWidePtrM (.VTablePointer trId)`) decode identically. -/
+theorem coherent_wide_dyn_decode_agreement {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (isRef : Bool) (tr : String) (trId : Gen.TraitName)
+    (d m : List AbstractByte) (fd fm : PtrByteFrag)
+    (hd : d.length = 8) (hm : m.length = 8)
+    (hcd : abstractBytesCoherentPtrProv? d = some fd) (hwd : fd.ptrBytes = 8)
+    (hcm : abstractBytesCoherentPtrProv? m = some fm) (hwm : fm.ptrBytes = 8) :
+    ∃ dd md, trData d = some dd ∧ trData m = some md ∧
+      decodePtrBytesNoForge isRef (.dynamic tr) 8 (d ++ m) =
+        some (.aggregate 0 [.ptr { allocId := fd.allocId, offsetBytes := Interp.leValue dd } 8,
+          .ptr { allocId := fm.allocId, offsetBytes := Interp.leValue md } 8]) ∧
+      Interp.decodeWidePtrM (M := M) (.VTablePointer trId) (projBytes pv (d ++ m)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int),
+                            provenance := some (pv fd.allocId fd.tag) },
+          metadata := some (.VTablePointer {
+            addr := ((Interp.leValue md : Nat) : Int),
+            provenance := some (pv fm.allocId fm.tag) }) })) := by
+  obtain ⟨dd, hdd, htd, _⟩ := coherent_decode_agreement (M := M) pv d fd isRef hd hcd hwd
+  obtain ⟨md, hmd, htm, _⟩ := coherent_decode_agreement (M := M) pv m fm isRef hm hcm hwm
+  have hproj : projBytes pv (d ++ m) = projBytes pv d ++ projBytes pv m := List.map_append
+  refine ⟨dd, md, hdd, hmd, ?_, ?_⟩
+  · have h := decodePtrBytesNoForge_dyn isRef tr d m (by omega) (by omega)
+    rw [hd] at h; rw [h, htd, htm]
+  · rw [hproj, decodeWidePtrM_dyn_eq trId _ _ (by rw [projBytes_length, hd]) (by rw [projBytes_length, hm]),
+      proj_data, proj_data, hdd, hmd,
+      trusted_coherent_implies_minirust_retains pv d fd hcd,
+      trusted_coherent_implies_minirust_retains pv m fm hcm]
+
+/-- **Universal swapped wide-slice divergence (`DIV-MR-PTR2INT`).** On `m ++ d` where `m` is an
+8-byte plain integer and `d` is an 8-byte coherent pointer, `Trusted` rejects `m ++ d` under
+`Ptr2IntTransmutePolicy.strictUcg630Ub` (`= none`), whereas MiniRust `decodeWidePtrM .ElementCount`
+accepts it as a provenance-free data pointer with element count equal to `d`'s address. -/
+theorem swapped_wide_slice_div {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (isRef : Bool) (elem : RigidTy)
+    (m d : List AbstractByte) (f : PtrByteFrag) (md : List UInt8)
+    (hm : m.length = 8) (hd : d.length = 8)
+    (hmd : trData m = some md) (hm0 : ∃ v, m[0]? = some (.init v none))
+    (hcd : abstractBytesCoherentPtrProv? d = some f) :
+    ∃ dd, trData d = some dd ∧
+      decodePtrBytesNoForge isRef (.slice elem) 8 (m ++ d) = none ∧
+      Interp.decodeWidePtrM (M := M) .ElementCount (projBytes pv (m ++ d)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue md : Nat) : Int), provenance := none },
+          metadata := some (.ElementCount ((Interp.leValue dd : Nat) : Int)) })) := by
+  obtain ⟨_, _, hcoh⟩ := (coherent?_eq_some_iff d f).mp hcd
+  obtain ⟨dd, hdd⟩ := trCoh_data _ _ _ _ d 0 hcoh
+  have hdp : abstractBytesHaveProv d = true := by
+    cases d with
+    | nil => cases hd
+    | cons x rest =>
+      obtain ⟨v, rfl⟩ := hcoh.1
+      rfl
+  obtain ⟨v0, hv0⟩ := hm0
+  have hmp : mrProvM M (projBytes pv m) = none := missing_provenance_strips_minirust pv m 0 v0 hv0
+  have hproj : projBytes pv (m ++ d) = projBytes pv m ++ projBytes pv d := List.map_append
+  refine ⟨dd, hdd, ?_, ?_⟩
+  · have h := slice_meta_with_provenance_rejected isRef elem m d (by omega) (by omega) hdp
+    rw [hm] at h; exact h
+  · rw [hproj, decodeWidePtrM_slice_eq _ _ (by rw [projBytes_length, hm]) (by rw [projBytes_length, hd]),
+      proj_data, proj_data, hmd, hdd, hmp]
+
 /-! ### §9. `Kani#5205`: read-time validity of untyped bytes -/
 
 /-- **MiniRust rejects every non-`0`/`1` byte at `Type::Bool`** (for any
@@ -1524,6 +2023,82 @@ theorem minirust_u8_valid (v : UInt8) (fr : Option (Gen.ProvenanceFrag Interp.Pr
     Interp.Type.decode (.Int ⟨.Unsigned, ⟨1⟩⟩) [.Init v fr] = .ok (some (.Int (v.toNat : Int))) := by
   rw [Interp.Type.decode]
   rfl
+
+/-- **Universal polymorphic `Kani#5205` `Trusted` ↔ MiniRust `bool` validity correspondence**
+across BOTH `BasicMemory` and `TreeBorrowsMemory` for every byte `v : UInt8`: untyped storage
+accepts `v`, while typed `bool` decoding / validation agrees iff `v ∈ {0, 1}`. -/
+theorem kani5205_bool_correspondence_M {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (layouts : LayoutTable) (tyBool : Ty)
+    (hty : tyBool.kind = .bool) (v : UInt8) :
+    decodeUntypedStorageBytes defaultCodecFuel layouts tyBool [.init v none] =
+      some (.scalar ⟨v.toNat, 1⟩) ∧
+    ((decodeTypedValueFromBytes defaultCodecFuel layouts tyBool [.init v none]).isSome = true ↔
+      ∃ b, Interp.Type.decodeM (M := M) .Bool (projBytes pv [.init v none]) = .ok (some (.Bool b))) ∧
+    (validateValueForTy? layouts (some tyBool) (.scalar ⟨v.toNat, 1⟩) = true ↔
+      ∃ b, Interp.Type.decodeM (M := M) .Bool (projBytes pv [.init v none]) = .ok (some (.Bool b))) := by
+  obtain ⟨kind, lidx⟩ := tyBool
+  dsimp only at hty
+  subst hty
+  have hun : decodeUntypedStorageBytes defaultCodecFuel layouts ⟨.bool, lidx⟩ [.init v none] =
+      some (.scalar ⟨v.toNat, 1⟩) := by
+    show some (Value.scalar ⟨v.toBitVec.toNat + 256 * 0, 1⟩) = some (Value.scalar ⟨v.toNat, 1⟩)
+    rw [Nat.mul_zero, Nat.add_zero]; rfl
+  have hmr : Interp.Type.decodeM (M := M) .Bool (projBytes pv [.init v none]) =
+      (if v = 0 then .ok (some (.Bool false))
+       else if v = 1 then .ok (some (.Bool true))
+       else .ok none) := minirust_bool_decodeM_iff (M := M) v none
+  refine ⟨hun, ?_, ?_⟩
+  · by_cases h0 : v = 0
+    · subst h0
+      have htr : decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.bool, lidx⟩ [.init 0 none] =
+          some (.scalar ⟨0, 1⟩) := rfl
+      simp [hmr, htr]
+    · by_cases h1 : v = 1
+      · subst h1
+        have htr : decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.bool, lidx⟩ [.init 1 none] =
+            some (.scalar ⟨1, 1⟩) := rfl
+        simp [hmr, htr]
+      · have hne0 : Nat.beq v.toBitVec.toNat 0 = false := by
+          cases h : Nat.beq v.toBitVec.toNat 0 with
+          | false => rfl
+          | true =>
+            have hv0 : v.toNat = 0 := (nat_beq_iff _ _).mp h
+            exact absurd (UInt8.toNat_inj.mp hv0) h0
+        have hne1 : Nat.beq v.toBitVec.toNat 1 = false := by
+          cases h : Nat.beq v.toBitVec.toNat 1 with
+          | false => rfl
+          | true =>
+            have hv1 : v.toNat = 1 := (nat_beq_iff _ _).mp h
+            exact absurd (UInt8.toNat_inj.mp hv1) h1
+        have htr : decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.bool, lidx⟩ [.init v none] = none := by
+          show (match Nat.beq v.toBitVec.toNat 0 with
+            | true => some (Value.scalar ⟨0, 1⟩)
+            | false => match Nat.beq v.toBitVec.toNat 1 with
+              | true => some (Value.scalar ⟨1, 1⟩)
+              | false => none) = none
+          rw [hne0, hne1]
+        simp [hmr, h0, h1, htr]
+  · by_cases h0 : v = 0
+    · subst h0
+      have hval : validateValueForTy? layouts (some ⟨.bool, lidx⟩) (.scalar ⟨0, 1⟩) = true := rfl
+      simp [hmr, hval]
+    · by_cases h1 : v = 1
+      · subst h1
+        have hval : validateValueForTy? layouts (some ⟨.bool, lidx⟩) (.scalar ⟨1, 1⟩) = true := rfl
+        simp [hmr, hval]
+      · have hble : Nat.ble v.toNat 1 = false := by
+          cases h : Nat.ble v.toNat 1 with
+          | false => rfl
+          | true =>
+            have hle : v.toNat ≤ 1 := Nat.ble_eq.mp h
+            have : v.toNat = 0 ∨ v.toNat = 1 := by omega
+            rcases this with hv | hv
+            · exact absurd (UInt8.toNat_inj.mp hv) h0
+            · exact absurd (UInt8.toNat_inj.mp hv) h1
+        have hval : validateValueForTy? layouts (some ⟨.bool, lidx⟩) (.scalar ⟨v.toNat, 1⟩) = false := by
+          show Bool.and true (Nat.ble v.toNat 1) = false
+          rw [hble]; rfl
+        simp [hmr, h0, h1, hval]
 
 /-! ### §10. Fixtures and kernel-checked witnesses -/
 
@@ -1917,6 +2492,164 @@ theorem wide_and_bool_instance :
    decodePtrBytesNoForge_slice false (.uint .u8) wP wLen3 (by decide) rfl,
    minirust_bool_invalid 2 none (by decide) (by decide), minirust_u8_valid 2 none⟩
 
+def wUnalignedBoolL : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [2] }
+def wMaybeUninitBoolL : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [2, 0] }
+def wKaniLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [wUnitL, wU8L, wBoolL, wCharL, wU32L, wUnalignedBoolL, wMaybeUninitBoolL] }
+def wTyUnalignedBool : Ty := { kind := .adt "Unaligned" [.bool], layoutIdx := 5 }
+def wTyMaybeUninitBool : Ty := { kind := .adt "core::mem::MaybeUninit" [.bool], layoutIdx := 6 }
+def wTyRawPtrU8 : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
+
+/-- **`Kani#5205`: `Unaligned<bool>` and `MaybeUninit<bool>`** across `Trusted` and MiniRust
+(`BasicMemory` and `TreeBorrowsMemory`). Untyped storage accepts `2u8` (including inside
+`MaybeUninit<bool>` and MiniRust `Type::Union`); typed `Unaligned<bool>` / `bool` reads reject it
+in both authorities. -/
+theorem w_kani5205_unaligned_and_maybeuninit :
+    decodeUntypedStorageBytes defaultCodecFuel wKaniLayouts wTyUnalignedBool [.init 2 none] =
+      some (.aggregate 0 [.scalar ⟨2, 1⟩]) ∧
+    decodeTypedValueFromBytes defaultCodecFuel wKaniLayouts wTyUnalignedBool [.init 2 none] = none ∧
+    decodeTypedValueFromBytes defaultCodecFuel wKaniLayouts wTyUnalignedBool [.init 1 none] =
+      some (.aggregate 0 [.scalar ⟨1, 1⟩]) ∧
+    (decodeTypedValueFromBytes defaultCodecFuel wKaniLayouts wTyMaybeUninitBool [.init 2 none]).isSome = true ∧
+    Interp.Type.decodeM (M := Interp.BM) (.Union [] [(⟨0⟩, ⟨1⟩)] ⟨1⟩ ⟨1⟩) [.Init 2 none] =
+      .ok (some (.Union [[.Init 2 none]])) ∧
+    Interp.Type.decodeM (M := Interp.TBM) (.Union [] [(⟨0⟩, ⟨1⟩)] ⟨1⟩ ⟨1⟩) [.Init 2 none] =
+      .ok (some (.Union [[.Init 2 none]])) ∧
+    Interp.Type.decodeM (M := Interp.BM) .Bool [.Init 2 none] = .ok none ∧
+    Interp.Type.decodeM (M := Interp.TBM) .Bool [.Init 2 none] = .ok none ∧
+    Interp.Type.decodeM (M := Interp.TBM) .Bool [.Uninit] = .ok none := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl
+
+/-- Complete non-vacuous instantiations of every universal `A0` and `ep2-B1` theorem in this
+dialect: `scalarLayoutPtr_{coherent,incoherent,union_coherent,union_incoherent}`,
+`scalarLayoutNonPtr_strictUb_rejects_prov`, `decodePtrBytesNoForge_{thin,str,dyn}`,
+`encodeUntyped_ptr`, `encodeValueToBytes_thinPtr`, `proj_plain_bytes`,
+`trusted_retains_implies_minirust_retains`, `thinDecode_{raw_incoherent,ref_incoherent,uninit}`,
+`w1_transforms_decode_strips`, `offset_splice_decode_divergence`, `encodeWidePtrM_{slice,dyn}_proj`,
+`coherent_wide_{slice,dyn}_decode_agreement`, `swapped_wide_slice_div`,
+`kani5205_bool_correspondence_M`, and shared `*_eq_M` / `bmProv_eq_iff` / `minirust_*_decodeM`. -/
+theorem ep2_b1_mr_non_vacuity_instances :
+    decodeScalarLayoutBytesNoForge (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩) wP .strictUcg630Ub 8 =
+      some (.ptr { allocId := 7, offsetBytes := 0x1000 } 8) ∧
+    decodeScalarLayoutBytesNoForge (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩) wPlain .strictUcg630Ub 8 =
+      some (.scalar ⟨0x1000, 8⟩) ∧
+    decodeScalarLayoutBytesNoForge (.union (.pointer 0)) (encodePtrBytes 0x1000 4 9 9) .strictUcg630Ub 4 =
+      some (.ptr { allocId := 9, offsetBytes := 0x1000 } 4) ∧
+    decodeScalarLayoutBytesNoForge (.union (.pointer 0)) (encodePlainLittleEndianBytes 0x1000 4) .strictUcg630Ub 4 =
+      some (.scalar ⟨0x1000, 4⟩) ∧
+    (decodeScalarLayoutBytesNoForge (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩) wP .strictUcg630Ub 8 = none ∧
+     decodeScalarLayoutBytesNoForge (.union (.int 64 false)) wP .strictUcg630Ub 8 = none) ∧
+    decodePtrBytesNoForge true (.uint .u8) 8 wP = thinDecode true 8 wP ∧
+    decodePtrBytesNoForge true .str 8 (wP ++ wLen3) =
+      (match thinDecode true 8 wP, sliceMetaDecode 8 wLen3 with
+       | some dv, some mv => some (.aggregate 0 [dv, mv]) | _, _ => none) ∧
+    decodePtrBytesNoForge true (.dynamic "T") 8 (wP ++ wVt) =
+      (match thinDecode true 8 wP, thinDecode true 8 wVt with
+       | some dv, some mv => some (.aggregate 0 [dv, mv]) | _, _ => none) ∧
+    encodeUntypedValueToBytes 1 (.ptr ⟨7, 0x1000⟩ 8) = some wP ∧
+    encodeValueToBytes 1 wLayouts wTyRawPtrU8 (.ptr ⟨7, 0x1000⟩ 8) = some wP ∧
+    projBytes tbProv wPlain = Interp.encodePtrBytesM (M := Interp.TBM) none 0 (Interp.leBytes 0x1000 8) ∧
+    (mrProvM Interp.TBM (projBytes tbProv wP)).isSome = true ∧
+    thinDecode false 8 wPlain = some (.scalar ⟨0x1000, 8⟩) ∧
+    thinDecode true 8 wPlain = none ∧
+    thinDecode false 8 (wP.take 7 ++ [.uninit]) = none ∧
+    (bmProv 7 7 = bmProv 7 9 ↔ (7 : Nat) = 7) ∧
+    Interp.decodePtr (projBytes bmProv wP) = Interp.decodePtrM (M := Interp.BM) (projBytes bmProv wP) ∧
+    Interp.encodePtr ⟨0x1000, some (bmProv 7 7)⟩ = Interp.encodePtrM (M := Interp.BM) ⟨0x1000, some (bmProv 7 7)⟩ ∧
+    Interp.decodePtrProvenance 0 (Interp.firstProvenance (projBytes bmProv wP)) (projBytes bmProv wP) =
+      Interp.decodePtrProvenanceM (M := Interp.BM) 0 (Interp.firstProvenance (projBytes bmProv wP)) (projBytes bmProv wP) ∧
+    (∃ d, trData wP.reverse = some d ∧ thinDecode false 8 wP.reverse = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 wP.reverse = none ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv wP.reverse) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none })) ∧
+    (∃ d, trData (wP.take 1 ++ wP256.drop 1) = some d ∧
+      thinDecode false 8 (wP.take 1 ++ wP256.drop 1) = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 (wP.take 1 ++ wP256.drop 1) = none ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv (wP.take 1 ++ wP256.drop 1)) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := some (tbProv 7 7) })) ∧
+    Interp.encodeWidePtrM (M := Interp.TBM) .ElementCount
+      { thin_pointer := { addr := ((0x1000 : Nat) : Int), provenance := some (tbProv 7 7) },
+        metadata := some (.ElementCount ((3 : Nat) : Int)) } =
+      .ok (projBytes tbProv (wP ++ wLen3)) ∧
+    Interp.encodeWidePtrM (M := Interp.TBM) (.VTablePointer ⟨⟨0⟩⟩)
+      { thin_pointer := { addr := ((0x1000 : Nat) : Int), provenance := some (tbProv 7 7) },
+        metadata := some (.VTablePointer { addr := ((0x80 : Nat) : Int), provenance := some (tbProv 42 42) }) } =
+      .ok (projBytes tbProv (wP ++ wVt)) ∧
+    (∃ dd, trData wP = some dd ∧
+      decodePtrBytesNoForge true (.slice (.uint .u8)) 8 (wP ++ wLen3) =
+        some (.aggregate 0 [.ptr { allocId := 7, offsetBytes := Interp.leValue dd } 8,
+          .scalar ⟨Interp.leValue [3, 0, 0, 0, 0, 0, 0, 0], 8⟩]) ∧
+      decodePtrBytesNoForge true .str 8 (wP ++ wLen3) =
+        some (.aggregate 0 [.ptr { allocId := 7, offsetBytes := Interp.leValue dd } 8,
+          .scalar ⟨Interp.leValue [3, 0, 0, 0, 0, 0, 0, 0], 8⟩]) ∧
+      Interp.decodeWidePtrM (M := Interp.TBM) .ElementCount (projBytes tbProv (wP ++ wLen3)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int), provenance := some (tbProv 7 7) },
+          metadata := some (.ElementCount ((Interp.leValue [3, 0, 0, 0, 0, 0, 0, 0] : Nat) : Int)) }))) ∧
+    (∃ dd md, trData wP = some dd ∧ trData wVt = some md ∧
+      decodePtrBytesNoForge true (.dynamic "T") 8 (wP ++ wVt) =
+        some (.aggregate 0 [.ptr { allocId := 7, offsetBytes := Interp.leValue dd } 8,
+          .ptr { allocId := 42, offsetBytes := Interp.leValue md } 8]) ∧
+      Interp.decodeWidePtrM (M := Interp.TBM) (.VTablePointer ⟨⟨0⟩⟩) (projBytes tbProv (wP ++ wVt)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int), provenance := some (tbProv 7 7) },
+          metadata := some (.VTablePointer {
+            addr := ((Interp.leValue md : Nat) : Int), provenance := some (tbProv 42 42) }) }))) ∧
+    (∃ dd, trData wP = some dd ∧
+      decodePtrBytesNoForge true (.slice (.uint .u8)) 8 (wLen3 ++ wP) = none ∧
+      Interp.decodeWidePtrM (M := Interp.TBM) .ElementCount (projBytes tbProv (wLen3 ++ wP)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue [3, 0, 0, 0, 0, 0, 0, 0] : Nat) : Int), provenance := none },
+          metadata := some (.ElementCount ((Interp.leValue dd : Nat) : Int)) }))) ∧
+    (decodeUntypedStorageBytes defaultCodecFuel wLayouts wTyBool [.init 2 none] = some (.scalar ⟨2, 1⟩) ∧
+     ((decodeTypedValueFromBytes defaultCodecFuel wLayouts wTyBool [.init 2 none]).isSome = true ↔
+       ∃ b, Interp.Type.decodeM (M := Interp.TBM) .Bool (projBytes tbProv [.init 2 none]) = .ok (some (.Bool b))) ∧
+     (validateValueForTy? wLayouts (some wTyBool) (.scalar ⟨(2 : UInt8).toNat, 1⟩) = true ↔
+       ∃ b, Interp.Type.decodeM (M := Interp.TBM) .Bool (projBytes tbProv [.init 2 none]) = .ok (some (.Bool b)))) :=
+  ⟨scalarLayoutPtr_coherent 0 ⟨0, 0xFFFFFFFFFFFFFFFF⟩ wP 0x1000 ⟨7, 7, 0, 0x1000, 8⟩ .strictUcg630Ub rfl rfl rfl rfl,
+   scalarLayoutPtr_incoherent 0 ⟨0, 0xFFFFFFFFFFFFFFFF⟩ wPlain 0x1000 .strictUcg630Ub rfl rfl rfl,
+   scalarLayoutPtr_union_coherent 0 4 (encodePtrBytes 0x1000 4 9 9) 0x1000 ⟨9, 9, 0, 0x1000, 4⟩ .strictUcg630Ub (by decide) rfl rfl rfl rfl,
+   scalarLayoutPtr_union_incoherent 0 4 (encodePlainLittleEndianBytes 0x1000 4) 0x1000 .strictUcg630Ub (by decide) rfl rfl rfl,
+   scalarLayoutNonPtr_strictUb_rejects_prov 64 false ⟨0, 0xFFFFFFFFFFFFFFFF⟩ 8 wP rfl,
+   decodePtrBytesNoForge_thin true (.uint .u8) 8 wP rfl,
+   decodePtrBytesNoForge_str true wP wLen3 (by decide) rfl,
+   decodePtrBytesNoForge_dyn true "T" wP wVt (by decide) rfl,
+   encodeUntyped_ptr 0 ⟨7, 0x1000⟩ 8 (by decide),
+   encodeValueToBytes_thinPtr 0 wLayouts wTyRawPtrU8 ⟨7, 0x1000⟩ 8 rfl (by decide) (Or.inl ⟨.not, .uint .u8, rfl, rfl⟩),
+   proj_plain_bytes (M := Interp.TBM) tbProv 8 0x1000 0,
+   trusted_retains_implies_minirust_retains (M := Interp.TBM) tbProv wP rfl,
+   thinDecode_raw_incoherent 8 wPlain 0x1000 (by decide) rfl rfl rfl,
+   thinDecode_ref_incoherent 8 wPlain rfl,
+   thinDecode_uninit false 8 (wP.take 7 ++ [.uninit]) rfl,
+   bmProv_eq_iff 7 7 7 9,
+   decodePtr_eq_M (projBytes bmProv wP),
+   encodePtr_eq_M ⟨0x1000, some (bmProv 7 7)⟩,
+   decodePtrProvenance_eq_M (projBytes bmProv wP) 0 (Interp.firstProvenance (projBytes bmProv wP)),
+   (w1_transforms_decode_strips (M := Interp.TBM) tbProv 0x1000 7 7).1,
+   offset_splice_decode_divergence (M := Interp.TBM) tbProv (wP.take 1 ++ wP256.drop 1)
+     0x1000 0x1100 7 7 0 1 _ _ rfl
+     (by intro k b hk; match k, hk with
+       | 0, h => exact Or.inl h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h => exact Or.inr h
+       | _ + 8, h => cases h)
+     rfl rfl rfl rfl (by decide),
+   encodeWidePtrM_slice_proj (M := Interp.TBM) tbProv 0x1000 3 7 7 (by decide) (by decide),
+   encodeWidePtrM_dyn_proj (M := Interp.TBM) ⟨⟨0⟩⟩ tbProv 0x1000 0x80 7 7 42 42 (by decide) (by decide),
+   coherent_wide_slice_decode_agreement (M := Interp.TBM) tbProv true (.uint .u8) wP wLen3
+     ⟨7, 7, 0, 0x1000, 8⟩ [3, 0, 0, 0, 0, 0, 0, 0] rfl rfl rfl rfl rfl rfl,
+   coherent_wide_dyn_decode_agreement (M := Interp.TBM) tbProv true "T" ⟨⟨0⟩⟩ wP wVt
+     ⟨7, 7, 0, 0x1000, 8⟩ ⟨42, 42, 0, 0x80, 8⟩ rfl rfl rfl rfl rfl rfl,
+   swapped_wide_slice_div (M := Interp.TBM) tbProv true (.uint .u8) wLen3 wP
+     ⟨7, 7, 0, 0x1000, 8⟩ [3, 0, 0, 0, 0, 0, 0, 0] rfl rfl rfl ⟨3, rfl⟩ rfl,
+   kani5205_bool_correspondence_M (M := Interp.TBM) tbProv wLayouts wTyBool rfl 2⟩
+
 end Witnesses
 
 end V06
@@ -1926,6 +2659,7 @@ end V06
 namespace V08
 
 open Trusted.Sequence
+open Trusted.Rustc.V2026_08_01.Layout
 open Trusted.Rustc.V2026_08_01.MirAst
 open Trusted.Rustc.V2026_08_01.MirSemantics
 
@@ -2438,6 +3172,49 @@ theorem scalarLayoutPtr_incoherent (addrSpace : Nat)
   simp only [e2, hbits, h]
   cases wrappingRangeContains vr bits <;> rfl
 
+/-- `decodeScalarLayoutBytesNoForge` at a union pointer scalar layout on a coherent stream, for
+any positive pointer width `pb` (including 32-bit `4` and 64-bit `8`). -/
+theorem scalarLayoutPtr_union_coherent (addrSpace pb : Nat) (bs : List AbstractByte) (bits : Nat)
+    (f : PtrByteFrag) (policy : Ptr2IntTransmutePolicy) (h0 : 0 < pb) (hlen : bs.length = pb)
+    (hbits : decodeLittleEndianBits bs = some bits)
+    (h : abstractBytesCoherentPtrProv? bs = some f) (hw : f.ptrBytes = pb) :
+    decodeScalarLayoutBytesNoForge (.union (.pointer addrSpace)) bs policy pb =
+      some (.ptr { allocId := f.allocId, offsetBytes := bits } pb) := by
+  have hne : Nat.beq pb 0 = false := by cases pb with | zero => omega | succ _ => rfl
+  have e2 : Nat.beq (length bs) pb = true := (nat_beq_iff _ _).mpr hlen
+  have e3 : Nat.beq f.ptrBytes pb = true := (nat_beq_iff _ _).mpr hw
+  unfold decodeScalarLayoutBytesNoForge scalarLayoutByteWidth primitiveKindByteWidth
+  simp only [hne, e2, hbits, h, e3]
+
+/-- `decodeScalarLayoutBytesNoForge` at a union pointer scalar layout on an incoherent stream never
+forges provenance, for any positive pointer width `pb` (32-bit `4` or 64-bit `8`). -/
+theorem scalarLayoutPtr_union_incoherent (addrSpace pb : Nat) (bs : List AbstractByte) (bits : Nat)
+    (policy : Ptr2IntTransmutePolicy) (h0 : 0 < pb) (hlen : bs.length = pb)
+    (hbits : decodeLittleEndianBits bs = some bits)
+    (h : abstractBytesCoherentPtrProv? bs = none) :
+    decodeScalarLayoutBytesNoForge (.union (.pointer addrSpace)) bs policy pb =
+      some (.scalar ⟨bits, pb⟩) := by
+  have hne : Nat.beq pb 0 = false := by cases pb with | zero => omega | succ _ => rfl
+  have e2 : Nat.beq (length bs) pb = true := (nat_beq_iff _ _).mpr hlen
+  unfold decodeScalarLayoutBytesNoForge scalarLayoutByteWidth primitiveKindByteWidth
+  simp only [hne, e2, hbits, h]
+
+/-- **UCG#630 W5 law**: `decodeScalarLayoutBytesNoForge` under `.strictUcg630Ub` rejects any
+provenance-bearing byte stream at non-pointer integer scalar layouts (both `.initialized` and
+`.union`). -/
+theorem scalarLayoutNonPtr_strictUb_rejects_prov (bitWidth : Nat) (signed : Bool)
+    (vr : Trusted.Rustc.V2026_08_01.Layout.WrappingRange) (pb : Nat) (bs : List AbstractByte)
+    (hp : abstractBytesHaveProv bs = true) :
+    decodeScalarLayoutBytesNoForge (.initialized (.int bitWidth signed) vr) bs .strictUcg630Ub pb = none ∧
+    decodeScalarLayoutBytesNoForge (.union (.int bitWidth signed)) bs .strictUcg630Ub pb = none := by
+  constructor <;> (
+    unfold decodeScalarLayoutBytesNoForge
+    cases scalarLayoutByteWidth _ pb with
+    | none => rfl
+    | some sz =>
+      dsimp only
+      cases Nat.beq (length bs) sz <;> simp [hp])
+
 /-! ### §5. Exact encoding and intact round trips -/
 
 theorem proj_encodeAux {M : Type} [Gen.Memory M] (pv : Nat → Nat → Gen.Memory.Provenance M)
@@ -2504,6 +3281,30 @@ theorem encodeUntyped_ptr (fuel : Nat) (p : ProvenancePtr) (sz : Nat) (hsz : 0 <
   cases sz with
   | zero => omega
   | succ n => rfl
+
+/-- **`encodeValueToBytes` on thin pointers.** For any thin pointer type (`.rawPtr`, `.ref`,
+`.fnPtr`) at target pointer width `pb > 0`, `encodeValueToBytes` produces `encodePtrBytes`. -/
+theorem encodeValueToBytes_thinPtr (fuel : Nat) (layouts : LayoutTable) (ty : Ty)
+    (p : ProvenancePtr) (pb : Nat) (hpb : layoutPointerBytes layouts = pb) (h0 : 0 < pb)
+    (hty : (∃ m pt, ty.kind = .rawPtr m pt ∧ thinPointee pt = true) ∨
+           (∃ m pt, ty.kind = .ref m pt ∧ thinPointee pt = true) ∨
+           (∃ a r s ab, ty.kind = .fnPtr a r s ab)) :
+    encodeValueToBytes (fuel + 1) layouts ty (.ptr p pb) =
+      some (encodePtrBytes p.offsetBytes pb p.allocId p.tag) := by
+  obtain ⟨kind, lidx⟩ := ty
+  have hblt : Nat.blt 0 pb = true := by rw [Nat.blt_eq]; exact h0
+  have hnz : Nat.beq pb 0 = false := by cases pb with | zero => omega | succ _ => rfl
+  rcases hty with ⟨m, pt, hk, hthin⟩ | ⟨m, pt, hk, hthin⟩ | ⟨a, r, s, ab, hk⟩
+  · dsimp only at hk; subst hk
+    cases pt <;> first
+      | (cases hthin; done)
+      | (unfold encodeValueToBytes; rw [hpb]; simp [hblt, encodeScalarBytes, hnz, encodeLittleEndianBytes])
+  · dsimp only at hk; subst hk
+    cases pt <;> first
+      | (cases hthin; done)
+      | (unfold encodeValueToBytes; rw [hpb]; simp [hblt, encodeScalarBytes, hnz, encodeLittleEndianBytes])
+  · dsimp only at hk; subst hk
+    unfold encodeValueToBytes; rw [hpb]; simp [hblt, encodeScalarBytes, hnz, encodeLittleEndianBytes]
 
 theorem bits_encodeAux (a t o pb : Nat) :
     ∀ (n bits idx : Nat),
@@ -2703,6 +3504,46 @@ theorem dupHead_strips {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
   ⟨permuted_strips_trusted _ bits 8 a t 1 0 _ (by decide) rfl rfl,
    permuted_strips_minirust pv _ bits 8 a t 1 0 _ (by decide) rfl rfl⟩
 
+/-- **End-to-end decoder stripping (`UCG#558` W1)** for full reversal, byte-0/1 swap, and head
+duplication: `Trusted` decodes raw pointers to provenance-free `.scalar` and rejects references
+(`none`), while MiniRust `decodePtrM` returns `.ok (some ⟨addr, none⟩)`. -/
+theorem w1_transforms_decode_strips {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (bits a t : Nat) :
+    let bsRev := (encodePtrBytes bits 8 a t).reverse
+    let bsSwap := swap01 (encodePtrBytes bits 8 a t)
+    let bsDup := dupHead (encodePtrBytes bits 8 a t)
+    (∃ d, trData bsRev = some d ∧ thinDecode false 8 bsRev = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 bsRev = none ∧
+      Interp.decodePtrM (M := M) (projBytes pv bsRev) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none })) ∧
+    (∃ d, trData bsSwap = some d ∧ thinDecode false 8 bsSwap = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 bsSwap = none ∧
+      Interp.decodePtrM (M := M) (projBytes pv bsSwap) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none })) ∧
+    (∃ d, trData bsDup = some d ∧ thinDecode false 8 bsDup = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 bsDup = none ∧
+      Interp.decodePtrM (M := M) (projBytes pv bsDup) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none })) := by
+  intro bsRev bsSwap bsDup
+  have hstep : ∀ (bs : List AbstractByte) (data : List UInt8),
+      bs.length = 8 → trData bs = some data →
+      abstractBytesCoherentPtrProv? bs = none →
+      mrProvM M (projBytes pv bs) = none →
+      ∃ d, trData bs = some d ∧ thinDecode false 8 bs = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+        thinDecode true 8 bs = none ∧
+        Interp.decodePtrM (M := M) (projBytes pv bs) =
+          .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none }) := by
+    intro bs data hlen hd htr hmr
+    have hbits : decodeLittleEndianBits bs = some (Interp.leValue data) := by
+      rw [bits_eq_leValue, hd]; rfl
+    refine ⟨data, hd, thinDecode_raw_incoherent 8 bs _ (by decide) hlen hbits htr,
+      thinDecode_ref_incoherent 8 bs htr, ?_⟩
+    rw [decodePtrM_proj pv bs hlen, hd, hmr]; rfl
+  refine ⟨?_, ?_, ?_⟩
+  · exact hstep bsRev _ rfl rfl (reversal_strips (M := M) pv bits a t).1 (reversal_strips (M := M) pv bits a t).2
+  · exact hstep bsSwap _ rfl rfl (swap01_strips (M := M) pv bits a t).1 (swap01_strips (M := M) pv bits a t).2
+  · exact hstep bsDup _ rfl rfl (dupHead_strips (M := M) pv bits a t).1 (dupHead_strips (M := M) pv bits a t).2
+
 /-- **Mixed provenance** (`Trusted`): fragments of two allocations or two tags. -/
 theorem mixed_provenance_strips_trusted (bs : List AbstractByte) (i j : Nat) (vi vj : UInt8)
     (fi fj : PtrByteFrag)
@@ -2816,6 +3657,53 @@ theorem offset_splice_minirust_retains {M : Type} [Gen.Memory M] [Interp.MemoryO
         · obtain ⟨v, hv⟩ := encodePtrBytes_get bits₂ pb a t i b h
           subst hv
           exact ⟨v, rfl⟩
+
+/-- **End-to-end offset-splice decoder divergence (`DIV-MR-OFFSET-SPLICE`, `UCG#558` W2).**
+For any 8-byte same-provenance splice `bs` drawing each byte in-position from `bits₁` or `bits₂`
+(with at least one byte from each and `normPtrByteOffset 8 bits₁ ≠ normPtrByteOffset 8 bits₂`):
+`Trusted` strips provenance (`thinDecode false` → `.scalar`, `thinDecode true` → `none`), while
+MiniRust `decodePtrM` retains `some (pv a t)` on the exact same decoded address. -/
+theorem offset_splice_decode_divergence {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (bs : List AbstractByte)
+    (bits₁ bits₂ a t i j : Nat) (b₁ b₂ : AbstractByte) (hlen : bs.length = 8)
+    (hsel : ∀ (k : Nat) (b : AbstractByte), bs[k]? = some b →
+      (encodePtrBytes bits₁ 8 a t)[k]? = some b ∨ (encodePtrBytes bits₂ 8 a t)[k]? = some b)
+    (h₁ : bs[i]? = some b₁) (e₁ : (encodePtrBytes bits₁ 8 a t)[i]? = some b₁)
+    (h₂ : bs[j]? = some b₂) (e₂ : (encodePtrBytes bits₂ 8 a t)[j]? = some b₂)
+    (hne : normPtrByteOffset 8 bits₁ ≠ normPtrByteOffset 8 bits₂) :
+    ∃ data, trData bs = some data ∧
+      thinDecode false 8 bs = some (.scalar ⟨Interp.leValue data, 8⟩) ∧
+      thinDecode true 8 bs = none ∧
+      Interp.decodePtrM (M := M) (projBytes pv bs) =
+        .ok (some { addr := ((Interp.leValue data : Nat) : Int),
+                    provenance := some (pv a t) }) := by
+  have htr := offset_splice_trusted_strips bs bits₁ bits₂ 8 a t i j b₁ b₂ h₁ e₁ h₂ e₂ hne
+  have hneList : bs ≠ [] := by intro h; subst h; cases hlen
+  have hmr := offset_splice_minirust_retains (M := M) pv bs bits₁ bits₂ 8 a t hneList hsel
+  have hdata : ∃ data, trData bs = some data := by
+    have hall : ∀ (k : Nat) (b : AbstractByte), bs[k]? = some b → ∃ (v : UInt8) (pr : Option PtrByteFrag), b = .init v pr := by
+      intro k b hk
+      rcases hsel k b hk with h | h
+      · obtain ⟨v, hv⟩ := encodePtrBytes_get bits₁ 8 a t k b h; exact ⟨v, _, hv⟩
+      · obtain ⟨v, hv⟩ := encodePtrBytes_get bits₂ 8 a t k b h; exact ⟨v, _, hv⟩
+    have aux : ∀ (l : List AbstractByte),
+        (∀ (k : Nat) (b : AbstractByte), l[k]? = some b → ∃ (v : UInt8) (pr : Option PtrByteFrag), b = .init v pr) → ∃ d, trData l = some d := by
+      intro l
+      induction l with
+      | nil => intro _; exact ⟨[], rfl⟩
+      | cons x xs ih =>
+        intro hl
+        obtain ⟨v, pr, rfl⟩ := hl 0 x rfl
+        obtain ⟨d, hd⟩ := ih (fun k b hk => hl (k + 1) b hk)
+        exact ⟨v :: d, by show (trData xs).map (v :: ·) = _; rw [hd]; rfl⟩
+    exact aux bs hall
+  obtain ⟨data, hd⟩ := hdata
+  have hbits : decodeLittleEndianBits bs = some (Interp.leValue data) := by
+    rw [bits_eq_leValue, hd]; rfl
+  refine ⟨data, hd, thinDecode_raw_incoherent 8 bs _ (by decide) hlen hbits htr,
+    thinDecode_ref_incoherent 8 bs htr, ?_⟩
+  rw [decodePtrM_proj pv bs hlen, hd, hmr]
+  rfl
 
 /-- **Exact characterization of the refinement gap.** For an injective
 provenance embedding, whenever MiniRust retains provenance on the projected
@@ -2974,6 +3862,153 @@ theorem slice_meta_with_provenance_rejected (isRef : Bool) (elem : RigidTy)
   rw [hp]
   cases thinDecode isRef d.length d <;> cases decodeLittleEndianBits m <;> rfl
 
+/-- **Wide trait-object pointers (`&dyn Trait`, `*const dyn Trait`)**: both data and vtable halves
+decode through `thinDecode`. -/
+theorem decodePtrBytesNoForge_dyn (isRef : Bool) (tr : String) (d m : List AbstractByte)
+    (h0 : 0 < d.length) (hm : m.length = d.length) :
+    decodePtrBytesNoForge isRef (.dynamic tr) d.length (d ++ m) =
+      (match thinDecode isRef d.length d, thinDecode isRef d.length m with
+       | some dv, some mv => some (.aggregate 0 [dv, mv])
+       | _, _ => none) := by
+  have e1 : Nat.blt 0 d.length = true := by rw [Nat.blt_eq]; exact h0
+  have e2 : Nat.beq (length (d ++ m)) (Nat.add d.length d.length) = true :=
+    (nat_beq_iff _ _).mpr (by show (d ++ m).length = d.length + d.length; rw [List.length_append, hm])
+  have e3 : Nat.beq (length m) d.length = true := (nat_beq_iff _ _).mpr hm
+  unfold decodePtrBytesNoForge thinDecode
+  simp only [e1, e2, e3, take_append, drop_append]
+  cases decodeLittleEndianBits m <;> rfl
+
+/-- **Exact wide slice/`str` encoding correspondence.** MiniRust `encodeWidePtrM .ElementCount`
+produces the exact projection of `encodePtrBytes addr 8 a t ++ encodePlainLittleEndianBytes len 8`. -/
+theorem encodeWidePtrM_slice_proj {M : Type} [Gen.Memory M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (addr len a t : Nat)
+    (ha : addr < 2 ^ 64) (hl : len < 2 ^ 64) :
+    Interp.encodeWidePtrM (M := M) .ElementCount
+      { thin_pointer := { addr := (addr : Int), provenance := some (pv a t) },
+        metadata := some (.ElementCount (len : Int)) } =
+      .ok (projBytes pv (encodePtrBytes addr 8 a t ++ encodePlainLittleEndianBytes len 8)) := by
+  rw [encodeWidePtrM_slice_eq addr len (some (pv a t)) ha hl]
+  unfold projBytes
+  rw [List.map_append]
+  change Except.ok _ = Except.ok (projBytes pv (encodePtrBytes addr 8 a t) ++
+    projBytes pv (encodePlainLittleEndianBytes len 8))
+  rw [proj_encodePtrBytes (M := M) pv addr 8 a t, proj_plain_bytes (M := M) pv 8 len 0]
+
+/-- **Exact wide `&dyn Trait` encoding correspondence.** MiniRust `encodeWidePtrM (.VTablePointer tr)`
+produces the exact projection of `encodePtrBytes addr 8 a t ++ encodePtrBytes vtAddr 8 va vt`. -/
+theorem encodeWidePtrM_dyn_proj {M : Type} [Gen.Memory M] (tr : Gen.TraitName)
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (addr vtAddr a t va vt : Nat)
+    (ha : addr < 2 ^ 64) (hv : vtAddr < 2 ^ 64) :
+    Interp.encodeWidePtrM (M := M) (.VTablePointer tr)
+      { thin_pointer := { addr := (addr : Int), provenance := some (pv a t) },
+        metadata := some (.VTablePointer { addr := (vtAddr : Int), provenance := some (pv va vt) }) } =
+      .ok (projBytes pv (encodePtrBytes addr 8 a t ++ encodePtrBytes vtAddr 8 va vt)) := by
+  rw [encodeWidePtrM_dyn_eq tr addr vtAddr (some (pv a t)) (some (pv va vt)) ha hv]
+  unfold projBytes
+  rw [List.map_append]
+  change Except.ok _ = Except.ok (projBytes pv (encodePtrBytes addr 8 a t) ++
+    projBytes pv (encodePtrBytes vtAddr 8 va vt))
+  rw [proj_encodePtrBytes (M := M) pv addr 8 a t, proj_encodePtrBytes (M := M) pv vtAddr 8 va vt]
+
+/-- **Universal wide slice/`str` decode correspondence.** On any 8-byte coherent data half `d` and
+8-byte initialized provenance-free metadata half `m`, `Trusted` (`decodePtrBytesNoForge` for both
+`.slice elem` and `.str`) and MiniRust (`Interp.decodeWidePtrM .ElementCount`) decode identically. -/
+theorem coherent_wide_slice_decode_agreement {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (isRef : Bool) (elem : RigidTy)
+    (d m : List AbstractByte) (f : PtrByteFrag) (md : List UInt8)
+    (hd : d.length = 8) (hm : m.length = 8)
+    (hcoh : abstractBytesCoherentPtrProv? d = some f) (hw : f.ptrBytes = 8)
+    (hmd : trData m = some md) (hplain : abstractBytesHaveProv m = false) :
+    ∃ dd, trData d = some dd ∧
+      decodePtrBytesNoForge isRef (.slice elem) 8 (d ++ m) =
+        some (.aggregate 0 [.ptr { allocId := f.allocId, offsetBytes := Interp.leValue dd } 8,
+          .scalar ⟨Interp.leValue md, 8⟩]) ∧
+      decodePtrBytesNoForge isRef .str 8 (d ++ m) =
+        some (.aggregate 0 [.ptr { allocId := f.allocId, offsetBytes := Interp.leValue dd } 8,
+          .scalar ⟨Interp.leValue md, 8⟩]) ∧
+      Interp.decodeWidePtrM (M := M) .ElementCount (projBytes pv (d ++ m)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int),
+                            provenance := some (pv f.allocId f.tag) },
+          metadata := some (.ElementCount ((Interp.leValue md : Nat) : Int)) })) := by
+  obtain ⟨dd, hdd, hthin, _⟩ := coherent_decode_agreement (M := M) pv d f isRef hd hcoh hw
+  have hmbits : decodeLittleEndianBits m = some (Interp.leValue md) := by
+    rw [bits_eq_leValue, hmd]; rfl
+  have hmeta : sliceMetaDecode 8 m = some (.scalar ⟨Interp.leValue md, 8⟩) := by
+    unfold sliceMetaDecode; rw [hmbits, hplain]
+  have hproj : projBytes pv (d ++ m) = projBytes pv d ++ projBytes pv m := List.map_append
+  refine ⟨dd, hdd, ?_, ?_, ?_⟩
+  · have h := decodePtrBytesNoForge_slice isRef elem d m (by omega) (by omega)
+    rw [hd] at h; rw [h, hthin, hmeta]
+  · have h := decodePtrBytesNoForge_str isRef d m (by omega) (by omega)
+    rw [hd] at h; rw [h, hthin, hmeta]
+  · rw [hproj, decodeWidePtrM_slice_eq _ _ (by rw [projBytes_length, hd]) (by rw [projBytes_length, hm]),
+      proj_data, proj_data, hdd, hmd, trusted_coherent_implies_minirust_retains pv d f hcoh]
+
+/-- **Universal wide `&dyn Trait` decode correspondence.** On any 8-byte coherent data half `d` and
+8-byte coherent vtable half `m`, `Trusted` (`decodePtrBytesNoForge`) and MiniRust
+(`Interp.decodeWidePtrM (.VTablePointer trId)`) decode identically. -/
+theorem coherent_wide_dyn_decode_agreement {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (isRef : Bool) (tr : String) (trId : Gen.TraitName)
+    (d m : List AbstractByte) (fd fm : PtrByteFrag)
+    (hd : d.length = 8) (hm : m.length = 8)
+    (hcd : abstractBytesCoherentPtrProv? d = some fd) (hwd : fd.ptrBytes = 8)
+    (hcm : abstractBytesCoherentPtrProv? m = some fm) (hwm : fm.ptrBytes = 8) :
+    ∃ dd md, trData d = some dd ∧ trData m = some md ∧
+      decodePtrBytesNoForge isRef (.dynamic tr) 8 (d ++ m) =
+        some (.aggregate 0 [.ptr { allocId := fd.allocId, offsetBytes := Interp.leValue dd } 8,
+          .ptr { allocId := fm.allocId, offsetBytes := Interp.leValue md } 8]) ∧
+      Interp.decodeWidePtrM (M := M) (.VTablePointer trId) (projBytes pv (d ++ m)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int),
+                            provenance := some (pv fd.allocId fd.tag) },
+          metadata := some (.VTablePointer {
+            addr := ((Interp.leValue md : Nat) : Int),
+            provenance := some (pv fm.allocId fm.tag) }) })) := by
+  obtain ⟨dd, hdd, htd, _⟩ := coherent_decode_agreement (M := M) pv d fd isRef hd hcd hwd
+  obtain ⟨md, hmd, htm, _⟩ := coherent_decode_agreement (M := M) pv m fm isRef hm hcm hwm
+  have hproj : projBytes pv (d ++ m) = projBytes pv d ++ projBytes pv m := List.map_append
+  refine ⟨dd, md, hdd, hmd, ?_, ?_⟩
+  · have h := decodePtrBytesNoForge_dyn isRef tr d m (by omega) (by omega)
+    rw [hd] at h; rw [h, htd, htm]
+  · rw [hproj, decodeWidePtrM_dyn_eq trId _ _ (by rw [projBytes_length, hd]) (by rw [projBytes_length, hm]),
+      proj_data, proj_data, hdd, hmd,
+      trusted_coherent_implies_minirust_retains pv d fd hcd,
+      trusted_coherent_implies_minirust_retains pv m fm hcm]
+
+/-- **Universal swapped wide-slice divergence (`DIV-MR-PTR2INT`).** On `m ++ d` where `m` is an
+8-byte plain integer and `d` is an 8-byte coherent pointer, `Trusted` rejects `m ++ d` under
+`Ptr2IntTransmutePolicy.strictUcg630Ub` (`= none`), whereas MiniRust `decodeWidePtrM .ElementCount`
+accepts it as a provenance-free data pointer with element count equal to `d`'s address. -/
+theorem swapped_wide_slice_div {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (isRef : Bool) (elem : RigidTy)
+    (m d : List AbstractByte) (f : PtrByteFrag) (md : List UInt8)
+    (hm : m.length = 8) (hd : d.length = 8)
+    (hmd : trData m = some md) (hm0 : ∃ v, m[0]? = some (.init v none))
+    (hcd : abstractBytesCoherentPtrProv? d = some f) :
+    ∃ dd, trData d = some dd ∧
+      decodePtrBytesNoForge isRef (.slice elem) 8 (m ++ d) = none ∧
+      Interp.decodeWidePtrM (M := M) .ElementCount (projBytes pv (m ++ d)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue md : Nat) : Int), provenance := none },
+          metadata := some (.ElementCount ((Interp.leValue dd : Nat) : Int)) })) := by
+  obtain ⟨_, _, hcoh⟩ := (coherent?_eq_some_iff d f).mp hcd
+  obtain ⟨dd, hdd⟩ := trCoh_data _ _ _ _ d 0 hcoh
+  have hdp : abstractBytesHaveProv d = true := by
+    cases d with
+    | nil => cases hd
+    | cons x rest =>
+      obtain ⟨v, rfl⟩ := hcoh.1
+      rfl
+  obtain ⟨v0, hv0⟩ := hm0
+  have hmp : mrProvM M (projBytes pv m) = none := missing_provenance_strips_minirust pv m 0 v0 hv0
+  have hproj : projBytes pv (m ++ d) = projBytes pv m ++ projBytes pv d := List.map_append
+  refine ⟨dd, hdd, ?_, ?_⟩
+  · have h := slice_meta_with_provenance_rejected isRef elem m d (by omega) (by omega) hdp
+    rw [hm] at h; exact h
+  · rw [hproj, decodeWidePtrM_slice_eq _ _ (by rw [projBytes_length, hm]) (by rw [projBytes_length, hd]),
+      proj_data, proj_data, hmd, hdd, hmp]
+
 /-! ### §9. `Kani#5205`: read-time validity of untyped bytes -/
 
 /-- **MiniRust rejects every non-`0`/`1` byte at `Type::Bool`** (for any
@@ -2998,6 +4033,82 @@ theorem minirust_u8_valid (v : UInt8) (fr : Option (Gen.ProvenanceFrag Interp.Pr
     Interp.Type.decode (.Int ⟨.Unsigned, ⟨1⟩⟩) [.Init v fr] = .ok (some (.Int (v.toNat : Int))) := by
   rw [Interp.Type.decode]
   rfl
+
+/-- **Universal polymorphic `Kani#5205` `Trusted` ↔ MiniRust `bool` validity correspondence**
+across BOTH `BasicMemory` and `TreeBorrowsMemory` for every byte `v : UInt8`: untyped storage
+accepts `v`, while typed `bool` decoding / validation agrees iff `v ∈ {0, 1}`. -/
+theorem kani5205_bool_correspondence_M {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M) (layouts : LayoutTable) (tyBool : Ty)
+    (hty : tyBool.kind = .bool) (v : UInt8) :
+    decodeUntypedStorageBytes defaultCodecFuel layouts tyBool [.init v none] =
+      some (.scalar ⟨v.toNat, 1⟩) ∧
+    ((decodeTypedValueFromBytes defaultCodecFuel layouts tyBool [.init v none]).isSome = true ↔
+      ∃ b, Interp.Type.decodeM (M := M) .Bool (projBytes pv [.init v none]) = .ok (some (.Bool b))) ∧
+    (validateValueForTy? layouts (some tyBool) (.scalar ⟨v.toNat, 1⟩) = true ↔
+      ∃ b, Interp.Type.decodeM (M := M) .Bool (projBytes pv [.init v none]) = .ok (some (.Bool b))) := by
+  obtain ⟨kind, lidx⟩ := tyBool
+  dsimp only at hty
+  subst hty
+  have hun : decodeUntypedStorageBytes defaultCodecFuel layouts ⟨.bool, lidx⟩ [.init v none] =
+      some (.scalar ⟨v.toNat, 1⟩) := by
+    show some (Value.scalar ⟨v.toBitVec.toNat + 256 * 0, 1⟩) = some (Value.scalar ⟨v.toNat, 1⟩)
+    rw [Nat.mul_zero, Nat.add_zero]; rfl
+  have hmr : Interp.Type.decodeM (M := M) .Bool (projBytes pv [.init v none]) =
+      (if v = 0 then .ok (some (.Bool false))
+       else if v = 1 then .ok (some (.Bool true))
+       else .ok none) := minirust_bool_decodeM_iff (M := M) v none
+  refine ⟨hun, ?_, ?_⟩
+  · by_cases h0 : v = 0
+    · subst h0
+      have htr : decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.bool, lidx⟩ [.init 0 none] =
+          some (.scalar ⟨0, 1⟩) := rfl
+      simp [hmr, htr]
+    · by_cases h1 : v = 1
+      · subst h1
+        have htr : decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.bool, lidx⟩ [.init 1 none] =
+            some (.scalar ⟨1, 1⟩) := rfl
+        simp [hmr, htr]
+      · have hne0 : Nat.beq v.toBitVec.toNat 0 = false := by
+          cases h : Nat.beq v.toBitVec.toNat 0 with
+          | false => rfl
+          | true =>
+            have hv0 : v.toNat = 0 := (nat_beq_iff _ _).mp h
+            exact absurd (UInt8.toNat_inj.mp hv0) h0
+        have hne1 : Nat.beq v.toBitVec.toNat 1 = false := by
+          cases h : Nat.beq v.toBitVec.toNat 1 with
+          | false => rfl
+          | true =>
+            have hv1 : v.toNat = 1 := (nat_beq_iff _ _).mp h
+            exact absurd (UInt8.toNat_inj.mp hv1) h1
+        have htr : decodeTypedValueFromBytes defaultCodecFuel layouts ⟨.bool, lidx⟩ [.init v none] = none := by
+          show (match Nat.beq v.toBitVec.toNat 0 with
+            | true => some (Value.scalar ⟨0, 1⟩)
+            | false => match Nat.beq v.toBitVec.toNat 1 with
+              | true => some (Value.scalar ⟨1, 1⟩)
+              | false => none) = none
+          rw [hne0, hne1]
+        simp [hmr, h0, h1, htr]
+  · by_cases h0 : v = 0
+    · subst h0
+      have hval : validateValueForTy? layouts (some ⟨.bool, lidx⟩) (.scalar ⟨0, 1⟩) = true := rfl
+      simp [hmr, hval]
+    · by_cases h1 : v = 1
+      · subst h1
+        have hval : validateValueForTy? layouts (some ⟨.bool, lidx⟩) (.scalar ⟨1, 1⟩) = true := rfl
+        simp [hmr, hval]
+      · have hble : Nat.ble v.toNat 1 = false := by
+          cases h : Nat.ble v.toNat 1 with
+          | false => rfl
+          | true =>
+            have hle : v.toNat ≤ 1 := Nat.ble_eq.mp h
+            have : v.toNat = 0 ∨ v.toNat = 1 := by omega
+            rcases this with hv | hv
+            · exact absurd (UInt8.toNat_inj.mp hv) h0
+            · exact absurd (UInt8.toNat_inj.mp hv) h1
+        have hval : validateValueForTy? layouts (some ⟨.bool, lidx⟩) (.scalar ⟨v.toNat, 1⟩) = false := by
+          show Bool.and true (Nat.ble v.toNat 1) = false
+          rw [hble]; rfl
+        simp [hmr, h0, h1, hval]
 
 /-! ### §10. Fixtures and kernel-checked witnesses -/
 
@@ -3391,6 +4502,164 @@ theorem wide_and_bool_instance :
    decodePtrBytesNoForge_slice false (.uint .u8) wP wLen3 (by decide) rfl,
    minirust_bool_invalid 2 none (by decide) (by decide), minirust_u8_valid 2 none⟩
 
+def wUnalignedBoolL : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [2] }
+def wMaybeUninitBoolL : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [2, 0] }
+def wKaniLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries := [wUnitL, wU8L, wBoolL, wCharL, wU32L, wUnalignedBoolL, wMaybeUninitBoolL] }
+def wTyUnalignedBool : Ty := { kind := .adt "Unaligned" [.bool], layoutIdx := 5 }
+def wTyMaybeUninitBool : Ty := { kind := .adt "core::mem::MaybeUninit" [.bool], layoutIdx := 6 }
+def wTyRawPtrU8 : Ty := { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }
+
+/-- **`Kani#5205`: `Unaligned<bool>` and `MaybeUninit<bool>`** across `Trusted` and MiniRust
+(`BasicMemory` and `TreeBorrowsMemory`). Untyped storage accepts `2u8` (including inside
+`MaybeUninit<bool>` and MiniRust `Type::Union`); typed `Unaligned<bool>` / `bool` reads reject it
+in both authorities. -/
+theorem w_kani5205_unaligned_and_maybeuninit :
+    decodeUntypedStorageBytes defaultCodecFuel wKaniLayouts wTyUnalignedBool [.init 2 none] =
+      some (.aggregate 0 [.scalar ⟨2, 1⟩]) ∧
+    decodeTypedValueFromBytes defaultCodecFuel wKaniLayouts wTyUnalignedBool [.init 2 none] = none ∧
+    decodeTypedValueFromBytes defaultCodecFuel wKaniLayouts wTyUnalignedBool [.init 1 none] =
+      some (.aggregate 0 [.scalar ⟨1, 1⟩]) ∧
+    (decodeTypedValueFromBytes defaultCodecFuel wKaniLayouts wTyMaybeUninitBool [.init 2 none]).isSome = true ∧
+    Interp.Type.decodeM (M := Interp.BM) (.Union [] [(⟨0⟩, ⟨1⟩)] ⟨1⟩ ⟨1⟩) [.Init 2 none] =
+      .ok (some (.Union [[.Init 2 none]])) ∧
+    Interp.Type.decodeM (M := Interp.TBM) (.Union [] [(⟨0⟩, ⟨1⟩)] ⟨1⟩ ⟨1⟩) [.Init 2 none] =
+      .ok (some (.Union [[.Init 2 none]])) ∧
+    Interp.Type.decodeM (M := Interp.BM) .Bool [.Init 2 none] = .ok none ∧
+    Interp.Type.decodeM (M := Interp.TBM) .Bool [.Init 2 none] = .ok none ∧
+    Interp.Type.decodeM (M := Interp.TBM) .Bool [.Uninit] = .ok none := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl
+
+/-- Complete non-vacuous instantiations of every universal `A0` and `ep2-B1` theorem in this
+dialect: `scalarLayoutPtr_{coherent,incoherent,union_coherent,union_incoherent}`,
+`scalarLayoutNonPtr_strictUb_rejects_prov`, `decodePtrBytesNoForge_{thin,str,dyn}`,
+`encodeUntyped_ptr`, `encodeValueToBytes_thinPtr`, `proj_plain_bytes`,
+`trusted_retains_implies_minirust_retains`, `thinDecode_{raw_incoherent,ref_incoherent,uninit}`,
+`w1_transforms_decode_strips`, `offset_splice_decode_divergence`, `encodeWidePtrM_{slice,dyn}_proj`,
+`coherent_wide_{slice,dyn}_decode_agreement`, `swapped_wide_slice_div`,
+`kani5205_bool_correspondence_M`, and shared `*_eq_M` / `bmProv_eq_iff` / `minirust_*_decodeM`. -/
+theorem ep2_b1_mr_non_vacuity_instances :
+    decodeScalarLayoutBytesNoForge (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩) wP .strictUcg630Ub 8 =
+      some (.ptr { allocId := 7, offsetBytes := 0x1000 } 8) ∧
+    decodeScalarLayoutBytesNoForge (.initialized (.pointer 0) ⟨0, 0xFFFFFFFFFFFFFFFF⟩) wPlain .strictUcg630Ub 8 =
+      some (.scalar ⟨0x1000, 8⟩) ∧
+    decodeScalarLayoutBytesNoForge (.union (.pointer 0)) (encodePtrBytes 0x1000 4 9 9) .strictUcg630Ub 4 =
+      some (.ptr { allocId := 9, offsetBytes := 0x1000 } 4) ∧
+    decodeScalarLayoutBytesNoForge (.union (.pointer 0)) (encodePlainLittleEndianBytes 0x1000 4) .strictUcg630Ub 4 =
+      some (.scalar ⟨0x1000, 4⟩) ∧
+    (decodeScalarLayoutBytesNoForge (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩) wP .strictUcg630Ub 8 = none ∧
+     decodeScalarLayoutBytesNoForge (.union (.int 64 false)) wP .strictUcg630Ub 8 = none) ∧
+    decodePtrBytesNoForge true (.uint .u8) 8 wP = thinDecode true 8 wP ∧
+    decodePtrBytesNoForge true .str 8 (wP ++ wLen3) =
+      (match thinDecode true 8 wP, sliceMetaDecode 8 wLen3 with
+       | some dv, some mv => some (.aggregate 0 [dv, mv]) | _, _ => none) ∧
+    decodePtrBytesNoForge true (.dynamic "T") 8 (wP ++ wVt) =
+      (match thinDecode true 8 wP, thinDecode true 8 wVt with
+       | some dv, some mv => some (.aggregate 0 [dv, mv]) | _, _ => none) ∧
+    encodeUntypedValueToBytes 1 (.ptr ⟨7, 0x1000⟩ 8) = some wP ∧
+    encodeValueToBytes 1 wLayouts wTyRawPtrU8 (.ptr ⟨7, 0x1000⟩ 8) = some wP ∧
+    projBytes tbProv wPlain = Interp.encodePtrBytesM (M := Interp.TBM) none 0 (Interp.leBytes 0x1000 8) ∧
+    (mrProvM Interp.TBM (projBytes tbProv wP)).isSome = true ∧
+    thinDecode false 8 wPlain = some (.scalar ⟨0x1000, 8⟩) ∧
+    thinDecode true 8 wPlain = none ∧
+    thinDecode false 8 (wP.take 7 ++ [.uninit]) = none ∧
+    (bmProv 7 7 = bmProv 7 9 ↔ (7 : Nat) = 7) ∧
+    Interp.decodePtr (projBytes bmProv wP) = Interp.decodePtrM (M := Interp.BM) (projBytes bmProv wP) ∧
+    Interp.encodePtr ⟨0x1000, some (bmProv 7 7)⟩ = Interp.encodePtrM (M := Interp.BM) ⟨0x1000, some (bmProv 7 7)⟩ ∧
+    Interp.decodePtrProvenance 0 (Interp.firstProvenance (projBytes bmProv wP)) (projBytes bmProv wP) =
+      Interp.decodePtrProvenanceM (M := Interp.BM) 0 (Interp.firstProvenance (projBytes bmProv wP)) (projBytes bmProv wP) ∧
+    (∃ d, trData wP.reverse = some d ∧ thinDecode false 8 wP.reverse = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 wP.reverse = none ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv wP.reverse) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := none })) ∧
+    (∃ d, trData (wP.take 1 ++ wP256.drop 1) = some d ∧
+      thinDecode false 8 (wP.take 1 ++ wP256.drop 1) = some (.scalar ⟨Interp.leValue d, 8⟩) ∧
+      thinDecode true 8 (wP.take 1 ++ wP256.drop 1) = none ∧
+      Interp.decodePtrM (M := Interp.TBM) (projBytes tbProv (wP.take 1 ++ wP256.drop 1)) =
+        .ok (some { addr := ((Interp.leValue d : Nat) : Int), provenance := some (tbProv 7 7) })) ∧
+    Interp.encodeWidePtrM (M := Interp.TBM) .ElementCount
+      { thin_pointer := { addr := ((0x1000 : Nat) : Int), provenance := some (tbProv 7 7) },
+        metadata := some (.ElementCount ((3 : Nat) : Int)) } =
+      .ok (projBytes tbProv (wP ++ wLen3)) ∧
+    Interp.encodeWidePtrM (M := Interp.TBM) (.VTablePointer ⟨⟨0⟩⟩)
+      { thin_pointer := { addr := ((0x1000 : Nat) : Int), provenance := some (tbProv 7 7) },
+        metadata := some (.VTablePointer { addr := ((0x80 : Nat) : Int), provenance := some (tbProv 42 42) }) } =
+      .ok (projBytes tbProv (wP ++ wVt)) ∧
+    (∃ dd, trData wP = some dd ∧
+      decodePtrBytesNoForge true (.slice (.uint .u8)) 8 (wP ++ wLen3) =
+        some (.aggregate 0 [.ptr { allocId := 7, offsetBytes := Interp.leValue dd } 8,
+          .scalar ⟨Interp.leValue [3, 0, 0, 0, 0, 0, 0, 0], 8⟩]) ∧
+      decodePtrBytesNoForge true .str 8 (wP ++ wLen3) =
+        some (.aggregate 0 [.ptr { allocId := 7, offsetBytes := Interp.leValue dd } 8,
+          .scalar ⟨Interp.leValue [3, 0, 0, 0, 0, 0, 0, 0], 8⟩]) ∧
+      Interp.decodeWidePtrM (M := Interp.TBM) .ElementCount (projBytes tbProv (wP ++ wLen3)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int), provenance := some (tbProv 7 7) },
+          metadata := some (.ElementCount ((Interp.leValue [3, 0, 0, 0, 0, 0, 0, 0] : Nat) : Int)) }))) ∧
+    (∃ dd md, trData wP = some dd ∧ trData wVt = some md ∧
+      decodePtrBytesNoForge true (.dynamic "T") 8 (wP ++ wVt) =
+        some (.aggregate 0 [.ptr { allocId := 7, offsetBytes := Interp.leValue dd } 8,
+          .ptr { allocId := 42, offsetBytes := Interp.leValue md } 8]) ∧
+      Interp.decodeWidePtrM (M := Interp.TBM) (.VTablePointer ⟨⟨0⟩⟩) (projBytes tbProv (wP ++ wVt)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue dd : Nat) : Int), provenance := some (tbProv 7 7) },
+          metadata := some (.VTablePointer {
+            addr := ((Interp.leValue md : Nat) : Int), provenance := some (tbProv 42 42) }) }))) ∧
+    (∃ dd, trData wP = some dd ∧
+      decodePtrBytesNoForge true (.slice (.uint .u8)) 8 (wLen3 ++ wP) = none ∧
+      Interp.decodeWidePtrM (M := Interp.TBM) .ElementCount (projBytes tbProv (wLen3 ++ wP)) =
+        .ok (some (.Ptr {
+          thin_pointer := { addr := ((Interp.leValue [3, 0, 0, 0, 0, 0, 0, 0] : Nat) : Int), provenance := none },
+          metadata := some (.ElementCount ((Interp.leValue dd : Nat) : Int)) }))) ∧
+    (decodeUntypedStorageBytes defaultCodecFuel wLayouts wTyBool [.init 2 none] = some (.scalar ⟨2, 1⟩) ∧
+     ((decodeTypedValueFromBytes defaultCodecFuel wLayouts wTyBool [.init 2 none]).isSome = true ↔
+       ∃ b, Interp.Type.decodeM (M := Interp.TBM) .Bool (projBytes tbProv [.init 2 none]) = .ok (some (.Bool b))) ∧
+     (validateValueForTy? wLayouts (some wTyBool) (.scalar ⟨(2 : UInt8).toNat, 1⟩) = true ↔
+       ∃ b, Interp.Type.decodeM (M := Interp.TBM) .Bool (projBytes tbProv [.init 2 none]) = .ok (some (.Bool b)))) :=
+  ⟨scalarLayoutPtr_coherent 0 ⟨0, 0xFFFFFFFFFFFFFFFF⟩ wP 0x1000 ⟨7, 7, 0, 0x1000, 8⟩ .strictUcg630Ub rfl rfl rfl rfl,
+   scalarLayoutPtr_incoherent 0 ⟨0, 0xFFFFFFFFFFFFFFFF⟩ wPlain 0x1000 .strictUcg630Ub rfl rfl rfl,
+   scalarLayoutPtr_union_coherent 0 4 (encodePtrBytes 0x1000 4 9 9) 0x1000 ⟨9, 9, 0, 0x1000, 4⟩ .strictUcg630Ub (by decide) rfl rfl rfl rfl,
+   scalarLayoutPtr_union_incoherent 0 4 (encodePlainLittleEndianBytes 0x1000 4) 0x1000 .strictUcg630Ub (by decide) rfl rfl rfl,
+   scalarLayoutNonPtr_strictUb_rejects_prov 64 false ⟨0, 0xFFFFFFFFFFFFFFFF⟩ 8 wP rfl,
+   decodePtrBytesNoForge_thin true (.uint .u8) 8 wP rfl,
+   decodePtrBytesNoForge_str true wP wLen3 (by decide) rfl,
+   decodePtrBytesNoForge_dyn true "T" wP wVt (by decide) rfl,
+   encodeUntyped_ptr 0 ⟨7, 0x1000⟩ 8 (by decide),
+   encodeValueToBytes_thinPtr 0 wLayouts wTyRawPtrU8 ⟨7, 0x1000⟩ 8 rfl (by decide) (Or.inl ⟨.not, .uint .u8, rfl, rfl⟩),
+   proj_plain_bytes (M := Interp.TBM) tbProv 8 0x1000 0,
+   trusted_retains_implies_minirust_retains (M := Interp.TBM) tbProv wP rfl,
+   thinDecode_raw_incoherent 8 wPlain 0x1000 (by decide) rfl rfl rfl,
+   thinDecode_ref_incoherent 8 wPlain rfl,
+   thinDecode_uninit false 8 (wP.take 7 ++ [.uninit]) rfl,
+   bmProv_eq_iff 7 7 7 9,
+   decodePtr_eq_M (projBytes bmProv wP),
+   encodePtr_eq_M ⟨0x1000, some (bmProv 7 7)⟩,
+   decodePtrProvenance_eq_M (projBytes bmProv wP) 0 (Interp.firstProvenance (projBytes bmProv wP)),
+   (w1_transforms_decode_strips (M := Interp.TBM) tbProv 0x1000 7 7).1,
+   offset_splice_decode_divergence (M := Interp.TBM) tbProv (wP.take 1 ++ wP256.drop 1)
+     0x1000 0x1100 7 7 0 1 _ _ rfl
+     (by intro k b hk; match k, hk with
+       | 0, h => exact Or.inl h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h => exact Or.inr h
+       | _ + 8, h => cases h)
+     rfl rfl rfl rfl (by decide),
+   encodeWidePtrM_slice_proj (M := Interp.TBM) tbProv 0x1000 3 7 7 (by decide) (by decide),
+   encodeWidePtrM_dyn_proj (M := Interp.TBM) ⟨⟨0⟩⟩ tbProv 0x1000 0x80 7 7 42 42 (by decide) (by decide),
+   coherent_wide_slice_decode_agreement (M := Interp.TBM) tbProv true (.uint .u8) wP wLen3
+     ⟨7, 7, 0, 0x1000, 8⟩ [3, 0, 0, 0, 0, 0, 0, 0] rfl rfl rfl rfl rfl rfl,
+   coherent_wide_dyn_decode_agreement (M := Interp.TBM) tbProv true "T" ⟨⟨0⟩⟩ wP wVt
+     ⟨7, 7, 0, 0x1000, 8⟩ ⟨42, 42, 0, 0x80, 8⟩ rfl rfl rfl rfl rfl rfl,
+   swapped_wide_slice_div (M := Interp.TBM) tbProv true (.uint .u8) wLen3 wP
+     ⟨7, 7, 0, 0x1000, 8⟩ [3, 0, 0, 0, 0, 0, 0, 0] rfl rfl rfl ⟨3, rfl⟩ rfl,
+   kani5205_bool_correspondence_M (M := Interp.TBM) tbProv wLayouts wTyBool rfl 2⟩
+
 end Witnesses
 
 end V08
@@ -3636,25 +4905,37 @@ elab "#assert_ptr_byte_coherence_mr_audit" : command => do
     "coherent?_eq_some_iff", "coherent_decode_agreement",
     "trusted_coherent_implies_minirust_retains", "trusted_retains_implies_minirust_retains",
     "converse_gap_iff", "offset_splice_trusted_strips", "offset_splice_minirust_retains",
+    "offset_splice_decode_divergence",
     "permuted_strips_trusted", "permuted_strips_minirust", "reversal_strips", "swap01_strips",
-    "dupHead_strips", "mixed_provenance_strips_trusted", "mixed_provenance_strips_minirust",
+    "dupHead_strips", "w1_transforms_decode_strips",
+    "mixed_provenance_strips_trusted", "mixed_provenance_strips_minirust",
     "missing_provenance_strips_trusted", "missing_provenance_strips_minirust",
     "uninit_rejected_trusted", "uninit_rejected_minirust", "proj_encodePtrBytes",
     "encodePtrM_proj", "encodePtr_proj", "decodePtrM_proj_encodePtrBytes",
     "thinDecode_encodePtrBytes", "decodePtrBytesNoForge_thin", "scalarLayoutPtr_coherent",
-    "scalarLayoutPtr_incoherent", "encodeUntyped_ptr", "rawCarrier_roundtrip",
+    "scalarLayoutPtr_incoherent", "scalarLayoutPtr_union_coherent",
+    "scalarLayoutPtr_union_incoherent", "scalarLayoutNonPtr_strictUb_rejects_prov",
+    "encodeUntyped_ptr", "encodeValueToBytes_thinPtr", "rawCarrier_roundtrip",
     "rawCarrier_ptr_roundtrip", "decodePtrBytesNoForge_slice", "decodePtrBytesNoForge_str",
-    "slice_meta_with_provenance_rejected", "minirust_bool_invalid", "minirust_u8_valid",
+    "decodePtrBytesNoForge_dyn", "slice_meta_with_provenance_rejected",
+    "encodeWidePtrM_slice_proj", "encodeWidePtrM_dyn_proj",
+    "coherent_wide_slice_decode_agreement", "coherent_wide_dyn_decode_agreement",
+    "swapped_wide_slice_div",
+    "minirust_bool_invalid", "minirust_u8_valid", "kani5205_bool_correspondence_M",
     "w_roundtrip", "w_ucg558_w1", "w_mixed_missing_uninit", "w_offset_splice_p_p4",
     "w_offset_splice_p_p256", "w_basic_memory_tag_blind", "w_wide_slice",
     "w_wide_swapped_halves", "w_wide_dyn", "w_kani5205_bool", "w_kani5205_char",
+    "w_kani5205_unaligned_and_maybeuninit",
     "coherent_decode_agreement_instance", "encode_roundtrip_instance",
     "rawCarrier_ptr_roundtrip_instance", "strip_laws_instance", "offset_splice_instance",
-    "wide_and_bool_instance" ]
+    "wide_and_bool_instance", "ep2_b1_mr_non_vacuity_instances" ]
   let shared : List Lean.Name := [
     ``mrProvM_eq_some_iff, ``decodePtrProvenanceM_eq_some_iff, ``decodePtrM_eq,
     ``decodePtr_eq_M, ``decodePtrProvenance_eq_M, ``encodePtr_eq_M, ``encodePtrBytes_eq_M,
-    ``endianness_encode_ptr, ``tbProv_inj, ``bmProv_eq_iff, ``coherent_parity, ``encode_parity,
+    ``endianness_encode_ptr, ``encodeWidePtrM_slice_eq, ``encodeWidePtrM_dyn_eq,
+    ``decodeWidePtrM_slice_eq, ``decodeWidePtrM_dyn_eq, ``minirust_bool_decodeM_iff,
+    ``minirust_u8_decodeM, ``minirust_bool_uninit_decodeM,
+    ``tbProv_inj, ``bmProv_eq_iff, ``coherent_parity, ``encode_parity,
     ``thinDecode_parity, ``lockstep_parity, ``w_lockstep_parity, ``lockstep_parity_instance ]
   let mut headline : Nat := 0
   for dialect in ["V06", "V08"] do
