@@ -395,7 +395,7 @@ def walkOleanRegion (b : ByteArray) (base root : Nat) (parents : Array OleanLaye
     unless rc == 0 && endO <= sz do throw s!"invalid object (tag={tag}) at offset {o}"
     for j in [0:n] do
       let c := readU64LE b (atO + 8 * j)
-      if c % 8 == 0 && base + 96 <= c && c <= base + sz - 8 then
+      if c % 8 == 0 && base + 96 <= c && c < base + o then -- post-order compaction: acyclic, strictly downward
         let ci := (c - base) >>> 3; let bi := ci >>> 3; let cur := seen.get! bi; let mk := (1 <<< (ci &&& 7)).toUInt8
         if cur &&& mk == 0 then seen := seen.set! bi (cur ||| mk); stack := stack.push c
       else unless c % 2 == 1 || (c % 8 == 0 && parents.any fun (pb, ps, _, _, pSeen) =>

@@ -761,7 +761,7 @@ def _walk_region(data: bytes, base: int, root: int, parents) -> set:
         if rc != 0 or end > size:
             raise ValueError(f"invalid object (tag {tag}) at offset {o}")
         for c in struct.unpack_from(f"<{n}Q", data, at):
-            if c & 7 == 0 and base + 96 <= c <= base + size - 8:
+            if c & 7 == 0 and base + 96 <= c < base + o:  # Compaction is post-order: own fields point strictly down.
                 if c not in seen:
                     seen.add(c)
                     stack.append(c)
