@@ -1108,7 +1108,9 @@ marker), its user suffix may not spoof a reserved root, and a private name that 
 other than the one storing it must be a verified realized auxiliary (never an axiom or opaque).
 `_at_` specialization names of IR helpers are exercised end-to-end by the self-test fixtures.
 The production auditor additionally admits, after a separate kernel check, `Trusted` matcher
-realizations stored by the module that realizes them; this model omits that allowance and is
+realizations stored by the module that realizes them, and IR-only auxiliaries (`_redArg`,
+`_boxed`, `_cstage*`) of a foreign private helper that the storing module compiled; this model
+omits both allowances (a kind-less foreign name is always `foreignOutsideRealizedAux`) and is
 therefore stricter than the production check on those names.
 -/
 
