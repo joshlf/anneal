@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2315,6 +2316,376 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         done("Episode 2 compiled spec-strength gates (V8/V9, 4 claim & 4 synth kinds, A1-4, A3-3 _sunfold, A1-2/S3 shadows, "
              "B1-1 theorem-major, B1-4/A1-1/A2-5 native-evaluator canaries, B1-5/A1-5/A2-4 provenance & constructive, "
              "A1-3/A1-6, B2-1/A2-1/A2-2/A2-6/A3-1 forged & private-module instances, A4-7)")
+        # Group 31: Episode 2 adversarial four-vector suite over the compiled-environment auditor:
+        # V1 `_private.<mod>.0.<user>` spoofing, V2 whole-module unreferenced axioms
+        # (`leanprover/lean4#16781`), V3 pre-import compacted-region bounds and artifact-root
+        # containment (`leanprover/lean4#16737`), V4 the `Init.ShareCommon` ban
+        # (`leanprover/lean4#16779`), compiler-override hooks, and the non-blocking
+        # `leanprover/lean4#14896` readiness count. Every attack is compiled, then rejected for its
+        # exact tag; every positive control is accepted with non-zero diagnostic counts.
+        g31_started = time.monotonic()
+        ol3 = olean_checker()
+        lean_roots = {"toolchainRoots": ["Init", "Std", "Lean"]}
+
+        def auditor_direct(names, artifacts=None, **extra):
+            """Run the staged auditor binary itself (no Python pre-validation): (exit code, verdict)."""
+            request = {"mode": "olean-audit", "sysroot": str(ol3.prefix), "foundation": [], "roots": names,
+                       "modules": names, "axioms": ol3.lock["axioms"], "maxReportedViolations": 200,
+                       "artifacts": artifacts if artifacts is not None else [[n, ol3.artifacts[n]] for n in names],
+                       **extra}
+            req = ol3.stage / f"g31-direct-{len(list(ol3.stage.glob('g31-direct-*.request.json')))}.request.json"
+            res = req.with_name(req.name.replace(".request.json", ".response.json"))
+            req.write_text(json.dumps(request))
+            binary = ol3._get_compiled_olean_auditor()
+            cmd = [str(binary), str(req), str(res)] if binary else [str(ol3.lean), "-j1", "--run",
+                                                                    str(ol3.olean_auditor), str(req), str(res)]
+            proc = subprocess.run(cmd, cwd=ol3.stage, env=ol3.environment, capture_output=True, text=True,
+                                  timeout=300)
+            return proc.returncode, json.loads(res.read_text())
+
+        def direct_reject(names, *needles, artifacts=None, **extra):
+            rc, verdict = auditor_direct(names, artifacts, **extra)
+            # Exit code 1 with a structured verdict: never a signal (SIGSEGV is -11) or a crash.
+            assert rc == 1 and verdict["ok"] is False, (rc, verdict)
+            for needle in needles:
+                assert needle in verdict["message"], (needle, verdict["message"])
+            return verdict["message"]
+
+        # V1 positive control: private helpers, a `List.map` specialization over a private helper
+        # (IR `_at_` names), and a genuine one-constructor `ctorIdx` `@[macro_inline]`.
+        olean_module(ol3, "OlG31Base", prelude_init + (
+            "structure GoodBox where\n  x : Nat\n"
+            "private def helper (n : Nat) : Nat := n + 1\n"
+            "private def mapped (xs : List Nat) : List Nat := xs.map helper\n"
+            "def pubFn (xs : List Nat) : Nat := (mapped xs).length + (GoodBox.mk 1).ctorIdx\n"
+            "def fib : Nat → Nat\n  | 0 => 0\n  | 1 => 1\n  | n + 2 => fib n + fib (n + 1)\n"), ["Init"])
+        g31_base = olean_accept(ol3, ["OlG31Base"])
+        assert g31_base["replay"] is True and g31_base["privateNamesAudited"] >= 2, g31_base
+        assert g31_base["oleanFilesValidated"] >= 1 and g31_base["opaqueTheoremReadinessFlags"] == 0, g31_base
+        # V1 attacks without metaprogramming: reserved-root user suffixes in an ordinary module.
+        olean_module(ol3, "OlG31V1Src", prelude_init + (
+            "namespace Trusted\nprivate def spoof : Nat := 1\nend Trusted\n"
+            "namespace Verify\nprivate theorem fakeClaim : True := trivial\nend Verify\n"), ["Init"])
+        olean_reject(ol3, ["OlG31V1Src"], "privateNamespaceSpoofed=2", "_private.OlG31V1Src.0.Trusted.spoof",
+                     "_private.OlG31V1Src.0.Verify.fakeClaim", "spoofs reserved/toolchain namespace")
+        # V1 attacks forged with `addDecl` / IR entries: foreign module claims, reserved suffixes,
+        # an embedded numeric tail, nested / non-leading / non-zero / double-zero markers, a foreign
+        # private axiom, a phantom `eq_999` of a real foreign private helper, and a forged `_at_`
+        # specialization site naming `Trusted`. The same module carries a `@[tagged_return]` hook,
+        # which needs the Lean attribute API and must be refused once the Lean library is admitted.
+        v1_meta = (
+            "prelude\nimport Lean\nimport Init.Data.Array.Basic\nimport OlG31Base\nopen Lean\n"
+            "def g31P (m : Name) (k : Nat) (u : List String) : Name :=\n"
+            "  u.foldl Name.str (Name.num (m.components.foldl (fun acc c => Name.str acc c.toString) "
+            "(Name.str .anonymous \"_private\")) k)\n"
+            "def g31Def (n : Name) : CoreM Unit :=\n"
+            "  addDecl (.defnDecl {\n"
+            "    name := n, levelParams := [], type := mkConst ``Nat, value := mkNatLit 0,\n"
+            "    hints := .opaque, safety := .safe })\n"
+            "run_meta do\n"
+            "  g31Def (g31P `Init.Prelude 0 [\"fake\"])\n"
+            "  g31Def (g31P `OlG31V1Meta 0 [\"Trusted\", \"foo\"])\n"
+            "  g31Def (g31P `OlG31V1Meta 0 [\"sorryAx\"])\n"
+            "  g31Def ((g31P `OlG31V1Meta 0 [\"Innocent\"]).num 0 |>.str \"Trusted\" |>.str \"foo\")\n"
+            "  g31Def (g31P `OlG31V1Meta 0 [\"_private\", \"nest\"])\n"
+            "  g31Def (Name.str (Name.str (Name.str .anonymous \"Lead\") \"_private\") \"nonlead\")\n"
+            "  g31Def (g31P `OlG31V1Meta 1 [\"nonzero\"])\n"
+            "  g31Def ((g31P `OlG31V1Meta 0 []).num 0 |>.str \"dbl\")\n"
+            "  addDecl (.axiomDecl {\n"
+            "    name := g31P `OlG31Base 0 [\"cheat\"], levelParams := [], type := mkConst ``True,\n"
+            "    isUnsafe := false })\n"
+            "  let base := g31P `OlG31Base 0 [\"helper\"]\n"
+            "  addDecl (.thmDecl {\n"
+            "    name := base.str \"eq_999\", levelParams := [],\n"
+            "    type := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Nat) (mkApp (mkConst base) (mkNatLit 0)) (mkNatLit 1),\n"
+            "    value := mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Nat) (mkNatLit 1) })\n"
+            "  let h := g31P `Init.Data.Array.Basic 0 [\"Array\", \"foldrMUnsafe\", \"fold\"]\n"
+            "  let atName := h.str \"_at_\" |>.str \"Trusted\" |>.str \"forged_site\" |>.str \"spec_0\"\n"
+            "  modifyEnv fun env => IR.declMapExt.addEntry env\n"
+            "    (.fdecl atName #[] .object (.vdecl ⟨0⟩ .object (.lit (.num 0)) (.ret (.var ⟨0⟩))) {})\n"
+            "def trOnly (n : Nat) : Nat := n\n"
+            "run_meta do\n"
+            "  let stx := Syntax.node .none `Lean.Parser.Attr.simple #[mkIdent `tagged_return]\n"
+            "  Attribute.add ``trOnly `tagged_return stx .global\n")
+        olean_module(ol3, "OlG31V1Meta", v1_meta, ["Lean", "Init.Data.Array.Basic", "OlG31Base"])
+        v1_msg = olean_reject(ol3, ["OlG31Base", "OlG31V1Meta"], "[privateNamespaceSpoofed]",
+                              "_private.Init.Prelude.0.fake", "_private.OlG31V1Meta.0.Trusted.foo",
+                              "_private.OlG31V1Meta.0.sorryAx", "_private.OlG31V1Meta.0.Innocent.0.Trusted.foo",
+                              "_private.OlG31V1Meta.0._private.nest", "Lead._private.nonlead",
+                              "_private.OlG31V1Meta.1.nonzero", "_private.OlG31V1Meta.0.0.dbl",
+                              "foreign _private axiom/opaque claiming module OlG31Base",
+                              "_private.OlG31Base.0.helper.eq_999", "_at_.Trusted.forged_site",
+                              "malformed _private name shape", "outside verified realized-aux set",
+                              "[compilerOverrideAttribute] trOnly (OlG31V1Meta)", "tagged_return", **lean_roots)
+        assert "privateNamespaceSpoofed=11" in v1_msg, v1_msg
+
+        # V2: an unreferenced top-level axiom nothing refers to; a foreign `Assumptions.*` axiom
+        # inside a file-local test-axiom module; an unreferenced axiom of a transitively imported
+        # module; and the same dependency reached by a spec-strength check.
+        olean_module(ol3, "OlG31V2Unused", prelude_init + "axiom unused_cheat : False\ndef cleanFn : Nat := 42\n",
+                     ["Init"])
+        olean_reject(ol3, ["OlG31V2Unused"], "[unapprovedAxiom]", "unused_cheat")
+        olean_module(ol3, "OlG31V2Assm", prelude_init + (
+            "namespace Assumptions.Other\naxiom ax : False\nend Assumptions.Other\n"
+            "axiom localTestAx : True\ntheorem usesLocal : True := localTestAx\n"), ["Init"])
+        olean_reject(ol3, ["OlG31V2Assm"], "[unapprovedAxiom]", "Assumptions.Other.ax",
+                     "foreign Assumptions.* axiom", localAxiomModules=["OlG31V2Assm"])
+        olean_module(ol3, "OlG31V2Dep", prelude_init + "axiom dep_cheat : False\ndef helperSpec : Nat := 1\n",
+                     ["Init"])
+        olean_module(ol3, "OlG31V2User", "prelude\nimport OlG31V2Dep\ntheorem claimUsesDep : helperSpec = 1 := rfl\n",
+                     ["OlG31V2Dep"])
+        olean_reject(ol3, ["OlG31V2User"], "[unapprovedAxiom]", "dep_cheat")
+        # V2 positive control: a file-local test axiom (referenced and unreferenced) is swept and admitted.
+        olean_module(ol3, "OlG31V2Local", prelude_init + (
+            "axiom localTestAx : True\naxiom unusedLocalAx : True\ntheorem usesLocal : True := localTestAx\n"), ["Init"])
+        v2_ok = olean_accept(ol3, ["OlG31V2Local"], localAxiomModules=["OlG31V2Local"])
+        assert v2_ok["moduleConstantsAxiomSwept"] >= 2 and v2_ok["localTestAxioms"] >= 1, v2_ok
+        # V2 through the spec-strength gate: the claim's dependency stores an unreferenced axiom.
+        olean_module(ol3, "Trusted.Rustc.V2026_06_01.MirSemantics", mir_stub, ["Init"], module_file=True)
+        olean_module(ol3, "Trusted.VerificationResult", verif_stub,
+                     ["Init", "Trusted.Rustc.V2026_06_01.MirSemantics"], module_file=True)
+        olean_module(ol3, "Anneal.OleanSpecStrengthAuditor", spec_lib_stub, ["Init", "Trusted.VerificationResult"],
+                     module_file=True)
+        g31_spec_mods = ["Trusted.Rustc.V2026_06_01.MirSemantics", "Trusted.VerificationResult",
+                         "Anneal.OleanSpecStrengthAuditor"]
+        g31_claim = (
+            "prelude\nimport Init\nimport Anneal.OleanSpecStrengthAuditor\n{dep}"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics Trusted.VerificationResult Anneal.OleanSpecStrengthAuditor\n"
+            "set_option linter.defProp false\n"
+            "def gPre (xs : List Value) : Prop := xs = [0]\n"
+            "def gPost (_ : List Value) (r : Value) : Prop := r = {ten}\n"
+            "def gClaim : Claim := {{ pre := gPre, post := gPost }}\n"
+            "theorem gClaim_ok : VerificationResult gClaim := ⟨trivial⟩\n"
+            "def gCert : SpecStrengthCert gPre gPost := {{\n"
+            "  witnessInput := [0], witnessValid := rfl, referenceOutput := 10, referenceAccepted := rfl,\n"
+            "  mutantOutput := 0, mutantRejected := (by dsimp [gPost]; decide) }}\n"
+            "def gMulti : MultiMutantSpecCert gPre gPost := {{\n"
+            "  kills := [{{\n"
+            "    name := \"k\", category := .wrongReturn, input := [0], inputValid := rfl,\n"
+            "    referenceOutput := 10, referenceAccepted := rfl, mutantOutput := 0,\n"
+            "    mutantRejected := (by dsimp [gPost]; decide) }}],\n"
+            "  nonEmpty := (by intro h; nomatch h) }}\n")
+        olean_module(ol3, "OlG31SpecOk", g31_claim.format(dep="", ten="10"), ["Init", "Anneal.OleanSpecStrengthAuditor"])
+        g31_check = [{"kind": "claim", "claim": "gClaim_ok", "cert": "gMulti"}]
+        spec_ok = olean_accept(ol3, g31_spec_mods + ["OlG31SpecOk"], specStrengthChecks=g31_check)
+        assert spec_ok["specStrengthChecksPassed"] == 1, spec_ok
+        olean_module(ol3, "OlG31SpecDep", g31_claim.format(dep="import OlG31V2Dep\n", ten="helperSpec * 10"),
+                     ["Init", "Anneal.OleanSpecStrengthAuditor", "OlG31V2Dep"])
+        olean_reject(ol3, g31_spec_mods + ["OlG31SpecDep"], "[unapprovedAxiom]", "dep_cheat",
+                     specStrengthChecks=g31_check)
+
+        # V3: binary corruption of a compiled module file (all five parts), rejected by the Python
+        # pre-validation AND by the auditor binary itself before `importModules` maps the region.
+        v3_parts = olean_module(ol3, "OlG31V3", (
+            "module\nprelude\npublic import Init\n"
+            "public def bigN : Nat := 1234567890123456789012345678901234567890\n"
+            "public def str : String := \"hello_world_padding_bytes\"\n"
+            "public def bytes : ByteArray := ByteArray.mk #[1, 2, 3, 4]\n"), ["Init"], module_file=True)
+        assert set(v3_parts) == set(runner.PARTS)
+        v3_genuine = [list(g) for g in ol3.artifacts["OlG31V3"]]
+        del ol3.artifacts["OlG31V3"]  # Every other audit below must see only intact artifacts.
+
+        def v3_walk(data, pred):
+            """First reachable own-region object satisfying `pred(off, rc, cs, other, tag, size, cap)`."""
+            base, root = struct.unpack_from("<QQ", data, 80)
+            seen, stack = set(), [root]
+            while stack:
+                p = stack.pop()
+                if p in seen:
+                    continue
+                seen.add(p)
+                o = p - base
+                rc, cs, oth, tag = struct.unpack_from("<iHBB", data, o)
+                size, cap = struct.unpack_from("<QQ", data, o + 8) if o + 24 <= len(data) else (0, 0)
+                if pred(o, rc, cs, oth, tag, size, cap):
+                    return o, size
+                n, at = (oth, o + 8) if tag <= 243 else (size, o + 24) if tag == 246 else (0, o)
+                stack.extend(c for c in struct.unpack_from(f"<{n}Q", data, at)
+                             if c % 8 == 0 and base + 96 <= c <= base + len(data) - 8)
+            raise AssertionError("no reachable object matches the V3 mutation predicate")
+
+        def v3_import_elem(data):
+            """Offset of the first `Import` constructor in the root's `imports` array."""
+            base, root = struct.unpack_from("<QQ", data, 80)
+            imports = struct.unpack_from("<Q", data, root - base + 8)[0]
+            assert struct.unpack_from("<Q", data, imports - base + 8)[0] >= 1, "module imports nothing"
+            return struct.unpack_from("<Q", data, imports - base + 24)[0] - base
+
+        def v3_mutate(label, part_index, mutate):
+            work = ol3.stage / f"g31-v3-{label}"
+            work.mkdir()
+            parts = [[], []]
+            for group, paths in enumerate(v3_genuine):
+                for p in paths:
+                    dest = work / Path(p).name
+                    shutil.copyfile(p, dest)
+                    parts[group].append(str(dest))
+            flat = parts[0] + parts[1]
+            target = Path(flat[part_index])
+            data = bytearray(target.read_bytes())
+            base, root = struct.unpack_from("<QQ", data, 80)
+            data = mutate(data, base, root)
+            target.write_bytes(bytes(data))
+            ol3.artifacts["OlG31V3"] = parts
+            try:
+                olean_reject(ol3, ["OlG31V3"], "[oleanBinaryInvalid] OlG31V3")
+            finally:
+                del ol3.artifacts["OlG31V3"]
+            direct_reject(["OlG31V3"], "[oleanBinaryInvalid]", artifacts=[["OlG31V3", parts]])
+
+        def put(fmt, off, value):
+            def mutate(data, base, root):
+                struct.pack_into(fmt, data, off(data, base, root), value)
+                return data
+            return mutate
+
+        def at_obj(pred, delta):
+            return lambda data, base, root: v3_walk(bytes(data), pred)[0] + delta
+
+        root_off = lambda data, base, root: root - base  # noqa: E731
+        forged = 0x4141414141414140
+        olean_ix, private_ix, ir_ix = 0, 2, 4  # `.olean`, `.olean.private`, `.ir` in the flattened part list.
+        v3_mutate("truncated", olean_ix, lambda data, base, root: data[:95])
+        v3_mutate("tag244", olean_ix, put("<B", lambda d, b, r: r - b + 7, 244))
+        v3_mutate("rc1", olean_ix, put("<i", root_off, 1))
+        v3_mutate("short-root", olean_ix, put("<H", lambda d, b, r: r - b + 4, 48))
+        v3_mutate("array-oob", olean_ix, put("<Q", at_obj(lambda o, rc, cs, oth, tag, size, cap:
+                                                          tag == 246 and size >= 1, 24), forged))
+        v3_mutate("array-capacity", olean_ix, put("<Q", at_obj(lambda o, rc, cs, oth, tag, size, cap:
+                                                               tag == 246 and size >= 1, 16), 1 << 40))
+        # The big-integer literal lives in the private layer (`.olean.private`) and in the `.ir`.
+        v3_mutate("mpz-limbs", private_ix, put("<Q", at_obj(lambda o, rc, cs, oth, tag, size, cap: tag == 250, 16),
+                                               forged))
+
+        def string_to_zero_elem_scalar_array(data, base, root):
+            """Re-tag a reachable string as a scalar array with element size 0 and a 2^40 size."""
+            o, _ = v3_walk(bytes(data), lambda o, rc, cs, oth, tag, size, cap: tag == 249 and size >= 10)
+            struct.pack_into("<iHBBQQ", data, o, 0, 0, 0, 248, 1 << 40, 1 << 40)
+            return data
+
+        v3_mutate("scalar-elem0", olean_ix, string_to_zero_elem_scalar_array)
+        def clobber_string_nul(data, base, root):
+            o, size = v3_walk(bytes(data), lambda o, rc, cs, oth, tag, size, cap: tag == 249 and size >= 2)
+            data[o + 32 + size - 1] = 0x41
+            return data
+
+        def import_module_field(target):
+            """Point the first `Import.module` field at `target(base, root, import_addr)`."""
+            def mutate(data, base, root):
+                elem = v3_import_elem(bytes(data))
+                struct.pack_into("<Q", data, elem + 8, target(base, root, base + elem))
+                return data
+            return mutate
+
+        v3_mutate("string-nul", olean_ix, clobber_string_nul)
+        v3_mutate("import-module-oob", olean_ix, import_module_field(lambda base, root, elem: forged))
+        for part_label, ix in (("olean", olean_ix), ("ir", ir_ix)):
+            v3_mutate(f"self-loop-{part_label}", ix, import_module_field(lambda base, root, elem: elem))
+            v3_mutate(f"cycle-to-root-{part_label}", ix, import_module_field(lambda base, root, elem: root))
+        # V3 positive control on the genuine parts (MPZ, String, ByteArray objects all walked).
+        ol3.artifacts["OlG31V3"] = v3_genuine
+        v3_ok = olean_accept(ol3, ["OlG31V3"])
+        assert v3_ok["oleanFilesValidated"] >= 5, v3_ok
+        del ol3.artifacts["OlG31V3"]
+
+        # V3 artifact provenance: a symlinked `.olean`, an artifact root shadowing `Init.olean` /
+        # `Init.ir`, and `approvedBuildRoots` prefix confusion and regular-file roots.
+        def v3_copy(dir_name):
+            d = ol3.stage / dir_name
+            d.mkdir(parents=True)
+            out = [[], []]
+            for group, paths in enumerate(v3_genuine):
+                for p in paths:
+                    shutil.copyfile(p, d / Path(p).name)
+                    out[group].append(str(d / Path(p).name))
+            return d, out
+
+        def v3_request(parts, **extra):
+            return {"roots": ["OlG31V3"], "modules": ["OlG31V3"], "artifacts": [["OlG31V3", parts]],
+                    "scope": "g31", **extra}
+
+        # `--audit-olean` audits the request together with every artifact the checker already holds;
+        # hold none here so each verdict is about the one staged copy under test.
+        g31_held = ol3.artifacts
+        ol3.artifacts = {}
+        sym_dir = ol3.stage / "g31-sym"
+        sym_dir.mkdir()
+        sym_parts = [[], []]
+        for group, paths in enumerate(v3_genuine):
+            for p in paths:
+                (sym_dir / Path(p).name).symlink_to(p)
+                sym_parts[group].append(str(sym_dir / Path(p).name))
+        # `--audit-olean` refuses the symlink at request admission; the auditor itself reports provenance.
+        expect_failure(lambda: ol3.audit_olean_request(v3_request(sym_parts)), 1, "olean-audit",
+                       "expected a regular file", str(sym_dir / "OlG31V3.olean"))
+        direct_reject(["OlG31V3"], "[moduleProvenanceSpoofed]", artifacts=[["OlG31V3", sym_parts]])
+        lib = ol3.prefix / "lib/lean"
+        for shadow in ("Init.olean", "Init.ir"):
+            shadow_dir, shadow_parts = v3_copy(f"g31-shadow-{shadow}")
+            shutil.copyfile(lib / shadow, shadow_dir / shadow)
+            expect_failure(lambda: ol3.audit_olean_request(v3_request(shadow_parts)), 1, "olean-audit",
+                           "[moduleProvenanceSpoofed]", "shadows toolchain", str(shadow_dir / shadow))
+            direct_reject(["OlG31V3"], "[moduleProvenanceSpoofed]", "shadows toolchain",
+                          artifacts=[["OlG31V3", shadow_parts]])
+        root_dir, root_parts = v3_copy("g31-roots/root")
+        evil_dir, evil_parts = v3_copy("g31-roots/root_evil")
+        expect_failure(lambda: ol3.audit_olean_request(v3_request(evil_parts, approvedBuildRoots=[str(root_dir)])),
+                       1, "olean-audit", "[moduleProvenanceSpoofed]", "escapes approvedBuildRoots",
+                       str(evil_dir / "OlG31V3.olean"))
+        direct_reject(["OlG31V3"], "[moduleProvenanceSpoofed]", "escapes approvedBuildRoots",
+                      artifacts=[["OlG31V3", evil_parts]], approvedBuildRoots=[str(root_dir)])
+        regular_root = ol3.stage / "g31-roots/regular-file"
+        regular_root.write_text("not a directory\n")
+        expect_failure(lambda: ol3.audit_olean_request(v3_request(root_parts, approvedBuildRoots=[str(regular_root)])),
+                       1, "olean-audit", "[moduleProvenanceSpoofed]", str(regular_root))
+        direct_reject(["OlG31V3"], "[moduleProvenanceSpoofed]", "approvedBuildRoots",
+                      artifacts=[["OlG31V3", root_parts]], approvedBuildRoots=[str(regular_root)])
+        for approved in (str(root_dir), str(root_dir) + "/", str(root_dir.parent)):
+            roots_ok = ol3.audit_olean_request(v3_request(root_parts, approvedBuildRoots=[approved]))
+            assert roots_ok["replay"] is True and roots_ok["oleanFilesValidated"] >= 5, (approved, roots_ok)
+        ol3.artifacts = g31_held
+
+        # V4: the structural-sharing ban through a direct import, through `import Init`, and through
+        # a `lean_sharecommon_*` extern; unauthorized hooks; and a forged multi-constructor `ctorIdx`.
+        olean_module(ol3, "OlG31V4Imp", "prelude\nimport Init.ShareCommon\ndef ok : Nat := 1\n", ["Init.ShareCommon"])
+        olean_reject(ol3, ["OlG31V4Imp"], "[shareCommonForbidden]", "direct import of Init.ShareCommon")
+        olean_module(ol3, "OlG31V4Use", prelude_init + (
+            "def usesSfb (b : ShareCommon.StateFactoryBuilder) : ShareCommon.StateFactoryBuilder := b\n"
+            "def usesShare (n : Nat) : Nat := ShareCommon.shareCommon' n\n"
+            "@[extern \"lean_sharecommon_quick\"] def scExtern (n : Nat) : Nat := n\n"), ["Init"])
+        olean_reject(ol3, ["OlG31V4Use"], "[shareCommonForbidden]", "usesSfb", "usesShare", "scExtern",
+                     "lean_sharecommon_*")
+        olean_module(ol3, "OlG31V4Hooks", prelude_init + (
+            "@[unbox] structure UBox where\n  x : Nat\n"
+            "@[never_extract] def neFn (n : Nat) : Nat := n\n"
+            "inductive Tri where\n  | a | b | c\n"
+            "attribute [macro_inline] Tri.ctorIdx\n"
+            "def useTri (t : Tri) : Nat := t.ctorIdx\n"), ["Init"])
+        olean_reject(ol3, ["OlG31V4Hooks"], "[compilerOverrideAttribute]", "unbox", "UBox", "never_extract", "neFn",
+                     "macro_inline", "Tri.ctorIdx")
+        # Non-blocking `leanprover/lean4#14896` readiness: a theorem as an `Eq.rec` major premise
+        # (directly and behind `id`) is counted only when requested and never blocks acceptance.
+        olean_module(ol3, "OlG31Ready", prelude_init + (
+            "theorem myEq : (1 : Nat) = 1 := rfl\n"
+            "def usesThmInRec : Nat := Eq.rec (motive := fun _ _ => Nat) 7 myEq\n"
+            "def usesIdThmInRec : Nat := Eq.rec (motive := fun _ _ => Nat) 8 (id myEq)\n"
+            "def usesThmAsArg : Nat := (fun (_ : (1 : Nat) = 1) => 3) myEq\n"), ["Init"])
+        ready_off = olean_accept(ol3, ["OlG31Ready"])
+        assert ready_off["opaqueTheoremReadinessFlags"] == 0, ready_off
+        ready_on = olean_accept(ol3, ["OlG31Ready"], checkOpaqueTheoremReadiness=True)
+        assert ready_on["replay"] is True and ready_on["opaqueTheoremReadinessFlags"] >= 2, ready_on
+        clean_on = olean_accept(ol3, ["OlG31Base"], checkOpaqueTheoremReadiness=True)
+        assert clean_on["opaqueTheoremReadinessFlags"] == 0, clean_on
+
+        g31_elapsed = time.monotonic() - g31_started
+        assert g31_elapsed < 240.0, f"Group 31 exceeded its runtime budget: {g31_elapsed:.1f}s"
+        runner.make_tree_writable(ol3.stage)
+        shutil.rmtree(ol3.stage)
+        runner.make_tree_writable(ol3.checkout)
+        shutil.rmtree(ol3.checkout)
+        done(f"Episode 2 adversarial V1-V4: private-name spoofing, unreferenced/transitive/spec-path axioms, "
+             f"pre-import region bounds and cycles on .olean/.ir, root containment, ShareCommon ban, compiler "
+             f"hooks, non-blocking lean4#14896 readiness ({g31_elapsed:.0f}s)")
     except BaseException as error:
         (suite / "failure.traceback").write_text(traceback.format_exc())
         print(f"SELF-TEST FAILED: {error}\nPreserved fixture sources/raw logs: {suite}", file=sys.stderr)
