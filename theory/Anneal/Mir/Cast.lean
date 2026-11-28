@@ -4931,48 +4931,7 @@ theorem trusted_decodeTypedValueFromBytes_adt_multiple_eq
   have hBeq : Nat.beq (Trusted.Sequence.length bs) l.size.bytes = true := by
     rw [hLen]; exact Nat.beq_refl _
   simp only [decodeTypedValueFromBytes, normalizeCodecTy, hLookup, hInhab, hBeq, Bool.not_true,
-    Bool.or_false, hVar]
-  cases hTagPtr : scalarLayoutIsPointer tag with
-  | true =>
-    dsimp only
-    rfl
-  | false =>
-    dsimp only
-    cases hFields : l.fields with
-    | primitive =>
-      dsimp only
-      rw [hProv]
-      cases backendReprHasPointer l.backendRepr <;> rfl
-    | array _ _ | union _ =>
-      cases backendReprHasPointer l.backendRepr with
-      | true => rfl
-      | false => dsimp only; rw [hProv]; rfl
-    | arbitrary outerOffsets memOrder =>
-      cases hW : scalarLayoutByteWidth tag (layoutPointerBytes layouts) with
-      | none =>
-        cases backendReprHasPointer l.backendRepr with
-        | true => rfl
-        | false => dsimp only; rw [hProv]; rfl
-      | some tagSz =>
-        dsimp only
-        cases hOff : Trusted.Sequence.get? outerOffsets tagField with
-        | none =>
-          cases backendReprHasPointer l.backendRepr with
-          | true => rfl
-          | false => dsimp only; rw [hProv]; rfl
-        | some tagOff =>
-          dsimp only
-          cases hSl : sliceAbstractBytes bs tagOff.bytes tagSz with
-          | some tagSlice =>
-            have hSlP := abstractBytesHaveProv_slice_of_false bs tagSlice tagOff.bytes tagSz hProv hSl
-            dsimp only
-            rw [hSlP]
-            cases backendReprHasPointer l.backendRepr with
-            | true => rfl
-            | false => dsimp only; rw [hProv]; rfl
-          | none =>
-            unfold decodeValueFromBytes
-            simp only [hLookup, hInhab, hBeq, Bool.not_true, Bool.or_false, hVar, hFields, hW, hOff, hSl]
+    Bool.or_false, hVar, hProv]
 
 /-- Direct `Trusted.MirSemantics` step-level correspondence for `evalByteCast` (`CastKind.transmute`)
 from `u8` to `bool`: transmuting a 1-byte unsigned integer `bits < 256` to `bool` returns

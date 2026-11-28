@@ -6425,52 +6425,11 @@ theorem decodeTypedValueFromBytes_strictUcg630Ub_refines_stripProvenance
           dsimp only
           cases l.variants with
           | empty => exact id
-          | multiple tag tagField varShapes =>
+          | multiple _ _ _ =>
             dsimp only
-            have hPostFalse :
-                (match backendReprHasPointer l.backendRepr with
-                 | true => decodeValueFromBytes (.succ fuel') layouts (normalizeCodecTy ty) bytes
-                 | false =>
-                   match abstractBytesHaveProv bytes with
-                   | true => none
-                   | false => decodeValueFromBytes (.succ fuel') layouts (normalizeCodecTy ty) bytes) = some v →
-                (match backendReprHasPointer l.backendRepr with
-                 | true => decodeValueFromBytes (.succ fuel') layouts (normalizeCodecTy ty) bytes
-                 | false => decodeValueFromBytes (.succ fuel') layouts (normalizeCodecTy ty) bytes) = some v := by
-              cases backendReprHasPointer l.backendRepr with
-              | true => exact id
-              | false =>
-                dsimp only
-                cases abstractBytesHaveProv bytes with
-                | true => intro h'; cases h'
-                | false => exact id
-            cases scalarLayoutIsPointer tag with
-            | true => exact id
-            | false =>
-              dsimp only [Bool.or]
-              cases l.fields with
-              | arbitrary offs _ =>
-                cases scalarLayoutByteWidth tag (layoutPointerBytes layouts) with
-                | none => exact hPostFalse
-                | some tagSz =>
-                  dsimp only
-                  cases get? offs tagField with
-                  | none => exact hPostFalse
-                  | some tagOff =>
-                    dsimp only
-                    cases sliceAbstractBytes bytes tagOff.bytes tagSz with
-                    | none => exact id
-                    | some tagSlice =>
-                      dsimp only
-                      cases abstractBytesHaveProv tagSlice with
-                      | true => intro h; cases h
-                      | false => exact hPostFalse
-              | primitive =>
-                dsimp only
-                cases abstractBytesHaveProv bytes with
-                | true => intro h; cases h
-                | false => exact id
-              | _ => exact hPostFalse
+            cases abstractBytesHaveProv bytes with
+            | true => intro h; cases h
+            | false => exact id
           | single variantIdx =>
             cases variantIdx <;>
             cases l.fields with
@@ -7440,47 +7399,9 @@ theorem decodeTypedValueFromBytes_eq_of_provFree
           dsimp only
           cases l.variants with
           | empty => rfl
-          | multiple tag tagField _ =>
+          | multiple _ _ _ =>
             dsimp only
-            cases scalarLayoutIsPointer tag with
-            | true => rfl
-            | false =>
-              dsimp only [Bool.or]
-              cases l.fields with
-              | arbitrary outerOffsets _ =>
-                cases scalarLayoutByteWidth tag (layoutPointerBytes layouts) with
-                | none =>
-                  dsimp only
-                  cases backendReprHasPointer l.backendRepr with
-                  | true => rfl
-                  | false => dsimp only; rw [hbs]
-                | some tagSz =>
-                  dsimp only
-                  cases get? outerOffsets tagField with
-                  | none =>
-                    dsimp only
-                    cases backendReprHasPointer l.backendRepr with
-                    | true => rfl
-                    | false => dsimp only; rw [hbs]
-                  | some tagOff =>
-                    dsimp only
-                    cases hsl : sliceAbstractBytes bytes tagOff.bytes tagSz with
-                    | none => rfl
-                    | some tagSlice =>
-                      dsimp only
-                      rw [abstractBytesHaveProv_sliceAbstractBytes_false bytes tagSlice tagOff.bytes tagSz hbs hsl]
-                      dsimp only
-                      cases backendReprHasPointer l.backendRepr with
-                      | true => rfl
-                      | false => dsimp only; rw [hbs]
-              | primitive =>
-                dsimp only
-                rw [hbs]
-              | _ =>
-                dsimp only
-                cases backendReprHasPointer l.backendRepr with
-                | true => rfl
-                | false => dsimp only; rw [hbs]
+            rw [hbs]
           | single varIdx =>
             cases varIdx <;>
             cases l.fields with
@@ -9791,7 +9712,7 @@ theorem decodeTypedValueFromBytes_adt_multiple_strip_eq_strict_stripProv
     (hlu : LayoutTable.lookup layouts li = .some l)
     (hvar : l.variants = .multiple tag tagField varShapes)
     (hTagNp : scalarLayoutIsPointer tag = false)
-    (hBrNp : backendReprHasPointer l.backendRepr = false) :
+    (_hBrNp : backendReprHasPointer l.backendRepr = false) :
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := li } bs .stripProvenance =
       decodeTypedValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := li }
         (stripAbstractBytesProv bs) .strictUcg630Ub := by
@@ -9910,8 +9831,8 @@ theorem decodeTypedValueFromBytes_adt_multiple_strip_eq_strict_stripProv
     dsimp only
     rw [hvar]
     dsimp only
-    rw [hTagNp, hBrNp, abstractBytesHaveProv_stripAbstractBytesProv]
-    dsimp only [Bool.or]
+    rw [abstractBytesHaveProv_stripAbstractBytesProv]
+    dsimp only
     unfold decodeValueFromBytes
     dsimp only
     rw [hlu]
@@ -9935,8 +9856,6 @@ theorem decodeTypedValueFromBytes_adt_multiple_strip_eq_strict_stripProv
           | none => rfl
           | some tagSlice =>
             dsimp only [Option.map]
-            rw [abstractBytesHaveProv_stripAbstractBytesProv]
-            dsimp only
             rw [hdecTag tagSlice]
             cases decodeScalarLayoutBytes tag tagSlice (layoutPointerBytes layouts) with
             | none => rfl

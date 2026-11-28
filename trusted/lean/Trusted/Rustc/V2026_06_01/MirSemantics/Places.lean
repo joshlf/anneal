@@ -8533,40 +8533,14 @@ def decodeTypedValueFromBytes
                   match decodeScalarBytes bytes false with
                   | .some (sv, _) => .some (.scalar sv)
                   | .none => .none
-          | .multiple tag tagField _, _ =>
-            let tagProvRejected : Bool :=
-              match scalarLayoutIsPointer tag with
-              | true => false
-              | false =>
-                match l.fields, scalarLayoutByteWidth tag ptrBytes with
-                | .arbitrary outerOffsets _, .some tagSz =>
-                  match get? outerOffsets tagField with
-                  | .none => false
-                  | .some tagOff =>
-                    match sliceAbstractBytes bytes tagOff.bytes tagSz with
-                    | .some tagSlice =>
-                      match policy with
-                      | .strictUcg630Ub => abstractBytesHaveProv tagSlice
-                      | .stripProvenance => false
-                    | .none => true
-                | .primitive, _ =>
-                  match policy with
-                  | .strictUcg630Ub => abstractBytesHaveProv bytes
-                  | .stripProvenance => false
-                | _, _ => false
-            match tagProvRejected with
+          | .multiple _ _ _, _ =>
+            match
+              (match policy with
+               | .strictUcg630Ub => abstractBytesHaveProv bytes
+               | .stripProvenance => false)
+            with
             | true => .none
-            | false =>
-              match Bool.or (scalarLayoutIsPointer tag) (backendReprHasPointer l.backendRepr) with
-              | true => decodeValueFromBytes (.succ fuel') layouts rTy bytes
-              | false =>
-                match
-                  (match policy with
-                   | .strictUcg630Ub => abstractBytesHaveProv bytes
-                   | .stripProvenance => false)
-                with
-                | true => .none
-                | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+            | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
           | _, _ => decodeValueFromBytes (.succ fuel') layouts rTy bytes
     | .uint .usize =>
       match
@@ -12185,7 +12159,20 @@ def evalStackThinPtrTypedDerefRead
 /--
 Dereference and project a slice fat pointer
 `Value.aggregate 0 [Value.ptr ptrVal ptrSz, Value.scalar lenSc]` through
-`borrows` or `globals`.
+`borrows` or `globals`, falling back to target-width-aware
+`decodeTypedValueFromBytes` on global allocations when 64-bit
+`decodeValueFromBytes` returns `.none` (e.g., 32-bit `usize`/`isize`/pointer
+slices or IEEE-754 float slices).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Slices"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#slice-layout>
+
+> "Slices have the same layout as the section of the array they slice."
+
+Modeling choice (`agent_docs/trusted-rust.md`): global slice windows first
+preserve the 64-bit `decodeValueFromBytes` path used by `SliceTypedAt` lenses
+and fall back to `decodeTypedValueFromBytes` at `layoutPointerBytes layouts`
+when `decodeValueFromBytes` returns `.none`.
 -/
 def evalSliceFatPtrDerefRead
     (locals : List LocalSlot)
@@ -12334,13 +12321,23 @@ def evalSliceFatPtrDerefRead
                 { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
             with
             | .some n => n
-            | .none => 1
+            | .none =>
+              match decodeTypedKindByteSize layouts elemKind with
+              | .some n => n
+              | .none => 1
           let totalBytes := Nat.mul lenSc.bits elemSz
           match globalAllocSliceToAbstractBytes alloc ptrVal.offsetBytes totalBytes ptrBytes with
           | .some absBytes =>
             let sliceArrTy : Ty :=
               { kind := .array elemKind lenSc.bits, layoutIdx := unresolvedLayoutIdx layouts }
-            match decodeValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes with
+            let decodedOpt : Option Value :=
+              match abstractBytesHaveProv absBytes with
+              | true => decodeTypedValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes
+              | false =>
+                match decodeValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes with
+                | .some v => .some v
+                | .none => decodeTypedValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes
+            match decodedOpt with
             | .some decodedVal =>
               match readProjectedValue locals decodedVal restProj with
               | .ok fieldVal =>

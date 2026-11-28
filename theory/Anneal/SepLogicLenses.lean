@@ -24285,7 +24285,9 @@ theorem SliceTypedAt.evalPlaceRead_index {α : Type} {n : Nat} {c : ByteLensCode
       (toVal (xs[i]'(by rw [h.length_eq]; exact hi))) = true)
     (hNoUninit : valueContainsUninit
       (toVal (xs[i]'(by rw [h.length_eq]; exact hi))) = false := by rfl)
-    (hPtrBytes : layoutPointerBytes layouts = 8 := by rfl) :
+    (hPtrBytes : layoutPointerBytes layouts = 8 := by rfl)
+    (hNoProv : abstractBytesHaveProv
+      (((globalAllocByteMem alloc).drop wide.1.offsetBytes).take (wide.2 * n)) = false := by rfl) :
     evalPlaceRead locals { local_ := slLoc, projection := [.deref, .index idxLoc] }
       mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
         .ok (toVal (xs[i]'(by rw [h.length_eq]; exact hi))) locals := by
@@ -24314,6 +24316,8 @@ theorem SliceTypedAt.evalPlaceRead_index {α : Type} {n : Nat} {c : ByteLensCode
   rw [hGlobAlign, hSz]
   dsimp (config := { zeta := true }) only
   rw [hPtrBytes, show Nat.mul wide.2 n = wide.2 * n from rfl, hWin]
+  dsimp only
+  rw [hNoProv]
   dsimp only
   rw [hArr]
   simp only [readProjectedValue, hIdx, hGetMap, hNoUninit, hValOk]
@@ -24349,7 +24353,9 @@ theorem SliceTypedAt.evalPlaceRead_index_oob_ub {α : Type} {n : Nat} {c : ByteL
     (hKindSz : rigidTyKindByteSize elemKind = some n)
     (hDec : ∀ chunk x, chunk.length = n → c.decode chunk = some x →
       decodeValueFromBytes 15 layouts { kind := elemKind, layoutIdx := 0 } chunk = some (toVal x))
-    (hPtrBytes : layoutPointerBytes layouts = 8 := by rfl) :
+    (hPtrBytes : layoutPointerBytes layouts = 8 := by rfl)
+    (hNoProv : abstractBytesHaveProv
+      (((globalAllocByteMem alloc).drop wide.1.offsetBytes).take (wide.2 * n)) = false := by rfl) :
     evalPlaceRead locals { local_ := slLoc, projection := [.deref, .index idxLoc] }
       mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack = .ub := by
   have hFit : wide.1.offsetBytes + wide.2 * n ≤ alloc.bytes.length := by
@@ -24377,6 +24383,8 @@ theorem SliceTypedAt.evalPlaceRead_index_oob_ub {α : Type} {n : Nat} {c : ByteL
   rw [hGlobAlign, hSz]
   dsimp (config := { zeta := true }) only
   rw [hPtrBytes, show Nat.mul wide.2 n = wide.2 * n from rfl, hWin]
+  dsimp only
+  rw [hNoProv]
   dsimp only
   rw [hArr]
   simp only [readProjectedValue, hIdx, hGetNone]

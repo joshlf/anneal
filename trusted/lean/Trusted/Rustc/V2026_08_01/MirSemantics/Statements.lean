@@ -694,7 +694,8 @@ Reference (`core::mem::transmute` documentation, Rust 1.98.0):
 def convertCopySingleValue?
     (layouts : LayoutTable)
     (srcPtOpt dstPtOpt dstPlaceTyOpt : Option Ty)
-    (copiedVal : Value) :
+    (copiedVal : Value)
+    (srcLayouts : LayoutTable := layouts) :
     Option Value :=
   let effDstTyOpt : Option Ty :=
     match dstPlaceTyOpt with
@@ -703,7 +704,7 @@ def convertCopySingleValue?
   let encodeCopied (sTyOpt : Option Ty) : Option (List AbstractByte) :=
     match sTyOpt with
     | .some sTy =>
-      match encodeTypedValueToBytes layouts sTy copiedVal with
+      match encodeTypedValueToBytes srcLayouts sTy copiedVal with
       | .some bs => .some bs
       | .none => encodeUntypedValueToBytes defaultCodecFuel copiedVal
     | .none => encodeUntypedValueToBytes defaultCodecFuel copiedVal
@@ -3741,12 +3742,21 @@ Frame-qualified single-element direct value copy (`count == 1`, `srcStart == 0`,
 `dstStart == 0`) for `copy_nonoverlapping` when at least one of `srcEntry` or
 `dstEntry` targets a suspended caller frame (`copyEntriesTargetActiveFrame = false`,
 `DIV-MR-CALL-TARGET-LOCAL`). Reads the source value from `(srcEntry.targetFrameDepth,
-srcEntry.targetLocal)` (`readFrameLocalSlot`), checks disjointness on the pair
-`(targetFrameDepth, targetLocal)` and `targetProjection`, applies the Tree Borrows
-read-then-write check and transition (`borrowsAfterCopySingleDirect`), and writes
-the converted value to `(dstEntry.targetFrameDepth, dstEntry.targetLocal)`
-(`writeFrameLocalSlot`). Non-unit counts or non-zero byte offsets across frames
+srcEntry.targetLocal)` (`readFrameLocalSlot`), resolves the destination frame's
+`(dstDecls, dstLayouts)` via `foreignFrameDeclsAndLayouts` so `convertCopySingleValue?`
+enforces no-forge reference/fnPtr decoding, `.strictUcg630Ub` `ptr -> int` rejection,
+and untyped `Kani#5205` storage decoding against the destination place's actual type,
+checks disjointness on `(targetFrameDepth, targetLocal)` and `targetProjection`,
+applies `borrowsAfterCopySingleDirect`, and writes to `(dstEntry.targetFrameDepth,
+dstEntry.targetLocal)`. Non-unit counts or non-zero byte offsets across frames
 fail closed with `MirStepNode.unsupported`.
+
+Reference (`core::ptr::copy_nonoverlapping` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "The copy is \"untyped\" in the sense that data may be uninitialized or
+> otherwise violate the requirements of `T`. The initialization state is
+> preserved exactly."
 -/
 def evalForeignFrameCopySingleDirect
     (s : MachineState)
@@ -3802,13 +3812,35 @@ def evalForeignFrameCopySingleDirect
         | .ub => MirStepNode.fail .ub
         | .unsupported => MirStepNode.unsupported
         | .ok copiedVal =>
+          let (dstDecls, dstFrameLayouts) : List LocalDecl × LayoutTable :=
+            match Nat.beq dstEntry.targetFrameDepth (length s.memory.callStack) with
+            | true =>
+              match get? locals₃ dstEntry.targetLocal with
+              | .some _ => (localDecls, layouts)
+              | .none => (.nil, layouts)
+            | false =>
+              foreignFrameDeclsAndLayouts
+                s.memory.callStack
+                layouts
+                dstEntry.targetFrameDepth
+                dstEntry.targetLocal
+          let dstPlaceTyOpt : Option Ty :=
+            placeTyResolved
+              dstDecls
+              dstFrameLayouts
+              { local_ := dstEntry.targetLocal, projection := dstEntry.targetProjection }
+          let effDstLayouts : LayoutTable :=
+            match dstPlaceTyOpt with
+            | .some _ => dstFrameLayouts
+            | .none => layouts
           let convertedOpt : Option Value :=
             convertCopySingleValue?
-              layouts
+              effDstLayouts
               (operandPointeeTy localDecls layouts src)
               (operandPointeeTy localDecls layouts dst)
-              .none
+              dstPlaceTyOpt
               copiedVal
+              layouts
           match convertedOpt with
           | .none => MirStepNode.fail .ub
           | .some finalVal =>
@@ -10959,11 +10991,24 @@ def encodeLeafForScalarLayout
   | .scalar sv =>
     match Nat.beq sv.sizeBytes expectedSz with
     | true => encodeScalarBytes sv .none
-    | false => .none
+    | false =>
+      match Bool.and (Nat.beq expectedSz 1) (Bool.and (Nat.beq sv.bits 0) (Nat.beq sv.sizeBytes 0)) with
+      | true => .some (.uninit :: .nil)
+      | false => .none
   | .ptr p sz =>
     match Nat.beq sz expectedSz with
     | true => encodePtrRawBytes mem p sz
     | false => .none
+  | .aggregate varIdx fields =>
+    match Nat.beq expectedSz 1 with
+    | true =>
+      match decodeRawAbstractByteVal? (.aggregate varIdx fields) with
+      | .some ab => .some (ab :: .nil)
+      | .none => .none
+    | false =>
+      match Bool.and (Nat.beq varIdx 0) (Bool.and (Nat.blt 2 (length fields)) (Nat.beq (length fields) expectedSz)) with
+      | true => decodeRawAbstractByteVals? fields
+      | false => .none
   | _ => .none
 
 /--
@@ -11038,7 +11083,15 @@ def encodeValueAtLayoutIdx
                     (Nat.beq varIdx expectedVar)
                     (Nat.beq (length fieldVals) (length offsets))
                 with
-                | false => .none
+                | false =>
+                  match
+                    Bool.and (Nat.beq varIdx 0)
+                      (Bool.and (Nat.blt 2 (length fieldVals))
+                        (Nat.beq (length fieldVals) l.size.bytes)),
+                    l.backendRepr
+                  with
+                  | true, .scalarPair _ _ => decodeRawAbstractByteVals? fieldVals
+                  | _, _ => .none
                 | true =>
                   match Nat.beq (length l.fieldLayouts) (length offsets) with
                   | true =>
@@ -11298,6 +11351,10 @@ def encodeRawValueBytes
                 with
                 | .some db, .some mb => .some (appendAbstractBytes db mb)
                 | _, _ => .none
+              | .aggregate 0 rawVals =>
+                match Bool.and (Nat.blt 2 (length rawVals)) (Nat.beq (length rawVals) (Nat.mul 2 ptrBytes)) with
+                | true => decodeRawAbstractByteVals? rawVals
+                | false => .none
               | _ => .none
             | .none =>
               match ptrPointeeMayBeUnsizedAux 8 pt with
@@ -11316,6 +11373,10 @@ def encodeRawValueBytes
                       with
                       | .some db, .some mb => .some (appendAbstractBytes db mb)
                       | _, _ => .none
+                    | true, .aggregate 0 rawVals =>
+                      match Bool.and (Nat.blt 2 (length rawVals)) (Nat.beq (length rawVals) sz) with
+                      | true => decodeRawAbstractByteVals? rawVals
+                      | false => .none
                     | _, _ => .none
                 | .none => .none
           | .rawPtr _ pt =>
@@ -11329,6 +11390,10 @@ def encodeRawValueBytes
                 with
                 | .some db, .some mb => .some (appendAbstractBytes db mb)
                 | _, _ => .none
+              | .aggregate 0 rawVals =>
+                match Bool.and (Nat.blt 2 (length rawVals)) (Nat.beq (length rawVals) (Nat.mul 2 ptrBytes)) with
+                | true => decodeRawAbstractByteVals? rawVals
+                | false => .none
               | _ => .none
             | .none =>
               match ptrPointeeMayBeUnsizedAux 8 pt with
@@ -11347,6 +11412,10 @@ def encodeRawValueBytes
                       with
                       | .some db, .some mb => .some (appendAbstractBytes db mb)
                       | _, _ => .none
+                    | true, .aggregate 0 rawVals =>
+                      match Bool.and (Nat.blt 2 (length rawVals)) (Nat.beq (length rawVals) sz) with
+                      | true => decodeRawAbstractByteVals? rawVals
+                      | false => .none
                     | _, _ => .none
                 | .none => .none
           | .array elem n =>
@@ -12255,19 +12324,29 @@ def decodeThinPtrBytes
         | true => .none
         | false => .some (.ptr { allocId := a, offsetBytes := sv.bits } ptrBytes)
       | .some .none, .some (sv, _) =>
-        match Bool.and requireNonNull (Nat.beq sv.bits 0) with
-        | true => .none
-        | false => .some (.ptr { allocId := 0, offsetBytes := sv.bits } ptrBytes)
+        match requireNonNull with
+        | true =>
+          match Nat.beq sv.bits 0 with
+          | true => .none
+          | false => .some (.ptr { allocId := 0, offsetBytes := sv.bits } ptrBytes)
+        | false => .some (.scalar sv)
       | _, _ => .none
 
 /--
 Decode a `List AbstractByte` into a `Value` for committing into a stack
-`LocalSlot`, enforcing type-level invariants (`bool`, `char`, `&!`, `&[T]`/`&str`
-lengths, `dyn` vtables, tuple fields) and using raw-byte union overlays for
-partially initialized unions (in `V2026_08_01`, which has no `Value.uninit`
-constructor, partially initialized non-union leaves fail closed `.none`, while
-wholly-uninit locals commit as `LocalSlot.uninit` in `commitRootAbstractBytes`;
-all commits are guarded downstream by `abstractBytesRefine`).
+`LocalSlot`, preserving lossless `PtrByteFrag` and `.uninit` raw-byte carriers
+across `[u8; N]`, unions, and partially-assembled or incoherent pointer slots
+(`UCG#558`), deferring bit-invalid `bool`/`char` checks to typed reads
+(`Kani#5205`, while `validateTypedBytes` enforces typed validity for
+`typed_swap_nonoverlapping`), and rejecting provenance-in-integer writes
+(guarded downstream by `abstractBytesRefine`).
+
+Reference (`core::ptr::copy` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy.html>
+
+> "The copy is \"untyped\" in the sense that data may be uninitialized or
+> otherwise violate the requirements of `T`. The initialization state is
+> preserved exactly."
 -/
 def decodePartialUninitValue
     (mem : Memory)
@@ -12300,15 +12379,18 @@ def decodePartialUninitValue
               | .none => .none
       | .some ty =>
         let ptrBytes := layoutPointerBytes layouts
+        let rawPtrCarrierFallback (expWidth : Nat) : Option Value :=
+          match
+            Bool.and (Bool.not allowUninitLeaf)
+              (Bool.and (Nat.blt 2 expWidth) (Nat.beq (length bytes) expWidth))
+          with
+          | true => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+          | false => .none
         match ty.kind with
         | .bool =>
           match bytes with
           | .uninit :: .nil => .none
-          | .init b .none :: .nil =>
-            let n := b.toBitVec.toNat
-            match Nat.ble n 1 with
-            | true => .some (.scalar ⟨n, 1⟩)
-            | false => .none
+          | .init b .none :: .nil => .some (.scalar ⟨b.toBitVec.toNat, 1⟩)
           | _ => .none
         | .char =>
           match Nat.beq (length bytes) 4 with
@@ -12321,10 +12403,7 @@ def decodePartialUninitValue
               | true => .none
               | false =>
                 match decodeScalarBytes bytes false with
-                | .some (sv, _) =>
-                  match isValidCharCode sv.bits with
-                  | true => .some (.scalar sv)
-                  | false => .none
+                | .some (sv, _) => .some (.scalar sv)
                 | .none => .none
         | .int _ | .uint _ =>
           match intTyTargetBytes layouts ty.kind with
@@ -12361,7 +12440,10 @@ def decodePartialUninitValue
           | .nil => .some .unit
           | _ :: _ => .none
         | .never => .none
-        | .fnPtr _ _ _ _ => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
+        | .fnPtr _ _ _ _ =>
+          match decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes with
+          | .some v => .some v
+          | .none => rawPtrCarrierFallback ptrBytes
         | .ref _ pt =>
           match knownWidePointeeTailAux? 8 pt with
           | .some tailTy =>
@@ -12370,7 +12452,7 @@ def decodePartialUninitValue
             | false => .none
             | true =>
               match allBytesUninit bytes with
-              | true => .none
+              | true => rawPtrCarrierFallback (Nat.mul 2 ptrBytes)
               | false =>
                 let dBs := takeAbstractBytes ptrBytes bytes
                 let mBs := dropAbstractBytes ptrBytes bytes
@@ -12389,14 +12471,17 @@ def decodePartialUninitValue
                         | .none => .none
                   with
                   | .some dv, .some mv => .some (.aggregate 0 (dv :: mv :: .nil))
-                  | _, _ => .none
-                | _ => .none
+                  | _, _ => rawPtrCarrierFallback (Nat.mul 2 ptrBytes)
+                | _ => rawPtrCarrierFallback (Nat.mul 2 ptrBytes)
           | .none =>
             match ptrPointeeMayBeUnsizedAux 8 pt with
             | false =>
               match referenceToUninhabited localDecls layouts pt with
               | true => .none
-              | false => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
+              | false =>
+                match decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes with
+                | .some v => .some v
+                | .none => rawPtrCarrierFallback ptrBytes
             | true =>
               match declPtrToPointeeByteSize? localDecls layouts pt with
               | .some sz =>
@@ -12404,7 +12489,10 @@ def decodePartialUninitValue
                 | true =>
                   match referenceToUninhabited localDecls layouts pt with
                   | true => .none
-                  | false => decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes
+                  | false =>
+                    match decodeThinPtrBytes mem ptrBytes true allowUninitLeaf bytes with
+                    | .some v => .some v
+                    | .none => rawPtrCarrierFallback ptrBytes
                 | false => .none
               | .none => .none
         | .rawPtr _ pt =>
@@ -12415,7 +12503,7 @@ def decodePartialUninitValue
             | false => .none
             | true =>
               match allBytesUninit bytes with
-              | true => .none
+              | true => rawPtrCarrierFallback (Nat.mul 2 ptrBytes)
               | false =>
                 let dBs := takeAbstractBytes ptrBytes bytes
                 let mBs := dropAbstractBytes ptrBytes bytes
@@ -12434,16 +12522,22 @@ def decodePartialUninitValue
                         | .none => .none
                   with
                   | .some dv, .some mv => .some (.aggregate 0 (dv :: mv :: .nil))
-                  | _, _ => .none
-                | _ => .none
+                  | _, _ => rawPtrCarrierFallback (Nat.mul 2 ptrBytes)
+                | _ => rawPtrCarrierFallback (Nat.mul 2 ptrBytes)
           | .none =>
             match ptrPointeeMayBeUnsizedAux 8 pt with
-            | false => decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes
+            | false =>
+              match decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes with
+              | .some v => .some v
+              | .none => rawPtrCarrierFallback ptrBytes
             | true =>
               match declPtrToPointeeByteSize? localDecls layouts pt with
               | .some sz =>
                 match Nat.beq sz ptrBytes with
-                | true => decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes
+                | true =>
+                  match decodeThinPtrBytes mem ptrBytes false allowUninitLeaf bytes with
+                  | .some v => .some v
+                  | .none => rawPtrCarrierFallback ptrBytes
                 | false => .none
               | .none => .none
         | .array (.uint .u8) n =>
@@ -12454,8 +12548,10 @@ def decodePartialUninitValue
               decodePartialUninitArrayChunks
                 (fun chunk =>
                   match chunk with
-                  | .uninit :: .nil => .none
+                  | .uninit :: .nil => .some (.scalar ⟨0, 0⟩)
                   | .init b .none :: .nil => .some (.scalar ⟨b.toBitVec.toNat, 1⟩)
+                  | .init b (.some frag) :: .nil =>
+                    .some (encodeRawAbstractByteVal (.init b (.some frag)))
                   | _ => .none)
                 1
                 n

@@ -1956,10 +1956,11 @@ theorem trusted_shallowInitBox_eq_transmute_on_rawPtr
       | mk kd li =>
         rw [hr] at hrBoxK; dsimp only at hrBoxK; subst hrBoxK
         unfold decodeTypedValueFromBytes
-        dsimp only [normalizeCodecTy, defaultCodecFuel]
-        unfold decodePtrBytesNoForge encodeLittleEndianBytes encodePtrBytes encodePtrBytesAux
-          decodeLittleEndianBits abstractBytesCoherentPtrProv? abstractBytesCoherentPtrProvAux
-        simp only [Nat.beq_refl, Bool.true_and, Bool.and_self]
+        simp only [normalizeCodecTy, defaultCodecFuel, decodePtrBytesNoForge,
+          encodeLittleEndianBytes, encodePtrBytes, encodePtrBytesAux,
+          decodeLittleEndianBits, abstractBytesCoherentPtrProv?,
+          abstractBytesCoherentPtrProvAux, layoutPointerBytes, emptyLayoutTable,
+          normPtrByteOffset, length, Nat.beq_refl, Bool.true_and, Bool.and_true, Bool.and_self]
         rfl
     show evalByteCast locals op boxTy mem decls emptyLayoutTable = _
     unfold evalByteCast

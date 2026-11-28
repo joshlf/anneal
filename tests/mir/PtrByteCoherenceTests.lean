@@ -17,13 +17,13 @@ namespace Anneal.PtrByteCoherenceTests
 namespace V06
 export Trusted.Rustc.V2026_06_01.Layout (LayoutTable TypeLayout Size Align BackendRepr
   ScalarLayout PrimitiveKind WrappingRange FieldsShape VariantsShape)
-export Trusted.Rustc.V2026_06_01.MirAst (Ty RigidTy Mutability UintTy IntTy ScalarInt
+export Trusted.Rustc.V2026_06_01.MirAst (Ty RigidTy Mutability UintTy IntTy FloatTy ScalarInt
   ProvenancePtr ConstScalar ConstValue ConstOperand ProjectionElem Place Operand Rvalue
   Statement StatementKind NonDivergingIntrinsic LocalDecl CapturedAllocation CapturedMir
   Terminator TerminatorKind)
 export Trusted.Rustc.V2026_06_01.MirSemantics (PtrByteFrag AbstractByte Value LocalSlot
   BorrowEntry TreeBorrowPerm Memory StackFrame MachineState SavedCallerFrame MirStepNode
-  RvalueEvalResult PlaceReadResult Ptr2IntTransmutePolicy UnionPlaceInfo
+  RvalueEvalResult PlaceReadResult Ptr2IntTransmutePolicy UnionPlaceInfo MemOpRes
   ResolvedCallTarget WriteBytesAction
   emptyMemory defaultCodecFuel
   normPtrByteOffset mkInitByte mkPtrFragByte
@@ -35,21 +35,22 @@ export Trusted.Rustc.V2026_06_01.MirSemantics (PtrByteFrag AbstractByte Value Lo
   decodeRawAbstractByteVals? overlayRawAbstractByteVals
   globalAllocSliceToAbstractBytes
   decodePtrBytesNoForge decodeScalarLayoutBytesNoForge decodeTypedValueFromBytes
-  validateValueForTy? evalConstValue evalOperand evalByteCast evalRvalue
+  validateValueForTy? evalConstValue evalGlobalDerefRead evalSliceFatPtrDerefRead
+  evalOperand evalByteCast evalRvalue
   evalStmt evalCopySingleDirect evalCopyUnionBytes evalForeignFrameCopySingleDirect
-  writePlaceValue writeBytesAction)
+  evalCopyMemory writePlaceValue writeBytesAction)
 end V06
 
 namespace V08
 export Trusted.Rustc.V2026_08_01.Layout (LayoutTable TypeLayout Size Align BackendRepr
   ScalarLayout PrimitiveKind WrappingRange FieldsShape VariantsShape)
-export Trusted.Rustc.V2026_08_01.MirAst (Ty RigidTy Mutability UintTy IntTy ScalarInt
+export Trusted.Rustc.V2026_08_01.MirAst (Ty RigidTy Mutability UintTy IntTy FloatTy ScalarInt
   ProvenancePtr ConstScalar ConstValue ConstOperand ProjectionElem Place Operand Rvalue
   Statement StatementKind NonDivergingIntrinsic LocalDecl CapturedAllocation CapturedMir
   Terminator TerminatorKind)
 export Trusted.Rustc.V2026_08_01.MirSemantics (PtrByteFrag AbstractByte Value LocalSlot
   BorrowEntry TreeBorrowPerm Memory StackFrame MachineState SavedCallerFrame MirStepNode
-  RvalueEvalResult PlaceReadResult Ptr2IntTransmutePolicy UnionPlaceInfo
+  RvalueEvalResult PlaceReadResult Ptr2IntTransmutePolicy UnionPlaceInfo MemOpRes
   ResolvedCallTarget WriteBytesAction
   emptyMemory defaultCodecFuel
   normPtrByteOffset mkInitByte mkPtrFragByte
@@ -61,9 +62,10 @@ export Trusted.Rustc.V2026_08_01.MirSemantics (PtrByteFrag AbstractByte Value Lo
   decodeRawAbstractByteVals? overlayRawAbstractByteVals
   globalAllocSliceToAbstractBytes
   decodePtrBytesNoForge decodeScalarLayoutBytesNoForge decodeTypedValueFromBytes
-  validateValueForTy? evalConstValue evalOperand evalByteCast evalRvalue
+  validateValueForTy? evalConstValue evalGlobalDerefRead evalSliceFatPtrDerefRead
+  evalOperand evalByteCast evalRvalue
   evalStmt evalCopySingleDirect evalCopyUnionBytes evalForeignFrameCopySingleDirect
-  writePlaceValue writeBytesAction)
+  evalCopyMemory writePlaceValue writeBytesAction)
 end V08
 
 /-! ## §0. Shared Dialect Fixtures (`V2026_06_01` and `V2026_08_01`) -/
@@ -3013,6 +3015,570 @@ theorem b2_wide_ptr_byte_permutations_v08 :
     IsUbStep08 (V08.evalStmt b2State_08 (b1Copy_08 13 18 (b2C_08 8)) b2Decls_08 a1Layouts64_08) := by
   repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
 
+/-! ## §4d. `[adv ep1-A2]` Adversarial Regressions & `lean-miri` Correspondence Gap Postmortem
+
+Covers the four soundness, parity, and `Kani#5205` gaps closed in `[adv ep1-A2]` across both
+`V2026_06_01` and `V2026_08_01`:
+1. **`W5` / `UCG#630` Multi-Variant Enum Provenance Leak (`decodeTypedValueFromBytes`)**:
+   `enum PtrOrInt { Int(u64), Ptr(*const u8) }` with `BackendRepr.scalarPair (u8, .union (.pointer 0))`
+   (`backendReprHasPointer = true`) previously bypassed `.strictUcg630Ub` and stripped pointer
+   provenance into `PtrOrInt::Int(Value.scalar)` via `decodeFieldsBySpan`.
+2. **`W5` & `Kani#5205` Cross-Frame `evalForeignFrameCopySingleDirect` Destination-Type Bypass**:
+   `evalForeignFrameCopySingleDirect` previously passed `dstPlaceTyOpt = .none` and used callee
+   `layouts`, permitting cross-frame `ptr -> usize` `Value.ptr` retention (`W5`), cross-frame
+   `usize -> &u8` reference forgery (`W5`), and spurious `.ub` when projecting `u.0` on a valid
+   `1u8` copied into a caller's `Unaligned<bool>`.
+3. **`core::intrinsics::copy` (`evalCopyMemory`) `[u8; N]`, Pointer-Carrier, Raw-Ptr Scalar, and
+   `Kani#5205` Parity**:
+   `evalCopyMemory` now preserves `PtrByteFrag` and `.uninit` losslessly across `[u8; N]` and
+   partial/incoherent pointer slots in BOTH dialects (closing the `V06` vs `V08` `.uninit` `[u8; N]`
+   parity gap), decodes provenance-free raw-pointer bytes to `Value.scalar` (so `transmute` to
+   `u64` succeeds), and defers `2u8` in `bool` / `0xD800` in `char` validity to typed reads.
+4. **32-Bit & IEEE-754 Float Global Slice Dereference (`evalSliceFatPtrDerefRead`)**:
+   `evalSliceFatPtrDerefRead` falls back to `decodeTypedValueFromBytes` on 32-bit `&[usize]` and
+   `&[f32]` global slices while rejecting global pointer relocations at non-pointer element types.
+
+### `lean-miri` Correspondence Gap Postmortem (`mir-correspondence-postmortem.md`)
+Why `LeanMiriSpec` did not catch the four `A2` defects prior to `[adv ep1-A2]`:
+1. `SimLM2_4` / `DropBinderAndSubtypeLM` enum transmute theorems cover fieldless `#[repr(Int)]`
+   enums and `RichAdtSpec` enums rather than `TypeLayout`-only `VariantsShape.multiple` enums with
+   `.union (.pointer 0)` `BackendRepr`.
+2. `CopyLM4_2` proves single-frame `copy_nonoverlapping` (`targetFrameDepth = 0`, `callStack = []`),
+   so `evalForeignFrameCopySingleDirect` (`copyEntriesTargetActiveFrame = false`) is outside its
+   precondition.
+3. `CoreMemPtrIntrinsicsTests` / `CoreMemPtrIntrinsicsMR` covered `evalCopyCall` on integer/struct
+   buffers rather than `PtrByteFrag` pointer-byte round-trips or `2u8`/`0xD800` `Kani#5205` writes
+   through `evalCopyMemory`.
+4. `WideSliceDstLM` assumes 64-bit `layoutPointerBytes = 8` and integer element types, excluding
+   32-bit `&[usize]` and `&[f32]` global slice dereferences. -/
+
+section A2Fixtures06
+
+open V06
+
+/-- `enum PtrOrInt { Int(u64), Ptr(*const u8) }`: 16 bytes, tag `u8` at offset `0`, payload at `8`,
+`backendRepr = .scalarPair (.initialized (.int 8 false) ⟨0, 1⟩) (.union (.pointer 0))`. -/
+def a2PtrOrIntEnumL_06 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩,
+    backendRepr := .scalarPair
+      (.initialized (.int 8 false) ⟨0, 1⟩)
+      (.union (.pointer 0)),
+    fields := .arbitrary [⟨0⟩] [0],
+    variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+      [.arbitrary [⟨0⟩, ⟨8⟩] [0, 1], .arbitrary [⟨0⟩, ⟨8⟩] [0, 1]],
+    isUninhabited := false }
+
+def a2Layouts64_06 : LayoutTable :=
+  { a1Layouts64_06 with entries := a1Layouts64_06.entries ++ [a2PtrOrIntEnumL_06] }
+
+def a2TyPtrOrInt_06 : Ty := { kind := .adt "PtrOrInt" [], layoutIdx := a1Layouts64_06.entries.length }
+
+def a2EnumRelocGlobal_06 : CapturedAllocation :=
+  { allocId := 80,
+    bytes := List.replicate 8 (some 0) ++
+      [some 0x10, some 0, some 0, some 0, some 0, some 0, some 0, some 0],
+    relocations := [(8, ptr64_06)],
+    align := ⟨8⟩, mutability := .not }
+
+def a2Plain32Global_06 : CapturedAllocation :=
+  { allocId := 81,
+    bytes := [some 0x11, some 0x22, some 0, some 0, some 0x33, some 0x44, some 0, some 0],
+    relocations := [],
+    align := ⟨4⟩, mutability := .not }
+
+def a2F32Global_06 : CapturedAllocation :=
+  { allocId := 82,
+    bytes := [some 0, some 0, some 0x80, some 0x3F],
+    relocations := [],
+    align := ⟨4⟩, mutability := .not }
+
+def a2BorrowWin_06 (tag loc len : Nat) (perm : TreeBorrowPerm := .active) : BorrowEntry :=
+  { tag := tag, targetLocal := loc, targetProjection := [], perm := perm,
+    rangeOffset := 0, rangeLen := len }
+
+end A2Fixtures06
+
+section A2Fixtures08
+
+open V08
+
+def a2PtrOrIntEnumL_08 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩,
+    backendRepr := .scalarPair
+      (.initialized (.int 8 false) ⟨0, 1⟩)
+      (.union (.pointer 0)),
+    fields := .arbitrary [⟨0⟩] [0],
+    variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+      [.arbitrary [⟨0⟩, ⟨8⟩] [0, 1], .arbitrary [⟨0⟩, ⟨8⟩] [0, 1]],
+    isUninhabited := false }
+
+def a2Layouts64_08 : LayoutTable :=
+  { a1Layouts64_08 with entries := a1Layouts64_08.entries ++ [a2PtrOrIntEnumL_08] }
+
+def a2TyPtrOrInt_08 : Ty := { kind := .adt "PtrOrInt" [], layoutIdx := a1Layouts64_08.entries.length }
+
+def a2EnumRelocGlobal_08 : CapturedAllocation :=
+  { allocId := 80,
+    bytes := List.replicate 8 (some 0) ++
+      [some 0x10, some 0, some 0, some 0, some 0, some 0, some 0, some 0],
+    relocations := [(8, ptr64_08)],
+    align := ⟨8⟩, mutability := .not }
+
+def a2Plain32Global_08 : CapturedAllocation :=
+  { allocId := 81,
+    bytes := [some 0x11, some 0x22, some 0, some 0, some 0x33, some 0x44, some 0, some 0],
+    relocations := [],
+    align := ⟨4⟩, mutability := .not }
+
+def a2F32Global_08 : CapturedAllocation :=
+  { allocId := 82,
+    bytes := [some 0, some 0, some 0x80, some 0x3F],
+    relocations := [],
+    align := ⟨4⟩, mutability := .not }
+
+def a2BorrowWin_08 (tag loc len : Nat) (perm : TreeBorrowPerm := .active) : BorrowEntry :=
+  { tag := tag, targetLocal := loc, targetProjection := [], perm := perm,
+    rangeOffset := 0, rangeLen := len }
+
+end A2Fixtures08
+
+/-- A2.1 (`W5` / `UCG#630` multi-variant enum with pointer `BackendRepr`, `V2026_06_01` & `V2026_08_01`):
+`PtrOrInt` (`backendReprHasPointer = true`) rejects provenance-bearing bytes under `.strictUcg630Ub`
+(both in `decodeTypedValueFromBytes` and `evalGlobalDerefRead`), strips provenance under
+`.stripProvenance`, and decodes provenance-free bytes cleanly. -/
+theorem a2_multiple_enum_ptr_backend_prov_reject_v06_v08 :
+    let tag0_06 := V06.encodeLittleEndianBytes 0 8 none
+    let plainPay_06 := V06.encodeLittleEndianBytes 0x42 8 none
+    let tag0_08 := V08.encodeLittleEndianBytes 0 8 none
+    let plainPay_08 := V08.encodeLittleEndianBytes 0x42 8 none
+    V06.decodeTypedValueFromBytes V06.defaultCodecFuel a2Layouts64_06 a2TyPtrOrInt_06
+      (tag0_06 ++ ptr64Bytes_06) .strictUcg630Ub = none ∧
+    V06.decodeTypedValueFromBytes V06.defaultCodecFuel a2Layouts64_06 a2TyPtrOrInt_06
+      (tag0_06 ++ ptr64Bytes_06) .stripProvenance =
+        some (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨0x10, 8⟩]) ∧
+    V06.decodeTypedValueFromBytes V06.defaultCodecFuel a2Layouts64_06 a2TyPtrOrInt_06
+      (tag0_06 ++ plainPay_06) .strictUcg630Ub =
+        some (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨0x42, 8⟩]) ∧
+    V06.evalGlobalDerefRead [] a2EnumRelocGlobal_06 0 16 [] a2Layouts64_06 (some a2TyPtrOrInt_06) = .ub ∧
+    V08.decodeTypedValueFromBytes V08.defaultCodecFuel a2Layouts64_08 a2TyPtrOrInt_08
+      (tag0_08 ++ ptr64Bytes_08) .strictUcg630Ub = none ∧
+    V08.decodeTypedValueFromBytes V08.defaultCodecFuel a2Layouts64_08 a2TyPtrOrInt_08
+      (tag0_08 ++ ptr64Bytes_08) .stripProvenance =
+        some (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨0x10, 8⟩]) ∧
+    V08.decodeTypedValueFromBytes V08.defaultCodecFuel a2Layouts64_08 a2TyPtrOrInt_08
+      (tag0_08 ++ plainPay_08) .strictUcg630Ub =
+        some (.aggregate 0 [.scalar ⟨0, 8⟩, .scalar ⟨0x42, 8⟩]) ∧
+    V08.evalGlobalDerefRead [] a2EnumRelocGlobal_08 0 16 [] a2Layouts64_08 (some a2TyPtrOrInt_08) = .ub := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+def a2ForeignCallerProj06 (callerDecls : List V06.LocalDecl) (st : V06.MirStepNode) :
+    Option ValSummary :=
+  match st with
+  | .tau (.running s) =>
+    match s.memory.callStack with
+    | cf :: _ =>
+      match V06.evalOperand cf.frame.locals (.copy ⟨2, [.field 0 tyBool_06]⟩)
+          [] [] layouts64_06 [] callerDecls with
+      | .ok v _ => some (valSummaryVal06 v)
+      | .ub => some .none
+      | .unsupported => none
+    | [] => none
+  | _ => none
+
+def a2ForeignCallerProj08 (callerDecls : List V08.LocalDecl) (st : V08.MirStepNode) :
+    Option ValSummary :=
+  match st with
+  | .tau (.running s) =>
+    match s.memory.callStack with
+    | cf :: _ =>
+      match V08.evalOperand cf.frame.locals (.copy ⟨2, [.field 0 tyBool_08]⟩)
+          [] [] layouts64_08 [] callerDecls with
+      | .ok v _ => some (valSummaryVal08 v)
+      | .ub => some .none
+      | .unsupported => none
+    | [] => none
+  | _ => none
+
+/-- A2.2 (`W5` & `Kani#5205` cross-frame `evalForeignFrameCopySingleDirect`, `V2026_06_01` & `V2026_08_01`):
+resolving the foreign destination frame's `(dstDecls, dstLayouts)` blocks cross-frame `*const u8 -> usize`
+provenance leaks (`W5`) and provenance-free `*const u8 -> &u8` reference forgery (`W5`), while decoding
+cross-frame `*mut u8 -> Unaligned<bool>` into `.aggregate 0 [.scalar ...]` so `u.0` succeeds on `1u8`
+and faults `.ub` on `2u8` even when callee `layouts` is `emptyLayoutTable`. -/
+theorem a2_foreign_frame_copy_no_leak_no_forge_and_unal_proj_v06_v08 :
+    let callerDecls06 : List V06.LocalDecl := [
+      { mutability := .mut, ty := tyUsize_06, debugName := none },
+      { mutability := .mut, ty := tyRefU8_06, debugName := none },
+      { mutability := .mut, ty := tyUnalignedBool_06, debugName := none }
+    ]
+    let savedCaller06 : V06.SavedCallerFrame :=
+      { callerBody := emptyBody06 callerDecls06 layouts64_06,
+        frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar ⟨0, 8⟩), .uninit, .uninit] },
+        destination := ⟨0, []⟩ }
+    let tyPtrToRawPtr06 : V06.Ty := { kind := .rawPtr .not tyRawPtrU8_06.kind, layoutIdx := 0 }
+    let tyMutPtrToRawPtr06 : V06.Ty := { kind := .rawPtr .mut tyRawPtrU8_06.kind, layoutIdx := 0 }
+    let calleeDecls06 : List V06.LocalDecl := [
+      { mutability := .not, ty := tyRawPtrU8_06, debugName := none },
+      { mutability := .not, ty := tyRawPtrU8_06, debugName := none },
+      { mutability := .not, ty := tyU8_06, debugName := none },
+      { mutability := .not, ty := tyU8_06, debugName := none },
+      { mutability := .not, ty := tyPtrToRawPtr06, debugName := none },
+      { mutability := .not, ty := tyPtrToRawPtr06, debugName := none },
+      { mutability := .not, ty := tyMutPtrToRawPtr06, debugName := none },
+      { mutability := .not, ty := tyMutPtrToRawPtr06, debugName := none },
+      { mutability := .not, ty := tyRawPtrU8_06, debugName := none },
+      { mutability := .not, ty := tyRawPtrU8_06, debugName := none },
+      { mutability := .not, ty := tyMutPtrU8_06, debugName := none }
+    ]
+    let sPtrE06 : V06.BorrowEntry := { tag := 70, targetLocal := 0, targetProjection := [], perm := .frozen, targetFrameDepth := 1 }
+    let sFakeE06 : V06.BorrowEntry := { tag := 71, targetLocal := 1, targetProjection := [], perm := .frozen, targetFrameDepth := 1 }
+    let sOneE06 : V06.BorrowEntry := { tag := 72, targetLocal := 2, targetProjection := [], perm := .frozen, targetFrameDepth := 1 }
+    let sTwoE06 : V06.BorrowEntry := { tag := 73, targetLocal := 3, targetProjection := [], perm := .frozen, targetFrameDepth := 1 }
+    let dUsizeE06 : V06.BorrowEntry := { tag := 74, targetLocal := 0, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+    let dRefE06 : V06.BorrowEntry := { tag := 75, targetLocal := 1, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+    let dUnalE06 : V06.BorrowEntry := { tag := 76, targetLocal := 2, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+    let calleeLocs06 : List V06.LocalSlot := [
+      .init (.ptr ptr64_06 8), .init (.scalar ⟨0x20000, 8⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨2, 1⟩),
+      .init (.ptr ⟨70, 0⟩ 8), .init (.ptr ⟨71, 0⟩ 8), .init (.ptr ⟨74, 0⟩ 8), .init (.ptr ⟨75, 0⟩ 8),
+      .init (.ptr ⟨72, 0⟩ 8), .init (.ptr ⟨73, 0⟩ 8), .init (.ptr ⟨76, 0⟩ 8)
+    ]
+    let mem06 : V06.Memory :=
+      { V06.emptyMemory with
+        borrows := [sPtrE06, sFakeE06, sOneE06, sTwoE06, dUsizeE06, dRefE06, dUnalE06],
+        callStack := [savedCaller06] }
+    let st06 := mkState06 calleeLocs06 mem06
+    let emptyLay06 : V06.LayoutTable := { entries := [], pointerBits := 64, isLittleEndian := true }
+    let leak06 := V06.evalForeignFrameCopySingleDirect st06 (.copy ⟨4, []⟩) (.copy ⟨6, []⟩)
+      calleeDecls06 emptyLay06 ⟨70, 0⟩ ⟨74, 0⟩ sPtrE06 dUsizeE06 1 calleeLocs06
+    let forge06 := V06.evalForeignFrameCopySingleDirect st06 (.copy ⟨5, []⟩) (.copy ⟨7, []⟩)
+      calleeDecls06 emptyLay06 ⟨71, 0⟩ ⟨75, 0⟩ sFakeE06 dRefE06 1 calleeLocs06
+    let okUnal06 := V06.evalForeignFrameCopySingleDirect st06 (.copy ⟨8, []⟩) (.copy ⟨10, []⟩)
+      calleeDecls06 emptyLay06 ⟨72, 0⟩ ⟨76, 0⟩ sOneE06 dUnalE06 1 calleeLocs06
+    let badUnal06 := V06.evalForeignFrameCopySingleDirect st06 (.copy ⟨9, []⟩) (.copy ⟨10, []⟩)
+      calleeDecls06 emptyLay06 ⟨73, 0⟩ ⟨76, 0⟩ sTwoE06 dUnalE06 1 calleeLocs06
+    -- V2026_08_01 mirror
+    let callerDecls08 : List V08.LocalDecl := [
+      { mutability := .mut, ty := tyUsize_08, debugName := none },
+      { mutability := .mut, ty := tyRefU8_08, debugName := none },
+      { mutability := .mut, ty := tyUnalignedBool_08, debugName := none }
+    ]
+    let savedCaller08 : V08.SavedCallerFrame :=
+      { callerBody := emptyBody08 callerDecls08 layouts64_08,
+        frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.scalar ⟨0, 8⟩), .uninit, .uninit] },
+        destination := ⟨0, []⟩ }
+    let tyPtrToRawPtr08 : V08.Ty := { kind := .rawPtr .not tyRawPtrU8_08.kind, layoutIdx := 0 }
+    let tyMutPtrToRawPtr08 : V08.Ty := { kind := .rawPtr .mut tyRawPtrU8_08.kind, layoutIdx := 0 }
+    let calleeDecls08 : List V08.LocalDecl := [
+      { mutability := .not, ty := tyRawPtrU8_08, debugName := none },
+      { mutability := .not, ty := tyRawPtrU8_08, debugName := none },
+      { mutability := .not, ty := tyU8_08, debugName := none },
+      { mutability := .not, ty := tyU8_08, debugName := none },
+      { mutability := .not, ty := tyPtrToRawPtr08, debugName := none },
+      { mutability := .not, ty := tyPtrToRawPtr08, debugName := none },
+      { mutability := .not, ty := tyMutPtrToRawPtr08, debugName := none },
+      { mutability := .not, ty := tyMutPtrToRawPtr08, debugName := none },
+      { mutability := .not, ty := tyRawPtrU8_08, debugName := none },
+      { mutability := .not, ty := tyRawPtrU8_08, debugName := none },
+      { mutability := .not, ty := tyMutPtrU8_08, debugName := none }
+    ]
+    let sPtrE08 : V08.BorrowEntry := { tag := 70, targetLocal := 0, targetProjection := [], perm := .frozen, targetFrameDepth := 1 }
+    let sFakeE08 : V08.BorrowEntry := { tag := 71, targetLocal := 1, targetProjection := [], perm := .frozen, targetFrameDepth := 1 }
+    let sOneE08 : V08.BorrowEntry := { tag := 72, targetLocal := 2, targetProjection := [], perm := .frozen, targetFrameDepth := 1 }
+    let sTwoE08 : V08.BorrowEntry := { tag := 73, targetLocal := 3, targetProjection := [], perm := .frozen, targetFrameDepth := 1 }
+    let dUsizeE08 : V08.BorrowEntry := { tag := 74, targetLocal := 0, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+    let dRefE08 : V08.BorrowEntry := { tag := 75, targetLocal := 1, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+    let dUnalE08 : V08.BorrowEntry := { tag := 76, targetLocal := 2, targetProjection := [], perm := .active, targetFrameDepth := 0 }
+    let calleeLocs08 : List V08.LocalSlot := [
+      .init (.ptr ptr64_08 8), .init (.scalar ⟨0x20000, 8⟩), .init (.scalar ⟨1, 1⟩), .init (.scalar ⟨2, 1⟩),
+      .init (.ptr ⟨70, 0⟩ 8), .init (.ptr ⟨71, 0⟩ 8), .init (.ptr ⟨74, 0⟩ 8), .init (.ptr ⟨75, 0⟩ 8),
+      .init (.ptr ⟨72, 0⟩ 8), .init (.ptr ⟨73, 0⟩ 8), .init (.ptr ⟨76, 0⟩ 8)
+    ]
+    let mem08 : V08.Memory :=
+      { V08.emptyMemory with
+        borrows := [sPtrE08, sFakeE08, sOneE08, sTwoE08, dUsizeE08, dRefE08, dUnalE08],
+        callStack := [savedCaller08] }
+    let st08 := mkState08 calleeLocs08 mem08
+    let emptyLay08 : V08.LayoutTable := { entries := [], pointerBits := 64, isLittleEndian := true }
+    let leak08 := V08.evalForeignFrameCopySingleDirect st08 (.copy ⟨4, []⟩) (.copy ⟨6, []⟩)
+      calleeDecls08 emptyLay08 ⟨70, 0⟩ ⟨74, 0⟩ sPtrE08 dUsizeE08 1 calleeLocs08
+    let forge08 := V08.evalForeignFrameCopySingleDirect st08 (.copy ⟨5, []⟩) (.copy ⟨7, []⟩)
+      calleeDecls08 emptyLay08 ⟨71, 0⟩ ⟨75, 0⟩ sFakeE08 dRefE08 1 calleeLocs08
+    let okUnal08 := V08.evalForeignFrameCopySingleDirect st08 (.copy ⟨8, []⟩) (.copy ⟨10, []⟩)
+      calleeDecls08 emptyLay08 ⟨72, 0⟩ ⟨76, 0⟩ sOneE08 dUnalE08 1 calleeLocs08
+    let badUnal08 := V08.evalForeignFrameCopySingleDirect st08 (.copy ⟨9, []⟩) (.copy ⟨10, []⟩)
+      calleeDecls08 emptyLay08 ⟨73, 0⟩ ⟨76, 0⟩ sTwoE08 dUnalE08 1 calleeLocs08
+    IsUbStep06 leak06 ∧ IsUbStep06 forge06 ∧
+    a2ForeignCallerProj06 callerDecls06 okUnal06 = some (.scalar 1 1) ∧
+    a2ForeignCallerProj06 callerDecls06 badUnal06 = some .none ∧
+    IsUbStep08 leak08 ∧ IsUbStep08 forge08 ∧
+    a2ForeignCallerProj08 callerDecls08 okUnal08 = some (.scalar 1 1) ∧
+    a2ForeignCallerProj08 callerDecls08 badUnal08 = some .none := by
+  exact ⟨trivial, trivial, rfl, rfl, trivial, trivial, rfl, rfl⟩
+
+def a2TwoPairMem_06 : V06.Memory :=
+  { V06.emptyMemory with
+    borrows := [a2BorrowWin_06 10 0 8 .frozen, a2BorrowWin_06 11 1 8 .active] }
+
+def a2Step1_06 (srcTy dstTy : V06.Ty) (srcSlot dstSlot : V06.LocalSlot)
+    (sOff dOff n : Nat) : Option (List V06.LocalSlot × V06.Memory) :=
+  let decls : List V06.LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match V06.evalCopyMemory (mkState06 l a2TwoPairMem_06) l decls layouts64_06
+      ⟨10, sOff⟩ ⟨11, dOff⟩ n with
+  | .ok res => some res
+  | _ => none
+
+def a2Copy1Slot_06 (srcTy dstTy : V06.Ty) (srcSlot dstSlot : V06.LocalSlot)
+    (sOff dOff n : Nat) : Option V06.LocalSlot :=
+  match a2Step1_06 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (_ :: dst' :: _, _) => some dst'
+  | _ => none
+
+def a2Copy1Read_06 (srcTy dstTy : V06.Ty) (srcSlot dstSlot : V06.LocalSlot)
+    (sOff dOff n : Nat) : Option ValSummary :=
+  let decls : List V06.LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  match a2Step1_06 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (l', _) =>
+    match V06.evalOperand l' (.copy ⟨1, []⟩) [] [] layouts64_06 [] decls with
+    | .ok v _ => some (valSummaryVal06 v)
+    | .ub => some .none
+    | .unsupported => none
+  | none => none
+
+def a2Copy1CastU64_06 (srcTy dstTy : V06.Ty) (srcSlot dstSlot : V06.LocalSlot)
+    (sOff dOff n : Nat) : Option ValSummary :=
+  let decls : List V06.LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  match a2Step1_06 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (l', m') =>
+    match V06.evalByteCast l' (.copy ⟨1, []⟩) tyU64_06 m' decls layouts64_06 with
+    | .ok v _ _ => some (valSummaryVal06 v)
+    | .ub => some .none
+    | .unsupported => none
+  | none => none
+
+def a2TwoPairMem_08 : V08.Memory :=
+  { V08.emptyMemory with
+    borrows := [a2BorrowWin_08 10 0 8 .frozen, a2BorrowWin_08 11 1 8 .active] }
+
+def a2Step1_08 (srcTy dstTy : V08.Ty) (srcSlot dstSlot : V08.LocalSlot)
+    (sOff dOff n : Nat) : Option (List V08.LocalSlot × V08.Memory) :=
+  let decls : List V08.LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  let l := [srcSlot, dstSlot]
+  match V08.evalCopyMemory (mkState08 l a2TwoPairMem_08) l decls layouts64_08
+      ⟨10, sOff⟩ ⟨11, dOff⟩ n with
+  | .ok res => some res
+  | _ => none
+
+def a2Copy1Slot_08 (srcTy dstTy : V08.Ty) (srcSlot dstSlot : V08.LocalSlot)
+    (sOff dOff n : Nat) : Option V08.LocalSlot :=
+  match a2Step1_08 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (_ :: dst' :: _, _) => some dst'
+  | _ => none
+
+def a2Copy1Read_08 (srcTy dstTy : V08.Ty) (srcSlot dstSlot : V08.LocalSlot)
+    (sOff dOff n : Nat) : Option ValSummary :=
+  let decls : List V08.LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  match a2Step1_08 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (l', _) =>
+    match V08.evalOperand l' (.copy ⟨1, []⟩) [] [] layouts64_08 [] decls with
+    | .ok v _ => some (valSummaryVal08 v)
+    | .ub => some .none
+    | .unsupported => none
+  | none => none
+
+def a2Copy1CastU64_08 (srcTy dstTy : V08.Ty) (srcSlot dstSlot : V08.LocalSlot)
+    (sOff dOff n : Nat) : Option ValSummary :=
+  let decls : List V08.LocalDecl := [
+    { mutability := .not, ty := srcTy, debugName := none },
+    { mutability := .mut, ty := dstTy, debugName := none }
+  ]
+  match a2Step1_08 srcTy dstTy srcSlot dstSlot sOff dOff n with
+  | some (l', m') =>
+    match V08.evalByteCast l' (.copy ⟨1, []⟩) tyU64_08 m' decls layouts64_08 with
+    | .ok v _ _ => some (valSummaryVal08 v)
+    | .ub => some .none
+    | .unsupported => none
+  | none => none
+
+def a2HalfBufSlot_06 : V06.LocalSlot :=
+  .init (.aggregate 0
+    (V06.encodeRawAbstractByteVals (ptr64Bytes_06.take 4) ++ List.replicate 4 .uninit))
+
+def a2FullBufSlot_06 : V06.LocalSlot :=
+  .init (.aggregate 0 (V06.encodeRawAbstractByteVals ptr64Bytes_06))
+
+def a2HalfPtrSlot_06 : V06.LocalSlot :=
+  .init (.aggregate 0
+    (V06.encodeRawAbstractByteVals (ptr64Bytes_06.take 4 ++ List.replicate 4 .uninit)))
+
+def a2HalfSwapSlot_06 : V06.LocalSlot :=
+  .init (.aggregate 0
+    (V06.encodeRawAbstractByteVals ((ptr64Bytes_06.drop 1).take 1 ++ ptr64Bytes_06.drop 1)))
+
+def a2HalfBufSlot_08 : V08.LocalSlot :=
+  .init (.aggregate 0
+    (V08.encodeRawAbstractByteVals (ptr64Bytes_08.take 4) ++ List.replicate 4 (.scalar ⟨0, 0⟩)))
+
+def a2FullBufSlot_08 : V08.LocalSlot :=
+  .init (.aggregate 0 (V08.encodeRawAbstractByteVals ptr64Bytes_08))
+
+def a2HalfPtrSlot_08 : V08.LocalSlot :=
+  .init (.aggregate 0
+    (V08.encodeRawAbstractByteVals (ptr64Bytes_08.take 4 ++ List.replicate 4 .uninit)))
+
+def a2HalfSwapSlot_08 : V08.LocalSlot :=
+  .init (.aggregate 0
+    (V08.encodeRawAbstractByteVals ((ptr64Bytes_08.drop 1).take 1 ++ ptr64Bytes_08.drop 1)))
+
+/-- A2.3a (`core::intrinsics::copy` / `evalCopyMemory` split `[u8; 8]` & pointer coherence,
+`V2026_06_01` & `V2026_08_01`): split 4+4 byte `evalCopyMemory` into an initially `.uninit`
+`[u8; 8]` buffer and from that `[u8; 8]` buffer into initially `.uninit` `*const u8` and `&u8`
+preserves partial `PtrByteFrag` + `.uninit` carriers after the first 4-byte copy and reassembles
+intact `Value.ptr` provenance after the second 4-byte copy across BOTH dialects. -/
+theorem a2_evalCopyMemory_ptr_coherence_u8_buf_v06_v08 :
+    a2Copy1Slot_06 tyRawPtrU8_06 tyArr8U8_06 (.init (.ptr ptr64_06 8)) .uninit 0 0 4 =
+      some a2HalfBufSlot_06 ∧
+    a2Copy1Slot_06 tyRawPtrU8_06 tyArr8U8_06 (.init (.ptr ptr64_06 8)) a2HalfBufSlot_06 4 4 4 =
+      some a2FullBufSlot_06 ∧
+    a2Copy1Slot_06 tyArr8U8_06 tyRawPtrU8_06 a2FullBufSlot_06 .uninit 0 0 4 =
+      some a2HalfPtrSlot_06 ∧
+    a2Copy1Read_06 tyArr8U8_06 tyRawPtrU8_06 a2FullBufSlot_06 a2HalfPtrSlot_06 4 4 4 =
+      some (.ptr 7 0x10 8) ∧
+    a2Copy1Slot_06 tyArr8U8_06 tyRefU8_06 a2FullBufSlot_06 .uninit 0 0 4 =
+      some a2HalfPtrSlot_06 ∧
+    a2Copy1Read_06 tyArr8U8_06 tyRefU8_06 a2FullBufSlot_06 a2HalfPtrSlot_06 4 4 4 =
+      some (.ptr 7 0x10 8) ∧
+    a2Copy1Slot_08 tyRawPtrU8_08 tyArr8U8_08 (.init (.ptr ptr64_08 8)) .uninit 0 0 4 =
+      some a2HalfBufSlot_08 ∧
+    a2Copy1Slot_08 tyRawPtrU8_08 tyArr8U8_08 (.init (.ptr ptr64_08 8)) a2HalfBufSlot_08 4 4 4 =
+      some a2FullBufSlot_08 ∧
+    a2Copy1Slot_08 tyArr8U8_08 tyRawPtrU8_08 a2FullBufSlot_08 .uninit 0 0 4 =
+      some a2HalfPtrSlot_08 ∧
+    a2Copy1Read_08 tyArr8U8_08 tyRawPtrU8_08 a2FullBufSlot_08 a2HalfPtrSlot_08 4 4 4 =
+      some (.ptr 7 0x10 8) ∧
+    a2Copy1Slot_08 tyArr8U8_08 tyRefU8_08 a2FullBufSlot_08 .uninit 0 0 4 =
+      some a2HalfPtrSlot_08 ∧
+    a2Copy1Read_08 tyArr8U8_08 tyRefU8_08 a2FullBufSlot_08 a2HalfPtrSlot_08 4 4 4 =
+      some (.ptr 7 0x10 8) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- A2.3b (`core::intrinsics::copy` / `evalCopyMemory` byte-swap, raw-ptr scalar, & `Kani#5205`,
+`V2026_06_01` & `V2026_08_01`): swapping bytes `0` and `1` succeeds at untyped write time and
+strips provenance on `*const u8` while faulting `.ub` on `&u8` at read time (`UCG#558`);
+`0x1000u64` copied into `*const u8` commits `Value.scalar` so `evalByteCast` (`transmute`)
+succeeds; and `2u8` into `bool` / `0xD800` into `char` succeed at write time and fault `.ub` on
+typed read (`Kani#5205`). -/
+theorem a2_evalCopyMemory_swap_cast_and_kani5205_v06_v08 :
+    let tyU32_06 : V06.Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let tyU32_08 : V08.Ty := { kind := .uint .u32, layoutIdx := 0 }
+    a2Copy1Slot_06 tyRawPtrU8_06 tyRawPtrU8_06 (.init (.ptr ptr64_06 8)) (.init (.ptr ptr64_06 8)) 1 0 1 =
+      some a2HalfSwapSlot_06 ∧
+    a2Copy1Read_06 tyRawPtrU8_06 tyRawPtrU8_06 (.init (.ptr ptr64_06 8)) a2HalfSwapSlot_06 0 1 1 =
+      some (.scalar 0x1000 8) ∧
+    a2Copy1Slot_06 tyRawPtrU8_06 tyRefU8_06 (.init (.ptr ptr64_06 8)) (.init (.ptr ptr64_06 8)) 1 0 1 =
+      some a2HalfSwapSlot_06 ∧
+    a2Copy1Read_06 tyRawPtrU8_06 tyRefU8_06 (.init (.ptr ptr64_06 8)) a2HalfSwapSlot_06 0 1 1 =
+      some .none ∧
+    a2Copy1CastU64_06 tyU64_06 tyRawPtrU8_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some (.scalar 0x1000 8) ∧
+    a2Copy1Read_06 tyU8_06 tyBool_06 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1 = some .none ∧
+    a2Copy1Read_06 tyU32_06 tyChar_06 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 = some .none ∧
+    a2Copy1Slot_08 tyRawPtrU8_08 tyRawPtrU8_08 (.init (.ptr ptr64_08 8)) (.init (.ptr ptr64_08 8)) 1 0 1 =
+      some a2HalfSwapSlot_08 ∧
+    a2Copy1Read_08 tyRawPtrU8_08 tyRawPtrU8_08 (.init (.ptr ptr64_08 8)) a2HalfSwapSlot_08 0 1 1 =
+      some (.scalar 0x1000 8) ∧
+    a2Copy1Slot_08 tyRawPtrU8_08 tyRefU8_08 (.init (.ptr ptr64_08 8)) (.init (.ptr ptr64_08 8)) 1 0 1 =
+      some a2HalfSwapSlot_08 ∧
+    a2Copy1Read_08 tyRawPtrU8_08 tyRefU8_08 (.init (.ptr ptr64_08 8)) a2HalfSwapSlot_08 0 1 1 =
+      some .none ∧
+    a2Copy1CastU64_08 tyU64_08 tyRawPtrU8_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 =
+      some (.scalar 0x1000 8) ∧
+    a2Copy1Read_08 tyU8_08 tyBool_08 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1 = some .none ∧
+    a2Copy1Read_08 tyU32_08 tyChar_08 (.init (.scalar ⟨0xD800, 4⟩)) .uninit 0 0 4 = some .none := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- A2.4 (32-bit `&[usize]` and `&[f32]` global slice dereference + 32/64-bit relocation rejection,
+`V2026_06_01` & `V2026_08_01`). -/
+theorem a2_32bit_and_float_global_slice_deref_v06_v08 :
+    let sliceUsize06 : Option V06.Ty := some { kind := .slice (.uint .usize), layoutIdx := 0 }
+    let sliceF3206 : Option V06.Ty := some { kind := .slice (.float .f32), layoutIdx := 0 }
+    let sliceU6406 : Option V06.Ty := some { kind := .slice (.uint .u64), layoutIdx := 0 }
+    let sliceUsize08 : Option V08.Ty := some { kind := .slice (.uint .usize), layoutIdx := 0 }
+    let sliceF3208 : Option V08.Ty := some { kind := .slice (.float .f32), layoutIdx := 0 }
+    let sliceU6408 : Option V08.Ty := some { kind := .slice (.uint .u64), layoutIdx := 0 }
+    V06.evalSliceFatPtrDerefRead [] ⟨81, 0⟩ 4 ⟨2, 4⟩ [] [] [a2Plain32Global_06]
+      a1Layouts32_06 [] sliceUsize06 [] =
+        .ok (.aggregate 0 [.scalar ⟨0x2211, 4⟩, .scalar ⟨0x4433, 4⟩]) [] ∧
+    V06.evalSliceFatPtrDerefRead [] ⟨51, 0⟩ 4 ⟨2, 4⟩ [] [] [relocAlloc32_06]
+      a1Layouts32_06 [] sliceUsize06 [] = .ub ∧
+    V06.evalSliceFatPtrDerefRead [] ⟨82, 0⟩ 8 ⟨1, 8⟩ [] [] [a2F32Global_06]
+      layouts64_06 [] sliceF3206 [] =
+        .ok (.aggregate 0 [.scalar ⟨0x3F800000, 4⟩]) [] ∧
+    V06.evalSliceFatPtrDerefRead [] ⟨51, 0⟩ 8 ⟨1, 8⟩ [] [] [relocAlloc32_06]
+      layouts64_06 [] sliceF3206 [] = .ub ∧
+    V06.evalSliceFatPtrDerefRead [] ⟨50, 0⟩ 8 ⟨2, 8⟩ [] [] [adjRelocAlloc64_06]
+      layouts64_06 [] sliceU6406 [] = .ub ∧
+    V08.evalSliceFatPtrDerefRead [] ⟨81, 0⟩ 4 ⟨2, 4⟩ [] [] [a2Plain32Global_08]
+      a1Layouts32_08 [] sliceUsize08 [] =
+        .ok (.aggregate 0 [.scalar ⟨0x2211, 4⟩, .scalar ⟨0x4433, 4⟩]) [] ∧
+    V08.evalSliceFatPtrDerefRead [] ⟨51, 0⟩ 4 ⟨2, 4⟩ [] [] [relocAlloc32_08]
+      a1Layouts32_08 [] sliceUsize08 [] = .ub ∧
+    V08.evalSliceFatPtrDerefRead [] ⟨82, 0⟩ 8 ⟨1, 8⟩ [] [] [a2F32Global_08]
+      layouts64_08 [] sliceF3208 [] =
+        .ok (.aggregate 0 [.scalar ⟨0x3F800000, 4⟩]) [] ∧
+    V08.evalSliceFatPtrDerefRead [] ⟨51, 0⟩ 8 ⟨1, 8⟩ [] [] [relocAlloc32_08]
+      layouts64_08 [] sliceF3208 [] = .ub ∧
+    V08.evalSliceFatPtrDerefRead [] ⟨50, 0⟩ 8 ⟨2, 8⟩ [] [] [adjRelocAlloc64_08]
+      layouts64_08 [] sliceU6408 [] = .ub := by
+  repeat first | refine ⟨?_, ?_⟩ | rfl | trivial
+
+/-- A2.5 (`V2026_06_01 == V2026_08_01` lockstep parity across all Pass A2 regressions). -/
+theorem a2_lockstep_parity :
+    let rd06 : V06.PlaceReadResult → Option V06.Value
+      | .ok v _ => some v
+      | _ => none
+    let rd08 : V08.PlaceReadResult → Option V08.Value
+      | .ok v _ => some v
+      | _ => none
+    let v06 : List ValSummary := [
+      valSummary06 (V06.decodeTypedValueFromBytes V06.defaultCodecFuel a2Layouts64_06 a2TyPtrOrInt_06
+        (V06.encodeLittleEndianBytes 0 8 none ++ ptr64Bytes_06) .strictUcg630Ub),
+      valSummary06 (V06.decodeTypedValueFromBytes V06.defaultCodecFuel a2Layouts64_06 a2TyPtrOrInt_06
+        (V06.encodeLittleEndianBytes 0 8 none ++ V06.encodeLittleEndianBytes 0x42 8 none) .strictUcg630Ub),
+      valSummary06 (rd06 (V06.evalSliceFatPtrDerefRead [] ⟨81, 0⟩ 4 ⟨2, 4⟩ [] [] [a2Plain32Global_06]
+        a1Layouts32_06 [] (some { kind := .slice (.uint .usize), layoutIdx := 0 }) [])),
+      valSummary06 (rd06 (V06.evalSliceFatPtrDerefRead [] ⟨51, 0⟩ 4 ⟨2, 4⟩ [] [] [relocAlloc32_06]
+        a1Layouts32_06 [] (some { kind := .slice (.uint .usize), layoutIdx := 0 }) []))
+    ]
+    let v08 : List ValSummary := [
+      valSummary08 (V08.decodeTypedValueFromBytes V08.defaultCodecFuel a2Layouts64_08 a2TyPtrOrInt_08
+        (V08.encodeLittleEndianBytes 0 8 none ++ ptr64Bytes_08) .strictUcg630Ub),
+      valSummary08 (V08.decodeTypedValueFromBytes V08.defaultCodecFuel a2Layouts64_08 a2TyPtrOrInt_08
+        (V08.encodeLittleEndianBytes 0 8 none ++ V08.encodeLittleEndianBytes 0x42 8 none) .strictUcg630Ub),
+      valSummary08 (rd08 (V08.evalSliceFatPtrDerefRead [] ⟨81, 0⟩ 4 ⟨2, 4⟩ [] [] [a2Plain32Global_08]
+        a1Layouts32_08 [] (some { kind := .slice (.uint .usize), layoutIdx := 0 }) [])),
+      valSummary08 (rd08 (V08.evalSliceFatPtrDerefRead [] ⟨51, 0⟩ 4 ⟨2, 4⟩ [] [] [relocAlloc32_08]
+        a1Layouts32_08 [] (some { kind := .slice (.uint .usize), layoutIdx := 0 }) []))
+    ]
+    v06 = v08 ∧
+    v06 = [.none, .agg 0 [.scalar 0 8, .scalar 0x42 8],
+           .agg 0 [.scalar 0x2211 4, .scalar 0x4433 4], .none] := by
+  exact ⟨rfl, rfl⟩
+
 /-! ## §5. Mechanical Local Axiom, Reachability, & Non-Triviality Audit -/
 
 open Lean Elab Command in
@@ -3083,6 +3649,8 @@ run_cmd do
     ``Trusted.Rustc.V2026_06_01.MirSemantics.evalByteCast,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.writeBytesAction,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.evalGlobalDerefRead,
+    ``Trusted.Rustc.V2026_06_01.MirSemantics.evalSliceFatPtrDerefRead,
+    ``Trusted.Rustc.V2026_06_01.MirSemantics.evalCopyMemory,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.globalRelocsOverlapRange,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.isPtrCopyKind,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.materializeReadPtrValue,
@@ -3104,6 +3672,8 @@ run_cmd do
     ``Trusted.Rustc.V2026_08_01.MirSemantics.evalByteCast,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.writeBytesAction,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.evalGlobalDerefRead,
+    ``Trusted.Rustc.V2026_08_01.MirSemantics.evalSliceFatPtrDerefRead,
+    ``Trusted.Rustc.V2026_08_01.MirSemantics.evalCopyMemory,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.globalRelocsOverlapRange,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.isPtrCopyKind,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.materializeReadPtrValue
