@@ -684,7 +684,8 @@ theorem test_canonicalDiode_midstream_halt_and_prefix_characterization :
   exact ⟨hCanon, hMid,
     ⟨consumed, rest, hSplit, hAll, hSome .rejectedByChecker rfl⟩, hOkFilter⟩
 
-/-! ## 3b. Obligation Streams (`foldStreamPrefix` over Pillars 1 and 2) -/
+/-! ## 3b. Obligation and Transform Streams (`foldStreamPrefix` over Pillars
+1, 2, and 4) -/
 
 /-- Overflow obligations of one function, by guard id. -/
 def mirObligation : Nat → FarkasMirGoal
@@ -916,6 +917,38 @@ theorem test_backend_transform_stream_prefix_safe :
     hValid (0, u64UncheckedAddOpt) (List.Mem.head _),
     hValid (2, paddingOpt)
       (List.Mem.tail _ (List.Mem.tail _ (List.Mem.head _)))⟩
+
+/-- The halted `blockOptGate` stream `[0, 1, 3, 2]` emits only what the table
+holds for each key (no invented or swapped output), its emitted keys are a
+prefix of the input, and it stopped at block `3`, the block the gate rejected.
+-/
+theorem test_backend_transform_stream_entries_and_prefix :
+    (∀ p : Nat × CompiledBlockUnit,
+      p ∈ (Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+        (ValidChunk := fun p : Nat × CompiledBlockUnit =>
+          SemRefinesUnder (SourceEntryPre (backendStreamSrc p.1))
+            (evalSourceBlockUnit (backendStreamSrc p.1))
+            (evalCompiledBlockUnit p.2))
+        backendStreamGate (transformTableProducer backendStreamTable ()) ()
+        [0, 1, 3, 2]).1 →
+      ∃ w, backendStreamTable p.1 = some (p.2, w)) ∧
+    (∃ rest : List Nat, [0, 1, 3, 2] = [0, 1] ++ rest ∧
+      ∃ u rest', rest = u :: rest' ∧
+        Anneal.Hybrid.evalGate backendStreamGate ((), u)
+          (transformTableProducer backendStreamTable () () u) =
+          .error .rejectedByChecker) := by
+  have hEntries :=
+    transformStream_table_entries (E := Unit)
+      (gateComapY backendStreamSrc (blockOptGate 4)) Nat.beq
+      (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+      backendStreamTable () [0, 1, 3, 2]
+  have ⟨rest, hSplit, _, hSome⟩ :=
+    transformStream_emitted_prefix (E := Unit)
+      (gateComapY backendStreamSrc (blockOptGate 4)) Nat.beq
+      (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+      (transformTableProducer backendStreamTable ()) [0, 1, 3, 2]
+  exact ⟨fun p hMem => let ⟨w, hE, _⟩ := hEntries p hMem; ⟨w, hE⟩,
+    ⟨rest, hSplit, hSome _ rfl⟩⟩
 
 /-! ## 4. `Anneal.Backend` + `OverflowTrapRefinement` End-to-End & Negatives -/
 
@@ -1734,7 +1767,7 @@ run_cmd do
     auditModule `Anneal.Backend.Canaries propextOnly propextOnly 30 64 0
   let r9 ←
     auditModule `Anneal.HybridCertBridgesV2026 constructive constructive
-      188 256 4
+      189 260 4
   -- Enforce an EXACT duplicate-free `Quot.sound` allowlist on
   -- `Anneal.HybridCertBridgesV2026`: every non-allowlisted constant must be
   -- `<= [propext]` (only exact allowlisted theorems and their direct
@@ -1896,7 +1929,7 @@ run_cmd do
   for tq in testQuotAllowed do
     unless testQuotActual.contains tq do
       throwError "audit: stale testQuotAllowed entry {tq}"
-  if testThms != 28 || testDefs != 55 then
+  if testThms != 29 || testDefs != 57 then
     throwError "audit: test count drift: thms={testThms}, defs={testDefs}"
   let rT :=
     s!"test module: {testThms} thms, {testDefs} defs, axioms={testUsed}, " ++
@@ -1934,7 +1967,8 @@ run_cmd do
       ``transformChunkGate_ok,
       ``transformStream_all_emitted_valid,
       ``transformStream_emitted_prefix,
-      ``transformStream_complete ]
+      ``transformStream_complete,
+      ``transformStream_table_entries ]
   expectAxioms propextOnly
     [ ``natCutIdxGate_cut_sound,
       ``intCutIdxGate_cut_sound,
@@ -2009,6 +2043,7 @@ run_cmd do
 #print axioms transformStream_all_emitted_valid
 #print axioms transformStream_emitted_prefix
 #print axioms transformStream_complete
+#print axioms transformStream_table_entries
 #print axioms mirOptExactOutcomeRefines_exec_iff_on_u64
 #print axioms semRefinesUnder_preserves_mirOptRefines_asymmetric
 #print axioms blockOptGate_cut_preserves_mirRefines
@@ -2046,6 +2081,7 @@ run_cmd do
 #print axioms test_backend_unchecked_sub_any_environment
 #print axioms test_obligation_stream_prefix_safe
 #print axioms test_backend_transform_stream_prefix_safe
+#print axioms test_backend_transform_stream_entries_and_prefix
 #print axioms test_backend_outcome_bridge_faithful
 #print axioms test_farkasMir_edge_weight_bounds
 #print axioms test_backend_unproven_tier_elision_never_certified

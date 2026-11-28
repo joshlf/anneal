@@ -1548,14 +1548,18 @@ theorem canonicalDiode_stream_prefix_eq_filterAll {A B E : Type}
         · rw [CanonicalDiode.filterAll_cons, hFilt, Option.bind_some, hAll,
             Option.map_some]
 
-/-! ## Obligation Streams: Pillars 1 and 2 under `foldStreamPrefix`
+/-! ## Obligation and Transform Streams under `foldStreamPrefix`
 
 `foldStreamPrefix` is not specific to `CanonicalDiode`. A sequence of proof
 obligations (for instance the overflow obligations of one function, in
 program order) is certified the same way: obligations are consumed in order,
 each one whose certificate the gate accepts is emitted, and the first one
 without an accepted certificate halts the stream. The emitted obligations
-are exactly a prefix of the input, and every one of them holds. -/
+are exactly a prefix of the input, and every one of them holds.
+
+`obligationChunkGate` covers gates with a `Unit` output (Pillars 1 and 2).
+`transformChunkGate` covers gates with an arbitrary output, such as Pillar
+4's `blockOptGate`, by emitting `(input, output)` pairs. -/
 
 /-- Re-index a `Unit`-output gate along `f : X' → X`, for instance from
 obligation identifiers to the goals they name. -/
@@ -1877,6 +1881,53 @@ theorem transformStream_complete {X Y W E : Type} {Spec : X → Y → Prop}
     rw [foldStreamPrefix_cons, hEv]
     dsimp only [List.map]
     exact ⟨ih.1, congrArg (List.cons u) ih.2⟩
+
+/-- With the table producer, every emitted pair is the table's own entry for
+its key, accepted by `g`, for ANY input list and whether or not the stream
+halts: the stream neither invents an output nor swaps outputs between keys.
+`transformStream_complete` alone only pins the emitted keys. -/
+theorem transformStream_table_entries {X Y W E : Type} {Spec : X → Y → Prop}
+    (g : CertifiedGate X Y W (fun _ => True) Spec)
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y)
+    (entryOf : X → Option (Y × W)) (eMissing : E) :
+    ∀ (us : List X) (p : X × Y),
+      p ∈ (foldStreamPrefix (AccInv := fun _ => True)
+        (ValidChunk := fun p => Spec p.1 p.2)
+        (transformChunkGate g beqX hBeq)
+        (transformTableProducer entryOf eMissing) () us).1 →
+      ∃ w, entryOf p.1 = some (p.2, w) ∧
+        gateCheckBounded g (p.1, p.2, w) = true
+  | [], _, hMem => by cases hMem
+  | u :: us, p, hMem => by
+    rw [foldStreamPrefix_cons] at hMem
+    revert hMem
+    cases hEv : evalGate (transformChunkGate g beqX hBeq) ((), u)
+        (transformTableProducer entryOf eMissing () u) with
+    | error _ => intro hMem; cases hMem
+    | ok sxy =>
+      intro hMem
+      have ⟨hKey, w, hRaw, hChk⟩ :=
+        transformChunkGate_ok g beqX hBeq u _ sxy hEv
+      cases hMem with
+      | tail _ hTl =>
+        exact transformStream_table_entries g beqX hBeq entryOf eMissing us p
+          hTl
+      | head =>
+        dsimp only [transformTableProducer] at hRaw
+        cases hEnt : entryOf u with
+        | none =>
+          rw [hEnt] at hRaw
+          nomatch hRaw
+        | some yw =>
+          cases yw with
+          | mk y' w' =>
+            rw [hEnt] at hRaw
+            dsimp only at hRaw
+            injection hRaw with hS hW
+            refine ⟨w, ?_, ?_⟩
+            · rw [hKey, hEnt, ← hS, hW]
+            · rw [hKey]
+              exact hChk
 
 /-! ## Pillar 4: `Anneal.Backend.CtxFact` <-> `OverflowTrapRefinement` -/
 
@@ -3728,11 +3779,11 @@ theorem u64_sub_natCutIdxGate_to_stepMirState_bridge (maxSteps : Nat)
 
 /-! ### 4.3b Certificate Transport: ANY Accepted `blockOptGate` Witness
 
-The bridges above pair the canonical `blockOptGate` certificate with a MIR
-equivalence proved from the arithmetic side condition. The theorems below
-make the Backend certificate load-bearing: the refinement between real
-`stepMirState` runs is derived from an arbitrary accepted `blockOptGate`
-`BoolCertCut` through the pointwise block correspondences. -/
+The `_bridge` capstones above instantiate certificate transport at one
+fixed `blockOptGate` certificate. The theorems below quantify over the
+certificate: the refinement between real `stepMirState` runs is derived from
+an arbitrary accepted `blockOptGate` `BoolCertCut` through the pointwise
+block correspondences. -/
 
 /-- `u64` checked addition: ANY certificate `blockOptGate` accepts for eliding
 `GuardCond.addNoOverflow 0 1` to `addNuw` transports to an equivalence of the
