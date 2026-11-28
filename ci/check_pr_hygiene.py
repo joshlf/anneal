@@ -37,7 +37,13 @@ tree at `--head`:
   block and one `anneal-receipt:v1` JSON footer that binds the checked
   comparison tuple and tree and lists every changed review-surface path
   (`--emit-receipt-footer` prints it).
-
+- `internal-path` and `internal-reference`: ephemeral agent batons
+  (`HANDOFF.md`, `PROGRESS.md`, `REPRODUCE*.md`), internal-only skills, and
+  case-insensitive internal-infrastructure references, with the definitions
+  that `ci/test_repo_hygiene.py` imports. With `--base`, they cover changed
+  paths, the added lines of changed files, and every line of files entering
+  Anneal scope; without it, every path and line in scope at `--head`.
+  Commit messages are not scanned.
 - `layout`: the candidate head changes the repository layout that the
   target base uses.
 
@@ -173,6 +179,102 @@ HRS_CONFIG_NAMES = {
     ".gitmodules",
 }
 TRUST_TIER_RE = re.compile(r"--\s*anneal-trust-tier:")
+
+# Public-distribution hygiene. `ci/test_repo_hygiene.py` imports these
+# definitions and `internal_reference_hits`, so the two checks cannot drift.
+# Ephemeral agent batons that must never be committed.
+BANNED_FILENAME_RE = re.compile(
+    r"(^|/)(HANDOFF|PROGRESS|REPRODUCE[^/]*)\.md$")
+# Internal-only skills, relative to `Layout.root`.
+BANNED_INTERNAL_PREFIXES = (
+    "skills/adversarial-rounds/",
+    "skills/hierarchical-supervision/",
+)
+# Internal-infrastructure references, matched case-insensitively per line.
+# Each pattern is built from parts so that this file holds no verbatim
+# banned string and passes its own check.
+BANNED_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (label, re.compile(pat, re.IGNORECASE))
+    for label, pat in (
+        ("internal-client", r"\b" + "jet" + r"ski\b"),
+        ("internal-service", r"\b" + "rshell" + r"d\b"),
+        ("internal-cli", r"\b" + "cp" + r"l\b"),
+        ("internal-user-m", r"\b" + "mark" + r"dittmer\b"),
+        ("internal-user-j", r"\b" + "jsw" + r"renn\b"),
+        ("internal-mount", r"/x" + r"20\b"),
+        ("internal-remote", r"/rem" + r"ote/"),
+        ("internal-fuse", r"/mnt/" + r"fuse/"),
+        ("internal-sync-bin", r"remote-" + r"sync\b"),
+        ("internal-fsd", r"remote" + r"fsd\b"),
+        ("internal-proto", r"storage_" + r"remote\b"),
+        ("internal-envelope", r"MessageSet" + r"Payload\b"),
+        ("internal-workstation", r"/usr/local/" + r"google\b"),
+        ("internal-sidecar-uri", r"sidecar:" + r"//"),
+        ("internal-repo", r"anneal-" + r"private\b"),
+        ("internal-team-dir", r"teams/anneal-" + r"agent\b"),
+        ("internal-placeholder", r"Projects/" + r"<"),
+        ("internal-flag-remote", r"--remote-" + r"uri\b"),
+        ("internal-flag-ff", r"--verify-bundle-" + r"ff\b"),
+        ("internal-flag-chk", r"--check-unstable-" + r"ff\b"),
+        ("internal-sym-sync", r"REMOTE_" + r"SYNC"),
+        ("internal-launcher", r"run_capsule_" + r"diff_test"),
+        ("internal-bucket-tf", r"team" + r"food\b"),
+        ("internal-bucket-wtu", r"3p-" + r"wtu\b"),
+        ("internal-infra-fsd", r"x20" + r"fsd\b"),
+        ("internal-fleet-cfg", r"fleet_" + r"node\b"),
+        ("internal-fleet-dir", r"fleet-" + r"management\b"),
+    )
+)
+# A case-insensitive regex pass over the whole tree takes many seconds, so
+# each file is first screened for each pattern's literal text (the pattern
+# without its `\b` anchors) in case-folded form, and only lines holding a
+# literal are matched. `_FOLD_EXTRA` holds the only non-ASCII characters
+# that `re.IGNORECASE` equates with a character of some literal (a unit test
+# checks every code point), mapped so that folding keeps them one character
+# long; `str.lower` alone would leave dotless i and long s unfolded.
+_BANNED_LITERALS = tuple(
+    pat.pattern.replace(r"\b", "").lower()
+    for _, pat in BANNED_CONTENT_PATTERNS
+)
+_FOLD_EXTRA = (("\u0130", "i"), ("\u0131", "i"), ("\u017f", "s"),
+               ("\u212a", "k"))
+
+
+def _fold(text: str) -> str:
+    """Case-fold `text` for the literal screen, keeping its line breaks."""
+    if not text.isascii():
+        for src, dst in _FOLD_EXTRA:
+            if src in text:
+                text = text.replace(src, dst)
+    return text.lower()
+
+
+def internal_reference_hits(
+    text: str, lines: set[int] | None = None
+) -> list[tuple[int, str]]:
+    """Return a `(line, label)` pair per banned reference in `text`.
+
+    Lines are numbered from 1 and split at LF only, as Git numbers them.
+    `lines`, if given, limits the scan to those line numbers.
+    """
+    folded = _fold(text)
+    present = [
+        (label, pat, lit)
+        for (label, pat), lit in zip(BANNED_CONTENT_PATTERNS, _BANNED_LITERALS)
+        if lit in folded
+    ]
+    if not present:
+        return []
+    hits: list[tuple[int, str]] = []
+    # Folding never adds or removes a line feed, so the lines correspond.
+    for lineno, (line, fline) in enumerate(
+            zip(text.split("\n"), folded.split("\n")), 1):
+        if lines is not None and lineno not in lines:
+            continue
+        for label, pat, lit in present:
+            if lit in fline and pat.search(line):
+                hits.append((lineno, label))
+    return hits
 
 
 @dataclass(frozen=True)
@@ -317,10 +419,11 @@ class Git:
         self.env["GIT_CONFIG_GLOBAL"] = os.devnull
         self.env["LC_ALL"] = "C"
 
-    def run(self, *args: str, ok_codes: tuple[int, ...] = (0,)) -> bytes:
+    def run(self, *args: str, ok_codes: tuple[int, ...] = (0,),
+            stdin: bytes | None = None) -> bytes:
         res = subprocess.run(
             ["git", *GIT_OPTIONS, *args], cwd=self.repo, env=self.env,
-            capture_output=True, check=False,
+            input=stdin, capture_output=True, check=False,
         )
         if res.returncode not in ok_codes:
             stderr = res.stderr.decode("utf-8", "replace").strip()
@@ -350,6 +453,45 @@ class Git:
         except GitError:
             return None
         return data.decode("utf-8", "replace")
+
+    def tree_entries(self, commit: str) -> dict[str, tuple[str, str]]:
+        """Map each path in the tree at `commit` to its object type and ID."""
+        listing = self.run("ls-tree", "-r", "-z", "--full-tree", commit)
+        out: dict[str, tuple[str, str]] = {}
+        for entry in listing.decode("utf-8", "surrogateescape").split("\0"):
+            if not entry:
+                continue
+            meta, path = entry.split("\t", 1)
+            parts = meta.split()
+            if len(parts) != 3:
+                raise GitError(f"malformed `git ls-tree` entry {entry[:80]!r}")
+            out[path] = (parts[1], parts[2])
+        return out
+
+    def blobs(self, oids: list[str]) -> dict[str, bytes]:
+        """Read many blobs with a single `git cat-file --batch`."""
+        unique = list(dict.fromkeys(oids))
+        if not unique:
+            return {}
+        data = self.run("cat-file", "--batch",
+                        stdin="".join(f"{o}\n" for o in unique).encode())
+        out: dict[str, bytes] = {}
+        pos = 0
+        for oid in unique:
+            eol = data.find(b"\n", pos)
+            if eol < 0:
+                raise GitError("truncated `git cat-file --batch` output")
+            header = data[pos:eol].decode("utf-8", "replace").split()
+            if (len(header) != 3 or header[0] != oid or header[1] != "blob"
+                    or not header[2].isdigit()):
+                raise GitError(f"cannot read blob {oid}: {' '.join(header)}")
+            start = eol + 1
+            end = start + int(header[2])
+            if data[end:end + 1] != b"\n":
+                raise GitError("malformed `git cat-file --batch` output")
+            out[oid] = data[start:end]
+            pos = end + 1
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -1552,6 +1694,72 @@ def crr_parity_findings(git: Git, head: str,
     return []
 
 
+def internal_path_message(path: str, layout: Layout = MONOREPO) -> str | None:
+    """Why `path` must not be committed, or `None` if it may be."""
+    if BANNED_FILENAME_RE.search(path):
+        return ("ephemeral agent baton; keep handoff, progress, and "
+                "reproduction notes out of the repository")
+    if (path.startswith(layout.root)
+            and path[len(layout.root):].startswith(BANNED_INTERNAL_PREFIXES)):
+        return "internal-only skill; keep it out of the repository"
+    return None
+
+
+def internal_findings(
+    git: Git, head: str, layout: Layout,
+    files: dict[str, ChangedFile] | None = None,
+) -> list[Finding]:
+    """`internal-path` and `internal-reference` findings at `head`.
+
+    With `files` (diff mode), checks each non-deleted in-scope changed path,
+    every line of a file entering Anneal scope (added, or renamed from
+    outside it), and the added lines of other files, so untouched lines
+    never fail a change. Without `files` (tree mode), checks every in-scope
+    path and line. Like `ci/test_repo_hygiene.py`, content scanning skips
+    blobs that are not valid UTF-8, where short patterns would match binary
+    data by chance; a symbolic link is scanned as its target text.
+    """
+    entries = git.tree_entries(head)
+    # Each path to check, with the lines to scan (`None` for all).
+    todo: list[tuple[str, set[int] | None]] = []
+    if files is None:
+        todo = [(p, None) for p in sorted(entries) if layout.in_scope(p)]
+    else:
+        for f in sorted(files.values(), key=lambda f: f.path):
+            if f.status == "D" or not layout.in_scope(f.path):
+                continue
+            entered = f.status == "A" or (
+                f.old_path is not None and not layout.in_scope(f.old_path))
+            todo.append((f.path, None if entered else f.added))
+    out: list[Finding] = []
+    scan: list[tuple[str, str, set[int] | None]] = []
+    for path, lines in todo:
+        msg = internal_path_message(path, layout)
+        if msg is not None:
+            out.append(Finding("internal-path", msg, path))
+        entry = entries.get(path)
+        if entry is None:
+            raise GitError(f"cannot find {head[:12]}:{path}")
+        # Submodule entries have no content here.
+        if entry[0] == "blob" and lines != set():
+            scan.append((path, entry[1], lines))
+    blobs = git.blobs([oid for _, oid, _ in scan])
+    for path, oid, lines in scan:
+        try:
+            text = blobs[oid].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for lineno, label in internal_reference_hits(text, lines):
+            out.append(Finding(
+                "internal-reference",
+                f"internal-infrastructure reference ({label}); public "
+                "content must not name internal tools, hosts, users, or "
+                "paths",
+                path, lineno,
+            ))
+    return out
+
+
 def detect_layout(git: Git, commit: str) -> Layout:
     """Return the layout of the tree at `commit` (see `MONOREPO_MARKER`).
 
@@ -1649,6 +1857,7 @@ def check(
     report.findings += agents_budget_findings(git, head, layout)
     report.findings += crr_parity_findings(git, head, layout)
     if target_base is None:
+        report.findings += internal_findings(git, head, layout)
         return report, meta
 
     merge_base = git.text("merge-base", target_base, head).strip()
@@ -1686,6 +1895,7 @@ def check(
         report.findings += commit_message_findings(c.sha, c.message)
 
     files = changed_files(git, merge_base, head)
+    report.findings += internal_findings(git, head, layout, files)
     scoped = [f for f in files.values() if in_anneal_scope(f.path, layout)]
     citation_prefixes = layout.trusted_citation_prefixes
     check_paths = [f.path for f in scoped if f.status != "D"]

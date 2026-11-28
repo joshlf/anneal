@@ -11,8 +11,14 @@
 from pathlib import Path
 import re
 import subprocess
+import sys
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# `check_pr_hygiene.py` runs isolated (`python3 -I`) and cannot import this
+# module, so it owns the shared definitions and this test imports them. Both
+# checks therefore enforce the same filenames, prefixes, and patterns.
+import check_pr_hygiene as cph  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -23,45 +29,10 @@ _EXCLUDED_PREFIXES = (
     "theory/MiniRust/vendor/",
 )
 
-_BANNED_FILENAME_RE = re.compile(r"(^|/)(HANDOFF|PROGRESS|REPRODUCE[^/]*)\.md$")
-_BANNED_INTERNAL_PREFIXES = (
-    "skills/adversarial-rounds/",
-    "skills/hierarchical-supervision/",
-)
-
-# Constructed from parts so this test module does not contain verbatim banned
-# strings itself.
-_BANNED_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (label, re.compile(pat, re.IGNORECASE))
-    for label, pat in (
-        ("internal-client", r"\b" + "jet" + r"ski\b"),
-        ("internal-service", r"\b" + "rshell" + r"d\b"),
-        ("internal-cli", r"\b" + "cp" + r"l\b"),
-        ("internal-user-m", r"\b" + "mark" + r"dittmer\b"),
-        ("internal-user-j", r"\b" + "jsw" + r"renn\b"),
-        ("internal-mount", r"/x" + r"20\b"),
-        ("internal-remote", r"/rem" + r"ote/"),
-        ("internal-fuse", r"/mnt/" + r"fuse/"),
-        ("internal-sync-bin", r"remote-" + r"sync\b"),
-        ("internal-fsd", r"remote" + r"fsd\b"),
-        ("internal-proto", r"storage_" + r"remote\b"),
-        ("internal-envelope", r"MessageSet" + r"Payload\b"),
-        ("internal-workstation", r"/usr/local/" + r"google\b"),
-        ("internal-sidecar-uri", r"sidecar:" + r"//"),
-        ("internal-repo", r"anneal-" + r"private\b"),
-        ("internal-team-dir", r"teams/anneal-" + r"agent\b"),
-        ("internal-placeholder", r"Projects/" + r"<"),
-        ("internal-flag-remote", r"--remote-" + r"uri\b"),
-        ("internal-flag-ff", r"--verify-bundle-" + r"ff\b"),
-        ("internal-flag-chk", r"--check-unstable-" + r"ff\b"),
-        ("internal-sym-sync", r"REMOTE_" + r"SYNC"),
-        ("internal-launcher", r"run_capsule_" + r"diff_test"),
-        ("internal-bucket-tf", r"team" + r"food\b"),
-        ("internal-bucket-wtu", r"3p-" + r"wtu\b"),
-        ("internal-infra-fsd", r"x20" + r"fsd\b"),
-        ("internal-fleet-cfg", r"fleet_" + r"node\b"),
-        ("internal-fleet-dir", r"fleet-" + r"management\b"),
-    )
+_BANNED_FILENAME_RE = cph.BANNED_FILENAME_RE
+_BANNED_INTERNAL_PREFIXES = cph.BANNED_INTERNAL_PREFIXES
+_BANNED_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    cph.BANNED_CONTENT_PATTERNS
 )
 
 
@@ -74,6 +45,21 @@ def _tracked_files() -> list[str]:
 
 
 class RepoHygieneTests(unittest.TestCase):
+    def test_shared_patterns_flag_internal_tokens(self) -> None:
+        # Built from parts, like the patterns themselves. A short local
+        # binding that spells the internal CLI is still a violation; the
+        # descriptive spelling is not.
+        cli = "cp" + "L"
+        self.assertEqual(len(_BANNED_CONTENT_PATTERNS), 27)
+        self.assertEqual(
+            cph.internal_reference_hits(f"let (ty, {cli}, r) := x\n"),
+            [(1, "internal-cli")],
+        )
+        self.assertEqual(
+            cph.internal_reference_hits("let (ty, checkPtrL, r) := x\n"),
+            [],
+        )
+
     def test_no_ephemeral_batons_or_internal_skills(self) -> None:
         bad_paths: list[str] = []
         for rel in _tracked_files():
@@ -99,10 +85,8 @@ class RepoHygieneTests(unittest.TestCase):
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
-            for line_no, line in enumerate(text.splitlines(), 1):
-                for label, pattern in _BANNED_CONTENT_PATTERNS:
-                    if pattern.search(line):
-                        violations.append(f"{rel}:{line_no} [{label}]")
+            for line_no, label in cph.internal_reference_hits(text):
+                violations.append(f"{rel}:{line_no} [{label}]")
         self.assertEqual(
             violations,
             [],

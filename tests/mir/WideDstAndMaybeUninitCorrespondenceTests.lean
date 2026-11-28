@@ -604,7 +604,7 @@ run_cmd do
     let wdBundleTy := mkConst (bNs ++ `WdBundle)
     -- Predicate-level `#300` controls: the pinned `checkPtr` and post-`#300` `checkPtrFnNonNull` on
     -- the null `fn()` pointer, with terms taken from the Episode 1 theorem statements.
-    let (cpTy, cpL, cpR, nnL, nnR) ← MetaM.run' do
+    let (checkPtrTy, checkPtrL, checkPtrR, nnL, nnR) ← MetaM.run' do
       let thTy ← inferType (mkConst (mrNs ++ `mr_checkPtr_null_fnptr_ok))
       let dom := thTy.bindingDomain!
       let t1 ← instantiateForall thTy #[mkApp (mkConst ``Option.none [0]) dom.appArg!]
@@ -777,11 +777,15 @@ run_cmd do
             (mkEq mrObsTy0 (mkApp lmToMr (lmObsU true 100)) (mrObs true 100))
             (mkRefl mrObsTy0 (mkApp lmToMr (lmObsU true 100)))),
         ("forged pin delta: pinned d821c6e3 checkPtr rejects the null FnPtr",
-          thmD (ns ++ `forged.pinnedCheckPtrRejectsNull) (mkEq cpTy cpL nnR) (mkRefl cpTy cpL),
-          thmD (ns ++ `honest.pinnedCheckPtrAcceptsNull) (mkEq cpTy cpL cpR) (mkRefl cpTy cpL)),
+          thmD (ns ++ `forged.pinnedCheckPtrRejectsNull)
+            (mkEq checkPtrTy checkPtrL nnR) (mkRefl checkPtrTy checkPtrL),
+          thmD (ns ++ `honest.pinnedCheckPtrAcceptsNull)
+            (mkEq checkPtrTy checkPtrL checkPtrR) (mkRefl checkPtrTy checkPtrL)),
         ("forged #300: checkPtrFnNonNull accepts the null FnPtr",
-          thmD (ns ++ `forged.nonNullCheckAcceptsNull) (mkEq cpTy nnL cpR) (mkRefl cpTy nnL),
-          thmD (ns ++ `honest.nonNullCheckRejectsNull) (mkEq cpTy nnL nnR) (mkRefl cpTy nnL)),
+          thmD (ns ++ `forged.nonNullCheckAcceptsNull)
+            (mkEq checkPtrTy nnL checkPtrR) (mkRefl checkPtrTy nnL),
+          thmD (ns ++ `honest.nonNullCheckRejectsNull)
+            (mkEq checkPtrTy nnL nnR) (mkRefl checkPtrTy nnL)),
         ("forged translation fidelity (lmToMr maps ub to unsupported)",
           thmD (ns ++ `forged.lmToMrUb) (mkEq mrObsTy0 (mkApp lmToMr (lmObsC `ub)) (mrC `unsupported))
             (mkRefl mrObsTy0 (mkApp lmToMr (lmObsC `ub))),

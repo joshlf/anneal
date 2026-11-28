@@ -15,9 +15,11 @@ the repository root.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -1386,6 +1388,355 @@ class LayoutUnitTests(unittest.TestCase):
                      "anneal/trusted/lean/A.lean"):
             self.assertFalse(cph.is_hrs_path(path, layout=solo), path)
         self.assertTrue(cph.is_hrs_path("theory/T.lean", True, solo))
+
+
+class InternalHygieneMixin:
+    """`internal-path` and `internal-reference` checks in one layout.
+
+    Banned tokens are built from parts so that this file contains none.
+    """
+
+    ROOT = ""
+    LAYOUT = "standalone"
+    CLI = "cp" + "L"
+    CLIENT = "JET" + "SKI"
+    MOUNT = "/x" + "20/teams"
+    USER = "mark" + "dittmer"
+    WORKSTATION = "/usr/local/" + "google"
+
+    def internal(self, *args: str, **kw) -> set[tuple]:
+        """Internal findings as `(check, path, line, label)` tuples."""
+        out = set()
+        for f in self.findings(*args, **kw):
+            if f["check"] == "internal-reference":
+                label = f["message"].split("(", 1)[1].split(")", 1)[0]
+                out.add((f["check"], f["path"], f["line"], label))
+            elif f["check"] == "internal-path":
+                out.add((f["check"], f["path"], f["line"], None))
+        return out
+
+    def ref(self, rel: str, line: int, label: str) -> tuple:
+        return ("internal-reference", self.ROOT + rel, line, label)
+
+    def seed(self, files: dict[str, str]) -> None:
+        """Commit `files` (relative to `ROOT`) into the `base` branch."""
+        for rel, text in files.items():
+            self.write(self.ROOT + rel, text)
+        self.commit("Seed")
+        git(self.repo, "branch", "-f", "base")
+
+    def test_layout_matches_fixture(self):
+        self.assertEqual(self.assert_clean(base=None)["layout"], self.LAYOUT)
+
+    def test_clean_identifiers_and_prose_pass(self):
+        self.write(self.ROOT + "theory/Clean.lean", HEADER_LEAN
+                   + "def checkPtrL := 1\n-- The coupling of checkPtrR.\n")
+        self.write(self.ROOT + "docs/clean.txt",
+                   "Normal prose: cplx, xcpl, cp-l, x20, remote, fleet.\n")
+        self.commit()
+        self.assertEqual(self.internal(), set())
+        self.assertEqual(self.internal(base=None), set())
+
+    def test_lean_token_in_new_and_modified_files(self):
+        self.write(self.ROOT + "theory/Bad.lean", HEADER_LEAN
+                   + f"def x := 1\n    let (checkPtrTy, {self.CLI}, y) := t\n")
+        self.write(self.ROOT + "ci/existing.py", HEADER_PY
+                   + f"\nVALUE = 1\n# uses {self.CLIENT}\n")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            self.ref("theory/Bad.lean", 9, "internal-cli"),
+            self.ref("ci/existing.py", 10, "internal-client"),
+        })
+
+    def test_every_extension_is_scanned_case_insensitively(self):
+        self.write(self.ROOT + "docs/notes.txt", f"see {self.MOUNT}\n")
+        self.write(self.ROOT + "data/cfg.json",
+                   '{"p": "' + self.WORKSTATION.upper() + '/x"}\n')
+        self.write(self.ROOT + "scripts/tool",
+                   f"#!/bin/sh\necho {self.CLIENT.lower()}\n")
+        self.write(self.ROOT + "crates/a/src/lib.rs",
+                   HEADER_RS + f"// {self.USER.title()}\n")
+        self.commit()
+        expected = {
+            self.ref("docs/notes.txt", 1, "internal-mount"),
+            self.ref("data/cfg.json", 1, "internal-workstation"),
+            self.ref("scripts/tool", 2, "internal-client"),
+            self.ref("crates/a/src/lib.rs", 8, "internal-user-m"),
+        }
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
+
+    def test_one_finding_per_label_and_line(self):
+        self.write(self.ROOT + "docs/two.txt",
+                   f"{self.CLI} {self.MOUNT} {self.CLI}\n")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            self.ref("docs/two.txt", 1, "internal-cli"),
+            self.ref("docs/two.txt", 1, "internal-mount"),
+        })
+        lines = [f for f in self.findings()
+                 if f["check"] == "internal-reference"]
+        self.assertEqual(len(lines), 2, lines)
+
+    def test_banned_paths(self):
+        banned = ["HANDOFF.md", "docs/PROGRESS.md", "REPRODUCE-1.md",
+                  "skills/adversarial-rounds/SKILL.md",
+                  "skills/hierarchical-supervision/tool.py"]
+        allowed = ["docs/MY-HANDOFF.md", "HANDOFF.md.txt", "handoff.md",
+                   "skills/adversarial-roundsx/SKILL.md", "docs/skills/"
+                   "adversarial-rounds/SKILL.md"]
+        for rel in banned + allowed:
+            self.write(self.ROOT + rel, "Clean text.\n")
+        self.commit()
+        expected = {("internal-path", self.ROOT + rel, None, None)
+                    for rel in banned}
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
+
+    def test_renamed_and_deleted_baton_paths(self):
+        self.seed({"docs/notes.md": HEADER_MD})
+        git(self.repo, "mv", self.ROOT + "docs/notes.md",
+            self.ROOT + "docs/HANDOFF.md")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            ("internal-path", self.ROOT + "docs/HANDOFF.md", None, None)})
+        self.seed({})
+        git(self.repo, "rm", "-q", self.ROOT + "docs/HANDOFF.md")
+        self.commit()
+        self.assertEqual(self.internal(), set())
+
+    def test_vendored_corpora_are_excluded(self):
+        for prefix in cph.LAYOUTS[self.LAYOUT].excluded:
+            self.write(prefix + "up/x.txt", f"{self.CLI} {self.MOUNT}\n")
+        self.commit()
+        self.assertEqual(self.internal(), set())
+        self.assertEqual(self.internal(base=None), set())
+
+    def test_rename_into_scope_scans_every_line(self):
+        vendor = cph.LAYOUTS[self.LAYOUT].excluded[0]
+        self.write(vendor + "up/Raw.lean",
+                   f"def raw := 1\n-- {self.CLI}\n")
+        self.commit("Seed")
+        git(self.repo, "branch", "-f", "base")
+        (self.repo / self.ROOT / "theory").mkdir(parents=True, exist_ok=True)
+        git(self.repo, "mv", vendor + "up/Raw.lean",
+            self.ROOT + "theory/Raw.lean")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            self.ref("theory/Raw.lean", 2, "internal-cli")})
+
+    def test_untouched_lines_do_not_fail_a_change(self):
+        # Shared filler keeps the edited file recognizably renamed below.
+        filler = "".join(f"filler line {i}\n" for i in range(20))
+        old = f"old {self.MOUNT}\n"
+        self.seed({"docs/legacy.txt": "line one\n" + old + filler})
+        self.write(self.ROOT + "docs/legacy.txt", "line 1\n" + old + filler)
+        self.commit()
+        self.assertEqual(self.internal(), set())
+        # A rename within scope adds no lines either.
+        git(self.repo, "mv", self.ROOT + "docs/legacy.txt",
+            self.ROOT + "docs/moved.txt")
+        self.commit()
+        self.assertEqual(self.internal(), set())
+        self.write(self.ROOT + "docs/moved.txt",
+                   "line 1\n" + old + filler + f"new {self.CLI}\n")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            self.ref("docs/moved.txt", 23, "internal-cli")})
+        # Tree mode still reports the pre-existing reference.
+        self.assertEqual(self.internal(base=None), {
+            self.ref("docs/moved.txt", 2, "internal-mount"),
+            self.ref("docs/moved.txt", 23, "internal-cli"),
+        })
+
+    def test_removing_references_is_clean(self):
+        self.seed({"docs/a.txt": f"keep\n{self.CLI}\n",
+                   "docs/b.txt": f"{self.MOUNT}\n"})
+        self.write(self.ROOT + "docs/a.txt", "keep\n")
+        git(self.repo, "rm", "-q", self.ROOT + "docs/b.txt")
+        self.commit()
+        self.assertEqual(self.internal(), set())
+
+    def test_binary_and_invalid_utf8_blobs_are_skipped(self):
+        path = self.repo / self.ROOT / "assets" / "blob.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe " + self.CLI.encode()
+                         + b" \x00 " + self.MOUNT.encode() + b"\n\x80\n")
+        self.commit()
+        for base in ("base", None):
+            code, report = self.run_check(base=base)
+            self.assertEqual(code, 0, report)
+            self.assertEqual(report["findings"], [], report)
+
+    def test_valid_utf8_with_nul_bytes_is_scanned(self):
+        path = self.repo / self.ROOT / "assets" / "data.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x00\x01\n" + self.MOUNT.encode() + b"\x00\n")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            self.ref("assets/data.bin", 2, "internal-mount")})
+
+    def test_symlink_target_is_scanned(self):
+        link = self.repo / self.ROOT / "docs" / "link"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(self.MOUNT + "/x", link)
+        self.commit()
+        expected = {self.ref("docs/link", 1, "internal-mount")}
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
+
+    def test_commit_messages_are_not_scanned(self):
+        self.write(self.ROOT + "docs/clean.txt", "Clean.\n")
+        self.commit(f"[ci] Add a note\n\nThanks to {self.USER} and "
+                    f"{self.CLI}.\n\n{TRAILER}\n")
+        self.assert_clean()
+
+
+class MonorepoInternalHygieneTests(InternalHygieneMixin, RepoTestCase):
+    ROOT = "anneal/"
+    LAYOUT = "monorepo"
+
+    def test_root_paths_outside_anneal_are_out_of_scope(self):
+        self.write("ci/x.txt", f"{self.CLI}\n")
+        self.write("HANDOFF.md", "x\n")
+        self.write("skills/adversarial-rounds/SKILL.md", "x\n")
+        self.commit("not Anneal")
+        self.assertEqual(self.internal(), set())
+        self.assertEqual(self.internal(base=None), set())
+
+    def test_integration_paths_are_in_scope(self):
+        self.write(".github/workflows/anneal.yml", f"# {self.CLI}\n")
+        self.write("zerocopy/proofs/01_x/PROGRESS.md", "x\n")
+        self.commit()
+        expected = {
+            ("internal-reference", ".github/workflows/anneal.yml", 1,
+             "internal-cli"),
+            ("internal-path", "zerocopy/proofs/01_x/PROGRESS.md", None, None),
+        }
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
+
+
+class StandaloneInternalHygieneTests(InternalHygieneMixin,
+                                     StandaloneRepoTestCase):
+    ROOT = ""
+    LAYOUT = "standalone"
+
+
+class InternalUnitTests(unittest.TestCase):
+    CLI = InternalHygieneMixin.CLI
+
+    def naive(self, text: str) -> list[tuple[int, str]]:
+        return [(n, label)
+                for n, line in enumerate(text.split("\n"), 1)
+                for label, pat in cph.BANNED_CONTENT_PATTERNS
+                if pat.search(line)]
+
+    def test_hits_report_lines_and_labels(self):
+        text = f"a\n{self.CLI} x\r\nb\f{self.CLI}\n"
+        self.assertEqual(cph.internal_reference_hits(text),
+                         [(2, "internal-cli"), (3, "internal-cli")])
+        self.assertEqual(cph.internal_reference_hits(text, {1, 4}), [])
+        self.assertEqual(cph.internal_reference_hits(text, {3}),
+                         [(3, "internal-cli")])
+
+    def test_literal_screen_agrees_with_the_patterns(self):
+        samples = ["", "plain", "cplx xcpl", "\u0130\u0131\u017f\u212a"]
+        for (label, pat), lit in zip(cph.BANNED_CONTENT_PATTERNS,
+                                     cph._BANNED_LITERALS):
+            for variant in (lit, lit.upper(), lit.title()):
+                samples += [variant, f"x {variant} y", f"a\n{variant}\nb",
+                            f"_{variant}_", f"\u2200 {variant}"]
+            # Non-ASCII characters that IGNORECASE equates with ASCII.
+            for src, dst in cph._FOLD_EXTRA:
+                samples.append(lit.replace(dst, src))
+        for text in samples:
+            with self.subTest(text=text):
+                self.assertEqual(cph.internal_reference_hits(text),
+                                 self.naive(text))
+
+    def test_literals_are_plain_text(self):
+        for (label, pat), lit in zip(cph.BANNED_CONTENT_PATTERNS,
+                                     cph._BANNED_LITERALS):
+            with self.subTest(label=label):
+                self.assertEqual(pat.flags & re.IGNORECASE, re.IGNORECASE)
+                self.assertFalse(set(lit) & set(".^$*+?{}[]|()\\"), lit)
+                self.assertTrue(pat.search(lit), lit)
+
+    def test_fold_extra_covers_every_case_insensitive_code_point(self):
+        chars = sorted(set("".join(cph._BANNED_LITERALS)))
+        cls = re.compile("[" + "".join(re.escape(c) for c in chars) + "]",
+                         re.IGNORECASE)
+        for cp in range(0x80, 0x110000):
+            if 0xD800 <= cp < 0xE000 or not cls.fullmatch(chr(cp)):
+                continue
+            folded = cph._fold(chr(cp))
+            with self.subTest(cp=hex(cp)):
+                self.assertEqual(len(folded), 1)
+                self.assertTrue(
+                    re.fullmatch(re.escape(folded), chr(cp), re.IGNORECASE))
+                self.assertIn(folded, chars)
+
+    def test_path_messages(self):
+        mono, solo = cph.MONOREPO, cph.STANDALONE
+        for path, layout in (("HANDOFF.md", solo), ("a/PROGRESS.md", solo),
+                             ("REPRODUCE.md", solo),
+                             ("anneal/HANDOFF.md", mono),
+                             ("skills/adversarial-rounds/x", solo),
+                             ("anneal/skills/hierarchical-supervision/x",
+                              mono)):
+            self.assertIsNotNone(cph.internal_path_message(path, layout), path)
+        for path, layout in (("HANDOFF.mdx", solo), ("xHANDOFF.md", solo),
+                             ("skills/adversarial-rounds/x", mono),
+                             ("anneal/skills/adversarial-rounds/x", solo),
+                             ("skills/other/x", solo)):
+            self.assertIsNone(cph.internal_path_message(path, layout), path)
+
+
+class RepoHygieneParityTests(unittest.TestCase):
+    """`ci/test_repo_hygiene.py` enforces the same definitions as this script.
+
+    The digest pins the pattern set, so that changing it is a deliberate,
+    reviewed edit to this test as well.
+    """
+
+    LABELS = (
+        "internal-client", "internal-service", "internal-cli",
+        "internal-user-m", "internal-user-j", "internal-mount",
+        "internal-remote", "internal-fuse", "internal-sync-bin",
+        "internal-fsd", "internal-proto", "internal-envelope",
+        "internal-workstation", "internal-sidecar-uri", "internal-repo",
+        "internal-team-dir", "internal-placeholder", "internal-flag-remote",
+        "internal-flag-ff", "internal-flag-chk", "internal-sym-sync",
+        "internal-launcher", "internal-bucket-tf", "internal-bucket-wtu",
+        "internal-infra-fsd", "internal-fleet-cfg", "internal-fleet-dir",
+    )
+    DIGEST = (
+        "53f8907db177f95a8a8dcf2fcf40dbc53575db2ee5dcbbdf9fe2f90fb1b5e933"
+    )
+
+    def test_shared_definitions(self):
+        import test_repo_hygiene as trh
+        self.assertIs(trh._BANNED_CONTENT_PATTERNS,
+                      cph.BANNED_CONTENT_PATTERNS)
+        self.assertIs(trh._BANNED_FILENAME_RE, cph.BANNED_FILENAME_RE)
+        self.assertIs(trh._BANNED_INTERNAL_PREFIXES,
+                      cph.BANNED_INTERNAL_PREFIXES)
+        self.assertLessEqual(set(trh._EXCLUDED_PREFIXES),
+                             set(cph.STANDALONE.excluded))
+
+    def test_pinned_definitions(self):
+        pats = cph.BANNED_CONTENT_PATTERNS
+        self.assertEqual(tuple(label for label, _ in pats), self.LABELS)
+        self.assertEqual(len(pats), 27)
+        self.assertEqual(cph.BANNED_FILENAME_RE.pattern,
+                         r"(^|/)(HANDOFF|PROGRESS|REPRODUCE[^/]*)\.md$")
+        self.assertEqual(cph.BANNED_INTERNAL_PREFIXES, (
+            "skills/adversarial-rounds/", "skills/hierarchical-supervision/"))
+        blob = "\n".join(f"{label}\t{pat.pattern}\t{pat.flags}"
+                         for label, pat in pats)
+        self.assertEqual(hashlib.sha256(blob.encode()).hexdigest(),
+                         self.DIGEST)
 
 
 class RepositoryTreeTests(unittest.TestCase):
