@@ -25,6 +25,8 @@ import olean_profiler  # noqa: E402
 import preflight_syntax_check  # noqa: E402
 import proof_health_scan  # noqa: E402
 import split_lean_module  # noqa: E402
+import stage_ref_pkg  # noqa: E402
+import verify_quorum  # noqa: E402
 
 
 class ProofHealthScanTests(unittest.TestCase):
@@ -284,6 +286,124 @@ class BuildLeanDagTests(unittest.TestCase):
                 out_dir, "Demo.Top", "Demo", 10, False, []
             )
             self.assertTrue(any(r["decl"] == "Demo.idNat_eq" for r in prof))
+
+
+class VerifyQuorumTests(unittest.TestCase):
+    def test_requires_explicit_export_root(self) -> None:
+        rc, rep = verify_quorum.run_quorum(
+            lean_file=None,
+            dep_files=[],
+            root_dir=None,
+            module_name="Demo",
+            export_roots=[],
+            extra_lean_paths=[],
+            neg_files=[],
+            permitted_axioms=list(verify_quorum.DEFAULT_PERMITTED_AXIOMS),
+        )
+        self.assertEqual(rc, 2)
+        self.assertEqual(rep["stage"], "export_roots")
+
+    def test_clean_quorum_nat_land_guard_and_forged_axiom_tamper(self) -> None:
+        try:
+            verify_quorum.resolve_tc_435(None)
+        except FileNotFoundError:
+            self.skipTest("Lean v4.35.0 toolchain not installed on this host")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            td = pathlib.Path(tmp)
+            clean_src = td / "QuorumClean.lean"
+            clean_src.write_text(
+                "prelude\nimport Init.Prelude\n"
+                "def pack8 (a b : Nat) : Nat := Nat.add (Nat.mul a 8) b\n"
+                "theorem pack8_div : Eq (Nat.div (pack8 9 3) 8) 9 := rfl\n",
+                encoding="utf-8",
+            )
+            bad_neg = td / "QuorumNeg.lean"
+            bad_neg.write_text(
+                "prelude\nimport Init.Prelude\n"
+                "theorem wrong_eq : Eq 1 2 := rfl\n",
+                encoding="utf-8",
+            )
+            rc_ok, rep_ok = verify_quorum.run_quorum(
+                lean_file=clean_src,
+                dep_files=[],
+                root_dir=td,
+                module_name="QuorumClean",
+                export_roots=["pack8_div"],
+                extra_lean_paths=[],
+                neg_files=[bad_neg],
+                permitted_axioms=list(verify_quorum.DEFAULT_PERMITTED_AXIOMS),
+            )
+            self.assertEqual(rc_ok, 0, rep_ok)
+            self.assertTrue(rep_ok["passed"])
+            self.assertIn("nanoda_bin", rep_ok["kernels"])
+            self.assertEqual(rep_ok["kernels"]["nanoda_bin"]["rc"], 0)
+            self.assertNotEqual(rep_ok["tamper_forged_axiom"]["nanoda_bin"]["rc"], 0)
+            self.assertTrue(rep_ok["negative_mutations"][0]["rejected_as_expected"])
+
+            nat_land_src = td / "QuorumNatLand.lean"
+            nat_land_src.write_text(
+                "prelude\nimport Init.Core\nimport Init.Data.Nat.Bitwise.Basic\n"
+                "theorem bad_land : Eq (Nat.land 5 7) 5 := rfl\n",
+                encoding="utf-8",
+            )
+            rc_land, rep_land = verify_quorum.run_quorum(
+                lean_file=nat_land_src,
+                dep_files=[],
+                root_dir=td,
+                module_name="QuorumNatLand",
+                export_roots=["bad_land"],
+                extra_lean_paths=[],
+                neg_files=[],
+                permitted_axioms=list(verify_quorum.DEFAULT_PERMITTED_AXIOMS),
+            )
+            self.assertEqual(rc_land, 2)
+            self.assertEqual(rep_land["stage"], "nat_land_guard")
+            self.assertIn("Anneal.NatBitwise", rep_land["error"])
+            self.assertIn("4444", rep_land["error"])
+
+
+class StageRefPkgTests(unittest.TestCase):
+    def test_stages_standalone_under_100kib_and_passes_reference_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            td = pathlib.Path(tmp)
+            try:
+                stage_ref_pkg.resolve_corpus_repo_and_ref(None, None)
+                has_git_corpus = True
+            except FileNotFoundError:
+                has_git_corpus = False
+
+            if has_git_corpus:
+                out_git = td / "staged_from_git"
+                rc, rep = stage_ref_pkg.stage_package(
+                    out_dir=out_git,
+                    slug="demo-standalone-stage",
+                    topics=["anneal/architecture", "verification/soundness"],
+                    with_support=True,
+                    max_bytes=102400,
+                )
+                self.assertEqual(rc, 0, rep)
+                self.assertTrue(rep["passed"])
+                self.assertLess(rep["total_bytes"], 102400)
+                self.assertEqual(rep["check_rc"], 0)
+                self.assertTrue((out_git / "CATALOG.json").is_file())
+                self.assertTrue((out_git / "reports" / "demo-standalone-stage" / "support").is_dir())
+
+                out_tpl = td / "staged_from_tpl"
+                rc2, rep2 = stage_ref_pkg.stage_package(
+                    out_dir=out_tpl,
+                    slug="second-package-check",
+                    template_dir=str(out_git),
+                    max_bytes=102400,
+                )
+                self.assertEqual(rc2, 0, rep2)
+                self.assertLess(rep2["total_bytes"], 102400)
+
+            rc_bad, _ = stage_ref_pkg.stage_package(
+                out_dir=td / "bad_slug",
+                slug="Invalid_Slug!",
+            )
+            self.assertEqual(rc_bad, 2)
 
 
 if __name__ == "__main__":

@@ -2434,6 +2434,57 @@
         "--json",
         "--target-lines"
       ]
+    },
+    {
+      "name": "stage_ref_pkg",
+      "path": "scripts/stage_ref_pkg.py",
+      "badge": "host_script",
+      "summary": "Stages a <100 KB standalone 1-package `reference-corpus/1` tree and runs `reference.py check`.",
+      "cli_flags": [
+        "--corpus-ref",
+        "--corpus-repo",
+        "--from-report-dir",
+        "--json",
+        "--max-bytes",
+        "--observed-at",
+        "--out-dir",
+        "--run-unit-tests",
+        "--slug",
+        "--subject-name",
+        "--subject-repo",
+        "--subject-rev",
+        "--template-dir",
+        "--title",
+        "--topic",
+        "--with-support"
+      ]
+    },
+    {
+      "name": "verify_quorum",
+      "path": "scripts/verify_quorum.py",
+      "badge": "host_script",
+      "summary": "Canonical multi-kernel Lean 4 NDJSON v3.1.0 quorum verifier with tamper and Nat.land guards.",
+      "cli_flags": [
+        "--allow-nat-land",
+        "--anneal-kc",
+        "--dep-file",
+        "--export-root",
+        "--file",
+        "--jobs",
+        "--json",
+        "--lean-path",
+        "--module",
+        "--neg-file",
+        "--no-wrapper",
+        "--out-json",
+        "--palladium",
+        "--permitted-axiom",
+        "--root-dir",
+        "--skip-tamper-check",
+        "--skip-v434",
+        "--tc-434",
+        "--tc-435"
+      ]
     }
   ]
 }
