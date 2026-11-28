@@ -54,7 +54,8 @@ the counterexamples that motivate its design:
    composed contract even with a sound checker and a correct fallback
    (`rung15_without_callerMemPreserved_unsound`); a memory-preserving
    producer with the same wrong candidate does not
-   (`canary_rung15_preserving`).
+   (`canary_rung15_preserving`), including under `isUnsafe = true`, unwinding,
+   and strict effect-mask weakening (`canary_rung15_unsafe_and_effects`).
 7. **Anti-vacuity:** an always-`none` body has no accepted witness, and an
    accepting body does (`canary_hasAcceptedWitness`); the slice-DST gate's
    specification kills a mutant inside the accepted fibre
@@ -88,8 +89,9 @@ the counterexamples that motivate its design:
 11. **Outcome gating:** `OutcomeAllowed` forbids undefined behavior under
    every mask (`canary_outcomeAllowed_effects`), each effect bit gates
    exactly its own outcome arm (`canary_outcomeAllowed_bit_arms`), and each
-   terminal arm also consults its postcondition
-   (`canary_outcomeAllowed_posts`).
+   terminal arm consults strictly its own postcondition with exact `(q, r, m)`
+   argument plumbing (`canary_outcomeAllowed_posts`,
+   `canary_outcomeAllowed_post_args`).
 -/
 
 namespace Anneal.Hybrid.Canaries
@@ -551,6 +553,68 @@ theorem canary_rung15_preserving :
   rw [h']
   exact rfl
 
+/-- An unsafe producer that preserves memory on return or unwind when
+`q.1 = 10`, and faults with `.faultUB` outside its safety precondition. -/
+def unsafeUnwindProducer (q : Nat × Nat)
+    (o : RunOutcome (Nat × Unit) Nat) : Prop :=
+  (q.1 = 10 ∧
+    (o = .terminal (.returned (q.2 + 999, ()) q.1) ∨
+      o = .terminal (.unwound q.1))) ∨
+  (q.1 ≠ 10 ∧ o = .faultUB)
+
+/-- Exercises `rung15_with_callerMemPreserved_sound` under `isUnsafe = true`,
+a nontrivial `safetyPre`, an unwinding producer, and non-vacuous strict effect
+weakening (`fEff := { true, false, true }` weakened to
+`outerEff := { true, false, false }`), while showing the same
+`.faultUB`-capable producer fails a safe (`isUnsafe = false`) contract even
+when `safetyPre := False`. -/
+theorem canary_rung15_unsafe_and_effects :
+    let outerEff : EffectMask :=
+      { terminates := true, noUnwind := false, noAbort := false }
+    ContractHolds
+        (rung15OuterContract (fun q => q.1 = 10) (fun _ => True) sumPost
+          outerEff)
+        true (rung15Run unsafeUnwindProducer sumCheck keepMem sumFb) ∧
+    ¬ ContractHolds
+        (rung15OuterContract (fun _ => False) (fun _ => True) sumPost
+          outerEff)
+        false (rung15Run unsafeUnwindProducer sumCheck keepMem sumFb) := by
+  let fEff : EffectMask :=
+    { terminates := true, noUnwind := false, noAbort := true }
+  let outerEff : EffectMask :=
+    { terminates := true, noUnwind := false, noAbort := false }
+  refine ⟨?_, ?_⟩
+  · refine rung15_with_callerMemPreserved_sound (fun q => q.1 = 10)
+      (fun _ => True) sumPost fEff outerEff true unsafeUnwindProducer sumCheck
+      keepMem sumFb
+      ⟨fun _ => rfl, fun h => Bool.noConfusion h,
+        fun h => Bool.noConfusion h⟩
+      ⟨?_, ?_⟩
+      (fun q y w _ h => sumCheck_sound q y w h) (fun q _ => sumFb_sound q)
+    · intro q hS hUb
+      have h10 : q.1 = 10 := hS rfl
+      cases hUb with
+      | inl hOk =>
+        cases hOk.2 with
+        | inl hR => cases hR
+        | inr hU => cases hU
+      | inr hBad => exact hBad.1 h10
+    · intro q hB o ho
+      have h10 : q.1 = 10 := hB.1 rfl
+      cases ho with
+      | inr hBad => exact absurd h10 hBad.1
+      | inl hOk =>
+        cases hOk.2 with
+        | inl hR =>
+          rw [hR]
+          exact rfl
+        | inr hU =>
+          rw [hU]
+          exact ⟨rfl, rfl⟩
+  · intro hSafe
+    have hNoUb := hSafe.1 (0, 0) (fun h => Bool.noConfusion h)
+    exact hNoUb ⟨.faultUB, Or.inr ⟨by decide, rfl⟩, rfl⟩
+
 /-! ## Anti-vacuity -/
 
 /-- A single-body model whose body returns `impl q`. -/
@@ -943,18 +1007,50 @@ theorem canary_outcomeAllowed_bit_arms :
     ⟨rfl, True.intro⟩, fun h => Bool.noConfusion h.1, rfl,
     ⟨rfl, True.intro⟩, ⟨rfl, True.intro⟩, fun h => Bool.noConfusion h⟩
 
-/-- Every terminal arm of `OutcomeAllowed` also consults its postcondition:
-with every effect permitted, a `False` postcondition still rejects the
-matching outcome, while divergence depends only on `terminates`. -/
+/-- Each terminal arm of `OutcomeAllowed` consults strictly its own
+postcondition: setting one postcondition to `False` while leaving the other
+two `True` rejects only the matching outcome arm (detecting swapped
+`postUnwind`/`postAbort` fields), while divergence depends only on
+`terminates`. -/
 theorem canary_outcomeAllowed_posts :
-    let c : FnContract Unit Unit Unit :=
-      { postReturn := fun _ _ _ => False, postUnwind := fun _ _ => False,
-        postAbort := fun _ _ => False, effects := anyExitMask }
-    ¬ OutcomeAllowed c () (.terminal (.returned () ())) ∧
-    ¬ OutcomeAllowed c () (.terminal (.unwound ())) ∧
-    ¬ OutcomeAllowed c () (.terminal (.aborted ())) ∧
-    OutcomeAllowed c () .diverged :=
-  ⟨fun h => h, fun h => h.2, fun h => h.2, rfl⟩
+    let cR : FnContract Unit Unit Unit :=
+      { postReturn := fun _ _ _ => False, effects := anyExitMask }
+    let cU : FnContract Unit Unit Unit :=
+      { postUnwind := fun _ _ => False, effects := anyExitMask }
+    let cA : FnContract Unit Unit Unit :=
+      { postAbort := fun _ _ => False, effects := anyExitMask }
+    ¬ OutcomeAllowed cR () (.terminal (.returned () ())) ∧
+    OutcomeAllowed cR () (.terminal (.unwound ())) ∧
+    OutcomeAllowed cR () (.terminal (.aborted ())) ∧
+    OutcomeAllowed cU () (.terminal (.returned () ())) ∧
+    ¬ OutcomeAllowed cU () (.terminal (.unwound ())) ∧
+    OutcomeAllowed cU () (.terminal (.aborted ())) ∧
+    OutcomeAllowed cA () (.terminal (.returned () ())) ∧
+    OutcomeAllowed cA () (.terminal (.unwound ())) ∧
+    ¬ OutcomeAllowed cA () (.terminal (.aborted ())) ∧
+    OutcomeAllowed cR () .diverged :=
+  ⟨fun h => h, ⟨rfl, True.intro⟩, ⟨rfl, True.intro⟩,
+    True.intro, fun h => h.2, ⟨rfl, True.intro⟩,
+    True.intro, ⟨rfl, True.intro⟩, fun h => h.2, rfl⟩
+
+/-- `OutcomeAllowed` threads exact `(q, r, m)` arguments into `postReturn`,
+`postUnwind`, and `postAbort`: distinct non-`Unit` values catch swapped or
+dropped arguments. -/
+theorem canary_outcomeAllowed_post_args :
+    let c : FnContract Nat Nat Nat :=
+      { postReturn := fun q r m => q = 1 ∧ r = 2 ∧ m = 3
+        postUnwind := fun q m => q = 1 ∧ m = 3
+        postAbort := fun q m => q = 1 ∧ m = 3
+        effects := anyExitMask }
+    OutcomeAllowed c 1 (.terminal (.returned 2 3)) ∧
+    ¬ OutcomeAllowed c 1 (.terminal (.returned 3 2)) ∧
+    OutcomeAllowed c 1 (.terminal (.unwound 3)) ∧
+    ¬ OutcomeAllowed c 3 (.terminal (.unwound 1)) ∧
+    OutcomeAllowed c 1 (.terminal (.aborted 3)) ∧
+    ¬ OutcomeAllowed c 3 (.terminal (.aborted 1)) :=
+  ⟨⟨rfl, rfl, rfl⟩, fun h => absurd h.2.1 (by decide),
+    ⟨rfl, rfl, rfl⟩, fun h => absurd h.2.1 (by decide),
+    ⟨rfl, rfl, rfl⟩, fun h => absurd h.2.1 (by decide)⟩
 
 /-- Pins the nine `DisclosedGap` constructors of
 `Trusted.Framework.DisclosedGap`: their payload types, their declaration
@@ -1082,11 +1178,14 @@ theorem canary_specRealizability_compat_bodies.{u, v, w} :
 
 /-- Pins the type-parameter, constructor-argument, and binder names of
 `Trusted.Framework` (`Ret`/`Mem`, `ret`/`mem`, `profileId`, `oracleId`,
-`identity`, `stage`, `Prog`/`Body`/`Sig`/`Query`, `isUnsafe`/`q`), so named
-arguments written against `Trusted.Framework` keep elaborating after the
-import swap. Distinct type arguments also pin parameter order. -/
+`identity`, `stage`, `Prog`/`Body`/`Sig`/`Query`, `Q`/`R`/`M`/`c`/`isUnsafe`/
+`q`) and `Anneal.SpecRealizability` (`X`/`Y`/`Z`/`obs`/`pre`/`post`), so named
+arguments keep elaborating after a future import swap. Distinct type arguments
+also pin parameter order. -/
 theorem canary_binder_names (r : Nat) (m : Bool) (s : String)
-    (c : FnContract Unit Nat Bool) :
+    (c : FnContract Unit Nat Bool)
+    (pre : Nat → Prop) (post : Nat → Bool → Prop)
+    (obs1 : Bool → String) (obs2 : Nat → Bool → String) :
     TerminalOutcome (Ret := Nat) (Mem := Bool) = TerminalOutcome Nat Bool ∧
     FnContract (Query := String) (Ret := Nat) (Mem := Bool) =
       FnContract String Nat Bool ∧
@@ -1113,11 +1212,23 @@ theorem canary_binder_names (r : Nat) (m : Bool) (s : String)
       .waivedInhabitation s ∧
     DisclosedGap.unverifiedDownstream (stage := s) =
       .unverifiedDownstream s ∧
-    c.effectiveSafetyPre (isUnsafe := true) (q := ()) =
+    FnContract.effectiveSafetyPre (Q := Unit) (R := Nat) (M := Bool)
+        (c := c) (isUnsafe := true) (q := ()) =
       c.effectiveSafetyPre true () ∧
-    c.effectiveBehaviorPre (isUnsafe := false) (q := ()) =
-      c.effectiveBehaviorPre false () :=
+    FnContract.effectiveBehaviorPre (Q := Unit) (R := Nat) (M := Bool)
+        (c := c) (isUnsafe := false) (q := ()) =
+      c.effectiveBehaviorPre false () ∧
+    PostconditionDichotomy (X := Nat) (Y := Bool) (pre := pre)
+        (post := post) = PostconditionDichotomy pre post ∧
+    ContractDeterministicOn (X := Nat) (Y := Bool) (Z := String)
+        (obs := obs1) (pre := pre) (post := post) =
+      ContractDeterministicOn obs1 pre post ∧
+    ContractDeterministic (X := Nat) (Y := Bool) (pre := pre)
+        (post := post) = ContractDeterministic pre post ∧
+    DichotomyModuloObservation (X := Nat) (Y := Bool) (Z := String)
+        (obs := obs2) (pre := pre) (post := post) =
+      DichotomyModuloObservation obs2 pre post :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
-    rfl, rfl, rfl⟩
+    rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.Hybrid.Canaries
