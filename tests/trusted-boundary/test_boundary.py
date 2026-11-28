@@ -2363,6 +2363,14 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         g31_base = olean_accept(ol3, ["OlG31Base"])
         assert g31_base["replay"] is True and g31_base["privateNamesAudited"] >= 2, g31_base
         assert g31_base["oleanFilesValidated"] >= 1 and g31_base["opaqueTheoremReadinessFlags"] == 0, g31_base
+
+        def ir_has_private_at(module):
+            """The compiled artifacts (IR lives in `.olean` for non-module files, in `.ir` for module
+            files) really carry an `_at_` specialization of a private helper."""
+            data = b"".join(Path(p).read_bytes() for group in ol3.artifacts[module] for p in group)
+            return b"_at_" in data and b"_private" in data and b"spec_" in data
+
+        assert ir_has_private_at("OlG31Base"), "positive control lost its private `_at_` specialization"
         olean_module(ol3, "OlG31ModPos", (
             "module\nprelude\npublic import Init\n"
             "public structure ModBox where\n  x : Nat\n"
@@ -2373,6 +2381,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         g31_mod = olean_accept(ol3, ["OlG31ModPos"])
         assert g31_mod["replay"] is True and g31_mod["privateNamesAudited"] >= 2, g31_mod
         assert g31_mod["oleanFilesValidated"] >= 5 and g31_mod["opaqueTheoremReadinessFlags"] == 0, g31_mod
+        assert ir_has_private_at("OlG31ModPos"), "module-file positive control lost its private `_at_` specialization"
         # V1 attacks without metaprogramming: reserved-root user suffixes in an ordinary module.
         olean_module(ol3, "OlG31V1Src", prelude_init + (
             "namespace Trusted\nprivate def spoof : Nat := 1\nend Trusted\n"
