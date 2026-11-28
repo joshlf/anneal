@@ -72,10 +72,11 @@ position of the byte inside its pointer.
    and end-to-end `evalCopyMemory` witnesses (`w_mr_global_reloc_and_copyMemory`,
    `w_kani5205_*`).
 5. **Lockstep parity** (`Parity` section: `lockstep_parity`, `globalAlloc_parity`,
-   `kani5205_char_parity`) and **non-vacuity** (`*_instance` theorems,
-   `ep2_b{1,2,3}_mr_non_vacuity_instances`, and `w_*` witnesses, all kernel-checked).
+   `kani5205_char_parity`, `kani5205_bool_parity`) and **non-vacuity** (`*_instance`
+   theorems, `ep2_b{1,2,3}_mr_non_vacuity_instances`, `ep2_b{3,4}_parity_instance`,
+   and `w_*` witnesses, all kernel-checked).
 
-## Scoped divergences (each pinned by a kernel-checked witness)
+## Scoped divergences and architectural boundaries (each pinned or cross-referenced)
 
 * `DIV-MR-OFFSET-SPLICE` (`w_offset_splice_*`): vendored MiniRust retains
   provenance on a same-provenance splice of `p` and `p + k` because its
@@ -103,6 +104,24 @@ position of the byte inside its pointer.
   it only in `check_value` through `Machine::vtable_from_ptr`; `Trusted` has no
   vtable table in its IR / `Memory` and rejects an incoherent `&dyn` vtable
   half at decode time.
+* **Target width (`x86_64` `PTR_SIZE = 8`) & `VariantsShape.multiple` schema boundary**:
+  vendored MiniRust fixes `Target := x86_64` (`PTR_SIZE = 8`, and `decodePtrM` panics on
+  non-8-byte inputs), so 32-bit (`ptrBytes = 4`) pointer-byte correspondence lives on the
+  independent `LeanMiriSpec.PtrByteCoherenceLM` authority (`readPtr4_*`, `globalAlloc_*_4`,
+  `w_lm_copyMemory_32`, `clear_partial_mid_strips_4_at`). Multi-variant per-variant layout
+  correspondence remains bounded by `Trusted`'s `VariantsShape.multiple` `TypeLayout` schema.
+
+## Correspondence-gap postmortem (`mir-correspondence-postmortem.md`)
+
+Pre-Episode-1 `MiniRustSpec` correspondence did not catch Episode 1's TCB soundness defects
+because: (a) pointer proofs related only aligned whole-pointer reads/writes without byte-level
+permutation or fragment-splitting (W1), and vendored MiniRust `ProvenanceFrag` itself lacks
+`origOffset` (W2, hence `DIV-MR-OFFSET-SPLICE` requires the independent `LeanMiriSpec` authority);
+(b) `body.globals` relocations, wide-pointer bytewise halves, union raw-byte carriers, and
+`evalCopyMemory` were not related at byte granularity (W3–W5); and (c) `Kani#5205` untyped-byte
+writes followed by typed `bool`/`char` reads were unbridged. Every one of these boundaries is now
+mechanically pinned by the theorems listed in §1–§5 above and the exact signature pins in
+`MiniRustSpec/Audit.lean`.
 
 This module imports no `Anneal.*`, `Miri.*`, or `LeanMiriSpec.*` module
 (verified by the trailing `#assert_ptr_byte_coherence_mr_audit`).
@@ -6429,6 +6448,50 @@ theorem ep2_b3_parity_instance :
     (kani5205_char_parity (M := Interp.TBM) tbProv 0xD800).1,
     (kani5205_char_parity (M := Interp.TBM) tbProv 0xD800).2.2.2⟩
 
+/-- **`V2026_06_01 ↔ V2026_08_01` lockstep parity for `Kani#5205` `bool` read-time validity.**
+For every byte `v : UInt8` and both `BasicMemory` and `TreeBorrowsMemory`, both dialects project
+to the exact same MiniRust byte, produce the same MiniRust `Type::Bool` decode result, and agree
+on `decodeTypedValueFromBytes` acceptance and `validateValueForTy?`. -/
+theorem kani5205_bool_parity {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (layouts6 : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (layouts8 : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (ty6 : Trusted.Rustc.V2026_06_01.MirAst.Ty) (hty6 : ty6.kind = .bool)
+    (ty8 : Trusted.Rustc.V2026_08_01.MirAst.Ty) (hty8 : ty8.kind = .bool)
+    (v : UInt8) :
+    V08.projBytes pv [.init v none] = V06.projBytes pv [.init v none] ∧
+    Interp.Type.decodeM (M := M) .Bool (V08.projBytes pv [.init v none]) =
+      Interp.Type.decodeM (M := M) .Bool (V06.projBytes pv [.init v none]) ∧
+    (Trusted.Rustc.V2026_08_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_08_01.MirSemantics.defaultCodecFuel layouts8 ty8 [.init v none]).isSome =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_06_01.MirSemantics.defaultCodecFuel layouts6 ty6 [.init v none]).isSome ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.validateValueForTy? layouts8 (some ty8) (.scalar ⟨v.toNat, 1⟩) =
+      Trusted.Rustc.V2026_06_01.MirSemantics.validateValueForTy? layouts6 (some ty6) (.scalar ⟨v.toNat, 1⟩) := by
+  have hp : V08.projBytes pv [.init v none] = V06.projBytes pv [.init v none] := rfl
+  have h6 := V06.kani5205_bool_correspondence_M (M := M) pv layouts6 ty6 hty6 v
+  have h8 := V08.kani5205_bool_correspondence_M (M := M) pv layouts8 ty8 hty8 v
+  refine ⟨hp, rfl, Bool.eq_iff_iff.mpr ?_, Bool.eq_iff_iff.mpr ?_⟩
+  · exact h8.2.1.trans h6.2.1.symm
+  · exact h8.2.2.trans h6.2.2.symm
+
+/-- Non-vacuous instantiations of `kani5205_bool_parity` on valid (`1u8`) and invalid (`2u8`) bytes
+across `TBM` and `BM`. -/
+theorem ep2_b4_parity_instance :
+    (Trusted.Rustc.V2026_08_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_08_01.MirSemantics.defaultCodecFuel V08.wLayouts V08.wTyBool [.init 2 none]).isSome =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_06_01.MirSemantics.defaultCodecFuel V06.wLayouts V06.wTyBool [.init 2 none]).isSome ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.validateValueForTy? V08.wLayouts (some V08.wTyBool) (.scalar ⟨2, 1⟩) =
+      Trusted.Rustc.V2026_06_01.MirSemantics.validateValueForTy? V06.wLayouts (some V06.wTyBool) (.scalar ⟨2, 1⟩) ∧
+    (Trusted.Rustc.V2026_08_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_08_01.MirSemantics.defaultCodecFuel V08.wLayouts V08.wTyBool [.init 1 none]).isSome =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_06_01.MirSemantics.defaultCodecFuel V06.wLayouts V06.wTyBool [.init 1 none]).isSome :=
+  ⟨(kani5205_bool_parity (M := Interp.TBM) tbProv V06.wLayouts V08.wLayouts V06.wTyBool rfl V08.wTyBool rfl 2).2.2.1,
+   (kani5205_bool_parity (M := Interp.BM) bmProv V06.wLayouts V08.wLayouts V06.wTyBool rfl V08.wTyBool rfl 2).2.2.2,
+   (kani5205_bool_parity (M := Interp.TBM) tbProv V06.wLayouts V08.wLayouts V06.wTyBool rfl V08.wTyBool rfl 1).2.2.1⟩
+
 end Parity
 
 /-! ## Axiom, import-isolation, and non-triviality audit -/
@@ -6515,7 +6578,8 @@ elab "#assert_ptr_byte_coherence_mr_audit" : command => do
     ``minirust_char_decodeM_eq, ``minirust_char_decodeM_iff, ``minirust_char_uninit_decodeM,
     ``tbProv_inj, ``bmProv_eq_iff, ``coherent_parity, ``encode_parity,
     ``thinDecode_parity, ``lockstep_parity, ``w_lockstep_parity, ``lockstep_parity_instance,
-    ``globalAlloc_parity, ``kani5205_char_parity, ``ep2_b3_parity_instance ]
+    ``globalAlloc_parity, ``kani5205_char_parity, ``ep2_b3_parity_instance,
+    ``kani5205_bool_parity, ``ep2_b4_parity_instance ]
   let mut headline : Nat := 0
   for dialect in ["V06", "V08"] do
     for name in perDialect do

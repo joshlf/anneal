@@ -19238,6 +19238,8 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.globalAlloc_parity
   MiniRustSpec.PtrByteCoherenceMR.kani5205_char_parity
   MiniRustSpec.PtrByteCoherenceMR.ep2_b3_parity_instance
+  MiniRustSpec.PtrByteCoherenceMR.kani5205_bool_parity
+  MiniRustSpec.PtrByteCoherenceMR.ep2_b4_parity_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent?_eq_some_iff
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement
   MiniRustSpec.PtrByteCoherenceMR.V06.trusted_coherent_implies_minirust_retains
@@ -19426,6 +19428,8 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.globalAlloc_parity
   MiniRustSpec.PtrByteCoherenceMR.kani5205_char_parity
   MiniRustSpec.PtrByteCoherenceMR.ep2_b3_parity_instance
+  MiniRustSpec.PtrByteCoherenceMR.kani5205_bool_parity
+  MiniRustSpec.PtrByteCoherenceMR.ep2_b4_parity_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent?_eq_some_iff
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement
   MiniRustSpec.PtrByteCoherenceMR.V06.trusted_coherent_implies_minirust_retains
@@ -19813,6 +19817,25 @@ example {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
       Interp.Type.decodeM (M := M) minirustCharType
         (V06.projBytes pv (Trusted.Rustc.V2026_06_01.MirSemantics.encodePlainLittleEndianBytes c 4)) :=
   MiniRustSpec.PtrByteCoherenceMR.kani5205_char_parity pv c
+
+open MiniRustSpec MiniRustSpec.PtrByteCoherenceMR in
+example {M : Type} [Gen.Memory M] [Interp.MemoryOps M]
+    (pv : Nat → Nat → Gen.Memory.Provenance M)
+    (layouts6 : Trusted.Rustc.V2026_06_01.Layout.LayoutTable)
+    (layouts8 : Trusted.Rustc.V2026_08_01.Layout.LayoutTable)
+    (ty6 : Trusted.Rustc.V2026_06_01.MirAst.Ty) (hty6 : ty6.kind = .bool)
+    (ty8 : Trusted.Rustc.V2026_08_01.MirAst.Ty) (hty8 : ty8.kind = .bool)
+    (v : UInt8) :
+    V08.projBytes pv [.init v none] = V06.projBytes pv [.init v none] ∧
+    Interp.Type.decodeM (M := M) .Bool (V08.projBytes pv [.init v none]) =
+      Interp.Type.decodeM (M := M) .Bool (V06.projBytes pv [.init v none]) ∧
+    (Trusted.Rustc.V2026_08_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_08_01.MirSemantics.defaultCodecFuel layouts8 ty8 [.init v none]).isSome =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_06_01.MirSemantics.defaultCodecFuel layouts6 ty6 [.init v none]).isSome ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.validateValueForTy? layouts8 (some ty8) (.scalar ⟨v.toNat, 1⟩) =
+      Trusted.Rustc.V2026_06_01.MirSemantics.validateValueForTy? layouts6 (some ty6) (.scalar ⟨v.toNat, 1⟩) :=
+  MiniRustSpec.PtrByteCoherenceMR.kani5205_bool_parity pv layouts6 layouts8 ty6 hty6 ty8 hty8 v
 
 #assert_minirustspec_import_isolation
 
