@@ -256,6 +256,16 @@ def ocCase7Mir : CapturedMir :=
   ocBody "oc::case7_drop_through_cast" 0 [ocU32Ty, ocU32Ty]
     [ocBb ocInit7 (.drop (ocLoc 1 [ocCastU32]) 1 .continue_),
      ocBb [.assign (ocLoc 0) (.use (.copy (ocLoc 1)))] .return_]
+/-- Case 7 protected-drop companion (mode-sensitive `D1.5`): `_2 = &mut _1`, `Retag(FnEntry, _2)`,
+then `Drop(_1 as u8) -> bb1`; `bb1: _0 = 7`. Succeeds (`7`) without a borrow tracker (`ocEraseRetags`),
+faults with UB under Tree Borrows because dropping `_1` conflicts with the active protector on `_2`. -/
+def ocCase7ProtectedDropMir : CapturedMir :=
+  ocBody "oc::case7_protected_drop_through_cast" 0 [ocU32Ty, ocU8Ty, ocMutRefU8Ty]
+    [ocBb [.storageLive 1, .storageLive 2, .assign (ocLoc 1) (.use (ocConstU8 3)),
+           .assign (ocLoc 2) (.ref (.mut false) (ocLoc 1)),
+           .retag .fnEntry (ocLoc 2)]
+       (.drop (ocLoc 1 [.opaqueCast ocU8Ty]) 1 .continue_),
+     ocBb [.assign (ocLoc 0) (.use (ocConstU32 7))] .return_]
 /-- Case 8 (fail-closed boundary): `_2 = &raw const _1`; `_0 = copy (*(_2 as *const u32))`
 (a dereference directly below a leading cast chain). -/
 def ocCase8Mir : CapturedMir :=
@@ -267,8 +277,13 @@ def ocCase8Mir : CapturedMir :=
 def ocCase9Mir : CapturedMir :=
   ocBody "oc::case9_uninit_read_through_cast" 0 [ocU32Ty, ocU32Ty]
     [ocBb [.storageLive 1, .assign (ocLoc 0) (.use (.copy (ocLoc 1 [ocCastU32])))] .return_]
+/-- Case 9 dead-local companion (negative, `D1.6` UB not masked): `StorageDead _1`, then
+`_0 = copy (_1 as u32)` — `.opaqueCast` does NOT mask dead-local UB either. -/
+def ocCase9DeadLocalMir : CapturedMir :=
+  ocBody "oc::case9_dead_local_read_through_cast" 0 [ocU32Ty, ocU32Ty]
+    [ocBb (ocInit7 ++ [.storageDead 1, .assign (ocLoc 0) (.use (.copy (ocLoc 1 [ocCastU32])))]) .return_]
 
-/-! #### Cast erasure (the post-borrowck / `PostAnalysisNormalize` image)
+/-! #### Cast erasure (the post-borrowck / `PostAnalysisNormalize` image) and place extraction
 
 `ocEraseBody` removes every `ProjectionElem.opaqueCast` from every place of every statement and
 terminator (and leaves everything else untouched). -/
@@ -284,6 +299,7 @@ def ocEraseOperand : Operand → Operand
   | .constant c => .constant c
 def ocEraseRvalue : Rvalue → Rvalue
   | .use op => .use (ocEraseOperand op)
+  | .repeat op n => .repeat (ocEraseOperand op) n
   | .ref k p => .ref k (ocErasePlace p)
   | .rawPtr m p => .rawPtr m (ocErasePlace p)
   | .len p => .len (ocErasePlace p)
@@ -293,6 +309,8 @@ def ocEraseRvalue : Rvalue → Rvalue
   | .binaryOp o a b => .binaryOp o (ocEraseOperand a) (ocEraseOperand b)
   | .unaryOp o a => .unaryOp o (ocEraseOperand a)
   | .aggregate k ops => .aggregate k (ops.map ocEraseOperand)
+  | .shallowInitBox op t => .shallowInitBox (ocEraseOperand op) t
+  | .wrapUnsafeBinder op t => .wrapUnsafeBinder (ocEraseOperand op) t
   | rv => rv
 def ocEraseStmt : StatementKind → StatementKind
   | .assign p rv => .assign (ocErasePlace p) (ocEraseRvalue rv)
@@ -300,15 +318,58 @@ def ocEraseStmt : StatementKind → StatementKind
   | .deinit p => .deinit (ocErasePlace p)
   | .retag k p => .retag k (ocErasePlace p)
   | .placeMention p => .placeMention (ocErasePlace p)
+  | .backwardIncompatibleDropHint p => .backwardIncompatibleDropHint (ocErasePlace p)
+  | .intrinsic (.copyNonOverlapping s d c) =>
+    .intrinsic (.copyNonOverlapping (ocEraseOperand s) (ocEraseOperand d) (ocEraseOperand c))
+  | .intrinsic (.assume op) => .intrinsic (.assume (ocEraseOperand op))
   | k => k
 def ocEraseTerm : TerminatorKind → TerminatorKind
+  | .switchInt d t => .switchInt (ocEraseOperand d) t
   | .drop p t u => .drop (ocErasePlace p) t u
   | .call f args d t u => .call (ocEraseOperand f) (args.map ocEraseOperand) (ocErasePlace d) t u
+  | .tailCall f args => .tailCall (ocEraseOperand f) (args.map ocEraseOperand)
+  | .assert c e t u => .assert (ocEraseOperand c) e t u
   | k => k
 def ocEraseBody (b : CapturedMir) : CapturedMir :=
   { b with basicBlocks := b.basicBlocks.map fun bb =>
       { bb with statements := bb.statements.map fun s => { s with kind := ocEraseStmt s.kind },
                 terminator := { bb.terminator with kind := ocEraseTerm bb.terminator.kind } } }
+
+/-- Whether a place carries a `ProjectionElem.opaqueCast` anywhere in its projection. -/
+def ocPlaceHasCast (p : Place) : Bool :=
+  p.projection.any fun e => match e with | .opaqueCast _ => true | _ => false
+
+def ocOperandPlaces : Operand → List Place
+  | .copy p | .move p => [p]
+  | .constant _ => []
+
+def ocRvaluePlaces : Rvalue → List Place
+  | .use op | .repeat op _ | .cast _ op _ | .unaryOp _ op
+  | .shallowInitBox op _ | .wrapUnsafeBinder op _ => ocOperandPlaces op
+  | .ref _ p | .rawPtr _ p | .len p | .discriminant p | .copyForDeref p => [p]
+  | .binaryOp _ a b => ocOperandPlaces a ++ ocOperandPlaces b
+  | .aggregate _ ops => ops.flatMap ocOperandPlaces
+  | _ => []
+
+/-- Every place addressed anywhere in a `CapturedMir` body (all statement, rvalue, intrinsic, and
+terminator place/operand positions). -/
+def ocBodyPlaces (b : CapturedMir) : List Place :=
+  b.basicBlocks.flatMap fun bb =>
+    bb.statements.flatMap (fun s => match s.kind with
+      | .assign p rv => p :: ocRvaluePlaces rv
+      | .setDiscriminant p _ | .deinit p | .retag _ p | .placeMention p
+      | .backwardIncompatibleDropHint p => [p]
+      | .intrinsic (.copyNonOverlapping s d c) =>
+        ocOperandPlaces s ++ ocOperandPlaces d ++ ocOperandPlaces c
+      | .intrinsic (.assume op) => ocOperandPlaces op
+      | _ => []) ++
+    (match bb.terminator.kind with
+      | .switchInt d _ => ocOperandPlaces d
+      | .drop p _ _ => [p]
+      | .call f args d _ _ => ocOperandPlaces f ++ args.flatMap ocOperandPlaces ++ [d]
+      | .tailCall f args => ocOperandPlaces f ++ args.flatMap ocOperandPlaces
+      | .assert c _ _ _ => ocOperandPlaces c
+      | _ => [])
 
 /-! #### `D2`: callee-only `FnEntry` protectors (`rust#166253`, `10..15`)
 
@@ -358,9 +419,8 @@ def ocCase12Callee : CapturedMir :=
 def ocCase12Mir : CapturedMir :=
   ocD2Main "oc::case12_main" "oc::case12_callee" (.ref (.mut false) (ocLoc 1)) ocMutRefU8Ty
     [.copy (ocLoc 3)] [.assign (ocLoc 1) (.use (ocConstU8 9))]
-/-- Case 13 callee (`fn(&mut u8, *mut u8)`, reverse transmutation: caller invokes through a
-`fn(*mut u8, *mut u8)` view passing `(_2, _2)`): callee's own `FnEntry` retag protects `_1`, local
-write `*_1 = 4` activates it, then aliased foreign write `*_2 = 5` violates the strong protector. -/
+/-- Case 13 callee (`fn(&mut u8, *mut u8)`): `FnEntry` retag protects `_1`, local write
+`*_1 = 4` activates it, then aliased foreign write `*_2 = 5` violates the strong protector. -/
 def ocCase13Callee : CapturedMir :=
   ocBody "oc::case13_callee" 2 [ocU8Ty, ocMutRefU8Ty, ocRawMutU8Ty]
     [ocBb [.retag .fnEntry (ocLoc 1),
@@ -369,7 +429,18 @@ def ocCase13Callee : CapturedMir :=
            .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
 def ocCase13Mir : CapturedMir :=
   ocD2Main "oc::case13_main" "oc::case13_callee" (.ref (.mut false) (ocLoc 2 [.deref])) ocMutRefU8Ty
-    [.copy (ocLoc 2), .copy (ocLoc 2)] []
+    [.copy (ocLoc 3), .copy (ocLoc 2)] []
+/-- Case 13 reverse-transmutation companion (`D2.3`): caller holds NO `&mut u8` local at all —
+only `x : u8 = 3` and `p = &raw mut x` — and invokes `ocCase13Callee` (`fn(&mut u8, *mut u8)`)
+passing `(p, p)` as a transmuted `fn(*mut u8, *mut u8)` caller view; the callee's own `FnEntry`
+retag still attaches a strong protector, making the aliased foreign write mode-sensitive UB. -/
+def ocCase13RevTransmuteMir : CapturedMir :=
+  ocBody "oc::case13_rev_transmute_main" 0 [ocBytePairTy, ocU8Ty, ocRawMutU8Ty, ocU8Ty]
+    [ocBb [.storageLive 1, .storageLive 2, .storageLive 3,
+           .assign (ocLoc 1) (.use (ocConstU8 3)),
+           .assign (ocLoc 2) (.rawPtr .mut (ocLoc 1))]
+       (.call (ocFnOp "oc::case13_callee") [.copy (ocLoc 2), .copy (ocLoc 2)] (ocLoc 3) (some 1) .continue_),
+     ocBb [.assign (ocLoc 0) (.aggregate .tuple [.copy (ocLoc 3), .copy (ocLoc 1)])] .return_]
 /-- Case 14 callee (`fn(&u8, *mut u8)`): `FnEntry` retag of the shared reference (`Frozen`),
 then the foreign write `*_2 = 5` while the protector is active. -/
 def ocCase14Callee : CapturedMir :=
@@ -649,6 +720,27 @@ def lmOcDeinitThenRead (tb : Bool) : LmOcM LmOcFpObs := do
   let (v, _) ← lmOcMem (lmLoad st p 4)
   pure (.okScalar v)
 
+/-- Case `7` protected-drop companion (`D1.5`): a live `u8 = 3` local protected by an active
+`FnEntry` `&mut u8` reborrow, then dropped (`lmTreeAccess` write + `Allocation.writeUninit`),
+returning `7` when `tb = false` and faulting with Tree Borrows UB when `tb = true`. -/
+def lmOcProtectedDrop (tb : Bool) : LmOcM LmOcFpObs := do
+  let (p, st) ← lmOcMem (lmAllocate (lmInit tb) 1 1)
+  let st ← lmOcMem (lmStore st p 1 3)
+  let (_, st) ← lmOcMem (lmRetag st p .reference lmFrozenFacts .Mutable .FnEntry true)
+  let (id, off, prov, alloc) ← lmOcMem (lmAccessTarget st p 1)
+  let range : AllocRange := ⟨off, Size.ofBytes 1⟩
+  let st ← lmOcMem (lmTreeAccess st true alloc p id prov range)
+  let _ ← match st.mem.live.find? (fun e => e.1 == id) with
+    | none => .error (.harness "dead local allocation")
+    | some (_, entry) =>
+      match Allocation.writeUninit range (Size.ofBytes 8) entry.allocation with
+      | .error e _ => .error (.mem (.allocation e))
+      | .ok () cleared =>
+        match st.mem.setLiveAllocation id cleared with
+        | .error e => .error (.mem (.access (.allocationLookup e)))
+        | .ok mem => pure { st with mem := mem }
+  pure (.okScalar 7)
+
 /-! ### `D2`: callee-only `FnEntry` protectors (`x : u8 = 3` at `p`) -/
 
 /-- The callee body of a `D2` case after the caller set up `x = 3` at the parent pointer `p`;
@@ -823,6 +915,8 @@ unroll_loops ocRunStepU := ocRunStep fuel 0 with ocStepHooksU
 
 unroll_loops lmOcDeinitThenReadU := lmOcDeinitThenRead fuel 0
   with lmAllocateU, lmStoreU, lmAccessTargetU, lmTreeAccessU, lmLoadU
+unroll_loops lmOcProtectedDropU := lmOcProtectedDrop fuel 0
+  with lmAllocateU, lmStoreU, lmRetagU, lmAccessTargetU, lmTreeAccessU
 unroll_loops lmOcD2U := lmOcD2 fuel 0 with lmAllocateU, lmStoreU, lmLoadU, lmRetagU, lmEndCallU
 unroll_loops lmOcPtrValidityU := lmOcPtrValidity fuel 0 with getAllocInfoU
 unroll_loops lmOcD3NullU := lmOcD3Null fuel 0 with lmOcPtrValidityU
@@ -967,37 +1061,6 @@ theorem lm_opaqueCast_phase_boundary {Prov : Type} [PointerProvenance Prov]
     (StepError.invalidProgram "OpaqueCast after borrowck" ≠ .undefinedBehavior "OpaqueCast after borrowck") :=
   ⟨rfl, rfl, by simp⟩
 
-/-- Whether a place carries a `ProjectionElem.opaqueCast` anywhere in its projection. -/
-def ocPlaceHasCast (p : Trusted.Rustc.V2026_06_01.MirAst.Place) : Bool :=
-  p.projection.any fun e => match e with | .opaqueCast _ => true | _ => false
-
-def ocOperandPlaces : Trusted.Rustc.V2026_06_01.MirAst.Operand → List Trusted.Rustc.V2026_06_01.MirAst.Place
-  | .copy p | .move p => [p]
-  | .constant _ => []
-
-def ocRvaluePlaces : Trusted.Rustc.V2026_06_01.MirAst.Rvalue → List Trusted.Rustc.V2026_06_01.MirAst.Place
-  | .use op => ocOperandPlaces op
-  | .ref _ p | .rawPtr _ p | .len p | .discriminant p | .copyForDeref p => [p]
-  | .cast _ op _ => ocOperandPlaces op
-  | .binaryOp _ a b => ocOperandPlaces a ++ ocOperandPlaces b
-  | .unaryOp _ a => ocOperandPlaces a
-  | .aggregate _ ops => ops.flatMap ocOperandPlaces
-  | _ => []
-
-/-- Every place a body addresses (statement destinations / operands / `Deinit` /
-`SetDiscriminant` / `Retag` / `PlaceMention`, and `Drop` / `Call` terminator places). -/
-def ocBodyPlaces (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
-    List Trusted.Rustc.V2026_06_01.MirAst.Place :=
-  b.basicBlocks.flatMap fun bb =>
-    bb.statements.flatMap (fun s => match s.kind with
-      | .assign p rv => p :: ocRvaluePlaces rv
-      | .setDiscriminant p _ | .deinit p | .retag _ p | .placeMention p => [p]
-      | _ => []) ++
-    (match bb.terminator.kind with
-      | .drop p _ _ => [p]
-      | .call f args d _ _ => ocOperandPlaces f ++ args.flatMap ocOperandPlaces ++ [d]
-      | _ => [])
-
 /-- Walk a translated projection chain with REAL vendored `Miri.Interpreter.project`. -/
 def lmOcProjectChain (base : OpTy Provenance) :
     List Miri.MIR.ProjectionElem → Except ProjectionError (OpTy Provenance)
@@ -1006,40 +1069,104 @@ def lmOcProjectChain (base : OpTy Provenance) :
     let b ← project (LeanMiriSpec.WideDstAndMaybeUninitLM.lmWdProjCx (lmInit false)) base e
     lmOcProjectChain b rest
 
-/-- **Phase-boundary observer (`D1`)**: the first opaque-cast place of the case's (un-erased)
-fixture, translated to vendored `Miri.MIR`, is walked with REAL vendored `Miri.Interpreter.project`
-from its root local's translated layout; the exact `invariant "OpaqueCast after borrowck"`
-rejection is observed as `.phaseBoundary`. -/
+/-- Minimal `PlaceProjectionHooks` for walking translated places through REAL vendored
+`Miri.Interpreter.PlaceDynamic.project` (`throw (.invalidProgram "OpaqueCast after borrowck")`). -/
+def ocPhaseDynHooks : PlaceProjectionHooks Provenance Unit Unit Unit where
+  place := {
+    debugAssertions := false
+    getFrame := throw (.unsupported "unused")
+    setFrame := fun _ => throw (.unsupported "unused")
+    frameIndex := pure 0
+    resolveLayout := fun _ _ => throw (.unsupported "unused")
+    localToOp := fun _ _ => throw (.unsupported "unused")
+    projection := fun _ => throw (.unsupported "unused")
+    deref := fun _ _ _ => throw (.unsupported "unused")
+    checkPlaceType := fun _ _ _ => pure ()
+    allocateStack := fun _ _ => throw (.unsupported "unused")
+    writeMemoryNoValidate := fun _ _ _ => throw (.unsupported "unused")
+    afterLocalMovedToMemory := fun _ _ _ => pure ()
+    memoryOffset := fun _ p _ _ _ => pure p
+    writeLocalImmediate := fun _ _ _ _ => throw (.unsupported "unused")
+    enforceValidity := fun _ _ => pure false
+    validate := fun _ _ => pure ()
+  }
+  target := lmLayout
+  maxSizeOfVal := Size.ofBytes 9223372036854775807
+  dynamic := {
+    target := lmLayout
+    maxSizeOfVal := Size.ofBytes 9223372036854775807
+    classify := fun _ _ => throw (.unsupported "unused")
+    field := fun _ _ _ => throw (.unsupported "unused")
+    packedAlign := fun _ _ => pure none
+    vtableSizeAndAlign := fun _ _ _ => throw (.unsupported "unused")
+  }
+  dynamicFuel := 4
+  isSliceOrStr := fun _ _ => pure false
+  field := fun _ _ _ => throw (.unsupported "unused")
+  variant := fun _ _ _ => throw (.unsupported "unused")
+  packedAlign := fun _ _ => pure none
+  subsliceLayout := fun _ _ _ => throw (.unsupported "unused")
+  layoutOf := fun _ _ => throw (.unsupported "unused")
+  localIndex := fun _ _ => throw (.unsupported "unused")
+
+/-- Walk a translated projection chain with REAL vendored `Miri.Interpreter.PlaceDynamic.project`. -/
+def lmOcPlaceDynChain (base : RuntimePlace Provenance) :
+    List Miri.MIR.ProjectionElem → PlaceM Unit (RuntimePlace Provenance)
+  | [] => pure base
+  | e :: rest => do
+    let b ← PlaceDynamic.project ocPhaseDynHooks () base e
+    lmOcPlaceDynChain b rest
+
+/-- Check ONE opaque-cast place in `body` against BOTH REAL vendored `Miri.Interpreter.project`
+(`.invariant "OpaqueCast after borrowck"`) AND REAL vendored `Miri.Interpreter.PlaceDynamic.project`
+(`.invalidProgram "OpaqueCast after borrowck"`). -/
+def lmOcPhaseCheckPlace (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+    (p : Trusted.Rustc.V2026_06_01.MirAst.Place) : LmOcFpObs :=
+  let rootTy := ((body.localDecls[p.local_]?).map (·.ty)).getD ocUnitTy
+  let lay := LeanMiriSpec.Correspondence.translateTy rootTy body.layouts
+  let proj := (LeanMiriSpec.Correspondence.translatePlace p).projection.toList
+  let baseOp : OpTy Provenance := ⟨.immediate .uninit, lay⟩
+  let basePl : RuntimePlace Provenance := ⟨.local 0 p.local_ none (.ofAllocationToken 0), lay⟩
+  match lmOcProjectChain baseOp proj, lmOcPlaceDynChain basePl proj () with
+  | .error (.invariant "OpaqueCast after borrowck"),
+    .error (.invalidProgram "OpaqueCast after borrowck") () => .phaseBoundary
+  | _, _ => .unsupported
+
+/-- **Phase-boundary observer (`D1`)**: checks EVERY opaque-cast place in `body` (not just the
+first!), requiring agreement on `.phaseBoundary` via BOTH `Miri.Interpreter.project` AND
+`Miri.Interpreter.PlaceDynamic.project` across every cast place. -/
+def lmOcPhaseObserveBody (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) : LmOcFpObs :=
+  match (ocBodyPlaces body).filter ocPlaceHasCast with
+  | [] => .unsupported
+  | p :: ps => ps.foldl (fun acc q => ocCombine acc (lmOcPhaseCheckPlace body q))
+      (lmOcPhaseCheckPlace body p)
+
+/-- **Phase-boundary observer by case index (`0..21`)**. -/
 def lmOcPhaseObserve (idx : Nat) : LmOcFpObs :=
   match ocCaseFixture? idx with
   | none => .unsupported
-  | some (body, _) =>
-    match (ocBodyPlaces body).filter ocPlaceHasCast with
-    | [] => .unsupported
-    | p :: _ =>
-      let rootTy := ((body.localDecls[p.local_]?).map (·.ty)).getD ocUnitTy
-      let base : OpTy Provenance :=
-        ⟨.immediate .uninit, LeanMiriSpec.Correspondence.translateTy rootTy body.layouts⟩
-      match lmOcProjectChain base (LeanMiriSpec.Correspondence.translatePlace p).projection.toList with
-      | .error (.invariant "OpaqueCast after borrowck") => .phaseBoundary
-      | _ => .unsupported
+  | some (body, _) => lmOcPhaseObserveBody body
 
-/-- **`D1` phase-boundary table (kernel-checked)**: EVERY `D1` `.opaqueCast` fixture (`0..9`) is
-rejected by real vendored `Miri.Interpreter.project` at the phase boundary, while no `D2` / `D3`
-fixture carries an opaque cast; and the cast-erased image `ocEraseBody` of every `D1` fixture
-addresses no opaque-cast place at all (so it is the program `Step.step` legitimately runs). -/
+/-- **`D1` phase-boundary table (kernel-checked)**: EVERY opaque-cast place in EVERY `D1`
+`.opaqueCast` fixture (`0..9` plus companions `ocCase6PayloadMir`, `ocCase7ProtectedDropMir`,
+`ocCase9DeadLocalMir`) is rejected by BOTH real vendored `Miri.Interpreter.project` AND real
+vendored `Miri.Interpreter.PlaceDynamic.project` at the phase boundary, while no `D2` / `D3`
+fixture carries an opaque cast; and the cast-erased image `ocEraseBody` addresses zero cast places. -/
 theorem lm_d1_phase_boundary_table :
     (List.range lmOcCaseCount).map lmOcPhaseObserve =
       [.phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary,
        .phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary, .phaseBoundary,
        .unsupported, .unsupported, .unsupported, .unsupported, .unsupported, .unsupported,
        .unsupported, .unsupported, .unsupported, .unsupported, .unsupported, .unsupported] ∧
+    lmOcPhaseObserveBody ocCase6PayloadMir = .phaseBoundary ∧
+    lmOcPhaseObserveBody ocCase7ProtectedDropMir = .phaseBoundary ∧
+    lmOcPhaseObserveBody ocCase9DeadLocalMir = .phaseBoundary ∧
     ((List.range 10).all fun idx => match ocCaseFixture? idx with
       | some (b, _) => ((ocBodyPlaces (ocEraseBody b)).filter ocPlaceHasCast).isEmpty
       | none => false) = true := by
-  refine ⟨?_, ?_⟩ <;> decide +kernel
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
-/-- `D1` **the cast erasure removes every cast (universal)**. -/
+/-- `D1` **the cast erasure removes every cast from a place (universal, constructive)**. -/
 theorem lm_ocErasePlace_cast_free (p : Trusted.Rustc.V2026_06_01.MirAst.Place) :
     ocPlaceHasCast (ocErasePlace p) = false := by
   obtain ⟨l, proj⟩ := p
@@ -1047,6 +1174,132 @@ theorem lm_ocErasePlace_cast_free (p : Trusted.Rustc.V2026_06_01.MirAst.Place) :
   induction proj with
   | nil => rfl
   | cons e rest ih => cases e <;> simp_all [ocEraseProj]
+
+/-- `D1` **complete body-level cast-erasure freedom (universal, constructive)**: for EVERY
+`CapturedMir` body `b`, every place addressed anywhere in `ocEraseBody b` is free of
+`ProjectionElem.opaqueCast`. -/
+theorem lm_ocEraseBody_cast_free (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) :
+    ∀ p ∈ ocBodyPlaces (ocEraseBody b), ocPlaceHasCast p = false := by
+  have hOp : ∀ (op : Trusted.Rustc.V2026_06_01.MirAst.Operand)
+      (p : Trusted.Rustc.V2026_06_01.MirAst.Place),
+      p ∈ ocOperandPlaces (ocEraseOperand op) → ocPlaceHasCast p = false := by
+    intro op p hp
+    cases op with
+    | copy q | move q =>
+      simp only [ocEraseOperand, ocOperandPlaces, List.mem_singleton] at hp
+      subst hp; exact lm_ocErasePlace_cast_free q
+    | constant _ => simp [ocEraseOperand, ocOperandPlaces] at hp
+  have hOps : ∀ (ops : List Trusted.Rustc.V2026_06_01.MirAst.Operand)
+      (p : Trusted.Rustc.V2026_06_01.MirAst.Place),
+      p ∈ (ops.map ocEraseOperand).flatMap ocOperandPlaces → ocPlaceHasCast p = false := by
+    intro ops p hp
+    simp only [List.mem_flatMap, List.mem_map] at hp
+    obtain ⟨op', ⟨op, _, rfl⟩, hp'⟩ := hp
+    exact hOp op p hp'
+  have hRv : ∀ (rv : Trusted.Rustc.V2026_06_01.MirAst.Rvalue)
+      (p : Trusted.Rustc.V2026_06_01.MirAst.Place),
+      p ∈ ocRvaluePlaces (ocEraseRvalue rv) → ocPlaceHasCast p = false := by
+    intro rv p hp
+    cases rv with
+    | use op | «repeat» op _ | cast _ op _ | unaryOp _ op | shallowInitBox op _
+    | wrapUnsafeBinder op _ => exact hOp op p hp
+    | ref _ q | rawPtr _ q | len q | discriminant q | copyForDeref q =>
+      simp only [ocEraseRvalue, ocRvaluePlaces, List.mem_singleton] at hp
+      subst hp; exact lm_ocErasePlace_cast_free q
+    | binaryOp _ a b =>
+      simp only [ocEraseRvalue, ocRvaluePlaces, List.mem_append] at hp
+      rcases hp with h | h
+      · exact hOp a p h
+      · exact hOp b p h
+    | aggregate _ ops => exact hOps ops p hp
+    | threadLocalRef _ | nullaryOp _ _ => simp [ocEraseRvalue, ocRvaluePlaces] at hp
+  intro p hp
+  simp only [ocBodyPlaces, ocEraseBody, List.mem_flatMap, List.mem_map] at hp
+  obtain ⟨bb', ⟨bb, _, rfl⟩, hbb⟩ := hp
+  simp only [List.mem_append] at hbb
+  rcases hbb with hStmts | hTerm
+  · simp only [List.mem_flatMap, List.mem_map] at hStmts
+    obtain ⟨s', ⟨s, _, rfl⟩, hs⟩ := hStmts
+    cases hk : s.kind with
+    | assign q rv =>
+      rw [hk] at hs
+      simp only [ocEraseStmt, List.mem_cons] at hs
+      rcases hs with rfl | hrv
+      · exact lm_ocErasePlace_cast_free q
+      · exact hRv rv p hrv
+    | setDiscriminant q _ | deinit q | retag _ q | placeMention q
+    | backwardIncompatibleDropHint q =>
+      rw [hk] at hs
+      simp only [ocEraseStmt, List.mem_singleton] at hs
+      subst hs; exact lm_ocErasePlace_cast_free q
+    | intrinsic intr =>
+      rw [hk] at hs
+      cases intr with
+      | copyNonOverlapping s1 d1 c1 =>
+        simp only [ocEraseStmt, List.mem_append] at hs
+        rcases hs with (h | h) | h
+        · exact hOp s1 p h
+        · exact hOp d1 p h
+        · exact hOp c1 p h
+      | assume op => exact hOp op p hs
+    | storageLive _ | storageDead _ | nop | coverage | constEvalCounter =>
+      rw [hk] at hs; simp [ocEraseStmt] at hs
+  · cases ht : bb.terminator.kind with
+    | switchInt d _ => rw [ht] at hTerm; exact hOp d p hTerm
+    | drop q _ _ =>
+      rw [ht] at hTerm
+      simp only [ocEraseTerm, List.mem_singleton] at hTerm
+      subst hTerm; exact lm_ocErasePlace_cast_free q
+    | call f args d _ _ =>
+      rw [ht] at hTerm
+      simp only [ocEraseTerm, List.mem_append, List.mem_singleton] at hTerm
+      rcases hTerm with (h | h) | rfl
+      · exact hOp f p h
+      · exact hOps args p h
+      · exact lm_ocErasePlace_cast_free d
+    | tailCall f args =>
+      rw [ht] at hTerm
+      simp only [ocEraseTerm, List.mem_append] at hTerm
+      rcases hTerm with h | h
+      · exact hOp f p h
+      · exact hOps args p h
+    | assert c _ _ _ => rw [ht] at hTerm; exact hOp c p hTerm
+    | goto _ | unwindResume | unwindTerminate | return_ | unreachable | inlineAsm _ _ _ =>
+      rw [ht] at hTerm; simp [ocEraseTerm] at hTerm
+
+/-- `D1.5` **protected-drop through `.opaqueCast` mode-sensitive UB (kernel-checked)**:
+vendored `lmOcProtectedDrop` (`RetagPipeline` `.FnEntry` + `MachineMemoryHooks.beforeMemoryWrite` +
+`Allocation.writeUninit`) and Trusted `stepMirFn` on `ocCase7ProtectedDropMir` both yield
+`.okScalar 7` without Tree Borrows and `.ub` under Tree Borrows. -/
+theorem lm_oc_protected_drop_mode_sensitive :
+    lmOcRun (lmOcProtectedDrop false) = .okScalar 7 ∧
+    lmOcRun (lmOcProtectedDrop true) = .ub ∧
+    lmOcTrustedObsOf 0 (ocRunTrustedRaw (ocEraseRetags ocCase7ProtectedDropMir) []) = .okScalar 7 ∧
+    lmOcTrustedObsOf 0 (ocRunTrustedRaw ocCase7ProtectedDropMir []) = .ub := by
+  rw [lmOcProtectedDropU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- `D1.6` **dead-local UB non-masking control (kernel-checked)**: real vendored
+`Miri.Interpreter.Step.step` on `ocEraseBody ocCase9DeadLocalMir` and Trusted `stepMirFn` on
+`ocCase9DeadLocalMir` both report `.ub`. -/
+theorem lm_oc_dead_local_ub_non_masking :
+    lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase9DeadLocalMir) ocU32Ty) = .ub ∧
+    lmOcTrustedObsOf 0 (ocRunTrustedRaw ocCase9DeadLocalMir []) = .ub := by
+  refine ⟨?_, ?_⟩
+  · rw [ocRunStepU.eq_src]; decide +kernel
+  · decide +kernel
+
+/-- `D2.3` **reverse transmutation `fn(*mut u8, *mut u8) -> fn(&mut u8, *mut u8)` mode-sensitivity
+(kernel-checked)**: Trusted on `ocCase13RevTransmuteMir` (caller holds NO `&mut` local) and
+LeanMiri `lmOcD2 _ 13` both yield `.okRetagPair 5 5` at `tb = false` and `.ub` at `tb = true`. -/
+theorem lm_oc_d2_rev_transmute_mode_sensitive :
+    lmOcTrustedObsOf 13 (ocRunTrustedRaw ocCase13RevTransmuteMir [ocEraseRetags ocCase13Callee]) =
+      .okRetagPair 5 5 ∧
+    lmOcTrustedObsOf 13 (ocRunTrustedRaw ocCase13RevTransmuteMir [ocCase13Callee]) = .ub ∧
+    lmOcRun (lmOcD2 false 13) = .okRetagPair 5 5 ∧
+    lmOcRun (lmOcD2 true 13) = .ub := by
+  rw [lmOcD2U.eq_src]
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- `D1` **`SetDiscriminant` payload companion (kernel-checked)**: vendored `Step.step` on the cast
 erasure of `ocCase6PayloadMir` (real `Discriminant.writeDiscriminant`, downcast field read) and
@@ -1385,6 +1638,20 @@ theorem lm_retagPipeline_rawPointer_no_protector {MachineKind : Type} [Decidable
       Miri.TreeBorrows.RetagPipeline.RetagTypeShape.classify, hMode, Id.run]
     rfl
 
+/-- `D2` **vendored `GlobalState.endCall` protector-release law (universal, constructive)**:
+(a) returning from a frame with zero `FnEntry` protectors (such as case `10`, `*mut u8`) leaves
+`GlobalState` unchanged;
+(b) installing a protector with `GlobalState.addProtector` and returning via `GlobalState.endCall`
+ALWAYS clears that tag from `protectedTags` (cases `12` and `15`). -/
+theorem lm_globalState_endCall_laws (state : Miri.TreeBorrows.GlobalState)
+    (allocId : AllocId) (tag : BorTag) (kind : Miri.TreeBorrows.ProtectorKind) :
+    Miri.TreeBorrows.GlobalState.endCall state ⟨#[]⟩ = state ∧
+    (let p := Miri.TreeBorrows.GlobalState.addProtector state ⟨#[]⟩ allocId tag kind
+     (Miri.TreeBorrows.GlobalState.endCall p.1 p.2).protectedTags.get tag = none) := by
+  refine ⟨rfl, ?_⟩
+  simp [Miri.TreeBorrows.GlobalState.addProtector, Miri.TreeBorrows.GlobalState.endCall,
+    Miri.TreeBorrows.FrameState.addProtector]
+
 /-- `D3` **zero-sized accesses are always dereferenceable (vendored, universal)**. -/
 theorem lm_checkPtrAccess_zero_size {Prov ProvExtra : Type} (t : PointerArithmetic)
     (ptr : Pointer (Option Prov)) (msg : CheckInAllocMsg) (r : PointerResolver Prov ProvExtra)
@@ -1463,6 +1730,72 @@ theorem lm_validityMachine_checkPointerAlign_laws {K User : Type}
     simp only [Bind.bind, EStateM.bind, hRes]
     exact ⟨_, rfl⟩
 
+/-- Minimal `ValidityMachine.Access` and `ValidityMachine.State` for non-vacuity execution of
+real vendored `ValidityMachine.checkPointerAccess` and `ValidityMachine.checkPointerAlign`. -/
+def ocValState (alignMode : ValidityMachine.AlignmentCheck) : ValidityMachine.State Unit Unit :=
+  { stack := { frames := #[] }
+    machine := {
+      memory := MemoryState.empty
+      borrowTracker := none
+      dataRace := none
+      threads := Miri.Concurrency.ThreadManager.initial false
+      raceAllocations := #[]
+      allocationSpans := #[]
+      user := {
+        addresses := {
+          intToPtrMap := #[]
+          baseAddr := #[]
+          exposed := #[]
+          provenanceMode := .strict
+          addressMode := .managed
+          generation := none
+        }
+        payload := { payload := (), validation := .Deep, alignment := alignMode }
+      }
+    } }
+
+def ocValAccess : ValidityMachine.Access Unit Unit where
+  runtime := RuntimeTargetDataLayout.default
+  ghostMode := false
+  globalKind := none
+  globalHooks := {
+    synchronizeMemory := fun _ h => h
+    evaluateStaticInitializer := fun mem h _ => ⟨mem, h, .error "unused"⟩
+    beforeAccessGlobal := fun mem h _ _ _ _ => ⟨mem, h, .ok ()⟩
+    adjustGlobalAllocation := fun mem h _ _ => ⟨mem, h, .error "unused"⟩
+  }
+  dynamicLayout := fun mem h _ => ⟨mem, h, .ok none⟩
+  resolvePointer := fun _ ptr _ st => .ok (.error ptr.offset.bytes) st
+  beforeAllocationAccess := fun _ => pure ()
+  diagnostic := fun _ _ _ => pure ()
+  weakMemoryWrite := fun _ _ => pure ()
+  syncAccess := fun _ _ _ => pure ()
+  retainTouched := fun m _ => m
+  memoryError := fun _ => .unsupported "unused"
+
+/-- `D3` **concrete non-vacuity witnesses for `ValidityMachine.{checkPointerAccess, checkPointerAlign}`**:
+executes REAL vendored `ValidityMachine.checkPointerAccess` (ZST -> `.ok ()`, dangling integer `0`
+-> `.error (.undefinedBehavior ...)`) and `ValidityMachine.checkPointerAlign` (align `1` ->
+`.ok ()`, malformed `pow2 = 30` -> `.error (.invalidProgram "malformed validity alignment")`,
+misaligned dangling pointer `addr = 2` at align `4` -> `.error (.undefinedBehavior ...)`). -/
+theorem lm_validityMachine_nonvacuity_witnesses :
+    let st := ocValState .Int
+    ValidityMachine.checkPointerAccess ocValAccess ⟨Size.ofBytes 4, none⟩ Size.ZERO st = .ok () st ∧
+    (∃ msg, ValidityMachine.checkPointerAccess ocValAccess ⟨Size.ofBytes 0, none⟩ (Size.ofBytes 4) st =
+      .error (.undefinedBehavior msg) st) ∧
+    ValidityMachine.checkPointerAlign ocValAccess ⟨Size.ofBytes 2, none⟩ ⟨0⟩ st = .ok () st ∧
+    ValidityMachine.checkPointerAlign ocValAccess ⟨Size.ofBytes 4, none⟩ ⟨30⟩ st =
+      .error (.invalidProgram "malformed validity alignment") st ∧
+    (∃ msg, ValidityMachine.checkPointerAlign ocValAccess ⟨Size.ofBytes 2, none⟩ ⟨2⟩ st =
+      .error (.undefinedBehavior msg) st) := by
+  refine ⟨(lm_validityMachine_checkPointerAccess_laws _ _ _).1,
+    (lm_validityMachine_checkPointerAccess_laws ocValAccess ⟨Size.ofBytes 0, none⟩ (ocValState .Int)).2.2.1
+      (Size.ofBytes 4) (ocValState .Int) 0 4 (.dereferenceable "pointer") rfl,
+    (lm_validityMachine_checkPointerAlign_laws _ _ _ _).1 rfl,
+    (lm_validityMachine_checkPointerAlign_laws _ _ _ _).2.1 (by decide),
+    (lm_validityMachine_checkPointerAlign_laws ocValAccess ⟨Size.ofBytes 2, none⟩ ⟨2⟩ (ocValState .Int)).2.2
+      (ocValState .Int) ⟨Align.maxAlignedFactor (Size.ofBytes 2), ⟨2⟩⟩ rfl⟩
+
 /-- `D3` **case `18` non-short-circuiting witness**: BOTH the sized `&u32` null pointer AND the
 ZST `&()` null pointer independently fail `Validity.checkScalar` with UB (neither is skipped). -/
 theorem lm_d3_null_both_halves_ub :
@@ -1507,7 +1840,11 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     type_of% @lm_opaqueCast_phase_boundary ∧
     type_of% lm_d1_phase_boundary_table ∧
     type_of% @lm_ocErasePlace_cast_free ∧
+    type_of% @lm_ocEraseBody_cast_free ∧
     type_of% lm_oc_setDiscriminant_payload_agreement ∧
+    type_of% lm_oc_protected_drop_mode_sensitive ∧
+    type_of% lm_oc_dead_local_ub_non_masking ∧
+    type_of% lm_oc_d2_rev_transmute_mode_sensitive ∧
     type_of% lm_step_adapter_boundaries ∧
     type_of% @lm_retagPolicy_protector ∧
     type_of% @lm_retagPolicy_none ∧
@@ -1517,9 +1854,11 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     type_of% lm_call_initStackFrame_fnEntry_witness ∧
     type_of% @lm_machineHooks_withRetagMode_laws ∧
     type_of% @lm_retagPipeline_rawPointer_no_protector ∧
+    type_of% @lm_globalState_endCall_laws ∧
     type_of% @lm_checkPtrAccess_zero_size ∧
     type_of% @lm_validityMachine_checkPointerAccess_laws ∧
     type_of% @lm_validityMachine_checkPointerAlign_laws ∧
+    type_of% lm_validityMachine_nonvacuity_witnesses ∧
     type_of% lm_d3_null_both_halves_ub ∧
     type_of% @lm_safe_ptr_range_contains_iff ∧
     type_of% lm_safe_ptr_validity_layout ∧
@@ -1528,12 +1867,15 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
   ⟨lmOcObserve_table, lmOcObserve_out_of_range, lmOcObserve_mode_sensitivity, lmOcTrustedObserve_table,
    lmOc_trusted_agreement,
    @lm_opaqueCast_phase_boundary, lm_d1_phase_boundary_table, @lm_ocErasePlace_cast_free,
-   lm_oc_setDiscriminant_payload_agreement, lm_step_adapter_boundaries,
+   @lm_ocEraseBody_cast_free, lm_oc_setDiscriminant_payload_agreement,
+   lm_oc_protected_drop_mode_sensitive, lm_oc_dead_local_ub_non_masking,
+   lm_oc_d2_rev_transmute_mode_sensitive, lm_step_adapter_boundaries,
    @lm_retagPolicy_protector, @lm_retagPolicy_none, lm_retagPolicy_fnEntry_witness,
    @lm_call_passArgument_copyAllowTransmute, @lm_call_initStackFrame_enters_fnEntry_mode,
    lm_call_initStackFrame_fnEntry_witness, @lm_machineHooks_withRetagMode_laws,
-   @lm_retagPipeline_rawPointer_no_protector, @lm_checkPtrAccess_zero_size,
-   @lm_validityMachine_checkPointerAccess_laws, @lm_validityMachine_checkPointerAlign_laws,
+   @lm_retagPipeline_rawPointer_no_protector, @lm_globalState_endCall_laws,
+   @lm_checkPtrAccess_zero_size, @lm_validityMachine_checkPointerAccess_laws,
+   @lm_validityMachine_checkPointerAlign_laws, lm_validityMachine_nonvacuity_witnesses,
    lm_d3_null_both_halves_ub, @lm_safe_ptr_range_contains_iff, lm_safe_ptr_validity_layout,
    @lm_scalarMayBeNull_int, rfl⟩
 
@@ -1552,7 +1894,17 @@ run_cmd do
   let bridgeReq : List (Lean.Name × Lean.Name) :=
     [ (ns ++ `lmOcObserve_table, `Miri.Interpreter.Step.step),
       (ns ++ `lm_d1_phase_boundary_table, `Miri.Interpreter.project),
+      (ns ++ `lm_d1_phase_boundary_table, `Miri.Interpreter.PlaceDynamic.project),
       (ns ++ `lm_oc_setDiscriminant_payload_agreement, `Miri.Interpreter.Step.step),
+      (ns ++ `lm_oc_protected_drop_mode_sensitive, `Miri.TreeBorrows.RetagPipeline.retagPointerValue),
+      (ns ++ `lm_oc_protected_drop_mode_sensitive, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
+      (ns ++ `lm_oc_protected_drop_mode_sensitive, `Miri.Memory.Allocation.writeUninit),
+      (ns ++ `lm_oc_dead_local_ub_non_masking, `Miri.Interpreter.Step.step),
+      (ns ++ `lm_oc_d2_rev_transmute_mode_sensitive, `Miri.TreeBorrows.RetagPipeline.retagPointerValue),
+      (ns ++ `lm_oc_d2_rev_transmute_mode_sensitive, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
+      (ns ++ `lm_globalState_endCall_laws, `Miri.TreeBorrows.GlobalState.endCall),
+      (ns ++ `lm_validityMachine_nonvacuity_witnesses, `Miri.Interpreter.ValidityMachine.checkPointerAccess),
+      (ns ++ `lm_validityMachine_nonvacuity_witnesses, `Miri.Interpreter.ValidityMachine.checkPointerAlign),
       (ns ++ `lmOcObserve_table, `Miri.Interpreter.Discriminant.writeDiscriminant),
       (ns ++ `lmOcObserve_table, `Miri.Interpreter.Discriminant.readDiscriminant),
       (ns ++ `lmOcObserve_table, `Miri.Interpreter.writeAggregate),
@@ -1605,8 +1957,10 @@ run_cmd do
   let constructive : List Lean.Name :=
     [ ns ++ `lmOcTrustedObserve_table,
       ns ++ `lm_opaqueCast_phase_boundary, ns ++ `lm_ocErasePlace_cast_free,
+      ns ++ `lm_ocEraseBody_cast_free,
       ns ++ `lm_retagPolicy_protector, ns ++ `lm_retagPolicy_none,
       ns ++ `lm_retagPolicy_fnEntry_witness,
+      ns ++ `lm_globalState_endCall_laws,
       ns ++ `lm_checkPtrAccess_zero_size,
       ns ++ `lm_safe_ptr_range_contains_iff, ns ++ `lm_safe_ptr_validity_layout ]
   let mut theorems : Nat := 0
@@ -1624,7 +1978,7 @@ run_cmd do
       if let .thmInfo _ := info then theorems := theorems + 1
   if !badConstructive.isEmpty then
     throwError "constructive theorems unexpectedly depend on Classical.choice: {badConstructive}"
-  if theorems < 24 then
+  if theorems < 30 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit

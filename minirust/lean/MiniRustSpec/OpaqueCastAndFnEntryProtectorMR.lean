@@ -254,6 +254,16 @@ def ocCase7Mir : CapturedMir :=
   ocBody "oc::case7_drop_through_cast" 0 [ocU32Ty, ocU32Ty]
     [ocBb ocInit7 (.drop (ocLoc 1 [ocCastU32]) 1 .continue_),
      ocBb [.assign (ocLoc 0) (.use (.copy (ocLoc 1)))] .return_]
+/-- Case 7 protected-drop companion (mode-sensitive `D1.5`): `_2 = &mut _1`, `Retag(FnEntry, _2)`,
+then `Drop(_1 as u8) -> bb1`; `bb1: _0 = 7`. Succeeds (`7`) without a borrow tracker (`ocEraseRetags`),
+faults with UB under Tree Borrows because dropping `_1` conflicts with the active protector on `_2`. -/
+def ocCase7ProtectedDropMir : CapturedMir :=
+  ocBody "oc::case7_protected_drop_through_cast" 0 [ocU32Ty, ocU8Ty, ocMutRefU8Ty]
+    [ocBb [.storageLive 1, .storageLive 2, .assign (ocLoc 1) (.use (ocConstU8 3)),
+           .assign (ocLoc 2) (.ref (.mut false) (ocLoc 1)),
+           .retag .fnEntry (ocLoc 2)]
+       (.drop (ocLoc 1 [.opaqueCast ocU8Ty]) 1 .continue_),
+     ocBb [.assign (ocLoc 0) (.use (ocConstU32 7))] .return_]
 /-- Case 8 (fail-closed boundary): `_2 = &raw const _1`; `_0 = copy (*(_2 as *const u32))`
 (a dereference directly below a leading cast chain). -/
 def ocCase8Mir : CapturedMir :=
@@ -265,8 +275,13 @@ def ocCase8Mir : CapturedMir :=
 def ocCase9Mir : CapturedMir :=
   ocBody "oc::case9_uninit_read_through_cast" 0 [ocU32Ty, ocU32Ty]
     [ocBb [.storageLive 1, .assign (ocLoc 0) (.use (.copy (ocLoc 1 [ocCastU32])))] .return_]
+/-- Case 9 dead-local companion (negative, `D1.6` UB not masked): `StorageDead _1`, then
+`_0 = copy (_1 as u32)` — `.opaqueCast` does NOT mask dead-local UB either. -/
+def ocCase9DeadLocalMir : CapturedMir :=
+  ocBody "oc::case9_dead_local_read_through_cast" 0 [ocU32Ty, ocU32Ty]
+    [ocBb (ocInit7 ++ [.storageDead 1, .assign (ocLoc 0) (.use (.copy (ocLoc 1 [ocCastU32])))]) .return_]
 
-/-! #### Cast erasure (the post-borrowck / `PostAnalysisNormalize` image)
+/-! #### Cast erasure (the post-borrowck / `PostAnalysisNormalize` image) and place extraction
 
 `ocEraseBody` removes every `ProjectionElem.opaqueCast` from every place of every statement and
 terminator (and leaves everything else untouched). -/
@@ -282,6 +297,7 @@ def ocEraseOperand : Operand → Operand
   | .constant c => .constant c
 def ocEraseRvalue : Rvalue → Rvalue
   | .use op => .use (ocEraseOperand op)
+  | .repeat op n => .repeat (ocEraseOperand op) n
   | .ref k p => .ref k (ocErasePlace p)
   | .rawPtr m p => .rawPtr m (ocErasePlace p)
   | .len p => .len (ocErasePlace p)
@@ -291,6 +307,8 @@ def ocEraseRvalue : Rvalue → Rvalue
   | .binaryOp o a b => .binaryOp o (ocEraseOperand a) (ocEraseOperand b)
   | .unaryOp o a => .unaryOp o (ocEraseOperand a)
   | .aggregate k ops => .aggregate k (ops.map ocEraseOperand)
+  | .shallowInitBox op t => .shallowInitBox (ocEraseOperand op) t
+  | .wrapUnsafeBinder op t => .wrapUnsafeBinder (ocEraseOperand op) t
   | rv => rv
 def ocEraseStmt : StatementKind → StatementKind
   | .assign p rv => .assign (ocErasePlace p) (ocEraseRvalue rv)
@@ -298,15 +316,58 @@ def ocEraseStmt : StatementKind → StatementKind
   | .deinit p => .deinit (ocErasePlace p)
   | .retag k p => .retag k (ocErasePlace p)
   | .placeMention p => .placeMention (ocErasePlace p)
+  | .backwardIncompatibleDropHint p => .backwardIncompatibleDropHint (ocErasePlace p)
+  | .intrinsic (.copyNonOverlapping s d c) =>
+    .intrinsic (.copyNonOverlapping (ocEraseOperand s) (ocEraseOperand d) (ocEraseOperand c))
+  | .intrinsic (.assume op) => .intrinsic (.assume (ocEraseOperand op))
   | k => k
 def ocEraseTerm : TerminatorKind → TerminatorKind
+  | .switchInt d t => .switchInt (ocEraseOperand d) t
   | .drop p t u => .drop (ocErasePlace p) t u
   | .call f args d t u => .call (ocEraseOperand f) (args.map ocEraseOperand) (ocErasePlace d) t u
+  | .tailCall f args => .tailCall (ocEraseOperand f) (args.map ocEraseOperand)
+  | .assert c e t u => .assert (ocEraseOperand c) e t u
   | k => k
 def ocEraseBody (b : CapturedMir) : CapturedMir :=
   { b with basicBlocks := b.basicBlocks.map fun bb =>
       { bb with statements := bb.statements.map fun s => { s with kind := ocEraseStmt s.kind },
                 terminator := { bb.terminator with kind := ocEraseTerm bb.terminator.kind } } }
+
+/-- Whether a place carries a `ProjectionElem.opaqueCast` anywhere in its projection. -/
+def ocPlaceHasCast (p : Place) : Bool :=
+  p.projection.any fun e => match e with | .opaqueCast _ => true | _ => false
+
+def ocOperandPlaces : Operand → List Place
+  | .copy p | .move p => [p]
+  | .constant _ => []
+
+def ocRvaluePlaces : Rvalue → List Place
+  | .use op | .repeat op _ | .cast _ op _ | .unaryOp _ op
+  | .shallowInitBox op _ | .wrapUnsafeBinder op _ => ocOperandPlaces op
+  | .ref _ p | .rawPtr _ p | .len p | .discriminant p | .copyForDeref p => [p]
+  | .binaryOp _ a b => ocOperandPlaces a ++ ocOperandPlaces b
+  | .aggregate _ ops => ops.flatMap ocOperandPlaces
+  | _ => []
+
+/-- Every place addressed anywhere in a `CapturedMir` body (all statement, rvalue, intrinsic, and
+terminator place/operand positions). -/
+def ocBodyPlaces (b : CapturedMir) : List Place :=
+  b.basicBlocks.flatMap fun bb =>
+    bb.statements.flatMap (fun s => match s.kind with
+      | .assign p rv => p :: ocRvaluePlaces rv
+      | .setDiscriminant p _ | .deinit p | .retag _ p | .placeMention p
+      | .backwardIncompatibleDropHint p => [p]
+      | .intrinsic (.copyNonOverlapping s d c) =>
+        ocOperandPlaces s ++ ocOperandPlaces d ++ ocOperandPlaces c
+      | .intrinsic (.assume op) => ocOperandPlaces op
+      | _ => []) ++
+    (match bb.terminator.kind with
+      | .switchInt d _ => ocOperandPlaces d
+      | .drop p _ _ => [p]
+      | .call f args d _ _ => ocOperandPlaces f ++ args.flatMap ocOperandPlaces ++ [d]
+      | .tailCall f args => ocOperandPlaces f ++ args.flatMap ocOperandPlaces
+      | .assert c _ _ _ => ocOperandPlaces c
+      | _ => [])
 
 /-! #### `D2`: callee-only `FnEntry` protectors (`rust#166253`, `10..15`)
 
@@ -356,9 +417,8 @@ def ocCase12Callee : CapturedMir :=
 def ocCase12Mir : CapturedMir :=
   ocD2Main "oc::case12_main" "oc::case12_callee" (.ref (.mut false) (ocLoc 1)) ocMutRefU8Ty
     [.copy (ocLoc 3)] [.assign (ocLoc 1) (.use (ocConstU8 9))]
-/-- Case 13 callee (`fn(&mut u8, *mut u8)`, reverse transmutation: caller invokes through a
-`fn(*mut u8, *mut u8)` view passing `(_2, _2)`): callee's own `FnEntry` retag protects `_1`, local
-write `*_1 = 4` activates it, then aliased foreign write `*_2 = 5` violates the strong protector. -/
+/-- Case 13 callee (`fn(&mut u8, *mut u8)`): `FnEntry` retag protects `_1`, local write
+`*_1 = 4` activates it, then aliased foreign write `*_2 = 5` violates the strong protector. -/
 def ocCase13Callee : CapturedMir :=
   ocBody "oc::case13_callee" 2 [ocU8Ty, ocMutRefU8Ty, ocRawMutU8Ty]
     [ocBb [.retag .fnEntry (ocLoc 1),
@@ -367,7 +427,18 @@ def ocCase13Callee : CapturedMir :=
            .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
 def ocCase13Mir : CapturedMir :=
   ocD2Main "oc::case13_main" "oc::case13_callee" (.ref (.mut false) (ocLoc 2 [.deref])) ocMutRefU8Ty
-    [.copy (ocLoc 2), .copy (ocLoc 2)] []
+    [.copy (ocLoc 3), .copy (ocLoc 2)] []
+/-- Case 13 reverse-transmutation companion (`D2.3`): caller holds NO `&mut u8` local at all —
+only `x : u8 = 3` and `p = &raw mut x` — and invokes `ocCase13Callee` (`fn(&mut u8, *mut u8)`)
+passing `(p, p)` as a transmuted `fn(*mut u8, *mut u8)` caller view; the callee's own `FnEntry`
+retag still attaches a strong protector, making the aliased foreign write mode-sensitive UB. -/
+def ocCase13RevTransmuteMir : CapturedMir :=
+  ocBody "oc::case13_rev_transmute_main" 0 [ocBytePairTy, ocU8Ty, ocRawMutU8Ty, ocU8Ty]
+    [ocBb [.storageLive 1, .storageLive 2, .storageLive 3,
+           .assign (ocLoc 1) (.use (ocConstU8 3)),
+           .assign (ocLoc 2) (.rawPtr .mut (ocLoc 1))]
+       (.call (ocFnOp "oc::case13_callee") [.copy (ocLoc 2), .copy (ocLoc 2)] (ocLoc 3) (some 1) .continue_),
+     ocBb [.assign (ocLoc 0) (.aggregate .tuple [.copy (ocLoc 3), .copy (ocLoc 1)])] .return_]
 /-- Case 14 callee (`fn(&u8, *mut u8)`): `FnEntry` retag of the shared reference (`Frozen`),
 then the foreign write `*_2 = 5` while the protector is active. -/
 def ocCase14Callee : CapturedMir :=
@@ -786,9 +857,7 @@ def ocMrProg12 : Program :=
         .Assign (wdLc 0) (.Load (ocMrDerefU8 1))], .Return, .Regular⟩)]
   mkProg [(fnId 0, ocMrD2Main (.AddrOf (wdLc 3) (.Ref .Mutable ocMrU8Pointee)) ocMrMutRefU8Ty
       [wdLd 5] [.Assign (wdLc 3) (ocCU8 9)] false), (fnId 1, callee)]
-/-- Case 13: reverse transmutation (`fn(*mut u8, *mut u8)` caller view passing `(_4, _4)` through a
-transmuted fn pointer into a `fn(&mut u8, *mut u8)` callee): callee's `Validate(_1, true)` at `&mut u8`
-attaches a strong protector, local write `*_1 = 4` succeeds, then foreign write `*_2 = 5` is TB UB. -/
+/-- Case 13: direct `&mut u8` callee writes `4` locally, then aliased foreign write `*_2 = 5`. -/
 def ocMrProg13 : Program :=
   let callee := mkFn [(locId 0, mrU8Ty), (locId 1, ocMrMutRefU8Ty), (locId 2, rawThinTy)]
     [locId 1, locId 2] (locId 0)
@@ -796,7 +865,29 @@ def ocMrProg13 : Program :=
         .Assign (ocMrDerefU8 2) (ocCU8 5), .Assign (wdLc 0) (.Load (ocMrDerefU8 2))],
        .Return, .Regular⟩)]
   mkProg [(fnId 0, ocMrD2Main (.AddrOf (ocMrDerefU8 4) (.Ref .Mutable ocMrU8Pointee))
-      ocMrMutRefU8Ty [wdLd 4, wdLd 4] [] true), (fnId 1, callee)]
+      ocMrMutRefU8Ty [wdLd 5, wdLd 4] [] false), (fnId 1, callee)]
+/-- Case 13 reverse-transmutation companion: caller holds NO `&mut` local, transmutes
+`fn(&mut u8, *mut u8)` to a `fn(*mut u8, *mut u8)` function pointer, and passes `(_4, _4)`. -/
+def ocMrProg13RevTransmute : Program :=
+  let mainFn := mkFn
+    [(locId 0, u32Ty), (locId 1, mrU64Ty), (locId 2, mrU64Ty), (locId 3, mrU8Ty),
+     (locId 4, rawThinTy), (locId 5, mrU8Ty), (locId 6, fnPtrTy), (locId 7, fnPtrTy)]
+    [] (locId 0)
+    [(bbId 0, ⟨[.StorageLive (locId 3), .StorageLive (locId 4), .StorageLive (locId 5),
+        .StorageLive (locId 6), .StorageLive (locId 7),
+        .Assign (wdLc 3) (ocCU8 3),
+        .Assign (wdLc 4) (.AddrOf (wdLc 3) (.Raw .None)),
+        .Assign (wdLc 6) (cFn 1),
+        .Assign (wdLc 7) (.UnOp (.Cast (.Transmute fnPtrTy)) (wdLd 6))],
+       .Call (wdLd 7) .Rust [.ByValue (wdLd 4), .ByValue (wdLd 4)] (wdLc 5) (some (bbId 1)) none,
+       .Regular⟩),
+     (bbId 1, ⟨wdFinish 1 (wdToU64 (wdLd 5)) (wdToU64 (wdLd 3)), exitTerm, .Regular⟩)]
+  let callee := mkFn [(locId 0, mrU8Ty), (locId 1, ocMrMutRefU8Ty), (locId 2, rawThinTy)]
+    [locId 1, locId 2] (locId 0)
+    [(bbId 0, ⟨[.Validate (wdLc 1) true, .Assign (ocMrDerefU8 1) (ocCU8 4),
+        .Assign (ocMrDerefU8 2) (ocCU8 5), .Assign (wdLc 0) (.Load (ocMrDerefU8 2))],
+       .Return, .Regular⟩)]
+  mkProg [(fnId 0, mainFn), (fnId 1, callee)]
 /-- Case 14: `&u8` callee (`Frozen` strong protector), foreign write `*_2 = 5`. -/
 def ocMrProg14 : Program :=
   let callee := mkFn [(locId 0, mrU8Ty), (locId 1, ocMrShrRefU8Ty), (locId 2, rawThinTy)]
@@ -1044,6 +1135,62 @@ def ocMrProg6Payload : Program :=
     ([.Assign (wdLc 3) (.Variant 0 (.Tuple [cU32 7] ocMrTwoVarPayloadTy) ocMrTwoVarTy),
       .SetDiscriminant (wdLc 3) 1] ++
      wdFinish 0 (wdToU64 (.Load (.Field (.Downcast (wdLc 3) 1) 0))) (wdCU64 0))
+
+/-- `ocMrProg7`'s protected-drop companion (`D1.5`): `_4 = &mut _3`, `Validate(_4, true)`, then
+`Deinit(_3)` while the protector on `_4` is active — OK (`7`) on `Mach`, UB on `MachTB`. -/
+def ocMrProg7ProtectedDrop : Program :=
+  wdProg [mrU8Ty, ocMrMutRefU8Ty]
+    ([.Assign (wdLc 3) (ocCU8 3),
+      .Assign (wdLc 4) (.AddrOf (wdLc 3) (.Ref .Mutable ocMrU8Pointee)),
+      .Validate (wdLc 4) true,
+      .Deinit (wdLc 3)] ++
+     wdFinish 0 (wdCU64 7) (wdCU64 0))
+
+/-- `ocMrProg9`'s dead-local companion (`D1.6`): `StorageDead _3`, then load `_3`. -/
+def ocMrProg9DeadLocal : Program :=
+  wdProg [u32Ty]
+    ([.Assign (wdLc 3) (cU32 7), .StorageDead (locId 3)] ++
+     wdFinish 0 (wdToU64 (wdLd 3)) (wdCU64 0))
+
+/-- **`D1.5` protected-drop through `.opaqueCast` mode-sensitive UB (kernel-checked)**:
+dropping `_1 as u8` while `_2 = &mut _1` carries an active `FnEntry` protector returns `7` without
+a borrow tracker (`ocEraseRetags` / `Mach`) and faults with UB under Tree Borrows (Trusted raw &
+MiniRust `MachTB`), matching across both authorities. -/
+theorem mr_oc_protected_drop_mode_sensitive :
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw (ocEraseRetags ocCase7ProtectedDropMir) []) = .okScalar 7 ∧
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw ocCase7ProtectedDropMir []) = .ub ∧
+    ocRun false [] ocMrProg7ProtectedDrop = .okScalar 7 ∧
+    ocRun true [] ocMrProg7ProtectedDrop = .ub ∧
+    runStopMsgBasic ocMrProg7ProtectedDrop = none ∧
+    runStopMsgTB ocMrProg7ProtectedDrop =
+      some "Tree Borrows: foreign read of protected Unique reference" := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **`D1.6` dead-local UB non-masking control (kernel-checked)**: `.opaqueCast` does NOT mask a
+dead-local read; Trusted on the `.opaqueCast` fixture, Trusted on its cast erasure, and MiniRust on
+`Mach` and `MachTB` all report `.ub`. -/
+theorem mr_oc_dead_local_ub_non_masking :
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw ocCase9DeadLocalMir []) = .ub ∧
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw (ocEraseBody ocCase9DeadLocalMir) []) = .ub ∧
+    ocRun false [] ocMrProg9DeadLocal = .ub ∧
+    ocRun true [] ocMrProg9DeadLocal = .ub := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **`D2.3` reverse transmutation `fn(*mut u8, *mut u8) -> fn(&mut u8, *mut u8)` mode-sensitivity
+(kernel-checked)**: when the caller has NO `&mut` local and invokes a `fn(&mut u8, *mut u8)` callee
+through a transmuted `fn(*mut u8, *mut u8)` function pointer, the callee's own `FnEntry` retag
+still attaches a strong protector, so the aliased foreign write is OK (`(5, 5)`) without Tree
+Borrows and UB under Tree Borrows in both Trusted and MiniRust. -/
+theorem mr_oc_d2_rev_transmute_mode_sensitive :
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw ocCase13RevTransmuteMir [ocEraseRetags ocCase13Callee]) =
+      .okRetagPair 5 5 ∧
+    mrOcTrustedObsOf .pair (ocRunTrustedRaw ocCase13RevTransmuteMir [ocCase13Callee]) = .ub ∧
+    ocRun false [] ocMrProg13RevTransmute = .okRetagPair 5 5 ∧
+    ocRun true [] ocMrProg13RevTransmute = .ub ∧
+    runStopMsgBasic ocMrProg13RevTransmute = none ∧
+    runStopMsgTB ocMrProg13RevTransmute =
+      some "Tree Borrows: foreign read of protected Unique reference" := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- **`D1` `SetDiscriminant` payload agreement (kernel-checked)**: after
 `SetDiscriminant(_1 as TwoVar, 1)` on `TwoVar::A(7)`, the variant-`B` payload reads `7` in Trusted
@@ -1550,6 +1697,101 @@ theorem trusted_d1_d2_nonvacuity_witnesses :
       rigidTyIsUninhabited 16 (.uint .u8) = false) := by
   refine ⟨?_, ?_, ⟨rfl, rfl, rfl⟩, ⟨rfl, rfl⟩⟩ <;> kernel_rfl
 
+/-- `D1` **complete body-level cast-erasure freedom (universal, constructive)**: for EVERY
+`CapturedMir` body `b`, every place addressed anywhere in `ocEraseBody b` (statements, rvalues,
+intrinsics, and terminators) is free of `ProjectionElem.opaqueCast`. -/
+theorem mr_ocEraseBody_cast_free (b : CapturedMir) :
+    ∀ p ∈ ocBodyPlaces (ocEraseBody b), ocPlaceHasCast p = false := by
+  have hPlace : ∀ p : Place, ocPlaceHasCast (ocErasePlace p) = false := by
+    intro ⟨l, proj⟩
+    simp only [ocPlaceHasCast, ocErasePlace]
+    induction proj with
+    | nil => rfl
+    | cons e rest ih => cases e <;> simp_all [ocEraseProj]
+  have hOp : ∀ (op : Operand) (p : Place), p ∈ ocOperandPlaces (ocEraseOperand op) →
+      ocPlaceHasCast p = false := by
+    intro op p hp
+    cases op with
+    | copy q | move q =>
+      simp only [ocEraseOperand, ocOperandPlaces, List.mem_singleton] at hp
+      subst hp; exact hPlace q
+    | constant _ => simp [ocEraseOperand, ocOperandPlaces] at hp
+  have hOps : ∀ (ops : List Operand) (p : Place),
+      p ∈ (ops.map ocEraseOperand).flatMap ocOperandPlaces → ocPlaceHasCast p = false := by
+    intro ops p hp
+    simp only [List.mem_flatMap, List.mem_map] at hp
+    obtain ⟨op', ⟨op, _, rfl⟩, hp'⟩ := hp
+    exact hOp op p hp'
+  have hRv : ∀ (rv : Rvalue) (p : Place), p ∈ ocRvaluePlaces (ocEraseRvalue rv) →
+      ocPlaceHasCast p = false := by
+    intro rv p hp
+    cases rv with
+    | use op | «repeat» op _ | cast _ op _ | unaryOp _ op | shallowInitBox op _
+    | wrapUnsafeBinder op _ => exact hOp op p hp
+    | ref _ q | rawPtr _ q | len q | discriminant q | copyForDeref q =>
+      simp only [ocEraseRvalue, ocRvaluePlaces, List.mem_singleton] at hp
+      subst hp; exact hPlace q
+    | binaryOp _ a b =>
+      simp only [ocEraseRvalue, ocRvaluePlaces, List.mem_append] at hp
+      rcases hp with h | h
+      · exact hOp a p h
+      · exact hOp b p h
+    | aggregate _ ops => exact hOps ops p hp
+    | threadLocalRef _ | nullaryOp _ _ => simp [ocEraseRvalue, ocRvaluePlaces] at hp
+  intro p hp
+  simp only [ocBodyPlaces, ocEraseBody, List.mem_flatMap, List.mem_map] at hp
+  obtain ⟨bb', ⟨bb, _, rfl⟩, hbb⟩ := hp
+  simp only [List.mem_append] at hbb
+  rcases hbb with hStmts | hTerm
+  · simp only [List.mem_flatMap, List.mem_map] at hStmts
+    obtain ⟨s', ⟨s, _, rfl⟩, hs⟩ := hStmts
+    cases hk : s.kind with
+    | assign q rv =>
+      rw [hk] at hs
+      simp only [ocEraseStmt, List.mem_cons] at hs
+      rcases hs with rfl | hrv
+      · exact hPlace q
+      · exact hRv rv p hrv
+    | setDiscriminant q _ | deinit q | retag _ q | placeMention q
+    | backwardIncompatibleDropHint q =>
+      rw [hk] at hs
+      simp only [ocEraseStmt, List.mem_singleton] at hs
+      subst hs; exact hPlace q
+    | intrinsic intr =>
+      rw [hk] at hs
+      cases intr with
+      | copyNonOverlapping s1 d1 c1 =>
+        simp only [ocEraseStmt, List.mem_append] at hs
+        rcases hs with (h | h) | h
+        · exact hOp s1 p h
+        · exact hOp d1 p h
+        · exact hOp c1 p h
+      | assume op => exact hOp op p hs
+    | storageLive _ | storageDead _ | nop | coverage | constEvalCounter =>
+      rw [hk] at hs; simp [ocEraseStmt] at hs
+  · cases ht : bb.terminator.kind with
+    | switchInt d _ => rw [ht] at hTerm; exact hOp d p hTerm
+    | drop q _ _ =>
+      rw [ht] at hTerm
+      simp only [ocEraseTerm, List.mem_singleton] at hTerm
+      subst hTerm; exact hPlace q
+    | call f args d _ _ =>
+      rw [ht] at hTerm
+      simp only [ocEraseTerm, List.mem_append, List.mem_singleton] at hTerm
+      rcases hTerm with (h | h) | rfl
+      · exact hOp f p h
+      · exact hOps args p h
+      · exact hPlace d
+    | tailCall f args =>
+      rw [ht] at hTerm
+      simp only [ocEraseTerm, List.mem_append] at hTerm
+      rcases hTerm with h | h
+      · exact hOp f p h
+      · exact hOps args p h
+    | assert c _ _ _ => rw [ht] at hTerm; exact hOp c p hTerm
+    | goto _ | unwindResume | unwindTerminate | return_ | unreachable | inlineAsm _ _ _ =>
+      rw [ht] at hTerm; simp [ocEraseTerm] at hTerm
+
 end TrustedD1
 
 /-! ### `D2` (MiniRust) -/
@@ -1631,6 +1873,21 @@ theorem mr_reborrowSettings_nonvacuity :
     (∃ s, ReborrowSettings.new vl p (.Ref .Mutable ocMrU8Pointee) false params true = .ok (some s) ∧
       s.protected = .No) := by
   refine ⟨⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩, ⟨_, rfl, rfl⟩⟩
+
+/-- `D2` **MiniRust protector release on return (`end_call`, universal)**:
+(a) on `BasicMemory`, `MemoryOps.end_call` is always the identity;
+(b) on `TreeBorrowsMemory`, a callee with no protected parameters (such as case `10`, `*mut u8`)
+leaves the memory unchanged;
+(c) a single-protector callee (such as cases `12` and `15`) delegates directly to
+`TreeBorrowsMemory.release_protector`. -/
+theorem mr_end_call_laws (bm : BM) (feBm : Memory.FrameExtra BM)
+    (tbm : TBM) (prov : TreeBorrowsProvenance) :
+    MemoryOps.end_call bm feBm = .ok bm ∧
+    TreeBorrowsMemory.end_call tbm ⟨[]⟩ = .ok tbm ∧
+    TreeBorrowsMemory.end_call tbm ⟨[prov]⟩ = TreeBorrowsMemory.release_protector tbm prov :=
+  ⟨rfl, rfl, by
+    dsimp [TreeBorrowsMemory.end_call, List.foldlM, bind, Except.bind, pure, Except.pure]
+    cases TreeBorrowsMemory.release_protector tbm prov <;> rfl⟩
 
 /-! ### `D3` -/
 
@@ -1959,6 +2216,15 @@ theorem mr_checkPtrM_nonvacuity :
       ub "Value::Ptr: unaligned safe pointer") := by
   refine ⟨fun _ _ => rfl, fun _ _ => rfl, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
+/-- `D3` **`checkValue` / `checkValueM` pointer bridge (universal)**: validating any `Value.Ptr`
+at `Type.Ptr ptrTy` dispatches definitionally to `checkPtr` / `checkPtrM`. -/
+theorem mr_checkValueM_ptr_eq_checkPtrM {M : Type} [Memory M] [MemoryOps M]
+    (p : Pointer (Memory.Provenance M)) (ptrTy : PtrType) (m : Option (Machine M))
+    (pB : Pointer Prov) (mB : Option Mach) :
+    checkValueM (.Ptr p) (.Ptr ptrTy) m = checkPtrM p ptrTy m ∧
+    checkValue (.Ptr pB) (.Ptr ptrTy) mB = checkPtr pB ptrTy mB :=
+  ⟨rfl, rfl⟩
+
 end UniversalLaws
 
 /-! ## §5. Capstones -/
@@ -2010,11 +2276,13 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% @trusted_fnEntryRetagPerm ∧
     type_of% @trusted_ocEraseRetags_retag_free ∧
     type_of% trusted_d1_d2_nonvacuity_witnesses ∧
+    type_of% @mr_ocEraseBody_cast_free ∧
     type_of% @mr_basic_retag_fnEntry_irrelevant ∧
     type_of% @mr_tb_retag_raw_noop ∧
     type_of% @mr_reborrowSettings_ref_protector ∧
     type_of% @mr_reborrowSettings_box_weak_protector ∧
     type_of% mr_reborrowSettings_nonvacuity ∧
+    type_of% @mr_end_call_laws ∧
     type_of% @mr_cm_dereferenceable_ne_unsupported ∧
     type_of% @mr_checkPtr_sized_never_unsupported ∧
     type_of% @mr_checkPtrM_sized_never_unsupported_bm_tbm ∧
@@ -2023,8 +2291,12 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% @mr_checkPtrM_unaligned_always_ub ∧
     type_of% @mr_checkPtrM_none_sized_prov_unsupported ∧
     type_of% mr_checkPtrM_nonvacuity ∧
+    type_of% @mr_checkValueM_ptr_eq_checkPtrM ∧
     type_of% mr_oc_exact_ub_diagnostics ∧
     type_of% mr_oc_minimize_lowering_contrasts ∧
+    type_of% mr_oc_protected_drop_mode_sensitive ∧
+    type_of% mr_oc_dead_local_ub_non_masking ∧
+    type_of% mr_oc_d2_rev_transmute_mode_sensitive ∧
     type_of% mr_oc_setDiscriminant_payload_agreement ∧
     type_of% mr_checkPtr_some_vs_none_contrast ∧
     type_of% mr_checkPtrM_tb_some_vs_none_contrast :=
@@ -2036,13 +2308,17 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
    @trusted_evalStmt_setDiscriminant_opaqueCast, @trusted_evalTerminator_drop_opaqueCast,
    @trusted_evalFnEntryRetag_attach, @trusted_evalFnEntryRetag_ref_creates_protected_child,
    @trusted_restoreCallerProtectors_law, @trusted_fnEntryRetagPerm, @trusted_ocEraseRetags_retag_free,
-   trusted_d1_d2_nonvacuity_witnesses, @mr_basic_retag_fnEntry_irrelevant, @mr_tb_retag_raw_noop,
+   trusted_d1_d2_nonvacuity_witnesses, @mr_ocEraseBody_cast_free,
+   @mr_basic_retag_fnEntry_irrelevant, @mr_tb_retag_raw_noop,
    @mr_reborrowSettings_ref_protector, @mr_reborrowSettings_box_weak_protector,
-   mr_reborrowSettings_nonvacuity, @mr_cm_dereferenceable_ne_unsupported,
+   mr_reborrowSettings_nonvacuity, @mr_end_call_laws, @mr_cm_dereferenceable_ne_unsupported,
    @mr_checkPtr_sized_never_unsupported, @mr_checkPtrM_sized_never_unsupported_bm_tbm,
    @mr_checkPtrM_zst_always_ok, @mr_checkPtrM_null_always_ub, @mr_checkPtrM_unaligned_always_ub,
-   @mr_checkPtrM_none_sized_prov_unsupported, mr_checkPtrM_nonvacuity, mr_oc_exact_ub_diagnostics,
-   mr_oc_minimize_lowering_contrasts, mr_oc_setDiscriminant_payload_agreement,
+   @mr_checkPtrM_none_sized_prov_unsupported, mr_checkPtrM_nonvacuity,
+   @mr_checkValueM_ptr_eq_checkPtrM, mr_oc_exact_ub_diagnostics,
+   mr_oc_minimize_lowering_contrasts, mr_oc_protected_drop_mode_sensitive,
+   mr_oc_dead_local_ub_non_masking, mr_oc_d2_rev_transmute_mode_sensitive,
+   mr_oc_setDiscriminant_payload_agreement,
    mr_checkPtr_some_vs_none_contrast, mr_checkPtrM_tb_some_vs_none_contrast⟩
 
 section AxiomAudit
@@ -2061,6 +2337,16 @@ run_cmd do
     [ (ns ++ `mrOcObserve_table, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_setDiscriminant_payload_agreement, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mr_oc_setDiscriminant_payload_agreement, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mr_oc_protected_drop_mode_sensitive, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `mr_oc_protected_drop_mode_sensitive, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mr_oc_dead_local_ub_non_masking, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `mr_oc_dead_local_ub_non_masking, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mr_oc_d2_rev_transmute_mode_sensitive, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `mr_oc_d2_rev_transmute_mode_sensitive, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mr_end_call_laws, `MiniRustSpec.Interp.TreeBorrowsMemory.end_call),
+      (ns ++ `mr_end_call_laws, `MiniRustSpec.Interp.TreeBorrowsMemory.release_protector),
+      (ns ++ `mr_checkValueM_ptr_eq_checkPtrM, `MiniRustSpec.Interp.checkValueM),
+      (ns ++ `mr_checkValueM_ptr_eq_checkPtrM, `MiniRustSpec.Interp.checkValue),
       (ns ++ `mrOcObserve_table, `MiniRustSpec.CrossFrameRefAndPanicMR.bootProgramM),
       (ns ++ `mrOcObserve_table, `MiniRustSpec.Interp.checkPtrM),
       (ns ++ `mrOcObserve_table, `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable),
@@ -2132,7 +2418,7 @@ run_cmd do
         throwError "{c} must be constructive (zero Classical.choice) but depends on Classical.choice"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 45 then
+  if theorems < 50 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit
