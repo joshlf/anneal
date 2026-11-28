@@ -14,6 +14,16 @@ certificates and negative non-vacuity metatheorems, importing only `Trusted`
 (zero `Lean.*` imports, zero `Classical.choice`, zero `partial`, zero `unsafe`,
 zero `sorry`).
 
+Sections 1–7 hold the certificates and the live models they are checked against.
+Sections 8–11 hold decidable models of the compiled-environment auditor's four hardened
+vectors, together with soundness and non-evasion theorems about them:
+- V1: `_private` name de-mangling and namespace spoofing.
+- V2: whole-module unreferenced axiom sweep (`leanprover/lean4#16781`).
+- V3: artifact root containment and acyclic compacted-region bounds (`leanprover/lean4#16737`).
+- V4: the `Init.ShareCommon` ban, compiler-override hooks, and the non-blocking
+  `leanprover/lean4#14896` readiness scanner.
+`tests/mir/OleanShadowAndOverrideAuditTests.lean` exercises and pins the V1–V4 models.
+
 All definitions and theorems in this module use at most Lean's constructive
 axioms (`propext` and `Quot.sound`) and never depend on `Classical.choice`.
 -/
