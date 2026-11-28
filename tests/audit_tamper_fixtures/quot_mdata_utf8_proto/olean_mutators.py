@@ -325,3 +325,23 @@ def corrupt_olean_with_expr_cycle(raw: bytes, decl_name: str) -> bytes:
                 img.write_u64(hdr.off + 8, ep)
                 return img.to_bytes()
     raise ValueError(f"no Expr.app found in {decl_name}")
+
+
+def empty_exported_axioms(raw: bytes, decl_names: set[str]) -> tuple[bytes, int]:
+    """Set `m_size = 0` on the axiom arrays that the private `exportedAxiomsExt` extension
+    stores for `decl_names` (the per-module cache consumed by `collectAxioms` /
+    `#print axioms`). Returns `(mutated_bytes, number_of_patched_entries)`."""
+    img = OleanImage(raw)
+    rh = img.read_header(img.root_ptr)
+    patched = 0
+    for pair in img.read_array(img.read_field(rh, 4)):
+        ph = img.read_header(pair)
+        if not img.read_name(img.read_field(ph, 0)).endswith("exportedAxiomsExt"):
+            continue
+        for entry in img.read_array(img.read_field(ph, 1)):
+            eh = img.read_header(entry)
+            if img.read_name(img.read_field(eh, 0)) in decl_names:
+                arr_hdr = img.read_header(img.read_field(eh, 1))
+                img.write_u64(arr_hdr.off + 8, 0)
+                patched += 1
+    return img.to_bytes(), patched

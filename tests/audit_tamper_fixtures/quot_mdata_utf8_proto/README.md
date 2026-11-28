@@ -81,6 +81,21 @@ bypasses reproduced live against Round B1:
   truncated `ReducibilityHints.regular` `cs_sz` + `LeanMPZ` `_mp_alloc` bounds, and
   independent `.olean*` / `.ir*` compacted-region validation (`validateModuleArtifactParts`).
 
+## Adversarial Hardening Regressions (Round B2)
+
+- **V-N6 / forged axiom cache**: Lean 4.34.1 `#print axioms` / `collectAxioms` never
+  traverses imported declarations; it trusts the per-declaration axiom arrays stored in each
+  `.olean`'s private `exportedAxiomsExt` entries. Emptying those arrays makes `#print axioms`
+  report "does not depend on any axioms" for `useEvil : False := evilAx` and for an honestly
+  compiled downstream `theorem downstream : 1 = 2` (live witness in `test_six_vectors.py`).
+  Closed by `validateExportedAxiomCache` / `validateEnvModuleFull`, which recompute closures
+  from kernel constants (`independentAxiomClosures`) and reject caches that omit axioms
+  (`forgedExportedAxioms`).
+- **V-U3 / Syntax DoS**: the shallow-hash `StrictSyntaxKey` cache collapsed every node of an
+  honest `Syntax` chain into one bucket (cubic time: 160 nodes took 1.5 s); replaced by a
+  linear fuel-charged tree walk (fail-closed on oversize / exponential DAGs), an iterative
+  byte-injective `ofSyntax` key, and an `MData`-aware `StrictExprKey` hash.
+
 ## Running the Suite
 
 ```bash

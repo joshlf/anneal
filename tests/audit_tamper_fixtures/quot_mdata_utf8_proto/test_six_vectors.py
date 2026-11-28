@@ -832,6 +832,58 @@ open Lean
         self.assertTrue(probe["fixedDemandDrivenPropOk"])
         self.assertTrue(probe["fixedDemandDrivenUnfoldOk"])
 
+        # BEFORE (forged per-module axiom cache): Lean 4.34.1 `#print axioms` / `collectAxioms`
+        # never traverses imported declarations; it trusts the axiom arrays stored in each
+        # `.olean`'s `exportedAxiomsExt` entries. Emptying them launders `evilAx` out of
+        # `#print axioms` for the forged module AND for an honest downstream theorem.
+        ax_dir = self.tmp / "v_n6_axcache"
+        forged_dir = ax_dir / "forged"
+        forged_dir.mkdir(parents=True, exist_ok=True)
+        ax_src = (
+            "axiom evilAx : False\n"
+            "theorem useEvil : False := evilAx\n"
+            "theorem useEvil2 : 1 = 2 := useEvil.elim\n"
+        )
+        ax_parts, _ = self._compile_fixture("Vn6AxCache", ax_src, ["Init"], subdir=ax_dir)
+        forged_bytes, patched = mut.empty_exported_axioms(
+            ax_parts[0].read_bytes(), {"useEvil", "useEvil2"}
+        )
+        self.assertEqual(patched, 2)
+        forged_olean = forged_dir / "Vn6AxCache.olean"
+        forged_olean.write_bytes(forged_bytes)
+        driver_src = (
+            "import Vn6AxCache\n"
+            "#print axioms useEvil2\n"
+            "theorem downstream : 1 = 2 := useEvil2\n"
+            "#print axioms downstream\n"
+        )
+        lean_env = os.environ.copy()
+        for label, search_dir, expect in (
+            ("honest", ax_dir, "depends on axioms: [evilAx]"),
+            ("forged", forged_dir, "does not depend on any axioms"),
+        ):
+            drv = search_dir / f"Driver_{label}.lean"
+            drv.write_text(driver_src, encoding="utf-8")
+            lean_env["LEAN_PATH"] = f"{search_dir}:{self.sysroot / 'lib/lean'}"
+            r_drv = subprocess.run(
+                [str(self.lean), "-j1", str(drv)],
+                cwd=search_dir,
+                env=lean_env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(r_drv.returncode, 0, r_drv.stderr)
+            self.assertIn(f"'useEvil2' {expect}", r_drv.stdout, (label, r_drv.stdout))
+            self.assertIn(f"'downstream' {expect}", r_drv.stdout, (label, r_drv.stdout))
+
+        # AFTER: in-memory validation recomputes closures independently and rejects the
+        # forged cache (`forgedExportedAxioms`); the honest olean stays clean of that tag.
+        for olean, should_flag in ((ax_parts[0], False), (forged_olean, True)):
+            _, rep = self._run_proto_cli(
+                "validate-env", str(self.sysroot), "Vn6AxCache", str(olean), ""
+            )
+            self.assertEqual("forgedExportedAxioms" in rep["tags"], should_flag, rep)
+
 
 if __name__ == "__main__":
     unittest.main()

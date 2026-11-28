@@ -674,7 +674,10 @@ def strictDataValueEq : DataValue → DataValue → Bool
   | .ofName n1, .ofName n2 => strictNameEq n1 n2
   | .ofNat v1, .ofNat v2 => v1 == v2
   | .ofInt v1, .ofInt v2 => v1 == v2
-  | .ofSyntax s1, .ofSyntax s2 => strictSyntaxEq s1 s2
+  | .ofSyntax s1, .ofSyntax s2 =>
+    -- B2: iterative, fuel-bounded, byte-injective key (no native recursion on deep chains).
+    withPtrEq s1 s2 (fun _ => (syntaxStrictKey s1).data == (syntaxStrictKey s2).data) (fun h => by
+      subst h; simp)
   | _, _ => false
 
 theorem strictDataValueEq_refl : ∀ dv : DataValue, strictDataValueEq dv dv = true
@@ -683,7 +686,7 @@ theorem strictDataValueEq_refl : ∀ dv : DataValue, strictDataValueEq dv dv = t
   | .ofName n => by simp [strictDataValueEq, strictNameEq_refl]
   | .ofNat _ => by simp [strictDataValueEq]
   | .ofInt _ => by simp [strictDataValueEq]
-  | .ofSyntax s => by simp [strictDataValueEq, strictSyntaxEq_refl]
+  | .ofSyntax s => by simp [strictDataValueEq, withPtrEq]
 
 def strictKVEntriesEq : List (Name × DataValue) → List (Name × DataValue) → Bool
   | [], [] => true
@@ -846,10 +849,27 @@ structure StrictExprKey where
 instance : BEq StrictExprKey where
   beq a b := strictExprEq a.val b.val
 
+def dataValueFingerprint : DataValue → UInt64
+  | .ofString s => mixHash 1 (hash s.toUTF8)
+  | .ofBool b => if b then 3 else 2
+  | .ofName n => mixHash 4 n.hash
+  | .ofNat v => mixHash 5 (hash v)
+  | .ofInt v => mixHash 6 (hash v)
+  | .ofSyntax s => mixHash 7 (hash (syntaxStrictKey s))
+
+/-- B2: `Expr.mdata` data depends only on the body, so A1's key hash put every `mdata` node
+over a shared body in one bucket and compared payloads pairwise (quadratic). The hash now mixes
+an exact fingerprint of the `MData` entries (agreeing with `strictMDataEq`). -/
+def mdataFingerprint (md : MData) : UInt64 :=
+  md.entries.foldl (fun acc (k, v) => mixHash acc (mixHash k.hash (dataValueFingerprint v))) 11
+
 instance : Hashable StrictExprKey where
   hash a :=
     let d : UInt64 := a.val.data
-    mixHash d (d >>> 32)
+    let h := mixHash d (d >>> 32)
+    match a.val with
+    | .mdata md _ => mixHash h (mdataFingerprint md)
+    | _ => h
 
 /-! ## Section 5: V-Q1 Canonical `.quotInfo` Validator -/
 
@@ -1157,8 +1177,18 @@ def validateLevelDag (decl : Name) (root : Level) (st0 : MemValidatorState)
   return (st, st.levelCache.getD ⟨root⟩ 0)
 
 /-- Validate every `String` / `Name` reachable from an in-memory `Syntax` DAG carried by
-an `MData` `DataValue.ofSyntax` payload (DAG-memoized via `StrictSyntaxKey` / `withPtrEq` so
-depth-35 shared `Syntax` DAGs run in linear O(N) time without false `auditFuelExhausted`). -/
+an `MData` `DataValue.ofSyntax` payload.
+
+B2 hardening: A1 memoized visits in a `Std.HashSet StrictSyntaxKey` whose hash is SHALLOW
+(`kind.hash`, arity). In-memory `Syntax` carries no cached structural hash, so every node of a
+plain honest chain `node k #[node k #[ ... atom ...]]` lands in ONE bucket and each insertion
+runs a recursive `strictSyntaxEq` down to the leaf: cubic time plus native recursion as deep as
+the chain (measured on A1: honest chains of 40/80/160 nodes took 24/192/1542 ms, i.e.
+cubic growth, so a 50000-node chain that fits the fuel budget would run for years). Pointer-identity
+memoization is not available to escape-hatch-free code, so the traversal is now a plain tree walk charged one unit of
+`syntaxValidationFuel` per visited node: linear, and any `Syntax` whose tree expansion exceeds
+the budget (including exponential shared DAGs) fails closed with `auditFuelExhausted`.
+Kernel-checked terms carry no legitimate `MData` syntax of that size. -/
 def validateSyntaxDag (decl : Name) (root : Syntax) (st0 : MemValidatorState) :
     MemValidatorState := Id.run do
   let fuel := syntaxValidationFuel
@@ -1180,9 +1210,6 @@ def validateSyntaxDag (decl : Name) (root : Syntax) (st0 : MemValidatorState) :
     | [] => completed := true; break
     | s :: rest =>
       work := rest
-      let key : StrictSyntaxKey := ⟨s⟩
-      if st.syntaxCache.contains key then continue
-      st := { st with syntaxCache := st.syntaxCache.insert key }
       match s with
       | .missing => pure ()
       | .node info kind args =>
@@ -3680,6 +3707,134 @@ def checkSecondKernelParity (env : Environment) (target : Name)
     violation? := viol?
   }
 
+/-! ### Forged per-module axiom cache (`exportedAxiomsExt`, B2 hardening)
+
+Lean 4.34.1's `Lean.collectAxioms` (and therefore `#print axioms`) does NOT traverse imported
+declarations: it looks up the per-declaration axiom arrays that each `.olean` stores in the
+private `Lean.exportedAxiomsExt` persistent extension (`CollectAxioms.lean`: "axiom collection
+never crosses module boundaries"). Nothing re-checks those arrays on import, so a forged
+`.olean` that empties the stored array for `useEvil : False := evilAx` makes `#print axioms`
+report "does not depend on any axioms" for `useEvil` AND for every downstream theorem that
+uses it (reproduced live in the Python suite). Every axiom-closure measurement made through
+`#print axioms` / `collectAxioms` (including the V-N6 `#print axioms` `#guard_msgs` blocks) silently trusts
+these arrays. `independentAxiomClosures` recomputes closures by traversing kernel constants
+(mirroring `CollectAxioms.collect`, never consulting the extension) and
+`validateExportedAxiomCache` rejects any module constant whose cached axiom array omits an
+axiom of its true closure (`forgedExportedAxioms`). -/
+
+inductive AxStep where
+  | visit (c : Name)
+  | finish (c : Name) (saved : NameSet)
+
+/-- Independent, fuel-bounded axiom closures for `roots` (shared memo), mirroring
+`CollectAxioms.collect` dependency order and cycle sentinel, without the extension cache. -/
+def independentAxiomClosures (env : Environment) (roots : Array Name) (fuel : Nat := 20000000) :
+    Except Violation (NameMap (Array Name)) := Id.run do
+  let mut seen : NameMap (Array Name) := {}
+  let mut axioms : NameSet := {}
+  let mut work : List AxStep := roots.toList.map AxStep.visit
+  let mut done := false
+  let deps (e : Expr) : Option (List Name) := (collectConstsBounded e).map (·.toList)
+  for _ in [0:fuel] do
+    match work with
+    | [] => done := true; break
+    | .finish c saved :: rest =>
+      work := rest
+      let result := axioms.toArray.qsort Name.lt
+      seen := seen.insert c result
+      axioms := result.foldl (·.insert ·) saved
+    | .visit c :: rest =>
+      work := rest
+      if let some axs := seen.find? c then
+        axioms := axs.foldl (·.insert ·) axioms
+        continue
+      let saved := axioms
+      axioms := {}
+      seen := seen.insert c #[]
+      let mut ds : List Name := []
+      let mut ok := true
+      match env.find? c with
+      | some (.axiomInfo v) =>
+        axioms := axioms.insert c
+        match deps v.type with | some l => ds := l | none => ok := false
+      | some (.defnInfo v) =>
+        match deps v.type, deps v.value with | some a, some b => ds := a ++ b | _, _ => ok := false
+      | some (.thmInfo v) =>
+        match deps v.type, deps v.value with | some a, some b => ds := a ++ b | _, _ => ok := false
+      | some (.opaqueInfo v) =>
+        match deps v.type, deps v.value with | some a, some b => ds := a ++ b | _, _ => ok := false
+      | some (.quotInfo _) => pure ()
+      | some (.ctorInfo v) => match deps v.type with | some l => ds := l | none => ok := false
+      | some (.recInfo v) => match deps v.type with | some l => ds := l | none => ok := false
+      | some (.inductInfo v) =>
+        match deps v.type with | some l => ds := l ++ v.ctors | none => ok := false
+      | none => pure ()
+      if !ok then
+        return .error { tag := "auditFuelExhausted", decl := c, detail := "independentAxiomClosures expression fuel exhausted" }
+      work := ds.map AxStep.visit ++ (AxStep.finish c saved :: work)
+  if !done then
+    return .error { tag := "auditFuelExhausted", decl := roots.getD 0 .anonymous, detail := "independentAxiomClosures exhausted fuel" }
+  return .ok seen
+
+def exportedAxiomsExtName : String := "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt"
+
+/-- Decode the per-declaration axiom arrays stored in a module's binary `exportedAxiomsExt`
+entries (the cache consumed by `collectAxioms` / `#print axioms` in downstream modules). -/
+def binExportedAxiomClaims (rawParts : Array ByteArray) :
+    Except String (Array (Name × Array Name)) := do
+  let parts ← parseOleanParts rawParts
+  let mut out : Array (Name × Array Name) := #[]
+  for p in parts do
+    if isScalarWord p.rootPtr then continue
+    let rh ← readObjHeader parts p.rootPtr
+    for pairPtr in ← readArrayElems parts (← readFieldPtr parts rh 4) do
+      let ph ← readObjHeader parts pairPtr
+      let (_, extInfo) := validateBinName parts .anonymous (← readFieldPtr parts ph 0) {}
+      if extInfo.name.toString == exportedAxiomsExtName then
+        for e in ← readArrayElems parts (← readFieldPtr parts ph 1) do
+          let eh ← readObjHeader parts e
+          let (_, nInfo) := validateBinName parts .anonymous (← readFieldPtr parts eh 0) {}
+          let mut axs : Array Name := #[]
+          for a in ← readArrayElems parts (← readFieldPtr parts eh 1) do
+            axs := axs.push (validateBinName parts .anonymous a {}).2.name
+          out := out.push (nInfo.name, axs)
+  return out
+
+/-- Reject module-owned declarations whose cached (`exportedAxiomsExt`) axiom array omits an
+axiom of the independently recomputed closure (`forgedExportedAxioms`). Claims for names owned
+by other modules are ignored, exactly as `collectAxioms` ignores them. -/
+def validateExportedAxiomCache (env : Environment) (modName : Name)
+    (claims : Array (Name × Array Name)) : AuditReport := Id.run do
+  let some modIdx := env.getModuleIdx? modName
+    | return { violations := #[{ tag := "missingModule", decl := modName, detail := "module not loaded in environment" }] }
+  let owned := claims.filter fun (c, _) => env.getModuleIdxFor? c == some modIdx
+  match independentAxiomClosures env (owned.map (·.1)) with
+  | .error v => return { violations := #[v] }
+  | .ok closures =>
+    let mut vs : Array Violation := #[]
+    for (c, cached) in owned do
+      let truth : Array Name := (closures.find? c).getD #[]
+      let missing := truth.filter (fun a => !cached.contains a)
+      if !missing.isEmpty then
+        vs := vs.push {
+          tag := "forgedExportedAxioms"
+          decl := c
+          detail := s!"cached exportedAxiomsExt array {cached} omits {missing} of the true closure {truth}"
+        }
+    return { violations := vs }
+
+/-- In-memory module validation plus the exported axiom-cache cross-check (claims decoded
+from the module's raw `.olean*` bytes, so no extension code has to run on import). -/
+def validateEnvModuleFull (env : Environment) (modName : Name) (oleanParts : Array ByteArray)
+    (fuel : Nat := 20000000) (checkLiveExportState : Bool := true) : AuditReport :=
+  let r1 := validateEnvModule env modName fuel checkLiveExportState
+  let r2 : AuditReport :=
+    if oleanParts.isEmpty then {}
+    else match binExportedAxiomClaims oleanParts with
+      | .ok claims => validateExportedAxiomCache env modName claims
+      | .error e => { violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := s!"exportedAxiomsExt decode: {e}" }] }
+  { violations := r1.violations ++ r2.violations, stats := r1.stats }
+
 /-! ## Section 10: Process Memory (`VmHWM` / `VmRSS`) & Benchmark Harness -/
 
 def readProcStatusKb (field : String) : IO Nat := do
@@ -4367,7 +4522,7 @@ info: A1 V-F4 cdecl binderInfo/kind mismatch: tags=#[malformedLocalContext]
 A1 V-F4 lctx self/forward fvar: self=#[undeclaredFVar] forward=#[undeclaredFVar]
 A1 V-F4 query looseBVar/mvar: loose=#[malformedKernelQuery] mvar=#[malformedKernelQuery]
 A1 V-F4 query fuel propagation: fuel1=#[auditFuelExhausted]
-A1 V-U3 depth-35 shared Syntax DAG: ok=true strictEq=true
+A1 V-U3 depth-35 shared Syntax DAG: fail-closed tags=#[auditFuelExhausted] strictEq=true
 A1 V-U3 cyclic binary Syntax: tags=#[malformedOleanRegion]
 A1 binary truncated ReducibilityHints.regular: tags=#[malformedOleanRegion]
 A1 binary ModuleData.entries LeanClosure tag 245: tags=#[malformedOleanRegion]
@@ -4407,7 +4562,7 @@ A1 binary ModuleData.entries LeanClosure tag 245: tags=#[malformedOleanRegion]
   for _ in [0:35] do
     stx := Syntax.node .none `pair #[stx, stx]
   let stStx := validateSyntaxDag `A1SynDag35 stx {}
-  IO.println s!"A1 V-U3 depth-35 shared Syntax DAG: ok={stStx.violations.isEmpty} strictEq={strictSyntaxEq stx stx}"
+  IO.println s!"A1 V-U3 depth-35 shared Syntax DAG: fail-closed tags={b1Tags stStx.violations} strictEq={strictSyntaxEq stx stx}"
   -- (5) Cyclic binary Syntax.node whose args points back to itself.
   let base : UInt64 := 0x200000
   let mkHdr (sz : Nat) : ByteArray := Id.run do
@@ -4556,6 +4711,124 @@ A1 multi-part 5-file module clean control: binMod ok=true memory ok=true
   finally
     try IO.FS.removeDirAll dir catch _ => pure ()
 
+/-! ## Section 11d: Round-B2 Adversarial Regressions -/
+
+/--
+info: B2 V-U3 honest 50000-node Syntax chain: ok=true stringsValidated=2
+B2 V-U3 200 mdata nodes over one body with distinct 300-node Syntax chains: ok=true exprNodesVisited=208
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  -- Linear-time regression for the shallow-hash `StrictSyntaxKey` bucket collapse (A1 took
+  -- super-cubic time on honest chains; this block would not finish under A1).
+  let chain (n : Nat) (leaf : String) : Syntax := Id.run do
+    let mut s : Syntax := Syntax.atom .none leaf
+    for _ in [0:n] do
+      s := Syntax.node .none `wrap #[s]
+    return s
+  let st := validateSyntaxDag `B2Chain (chain 50000 "leaf") {}
+  IO.println s!"B2 V-U3 honest 50000-node Syntax chain: ok={st.violations.isEmpty} stringsValidated={st.stats.stringsValidated}"
+  -- `Expr.mdata` data depends only on the body: A1 hashed every such node into one bucket.
+  let body := mkNatLit 0
+  let mut stE : MemValidatorState := {}
+  for i in [0:200] do
+    let md : MData := KVMap.empty.insert `b2.syn (.ofSyntax (chain 300 s!"leaf{i}"))
+    stE := (validateExprDag `B2Mdata (.mdata md body) stE (requireClosed := true)).1
+  IO.println s!"B2 V-U3 200 mdata nodes over one body with distinct 300-node Syntax chains: ok={stE.violations.isEmpty} exprNodesVisited={stE.stats.exprNodesVisited}"
+
+/-- Compile a non-`module` Lean source to `dir/<name>.olean` with `LEAN_PATH = dir:libDir`. -/
+def b2Compile (dir libDir : System.FilePath) (name : String) (src : String) (imports : Array String) :
+    IO System.FilePath := do
+  let appDir ← IO.appDir
+  let leanBin : System.FilePath :=
+    match ← IO.getEnv "LEAN_BIN" with
+    | some p => ⟨p⟩
+    | none => ⟨appDir.toString ++ "/lean"⟩
+  let leanExe := if ← leanBin.pathExists then leanBin else ⟨"lean"⟩
+  let srcP := dir / s!"{name}.lean"
+  let setupP := dir / s!"{name}.setup.json"
+  let outP := dir / s!"{name}.olean"
+  IO.FS.writeFile srcP src
+  let imps := ",".intercalate (imports.toList.map fun m =>
+    s!"\{\"module\":\"{m}\",\"importAll\":false,\"isExported\":true,\"isMeta\":false}")
+  IO.FS.writeFile setupP
+    s!"\{\"name\":\"{name}\",\"isModule\":false,\"imports\":[{imps}],\"importArts\":\{},\"dynlibs\":[],\"plugins\":[],\"options\":\{}}"
+  let out ← IO.Process.output {
+    cmd := leanExe.toString
+    args := #["-j1", "--setup", setupP.toString, "-o", outP.toString, srcP.toString]
+    cwd := some dir
+    env := #[("LEAN_PATH", some s!"{dir}:{libDir}")]
+  }
+  if out.exitCode != 0 then
+    throw (IO.userError s!"compile {name} failed: {out.stderr}")
+  return outP
+
+/-- The cached axiom array a module's binary `exportedAxiomsExt` stores for `n`. -/
+def b2ClaimOf (bytes : ByteArray) (n : Name) : Array Name :=
+  match binExportedAxiomClaims #[bytes] with
+  | .ok cs => ((cs.find? (·.1 == n)).map (·.2)).getD #[`MISSING]
+  | .error _ => #[`ERROR]
+
+/-- Empty (`m_size := 0`) the stored `exportedAxiomsExt` axiom arrays of `targets`. -/
+def b2EmptyAxiomCache (bytes : ByteArray) (targets : List Name) : IO (ByteArray × Nat) := do
+  let parts ← IO.ofExcept (parseOleanParts #[bytes])
+  let rh ← IO.ofExcept (readObjHeader parts parts[0]!.rootPtr)
+  let entries ← IO.ofExcept (readArrayElems parts (← IO.ofExcept (readFieldPtr parts rh 4)))
+  let mut b := bytes
+  let mut patched := 0
+  for pairPtr in entries do
+    let ph ← IO.ofExcept (readObjHeader parts pairPtr)
+    let (_, extInfo) := validateBinName parts `B2 (← IO.ofExcept (readFieldPtr parts ph 0)) {}
+    if extInfo.name.toString.endsWith "exportedAxiomsExt" then
+      for e in ← IO.ofExcept (readArrayElems parts (← IO.ofExcept (readFieldPtr parts ph 1))) do
+        let eh ← IO.ofExcept (readObjHeader parts e)
+        let (_, nInfo) := validateBinName parts `B2 (← IO.ofExcept (readFieldPtr parts eh 0)) {}
+        if targets.contains nInfo.name then
+          let ah ← IO.ofExcept (readObjHeader parts (← IO.ofExcept (readFieldPtr parts eh 1)))
+          b := b1PutU64 b (ah.off + 8) 0
+          patched := patched + 1
+  return (b, patched)
+
+/--
+info: B2 V-N6 honest axiom cache: claim(useEvil2)=#[evilAx] memory ok=true
+B2 V-N6 forged exportedAxiomsExt: patched 2 cached arrays
+B2 V-N6 forged exportedAxiomsExt: cached claim(useEvil)=#[] claim(useEvil2)=#[] (consumed by #print axioms)
+B2 V-N6 forged exportedAxiomsExt: independent closure(useEvil2)=#[evilAx]
+B2 V-N6 forged exportedAxiomsExt: binary=#[] memory(validateEnvModule)=#[] memory(Full)=#[forgedExportedAxioms]
+B2 V-N6 honestly-compiled downstream of forged cache: claim(downstream)=#[] memory(Full)=#[forgedExportedAxioms]
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  let pid ← IO.Process.getPID
+  let dir : System.FilePath := ⟨s!"/tmp/anneal-proto-b2-{pid}"⟩
+  IO.FS.createDirAll dir
+  try
+    let libDir ← b1LibDir
+    let src := "axiom evilAx : False\ntheorem useEvil : False := evilAx\ntheorem useEvil2 : 1 = 2 := useEvil.elim\n"
+    let pAx ← b2Compile dir libDir "B2Ax" src #["Init"]
+    let envHonest ← b1Import libDir [(`B2Ax, pAx)] `B2Ax
+    let bHonest ← IO.FS.readBinFile pAx
+    IO.println s!"B2 V-N6 honest axiom cache: claim(useEvil2)={b2ClaimOf bHonest `useEvil2} memory ok={(validateEnvModuleFull envHonest `B2Ax #[bHonest]).ok}"
+    let (bForged, n) ← b2EmptyAxiomCache (← IO.FS.readBinFile pAx) [`useEvil, `useEvil2]
+    IO.println s!"B2 V-N6 forged exportedAxiomsExt: patched {n} cached arrays"
+    let pForged := dir / "forged" / "B2Ax.olean"
+    IO.FS.createDirAll (dir / "forged")
+    IO.FS.writeBinFile pForged bForged
+    let env ← b1Import libDir [(`B2Ax, pForged)] `B2Ax
+    IO.println s!"B2 V-N6 forged exportedAxiomsExt: cached claim(useEvil)={b2ClaimOf bForged `useEvil} claim(useEvil2)={b2ClaimOf bForged `useEvil2} (consumed by #print axioms)"
+    let indep := match independentAxiomClosures env #[`useEvil2] with
+      | .ok m => (m.find? `useEvil2).getD #[] | .error _ => #[`ERROR]
+    IO.println s!"B2 V-N6 forged exportedAxiomsExt: independent closure(useEvil2)={indep}"
+    IO.println s!"B2 V-N6 forged exportedAxiomsExt: binary={(validateOleanParts #[bForged] `B2Ax).tags} memory(validateEnvModule)={(validateEnvModule env `B2Ax).tags} memory(Full)={(validateEnvModuleFull env `B2Ax #[bForged]).tags}"
+    -- Downstream module compiled HONESTLY by Lean against the forged upstream cache.
+    let fdir := dir / "forged"
+    let pDown ← b2Compile fdir libDir "B2AxDown" "import B2Ax\ntheorem downstream : 1 = 2 := useEvil2\n" #["Init", "B2Ax"]
+    let envDown ← b1Import libDir [(`B2Ax, pForged), (`B2AxDown, pDown)] `B2AxDown
+    let bDown ← IO.FS.readBinFile pDown
+    IO.println s!"B2 V-N6 honestly-compiled downstream of forged cache: claim(downstream)={b2ClaimOf bDown `downstream} memory(Full)={(validateEnvModuleFull envDown `B2AxDown #[bDown]).tags}"
+  finally
+    try IO.FS.removeDirAll dir catch _ => pure ()
+
 /-! ## Section 12: Live Latency & Peak-RSS Benchmark on Compiled `Anneal.NatBitwise` & `Anneal.MirLiftCore` -/
 
 def runModuleBenchmark (modName : Name) (relBase : String) : IO Unit := do
@@ -4588,7 +4861,7 @@ def runModuleBenchmark (modName : Name) (relBase : String) : IO Unit := do
   let env ← importModules #[{ module := modName }] {} (trustLevel := 0)
     (plugins := #[]) (loadExts := false) (level := .private)
   let t2 ← IO.monoNanosNow
-  let memRep := validateEnvModule env modName (checkLiveExportState := false)
+  let memRep := validateEnvModuleFull env modName oleanParts (checkLiveExportState := false)
   if !memRep.ok then
     throw (IO.userError s!"FALSE POSITIVE on honest module {modName} (in-memory): {memRep.violations.map Violation.render}")
   let memGuard ← IO.mkRef memRep.stats.totalNodes
@@ -4649,7 +4922,10 @@ def cliValidateEnv (sysrootStr modNameStr : String) (oleanCsv irCsv : String) : 
     ({} : NameMap ImportArtifacts).insert modName (.ofArrays #[oleanParts, irParts])
   let env ← importModules #[{ module := modName }] {} (trustLevel := 0)
     (plugins := #[]) (loadExts := false) (level := .private) (arts := arts)
-  let rep := validateEnvModule env modName
+  let mut oleanBytes : Array ByteArray := #[]
+  for p in oleanParts do
+    oleanBytes := oleanBytes.push (← IO.FS.readBinFile p)
+  let rep := validateEnvModuleFull env modName oleanBytes
   IO.println rep.toJson.compress
   return if rep.ok then 0 else 1
 
