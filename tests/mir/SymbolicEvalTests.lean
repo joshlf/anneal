@@ -4194,6 +4194,9 @@ private theorem listScalar2_eq_of_beq {xs : List ScalarInt} {b1 b2 : ScalarInt}
 -- Plain step-loop mirrors of `checkMirBoolExecBounded` and
 -- `checkMirRustPinnedSpecOptWithCallees` without periodic spine-normalization
 -- passes, proved equal via `stepMirStatePeriodic_eq` for closed kernel checks.
+-- `v26ModularAndCanary_checks` deliberately keeps the real
+-- `checkMirAutoModularPinnedSpec`, so the periodic normalizers still run on a
+-- closure-deref `ensures` body (`v26ReadAndOffsetEnsMir`) in this section.
 private def checkMirBoolExecPlain : Nat → CapturedMir → MirExecState → Bool
   | 0, _, _ => false
   | fuel' + 1, body, st =>
@@ -4241,7 +4244,7 @@ private theorem checkMirBoolExecPlain_eq
       · exact ih (k PUnit.unit)
       · rfl
 
-private theorem checkMirBoolWithCalleesPlain_eq
+private theorem checkMirBoolWithCalleesBounded_of_plain
     {fuel : Nat} {specBody : CapturedMir} {callees : List CapturedMir}
     {args : List Value}
     (h : checkMirBoolExecPlain fuel specBody
@@ -4249,7 +4252,7 @@ private theorem checkMirBoolWithCalleesPlain_eq
     checkMirBoolWithCalleesBounded fuel specBody callees args = true :=
   (checkMirBoolExecPlain_eq fuel specBody _).symm.trans h
 
-private theorem checkMirBoolFuelFreePlain_eq
+private theorem checkMirBoolBounded_of_plain
     {specBody : CapturedMir} {args : List Value}
     (h : checkMirBoolExecPlain 128 specBody
       (.running (initMachineState specBody args)) = true) :
@@ -4357,7 +4360,7 @@ private theorem v26FfiReadReg_subjEns64 :
       checkMirBoolWithCalleesBounded 64 v26FfiReadRegEnsMir []
         [.scalar ⟨10, 4⟩, .scalar ⟨42, 4⟩] :=
     by rfl
-  exact h.trans (checkMirBoolWithCalleesPlain_eq v26FfiReadReg_checks.1)
+  exact h.trans (checkMirBoolWithCalleesBounded_of_plain v26FfiReadReg_checks.1)
 
 private theorem v26FfiReadReg_subjSpecEns16 :
     checkMirRustPinnedSpecOptWithSpecCallees 16 64 v26FfiReadRegMir [] []
@@ -4368,7 +4371,7 @@ private theorem v26FfiReadReg_subjSpecEns16 :
       checkMirBoolWithCalleesBounded 64 v26FfiReadRegEnsMir []
         [.scalar ⟨10, 4⟩, .scalar ⟨42, 4⟩] :=
     by rfl
-  exact h.trans (checkMirBoolWithCalleesPlain_eq v26FfiReadReg_checks.1)
+  exact h.trans (checkMirBoolWithCalleesBounded_of_plain v26FfiReadReg_checks.1)
 
 private theorem v26FfiReadReg_autoCheck :
     checkMirAutoPinnedSpecWithCallees 64 64 v26FfiReadRegMir []
@@ -4429,7 +4432,7 @@ theorem v26FfiReadRegUntypedClaim_refuted :
       16
       [.aggregate 0 [.scalar { bits := 10, sizeBytes := 4 }]]
       ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree v26FfiReadRegReqMir _
-        (checkMirBoolFuelFreePlain_eq v26FfiReadReg_checks.2.2.2.2)⟩⟩
+        (checkMirBoolBounded_of_plain v26FfiReadReg_checks.2.2.2.2)⟩⟩
 
 def v26ClampAddOneMir : CapturedMir := mkV26AddConstU32Mir "sym_test::clamp_add_one" 1
 def v26ClampAddOneReqMir : CapturedMir :=
@@ -4706,7 +4709,7 @@ theorem v26FfiReadRegEnsUntypedRet_accepted :
     MirBoolPredicateHolds v26FfiReadRegEnsMir
       ([.scalar ⟨10, 4⟩] ++ [.aggregate 0 [.scalar ⟨42, 4⟩]]) :=
   mirBoolPredicateHolds_of_wp_fuelFree v26FfiReadRegEnsMir _
-    (checkMirBoolFuelFreePlain_eq v26ModularAndCanary_checks.2.2.2.1)
+    (checkMirBoolBounded_of_plain v26ModularAndCanary_checks.2.2.2.1)
 
 /-- The closure-deref checkers are exact: a wrong pinned value, a pin or return width that
 disagrees with the `u32` parameter / return binder, and a loosened upper bound are all
@@ -5056,7 +5059,8 @@ private theorem v26AddTwoRegs_subjEns64 :
       checkMirBoolWithCalleesBounded 64 v26AddTwoRegsEnsMir []
         [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩] :=
     by rfl
-  exact h.trans (checkMirBoolWithCalleesPlain_eq v26AddTwoRegs_checks.2.2)
+  exact h.trans
+    (checkMirBoolWithCalleesBounded_of_plain v26AddTwoRegs_checks.2.2)
 
 private theorem v26AddTwoRegs_subjSpecEns16 :
     checkMirRustPinnedSpecOptWithSpecCallees 16 64 v26AddTwoRegsMir [] []
@@ -5068,7 +5072,8 @@ private theorem v26AddTwoRegs_subjSpecEns16 :
       checkMirBoolWithCalleesBounded 64 v26AddTwoRegsEnsMir []
         [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩] :=
     by rfl
-  exact h.trans (checkMirBoolWithCalleesPlain_eq v26AddTwoRegs_checks.2.2)
+  exact h.trans
+    (checkMirBoolWithCalleesBounded_of_plain v26AddTwoRegs_checks.2.2)
 
 theorem v26AddTwoRegsPinnedAuto_verified :
     extractMirRequiresPins 64 v26AddTwoRegsReqMir = [⟨10, 4⟩, ⟨20, 4⟩] ∧
