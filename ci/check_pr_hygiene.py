@@ -44,7 +44,8 @@ tree at `--head`:
   paths, the added lines of changed files, and every line of files entering
   Anneal scope or turning from binary into text; without it, every path and
   line in scope at `--head`. Binary blobs skip only the shortest patterns
-  (see `decode_blob`), and commit messages are not scanned.
+  (see `decode_blob`), and commit messages are not scanned. Hits in vendored
+  paths that `ci/test_repo_hygiene.py` still checks are warnings.
 - `layout`: the candidate head changes the repository layout that the
   target base uses.
 
@@ -186,6 +187,13 @@ TRUST_TIER_RE = re.compile(r"--\s*anneal-trust-tier:")
 # Ephemeral agent batons that must never be committed.
 BANNED_FILENAME_RE = re.compile(
     r"(^|/)(HANDOFF|PROGRESS|REPRODUCE[^/]*)\.md$")
+# Vendored corpora whose content `ci/test_repo_hygiene.py` skips, relative to
+# `Layout.root`; it checks the rest of `Layout.excluded` (see
+# `_hygiene_vendor`).
+REPO_HYGIENE_EXCLUDED_PREFIXES = (
+    "minirust/vendor/",
+    "theory/MiniRust/vendor/",
+)
 # Internal-only skills, relative to `Layout.root`.
 BANNED_INTERNAL_PREFIXES = (
     "skills/adversarial-rounds/",
@@ -1796,12 +1804,29 @@ def decode_blob(
         return raw.decode("utf-8", "replace"), binary
 
 
+def _hygiene_vendor(path: str, layout: Layout) -> bool:
+    """Whether `path` is a vendored path under `Layout.root`.
+
+    Such paths skip this script's lint, but `ci/test_repo_hygiene.py` still
+    checks their names and, outside `REPO_HYGIENE_EXCLUDED_PREFIXES`, their
+    content.
+    """
+    return path.startswith(layout.root) and path.startswith(layout.excluded)
+
+
+def _hygiene_scans_content(path: str, layout: Layout) -> bool:
+    return layout.in_scope(path) or (
+        _hygiene_vendor(path, layout)
+        and not path[len(layout.root):].startswith(
+            REPO_HYGIENE_EXCLUDED_PREFIXES))
+
+
 def internal_findings(
     git: Git, head: str, layout: Layout,
     files: dict[str, ChangedFile] | None = None,
     base: str | None = None,
-) -> list[Finding]:
-    """`internal-path` and `internal-reference` findings at `head`.
+) -> tuple[list[Finding], list[Finding]]:
+    """`internal-path` and `internal-reference` findings and warnings.
 
     With `files` (diff mode), checks each non-deleted in-scope changed path,
     every line of a file entering Anneal scope or text scope (added, copied,
@@ -1811,55 +1836,76 @@ def internal_findings(
     `files` (tree mode), checks every in-scope path and line. Like
     `ci/test_repo_hygiene.py`, binary blobs are scanned for long patterns
     only (see `decode_blob`); a symbolic link is scanned as its target text.
+
+    Vendored paths are out of scope, but `ci/test_repo_hygiene.py` still
+    checks most of them (see `_hygiene_vendor`), so the same checks report
+    their hits as warnings: the change passes here, yet the warning names
+    what that test would reject after merge.
     """
     out: list[Finding] = []
+    warn: list[Finding] = []
+
+    def report(check: str, msg: str, path: str,
+               line: int | None = None) -> None:
+        if layout.in_scope(path):
+            out.append(Finding(check, msg, path, line))
+        else:
+            warn.append(Finding(
+                check, msg + "; the path is out of scope here, but "
+                "`ci/test_repo_hygiene.py` checks it", path, line))
+
+    def path_check(path: str) -> None:
+        msg = internal_path_message(path, layout)
+        if msg is not None:
+            report("internal-path", msg, path)
+
     # `(path, is_sym, oid, prev_oid, prev_path, prev_sym, lines)`.
     scan: list[tuple[str, bool, str, str | None, str, bool,
                      set[int] | None]] = []
     if files is None:
         records = git.tree_records(head)
         for path in sorted(records):
-            if not layout.in_scope(path):
+            if not (layout.in_scope(path) or _hygiene_vendor(path, layout)):
                 continue
-            msg = internal_path_message(path, layout)
-            if msg is not None:
-                out.append(Finding("internal-path", msg, path))
+            path_check(path)
             mode, kind, oid = records[path]
-            if kind == "blob":
+            if kind == "blob" and _hygiene_scans_content(path, layout):
                 scan.append(
                     (path, mode == "120000", oid, None, "", False, None))
     else:
         changed = [
             f for f in sorted(files.values(), key=lambda f: f.path)
-            if f.status != "D" and layout.in_scope(f.path)
+            if f.status != "D" and (layout.in_scope(f.path)
+                                    or _hygiene_vendor(f.path, layout))
         ]
         if not changed:
-            return []
+            return [], []
+
+        def entered(f: ChangedFile) -> bool:
+            # Lines move from warnings into findings when a file enters
+            # Anneal scope, and into either when it enters content scanning.
+            covered = (layout.in_scope if layout.in_scope(f.path)
+                       else lambda p: _hygiene_scans_content(p, layout))
+            return f.status in ("A", "C") or (
+                f.old_path is not None and not covered(f.old_path))
+
         records = git.tree_records(head, [f.path for f in changed])
-        prev_lookup: list[str] = []
-        for f in changed:
-            entered = f.status in ("A", "C") or (
-                f.old_path is not None and not layout.in_scope(f.old_path))
-            if not entered and base is not None:
-                prev_lookup.append(f.old_path or f.path)
+        prev_lookup = [f.old_path or f.path for f in changed
+                       if not entered(f) and base is not None]
         base_records = (
             git.tree_records(base, prev_lookup) if prev_lookup else {}
         )
         for f in changed:
-            msg = internal_path_message(f.path, layout)
-            if msg is not None:
-                out.append(Finding("internal-path", msg, f.path))
+            path_check(f.path)
             rec = records.get(f.path)
             if rec is None:
                 raise GitError(f"cannot find {head[:12]}:{f.path}")
             # Submodule entries (`commit`) have no blob content here.
-            if rec[1] != "blob":
+            if rec[1] != "blob" or not _hygiene_scans_content(f.path, layout):
                 continue
             is_sym = rec[0] == "120000"
             oid = rec[2]
-            entered = f.status in ("A", "C") or (
-                f.old_path is not None and not layout.in_scope(f.old_path))
-            if entered:
+            if entered(f):
                 scan.append((f.path, is_sym, oid, None, "", False, None))
                 continue
             if base is not None:
@@ -1899,14 +1945,14 @@ def internal_findings(
         for lineno, label in internal_reference_hits(
             text, lines, binary=binary, short_on_all_lines=became_text
         ):
-            out.append(Finding(
+            report(
                 "internal-reference",
                 f"internal-infrastructure reference ({label}); public "
                 "content must not name internal tools, hosts, users, or "
                 "paths",
                 path, lineno,
-            ))
-    return out
+            )
+    return out, warn
 
 
 def detect_layout(git: Git, commit: str) -> Layout:
@@ -2006,7 +2052,9 @@ def check(
     report.findings += agents_budget_findings(git, head, layout)
     report.findings += crr_parity_findings(git, head, layout)
     if target_base is None:
-        report.findings += internal_findings(git, head, layout)
+        errs, warns = internal_findings(git, head, layout)
+        report.findings += errs
+        report.warnings += warns
         return report, meta
 
     merge_base = git.text("merge-base", target_base, head).strip()
@@ -2044,8 +2092,9 @@ def check(
         report.findings += commit_message_findings(c.sha, c.message)
 
     files = changed_files(git, merge_base, head)
-    report.findings += internal_findings(
-        git, head, layout, files, merge_base)
+    errs, warns = internal_findings(git, head, layout, files, merge_base)
+    report.findings += errs
+    report.warnings += warns
     scoped = [f for f in files.values() if in_anneal_scope(f.path, layout)]
     citation_prefixes = layout.trusted_citation_prefixes
     check_paths = [f.path for f in scoped if f.status != "D"]

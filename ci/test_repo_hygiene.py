@@ -24,11 +24,9 @@ import check_pr_hygiene as cph  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Exclude vendored third-party corpora whose upstream prose is outside Anneal's
-# authoring boundary.
-_EXCLUDED_PREFIXES = (
-    "minirust/vendor/",
-    "theory/MiniRust/vendor/",
-)
+# authoring boundary. `check_pr_hygiene.py` warns about the vendored paths
+# that this test still scans.
+_EXCLUDED_PREFIXES = cph.REPO_HYGIENE_EXCLUDED_PREFIXES
 
 _BANNED_FILENAME_RE = cph.BANNED_FILENAME_RE
 _BANNED_INTERNAL_PREFIXES = cph.BANNED_INTERNAL_PREFIXES

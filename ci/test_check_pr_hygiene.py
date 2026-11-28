@@ -1404,10 +1404,10 @@ class InternalHygieneMixin:
     USER = "mark" + "dittmer"
     WORKSTATION = "/usr/local/" + "google"
 
-    def internal(self, *args: str, **kw) -> set[tuple]:
+    def internal(self, *args: str, key: str = "findings", **kw) -> set[tuple]:
         """Internal findings as `(check, path, line, label)` tuples."""
         out = set()
-        for f in self.findings(*args, **kw):
+        for f in self.run_check(*args, **kw)[1][key]:
             if f["check"] == "internal-reference":
                 label = f["message"].split("(", 1)[1].split(")", 1)[0]
                 out.add((f["check"], f["path"], f["line"], label))
@@ -1506,11 +1506,55 @@ class InternalHygieneMixin:
         self.assertEqual(self.internal(), set())
 
     def test_vendored_corpora_are_excluded(self):
+        # Vendored paths never fail here, but the ones whose content
+        # `ci/test_repo_hygiene.py` still scans are reported as warnings, as
+        # are banned names anywhere in them.
+        expected = set()
         for prefix in cph.LAYOUTS[self.LAYOUT].excluded:
             self.write(prefix + "up/x.txt", f"{self.CLI} {self.MOUNT}\n")
+            self.write(prefix + "HANDOFF.md", "x\n")
+            expected.add(("internal-path", prefix + "HANDOFF.md", None, None))
+            if not prefix[len(self.ROOT):].startswith(
+                    cph.REPO_HYGIENE_EXCLUDED_PREFIXES):
+                expected |= {
+                    ("internal-reference", prefix + "up/x.txt", 1, label)
+                    for label in ("internal-cli", "internal-mount")}
         self.commit()
+        for base in ("base", None):
+            code, report = self.run_check(base=base)
+            self.assertEqual(code, 0, report)
+            self.assertEqual(self.internal(base=base), set())
+            self.assertEqual(self.internal(base=base, key="warnings"),
+                             expected)
+        # Renaming a scanned vendored file into scope turns warnings into
+        # findings on every line.
+        scanned = [p for p in cph.LAYOUTS[self.LAYOUT].excluded
+                   if not p[len(self.ROOT):].startswith(
+                       cph.REPO_HYGIENE_EXCLUDED_PREFIXES)][0]
+        git(self.repo, "branch", "-f", "base")
+        (self.repo / self.ROOT / "docs").mkdir(parents=True, exist_ok=True)
+        git(self.repo, "mv", scanned + "up/x.txt", self.ROOT + "docs/x.txt")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            self.ref("docs/x.txt", 1, "internal-cli"),
+            self.ref("docs/x.txt", 1, "internal-mount"),
+        })
+
+    def test_vendored_edits_warn_on_added_lines_only(self):
+        vendor = [p for p in cph.LAYOUTS[self.LAYOUT].excluded
+                  if not p[len(self.ROOT):].startswith(
+                      cph.REPO_HYGIENE_EXCLUDED_PREFIXES)][0]
+        filler = "".join(f"filler line {i}\n" for i in range(20))
+        self.write(vendor + "up/old.txt", f"old {self.MOUNT}\n" + filler)
+        self.commit("Seed")
+        git(self.repo, "branch", "-f", "base")
+        self.write(vendor + "up/old.txt",
+                   f"old {self.MOUNT}\n" + filler + f"new {self.CLI}\n")
+        self.commit()
+        self.assertEqual(self.internal(key="warnings"), {
+            ("internal-reference", vendor + "up/old.txt", 22,
+             "internal-cli")})
         self.assertEqual(self.internal(), set())
-        self.assertEqual(self.internal(base=None), set())
 
     def test_rename_into_scope_scans_every_line(self):
         vendor = cph.LAYOUTS[self.LAYOUT].excluded[0]
@@ -1998,6 +2042,10 @@ class RepoHygieneParityTests(unittest.TestCase):
         self.assertIs(trh._BANNED_FILENAME_RE, cph.BANNED_FILENAME_RE)
         self.assertIs(trh._BANNED_INTERNAL_PREFIXES,
                       cph.BANNED_INTERNAL_PREFIXES)
+        self.assertIs(trh._EXCLUDED_PREFIXES,
+                      cph.REPO_HYGIENE_EXCLUDED_PREFIXES)
+        self.assertEqual(cph.REPO_HYGIENE_EXCLUDED_PREFIXES,
+                         ("minirust/vendor/", "theory/MiniRust/vendor/"))
         self.assertLessEqual(set(trh._EXCLUDED_PREFIXES),
                              set(cph.STANDALONE.excluded))
 
