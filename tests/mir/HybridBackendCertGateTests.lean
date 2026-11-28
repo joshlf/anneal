@@ -39,7 +39,9 @@ Exercises all four certificate-checked subsystems unified under
    canonical emission on valid streams, immediate halt with zero emission of
    malformed or tampered chunks at the head AND mid-stream, rejection of
    non-canonical/wrong-AST/replayed producer outputs, and the exact
-   `filterAll` characterization for adversarial producers.
+   `filterAll` characterization for adversarial producers. The same
+   `foldStreamPrefix` also runs `farkasMirGate` and `natCutIdxGate` as
+   prefix-safe obligation streams (`obligationChunkGate`).
 4. **`Anneal.Backend` + `Anneal.Mir.OverflowTrapRefinement`:**
    end-to-end `blockOptGate` `BoolCertCut` + `stepMirState` `u64` checked-to-
    unchecked add/sub refinement via `farkasMirGate`, `natCutIdxGate`, and
@@ -57,7 +59,8 @@ Exercises all four certificate-checked subsystems unified under
    `Anneal.Hybrid.EffectMask` and `Anneal.Hybrid.FnContract.effects`.
 6. **Exhaustive Axiom & `._unsafe_rec` Audit (`run_cmd` + `#print axioms`):**
    sweeps every constant across all 9 new theory modules plus this test
-   module, pins each module's exact axiom set, the exact `Quot.sound` users,
+   module, pins each module's exact declaration counts and axiom set, the
+   exact `Quot.sound` users,
    and the exact axiom set of every capstone, and looks up the `._unsafe_rec`
    companion of every reachable `Anneal.*` constant (none in the 10 audited
    modules; the pre-existing base ones are pinned by name).
@@ -681,6 +684,128 @@ theorem test_canonicalDiode_midstream_halt_and_prefix_characterization :
   exact ⟨hCanon, hMid,
     ⟨consumed, rest, hSplit, hAll, hSome .rejectedByChecker rfl⟩, hOkFilter⟩
 
+/-! ## 3b. Obligation Streams (`foldStreamPrefix` over Pillars 1 and 2) -/
+
+/-- Overflow obligations of one function, by guard id. -/
+def mirObligation : Nat → FarkasMirGoal
+  | 0 => mirAddGoal
+  | 1 => mirSubCertGoal
+  | 2 => mirMulGoal
+  | _ => mirSliceGoal
+
+/-- Certificate table: guard `3` and beyond have no certificate. -/
+def mirObligationCert : Nat → Option FarkasMirCert
+  | 0 => some mirAddCert
+  | 1 => some mirSubCert
+  | 2 => some mirMulCert
+  | _ => none
+
+/-- Forged table: guard `1` is handed guard `0`'s certificate, which is valid
+for guard `0` and wrong for guard `1`. -/
+def mirObligationForgedCert : Nat → Option FarkasMirCert
+  | 1 => some mirAddCert
+  | i => mirObligationCert i
+
+/-- `farkasMirGate` re-indexed by guard id and lifted to a stream gate. -/
+noncomputable def mirObligationGate :=
+  obligationChunkGate (gateComap mirObligation (farkasMirGate 16)) Nat.beq
+    (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+
+/-- `LinearArithIndexed` obligations by id, all with certificates. -/
+def natObligation : Nat → NatCutGoal
+  | 0 => natRowReuseGoal
+  | 1 => parityCutReqGoal
+  | _ => parityStrideGoal
+
+def natObligationCert : Nat → Option (List CutStep)
+  | 0 => some natRowReuseCert
+  | 1 => some parityCutReqCert
+  | _ => some parityStrideCert
+
+/-- `natCutIdxGate` re-indexed by obligation id and lifted to a stream gate.
+-/
+noncomputable def natObligationGate (maxSteps : Nat) :=
+  obligationChunkGate (gateComap natObligation (natCutIdxGate maxSteps))
+    Nat.beq (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+
+/-- Prefix-safe obligation streams over `farkasMirGate` and `natCutIdxGate`:
+certified obligations are emitted in order; the first one without an accepted
+certificate (missing, forged, oversized, or a valid certificate for a
+DIFFERENT obligation) halts the stream; every emitted obligation holds. -/
+theorem test_obligation_stream_prefix_safe :
+    -- All three certified guards are emitted, in order, with no error
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun i => (mirObligation i).denote)
+      mirObligationGate (tableProducer mirObligationCert ()) () [0, 1, 2] =
+      ([0, 1, 2], none) ∧
+    -- The first guard without a certificate halts the stream; guard `2`,
+    -- which does have one, is not emitted after it
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun i => (mirObligation i).denote)
+      mirObligationGate (tableProducer mirObligationCert ()) ()
+      [0, 1, 3, 2] = ([0, 1], some (.producerFailed ())) ∧
+    -- A certificate that is valid for another guard is rejected
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun i => (mirObligation i).denote)
+      mirObligationGate (tableProducer mirObligationForgedCert ()) ()
+      [0, 1, 2] = ([0], some .rejectedByChecker) ∧
+    -- Substitution: answering every guard with guard `0` and its valid
+    -- certificate is accepted for guard `0` only
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun i => (mirObligation i).denote)
+      mirObligationGate
+      (fun _ _ => .candidate (E := Unit) ((), 0) mirAddCert) ()
+      [0, 1, 2] = ([0], some .rejectedByChecker) ∧
+    -- The emitted obligations are a prefix of the input, and the stream
+    -- stopped at the first unemitted one
+    (∃ rest : List Nat, [0, 1, 3, 2] = [0, 1] ++ rest ∧
+      ∃ u rest', rest = u :: rest' ∧
+        Anneal.Hybrid.evalGate mirObligationGate ((), u)
+          (tableProducer mirObligationCert () () u) =
+          .error (.producerFailed ())) ∧
+    -- `natCutIdxGate` stream: complete at cap 8; at cap 5 the 5-step
+    -- certificate passes and the 8-step one is halted by the size bound
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun i => (natObligation i).denote)
+      (natObligationGate 8) (tableProducer natObligationCert ()) ()
+      [0, 1, 2] = ([0, 1, 2], none) ∧
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun i => (natObligation i).denote)
+      (natObligationGate 5) (tableProducer natObligationCert ()) ()
+      [1, 0, 2] = ([1], some (.witnessOversized 8 5)) ∧
+    -- Every emitted obligation holds
+    mirAddGoal.denote ∧ mirSubCertGoal.denote ∧ mirMulGoal.denote := by
+  have hComplete :=
+    obligationStream_complete (E := Unit)
+      (gateComap mirObligation (farkasMirGate 16)) Nat.beq
+      (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+      Anneal.InitLemmas.nat_beq_refl mirObligationCert () [0, 1, 2]
+      (fun x hMem => by
+        cases hMem with
+        | head => exact ⟨_, rfl, rfl⟩
+        | tail _ h1 =>
+          cases h1 with
+          | head => exact ⟨_, rfl, rfl⟩
+          | tail _ h2 =>
+            cases h2 with
+            | head => exact ⟨_, rfl, rfl⟩
+            | tail _ h3 => cases h3)
+  have hHold :=
+    obligationStream_all_emitted_hold (E := Unit)
+      (gateComap mirObligation (farkasMirGate 16)) Nat.beq
+      (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+      (tableProducer mirObligationCert ()) [0, 1, 2]
+  rw [hComplete] at hHold
+  have ⟨rest, hSplit, _, hSome⟩ :=
+    obligationStream_emitted_prefix (E := Unit)
+      (gateComap mirObligation (farkasMirGate 16)) Nat.beq
+      (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+      (tableProducer mirObligationCert ()) [0, 1, 3, 2]
+  exact ⟨hComplete, rfl, rfl, rfl, ⟨rest, hSplit, hSome _ rfl⟩, rfl, rfl,
+    hHold 0 (List.Mem.head _),
+    hHold 1 (List.Mem.tail _ (List.Mem.head _)),
+    hHold 2 (List.Mem.tail _ (List.Mem.tail _ (List.Mem.head _)))⟩
+
 /-! ## 4. `Anneal.Backend` + `OverflowTrapRefinement` End-to-End & Negatives -/
 
 /-- End-to-end `u64` addition and subtraction checked-to-unchecked refinement
@@ -1167,6 +1292,37 @@ theorem test_backend_every_environment_transport :
   exact ⟨by decide, by decide, hAddEntry, hWrapAddEntry, hAdd.1, hAdd.2.2.2,
     hWrapAdd.2.2.2, hWrapAddW.2.2.2, hSub.2.1, hWrapSubW.2.2.2⟩
 
+/-- Checked-to-UNCHECKED subtraction at an out-of-range environment, with no
+range hypothesis: the one unrestricted-environment transport theorem the test
+above does not instantiate. -/
+theorem test_backend_unchecked_sub_any_environment :
+    MirExactOutcomeEquiv
+      (classifyMirExecStateExact
+        (runMirCall (mkCheckedArithBody .u64 .sub .terminate) 6
+          (uintArgs2 .u64 (word64 (wrappedEnv 1))
+            (word64 (wrappedEnv 0)))))
+      (classifyMirExecStateExact
+        (runMirCall (mkUncheckedArithBody .u64 .sub) 2
+          (uintArgs2 .u64 (word64 (wrappedEnv 1))
+            (word64 (wrappedEnv 0))))) ∧
+    (mirCallTree (mkCheckedArithBody .u64 .sub .terminate)
+        (uintArgs2 .u64 (word64 (wrappedEnv 1))
+          (word64 (wrappedEnv 0)))).toPartial ≤
+      (mirCallTree (mkUncheckedArithBody .u64 .sub)
+        (uintArgs2 .u64 (word64 (wrappedEnv 1))
+          (word64 (wrappedEnv 0)))).toPartial := by
+  have hEntry :
+      SourceEntryPre u64CheckedSubSrc (fun i => wrappedEnv (1 - i)) :=
+    (sourceEntryPre_u64CheckedSub_any_env_iff _).2
+      ((sourceEntryPre_u64CheckedSub_iff _ _ (by decide) (by decide)).2
+        (by decide))
+  have h :=
+    u64_sub_blockOptGate_cut_to_stepMirState_any_env 2
+      u64CheckedSubToUncheckedSteps
+      (Anneal.Framework.StepWp.BoolCertCut.seal _ _ rfl)
+      (fun i => wrappedEnv (1 - i)) hEntry
+  exact ⟨h.1, h.2.2.2⟩
+
 /-- Undischarged-fact negatives. The SAME elision certificate that
 `blockOptGate` accepts for the `.proven` source is rejected once the fact is
 only `.fuzz` or `.sorryStub`; no certificate of any size is ever accepted
@@ -1406,10 +1562,11 @@ run_cmd do
       unless allowed.contains a do
         throwError "audit: {c} in {loc} uses axiom {a} (all={axs})"
     return (kind, axs)
-  -- Audit EVERY constant of an imported module, enforce declaration floors
-  -- (exact counts when `frozen`), and pin the exact union of axioms the
-  -- module uses.
-  let auditModule (mod : Name) (frozen : Bool)
+  -- Audit EVERY constant of an imported module, pin its theorem and
+  -- definition counts exactly, and pin the exact union of axioms the module
+  -- uses. A count that is merely a floor goes stale as soon as declarations
+  -- are added; an exact pin cannot drift in either direction.
+  let auditModule (mod : Name)
       (allowed expected : List Name) (minThms minDefs : Nat) :
       CommandElabM String := do
     let some idx := env.getModuleIdx? mod
@@ -1435,32 +1592,33 @@ run_cmd do
       throwError "audit: floor in {mod}: {nThm} thms < {minThms}"
     if nDef < minDefs then
       throwError "audit: floor in {mod}: {nDef} defs < {minDefs}"
-    if frozen && (nThm != minThms || nDef != minDefs) then
-      throwError "audit: frozen {mod} drifted: thms={nThm}, defs={nDef}"
+    if nThm != minThms || nDef != minDefs then
+      throwError "audit: {mod} count drift: thms={nThm}, defs={nDef}"
     unless sameSet used expected do
       throwError "audit: {mod} uses axioms {used}, expected {expected}"
     return s!"{mod}: {nThm} thms, {nDef} defs, {nOther} aux, axioms={used}"
-  -- The eight Episode 1 modules and the verbatim `Backend.Canaries` port are
-  -- frozen: their theorem and definition counts are pinned exactly.
-  let r1 ← auditModule `Anneal.Hybrid true propextOnly propextOnly 120 269
+  -- All counts are exact pins: the eight Episode 1 modules and the verbatim
+  -- `Backend.Canaries` port are frozen, and `HybridCertBridgesV2026` is
+  -- updated deliberately whenever declarations are added or removed.
+  let r1 ← auditModule `Anneal.Hybrid propextOnly propextOnly 120 269
   let r2 ←
-    auditModule `Anneal.Hybrid.Canaries true propextOnly propextOnly 65 70
+    auditModule `Anneal.Hybrid.Canaries propextOnly propextOnly 65 70
   let r3 ←
-    auditModule `Anneal.Backend.Rules true propextOnly propextOnly 95 316
+    auditModule `Anneal.Backend.Rules propextOnly propextOnly 95 316
   let r4 ←
-    auditModule `Anneal.Backend.CtxFact true propextOnly propextOnly 52 150
+    auditModule `Anneal.Backend.CtxFact propextOnly propextOnly 52 150
   let r5 ←
-    auditModule `Anneal.Backend.CongruenceDagCtx true propextOnly
+    auditModule `Anneal.Backend.CongruenceDagCtx propextOnly
       propextOnly 46 104
   let r6 ←
-    auditModule `Anneal.Backend.PassRefines true propextOnly propextOnly
+    auditModule `Anneal.Backend.PassRefines propextOnly propextOnly
       23 66
-  let r7 ← auditModule `Anneal.Backend true propextOnly [] 0 0
+  let r7 ← auditModule `Anneal.Backend propextOnly [] 0 0
   let r8 ←
-    auditModule `Anneal.Backend.Canaries true propextOnly propextOnly 30 64
+    auditModule `Anneal.Backend.Canaries propextOnly propextOnly 30 64
   let r9 ←
-    auditModule `Anneal.HybridCertBridgesV2026 false constructive
-      constructive 176 213
+    auditModule `Anneal.HybridCertBridgesV2026 constructive constructive
+      182 240
   -- Enforce an EXACT duplicate-free `Quot.sound` allowlist on
   -- `Anneal.HybridCertBridgesV2026`: every non-allowlisted constant must be
   -- `<= [propext]` (only exact allowlisted theorems and their direct
@@ -1589,7 +1747,8 @@ run_cmd do
       ``test_backend_blockOptGate_mirRefines_and_alt_bridges,
       ``test_backend_and_trap_negative_counterexamples,
       ``test_backend_asymmetric_ub_transport,
-      ``test_backend_every_environment_transport ]
+      ``test_backend_every_environment_transport,
+      ``test_backend_unchecked_sub_any_environment ]
   let mut seenTestQuot : List Name := []
   for tq in testQuotAllowed do
     if seenTestQuot.contains tq then
@@ -1616,8 +1775,8 @@ run_cmd do
   for tq in testQuotAllowed do
     unless testQuotActual.contains tq do
       throwError "audit: stale testQuotAllowed entry {tq}"
-  if testThms < 25 || testDefs < 41 then
-    throwError "audit: test floor: thms={testThms}, defs={testDefs}"
+  if testThms != 27 || testDefs != 52 then
+    throwError "audit: test count drift: thms={testThms}, defs={testDefs}"
   let rT :=
     s!"test module: {testThms} thms, {testDefs} defs, axioms={testUsed}, " ++
     s!"quotAllowed={quotAllowed.length}+{quotMatchHelpers}m, " ++
@@ -1646,7 +1805,11 @@ run_cmd do
       ``canonicalDiode_stream_all_emitted_canonical,
       ``canonicalDiode_stream_faithful_eq_filterAll,
       ``canonicalDiode_stream_halts_on_tampered_midstream,
-      ``canonicalDiode_stream_prefix_eq_filterAll ]
+      ``canonicalDiode_stream_prefix_eq_filterAll,
+      ``obligationChunkGate_ok,
+      ``obligationStream_all_emitted_hold,
+      ``obligationStream_emitted_prefix,
+      ``obligationStream_complete ]
   expectAxioms propextOnly
     [ ``natCutIdxGate_cut_sound,
       ``intCutIdxGate_cut_sound,
@@ -1718,6 +1881,9 @@ run_cmd do
 #print axioms canonicalDiode_stream_all_emitted_canonical
 #print axioms canonicalDiode_stream_faithful_eq_filterAll
 #print axioms canonicalDiode_stream_prefix_eq_filterAll
+#print axioms obligationStream_all_emitted_hold
+#print axioms obligationStream_emitted_prefix
+#print axioms obligationStream_complete
 #print axioms mirOptExactOutcomeRefines_exec_iff_on_u64
 #print axioms semRefinesUnder_preserves_mirOptRefines_asymmetric
 #print axioms blockOptGate_cut_preserves_mirRefines
@@ -1752,6 +1918,8 @@ run_cmd do
 #print axioms test_backend_cert_transport_to_stepMirState
 #print axioms test_backend_asymmetric_ub_transport
 #print axioms test_backend_every_environment_transport
+#print axioms test_backend_unchecked_sub_any_environment
+#print axioms test_obligation_stream_prefix_safe
 #print axioms test_backend_outcome_bridge_faithful
 #print axioms test_farkasMir_edge_weight_bounds
 #print axioms test_backend_unproven_tier_elision_never_certified

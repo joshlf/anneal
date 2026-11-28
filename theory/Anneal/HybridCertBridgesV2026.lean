@@ -44,6 +44,9 @@ Unifies Anneal's four certificate-checked subsystems under `Anneal.Hybrid`
    with `BoolCertCut` discharge, `firstAccepted` portfolios (made total by
    `gateVerdict`), and indexed-to-MIR arithmetic bridges from `natCutIdxGate`
    directly to `evalScalarBinOp` overflow/underflow freedom.
+   Both pillars also run under `foldStreamPrefix` as prefix-safe obligation
+   streams (`obligationChunkGate`): the emitted obligations are a prefix of
+   the input and every one of them holds.
 3. **Pillar 3 (`Anneal.CanonicalDiode`):** wraps any lawful `CanonicalDiode`
    with a sound equality check as `canonicalDiodeChunkGate` plugged into
    `Anneal.Hybrid.foldStreamPrefix`, proving strict canonical image on all
@@ -101,9 +104,6 @@ private theorem u64Mod_eq_modPow2 : u64Mod = modPow2 (uintWidth .u64) :=
 private theorem word64_eq_mod_u64 (n : Nat) :
     word64 n = n % modPow2 (uintWidth .u64) :=
   rfl
-
-private theorem word64_idem (n : Nat) : word64 (word64 n) = word64 n :=
-  Nat.mod_eq_of_lt (Nat.mod_lt n u64Mod_pos)
 
 /-! ## Pillar 1: `Anneal.LinearArithIndexed` Gates & Portfolios -/
 
@@ -1545,6 +1545,167 @@ theorem canonicalDiode_stream_prefix_eq_filterAll {A B E : Type}
           rfl
         · rw [CanonicalDiode.filterAll_cons, hFilt, Option.bind_some, hAll,
             Option.map_some]
+
+/-! ## Obligation Streams: Pillars 1 and 2 under `foldStreamPrefix`
+
+`foldStreamPrefix` is not specific to `CanonicalDiode`. A sequence of proof
+obligations (for instance the overflow obligations of one function, in
+program order) is certified the same way: obligations are consumed in order,
+each one whose certificate the gate accepts is emitted, and the first one
+without an accepted certificate halts the stream. The emitted obligations
+are exactly a prefix of the input, and every one of them holds. -/
+
+/-- Re-index a `Unit`-output gate along `f : X' → X`, for instance from
+obligation identifiers to the goals they name. -/
+def gateComap {X X' W : Type} {P : X → Prop} (f : X' → X)
+    (g : CertifiedGate X Unit W (fun _ => True) (fun x _ => P x)) :
+    CertifiedGate X' Unit W (fun _ => True) (fun x' _ => P (f x')) where
+  maxWitness := fun x' => g.maxWitness (f x')
+  wSize := g.wSize
+  check := fun x' _ w => g.check (f x') () w
+  sound := fun x' _ w _ hCap hChk => g.sound (f x') () w True.intro hCap hChk
+
+/-- Lift a `Unit`-output gate establishing `P x` to a streaming chunk gate
+over obligations: the emitted chunk must be the consumed obligation itself
+(by the sound equality test `beqX`), and its witness must be accepted by `g`.
+-/
+def obligationChunkGate {X W : Type} {P : X → Prop}
+    (g : CertifiedGate X Unit W (fun _ => True) (fun x _ => P x))
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y) :
+    CertifiedGate (Unit × X) (Unit × X) W (fun _ => True)
+      (fun _ sc => True ∧ P sc.2) where
+  maxWitness := fun su => g.maxWitness su.2
+  wSize := g.wSize
+  check := fun su sc w => beqX sc.2 su.2 && g.check su.2 () w
+  sound := by
+    intro su sc w _ hCap hChk
+    have hEq : sc.2 = su.2 := hBeq _ _ (bool_and_left hChk)
+    rw [hEq]
+    exact ⟨True.intro,
+      g.sound su.2 () w True.intro hCap (bool_and_right hChk)⟩
+
+/-- Any chunk the stream gate accepts, from any raw producer outcome, is the
+consumed obligation itself, carried by a witness the underlying gate accepts:
+a valid certificate for a different obligation cannot be passed off. -/
+theorem obligationChunkGate_ok {X W E : Type} {P : X → Prop}
+    (g : CertifiedGate X Unit W (fun _ => True) (fun x _ => P x))
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y) (x : X)
+    (raw : RawOutcome E (Unit × X) W) (sc : Unit × X)
+    (hOk : evalGate (obligationChunkGate g beqX hBeq) ((), x) raw = .ok sc) :
+    sc.2 = x ∧
+      ∃ w, raw = .candidate sc w ∧ gateCheckBounded g (x, (), w) = true := by
+  cases raw with
+  | trapped => cases hOk
+  | prodErr _ => cases hOk
+  | candidate y w =>
+    have h := (evalGate_candidate_ok_iff _ _ _ _ _).1 hOk
+    rw [h.1]
+    have hCap : g.wSize w ≤ g.maxWitness x := h.2.1
+    have hChk : (beqX y.2 x && g.check x () w) = true := h.2.2
+    refine ⟨hBeq _ _ (bool_and_left hChk), w, rfl, ?_⟩
+    dsimp only [gateCheckBounded]
+    rw [Nat.ble_eq_true_of_le hCap, bool_and_right hChk]
+    rfl
+
+/-- Every obligation the stream emits holds, including when it stops early
+(`foldStreamPrefix_all_emitted_valid`). -/
+theorem obligationStream_all_emitted_hold {X W E : Type} {P : X → Prop}
+    (g : CertifiedGate X Unit W (fun _ => True) (fun x _ => P x))
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y)
+    (pChunk : Unit → X → RawOutcome E (Unit × X) W) (us : List X) :
+    ∀ x, x ∈ (foldStreamPrefix (AccInv := fun _ => True) (ValidChunk := P)
+      (obligationChunkGate g beqX hBeq) pChunk () us).1 → P x :=
+  foldStreamPrefix_all_emitted_valid (AccInv := fun _ => True)
+    (ValidChunk := P) (obligationChunkGate g beqX hBeq) pChunk us ()
+    True.intro
+
+/-- Exact shape of the stream for ANY producer: the emitted obligations are a
+prefix of the input, in order; a stream without error consumed everything;
+and a stream with error `e` stopped at the first unemitted obligation, the
+one the gate rejected with `e`. -/
+theorem obligationStream_emitted_prefix {X W E : Type} {P : X → Prop}
+    (g : CertifiedGate X Unit W (fun _ => True) (fun x _ => P x))
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y)
+    (pChunk : Unit → X → RawOutcome E (Unit × X) W) :
+    ∀ us : List X, ∃ rest : List X,
+      us = (foldStreamPrefix (AccInv := fun _ => True) (ValidChunk := P)
+        (obligationChunkGate g beqX hBeq) pChunk () us).1 ++ rest ∧
+      ((foldStreamPrefix (AccInv := fun _ => True) (ValidChunk := P)
+        (obligationChunkGate g beqX hBeq) pChunk () us).2 = none →
+        rest = []) ∧
+      (∀ e, (foldStreamPrefix (AccInv := fun _ => True) (ValidChunk := P)
+        (obligationChunkGate g beqX hBeq) pChunk () us).2 = some e →
+        ∃ u rest', rest = u :: rest' ∧
+          evalGate (obligationChunkGate g beqX hBeq) ((), u) (pChunk () u) =
+            .error e)
+  | [] => by
+    refine ⟨[], rfl, fun _ => rfl, fun e h => ?_⟩
+    have h' : (none : Option (HybridErr E)) = some e := h
+    nomatch h'
+  | u :: us => by
+    have ih := obligationStream_emitted_prefix g beqX hBeq pChunk us
+    rw [foldStreamPrefix_cons]
+    cases hEv : evalGate (obligationChunkGate g beqX hBeq) ((), u)
+        (pChunk () u) with
+    | error err =>
+      dsimp only
+      refine ⟨u :: us, rfl, (fun h => nomatch h), fun e h => ?_⟩
+      injection h with h
+      rw [← h]
+      exact ⟨u, us, rfl, hEv⟩
+    | ok sc =>
+      have hSame := (obligationChunkGate_ok g beqX hBeq u (pChunk () u) sc
+        hEv).1
+      cases sc with
+      | mk s c =>
+        cases s
+        dsimp only at hSame ⊢
+        have ⟨rest, hSplit, hNone, hSome⟩ := ih
+        refine ⟨rest, ?_, hNone, hSome⟩
+        rw [hSame]
+        exact congrArg (List.cons u) hSplit
+
+/-- Producer that looks each obligation's certificate up in a table and
+reports `eMissing` when there is none. -/
+def tableProducer {X W E : Type} (certOf : X → Option W) (eMissing : E) :
+    Unit → X → RawOutcome E (Unit × X) W :=
+  fun _ x =>
+    match certOf x with
+    | none => .prodErr eMissing
+    | some w => .candidate ((), x) w
+
+/-- Completeness: when every obligation in `us` has a table certificate the
+underlying gate accepts, the stream emits all of `us` with no error. -/
+theorem obligationStream_complete {X W E : Type} {P : X → Prop}
+    (g : CertifiedGate X Unit W (fun _ => True) (fun x _ => P x))
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y)
+    (hBeqRefl : ∀ x, beqX x x = true) (certOf : X → Option W) (eMissing : E) :
+    ∀ us : List X,
+      (∀ x, x ∈ us → ∃ w, certOf x = some w ∧
+        gateCheckBounded g (x, (), w) = true) →
+      foldStreamPrefix (AccInv := fun _ => True) (ValidChunk := P)
+        (obligationChunkGate g beqX hBeq) (tableProducer certOf eMissing) ()
+        us = (us, none)
+  | [], _ => rfl
+  | u :: us, hAll => by
+    have ⟨w, hCert, hChk⟩ := hAll u (List.Mem.head _)
+    have hChk' : (Nat.ble (g.wSize w) (g.maxWitness u) && g.check u () w) =
+        true := hChk
+    have hCheck : (beqX u u && g.check u () w) = true := by
+      rw [hBeqRefl u, bool_and_right hChk']
+      rfl
+    have hEv :
+        evalGate (obligationChunkGate g beqX hBeq) ((), u)
+          (tableProducer certOf eMissing () u) = .ok ((), u) := by
+      dsimp only [tableProducer]
+      rw [hCert]
+      exact (evalGate_candidate_ok_iff
+        (obligationChunkGate g beqX hBeq) ((), u) ((), u) w ((), u)).2
+        ⟨rfl, Nat.le_of_ble_eq_true (bool_and_left hChk'), hCheck⟩
+    rw [foldStreamPrefix_cons, hEv]
+    dsimp only
+    rw [obligationStream_complete g beqX hBeq hBeqRefl certOf eMissing us
+      (fun x hMem => hAll x (List.Mem.tail _ hMem))]
 
 /-! ## Pillar 4: `Anneal.Backend.CtxFact` <-> `OverflowTrapRefinement` -/
 
