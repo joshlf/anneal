@@ -1117,7 +1117,8 @@ theorem tailCall_trusted_direct_enters_without_push
       hargs, hc]
   · simp only [frameDeallocConflict] at hc
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget, hfunc,
-      hargs, hc, hfind, checkCalleeTargetCompatible_direct, frameTeardownMem, tailEntryMem]
+      hargs, hc, hfind, checkCalleeTargetCompatible_direct, calleeEntryArgs, frameTeardownMem,
+      tailEntryMem]
   · rw [enterTail_callStack, hstack]
   · rw [enterTail_callStack, narrow_length, hstack]
   · intro caller rest hcs
@@ -1337,7 +1338,7 @@ theorem tailCall_trusted_external
     fun _ _ => rfl⟩ <;>
     simp only [frameDeallocConflict] at hc <;>
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget, hfunc,
-      hargs, hc, hnone, frameTeardownMem, externalTargetCanUnwind]
+      hargs, hc, hnone, Bool.false_and, frameTeardownMem, externalTargetCanUnwind]
 
 /-- The `MirExecState` a step node denotes (`tau`, `ret`, or a fault). -/
 def nodeState : MirStepNode → Option MirExecState
@@ -1503,7 +1504,7 @@ theorem tailCall_trusted_fail_closed_universal
     simp only [frameDeallocConflict] at hc
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
       evalTailFunc_fold, evalTailArgs_fold, hnodirect, h, hfi, hargs, hc, hfind,
-      checkCalleeTargetCompatible_direct, frameTeardownMem, tailEntryMem]
+      checkCalleeTargetCompatible_direct, calleeEntryArgs, frameTeardownMem, tailEntryMem]
 
 set_option linter.unusedSimpArgs false in
 /-- **Trusted non-function callees (universal).** Whatever a non-direct callee operand
@@ -1770,7 +1771,7 @@ theorem tailCall_trusted_direct_and_unsupported_fail_closed
     simp only [frameDeallocConflict] at hc
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
       evalTailFunc_fold, evalTailArgs_fold, hnodirect, h, hfi, hargs, hc, hfind,
-      checkCalleeTargetCompatible_direct, frameTeardownMem, tailEntryMem]
+      checkCalleeTargetCompatible_direct, calleeEntryArgs, frameTeardownMem, tailEntryMem]
   · intro target l argVals l' hres hargs hc
     simp only [frameDeallocConflict] at hc
     simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, evalTailArgs_fold, hres,

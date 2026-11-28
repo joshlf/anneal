@@ -94,7 +94,7 @@ theorem allBytesInitialized_uninit (rest : List AbstractByte) :
 
 @[simp]
 theorem allBytesInitialized_init
-    (b : UInt8) (prov : Option (Nat × Nat)) (rest : List AbstractByte) :
+    (b : UInt8) (prov : Option PtrByteFrag) (rest : List AbstractByte) :
     allBytesInitialized (.init b prov :: rest) = allBytesInitialized rest := rfl
 
 /-- Construct `n` zero-initialized bytes (`0x00` with no provenance). -/
@@ -331,20 +331,47 @@ theorem transmute_sound_of_into_from_bytes
 
 /-! ## 3. Little-Endian Scalar Codec and Primitive Trait Theorems -/
 
-@[simp]
-theorem length_encodeLittleEndianBytes (prov : Option (Nat × Nat)) :
-    ∀ n bits : Nat, length (encodeLittleEndianBytes bits n prov) = n
+private theorem length_encodePlainLittleEndianBytes :
+    ∀ n bits : Nat, length (encodePlainLittleEndianBytes bits n) = n
   | 0, _ => rfl
   | k + 1, bits =>
-    congrArg Nat.succ (length_encodeLittleEndianBytes prov k (bits / 256))
+    congrArg Nat.succ (length_encodePlainLittleEndianBytes k (bits / 256))
+
+private theorem length_encodePtrBytesAux (a t orig ptrBytes : Nat) :
+    ∀ n bits idx : Nat, length (encodePtrBytesAux a t orig ptrBytes bits idx n) = n
+  | 0, _, _ => rfl
+  | k + 1, bits, idx =>
+    congrArg Nat.succ (length_encodePtrBytesAux a t orig ptrBytes k (bits / 256) (idx + 1))
 
 @[simp]
-theorem allBytesInitialized_encodeLittleEndianBytes (prov : Option (Nat × Nat)) :
-    ∀ n bits : Nat,
-      allBytesInitialized (encodeLittleEndianBytes bits n prov) = true
+theorem length_encodeLittleEndianBytes (prov : Option (Nat × Nat))
+    (n bits : Nat) : length (encodeLittleEndianBytes bits n prov) = n := by
+  cases prov with
+  | none => exact length_encodePlainLittleEndianBytes n bits
+  | some p =>
+    rcases p with ⟨a, t⟩
+    exact length_encodePtrBytesAux a t (normPtrByteOffset n bits) n n bits 0
+
+private theorem allBytesInitialized_encodePlainLittleEndianBytes :
+    ∀ n bits : Nat, allBytesInitialized (encodePlainLittleEndianBytes bits n) = true
   | 0, _ => rfl
-  | k + 1, bits =>
-    allBytesInitialized_encodeLittleEndianBytes prov k (bits / 256)
+  | k + 1, bits => allBytesInitialized_encodePlainLittleEndianBytes k (bits / 256)
+
+private theorem allBytesInitialized_encodePtrBytesAux (a t orig ptrBytes : Nat) :
+    ∀ n bits idx : Nat, allBytesInitialized (encodePtrBytesAux a t orig ptrBytes bits idx n) = true
+  | 0, _, _ => rfl
+  | k + 1, bits, idx =>
+    allBytesInitialized_encodePtrBytesAux a t orig ptrBytes k (bits / 256) (idx + 1)
+
+@[simp]
+theorem allBytesInitialized_encodeLittleEndianBytes (prov : Option (Nat × Nat))
+    (n bits : Nat) :
+    allBytesInitialized (encodeLittleEndianBytes bits n prov) = true := by
+  cases prov with
+  | none => exact allBytesInitialized_encodePlainLittleEndianBytes n bits
+  | some p =>
+    rcases p with ⟨a, t⟩
+    exact allBytesInitialized_encodePtrBytesAux a t (normPtrByteOffset n bits) n n bits 0
 
 theorem encodeScalarBytes_length_and_init
     (sv : ScalarVal) (prov : Option (Nat × Nat)) (bs : List AbstractByte)
@@ -358,18 +385,27 @@ theorem encodeScalarBytes_length_and_init
            allBytesInitialized_encodeLittleEndianBytes prov sv.sizeBytes sv.bits⟩
   · nomatch h
 
-theorem decodeLittleEndianBytes_of_allBytesInitialized :
+theorem decodeLittleEndianBits_of_allBytesInitialized :
     ∀ bs : List AbstractByte,
       allBytesInitialized bs = true →
-      ∃ bits prov, decodeLittleEndianBytes bs = some (bits, prov)
-  | [], _ => ⟨0, none, rfl⟩
+      ∃ bits, decodeLittleEndianBits bs = some bits
+  | [], _ => ⟨0, rfl⟩
   | .uninit :: _, h => nomatch h
-  | .init b prov :: rest, h => by
-    rcases decodeLittleEndianBytes_of_allBytesInitialized rest h with
-      ⟨highBits, restProv, hRest⟩
-    refine ⟨b.toBitVec.toNat + 256 * highBits,
-            mergeByteProvenance prov restProv, ?_⟩
-    simp [decodeLittleEndianBytes, hRest]
+  | .init b _ :: rest, h => by
+    rcases decodeLittleEndianBits_of_allBytesInitialized rest h with ⟨highBits, hRest⟩
+    refine ⟨Nat.add b.toBitVec.toNat (Nat.mul 256 highBits), ?_⟩
+    simp only [decodeLittleEndianBits, hRest]
+
+theorem decodeLittleEndianBytes_of_allBytesInitialized
+    (bs : List AbstractByte) (h : allBytesInitialized bs = true) :
+    ∃ bits prov, decodeLittleEndianBytes bs = some (bits, prov) := by
+  rcases decodeLittleEndianBits_of_allBytesInitialized bs h with ⟨bits, hBits⟩
+  refine ⟨bits, match abstractBytesCoherentPtrProv? bs with
+    | .some frag => .some (frag.allocId, frag.tag)
+    | .none => .none, ?_⟩
+  unfold decodeLittleEndianBytes
+  rw [hBits]
+  rfl
 
 theorem decodeScalarBytes_of_allBytesInitialized
     (bs : List AbstractByte) (signed : Bool)
@@ -429,13 +465,15 @@ private theorem uint_encode_anyFuel
         v = some bs) :
     length bs = sz ∧ allBytesInitialized bs = true := by
   unfold encodeValueToBytes at hEnc
-  cases v <;> simp [hSz] at hEnc
-  case scalar sv =>
+  cases v with
+  | scalar sv =>
+    simp only [hSz] at hEnc
     cases hEq : Nat.beq sv.sizeBytes sz <;> rw [hEq] at hEnc
     · nomatch hEnc
     · have hSvSz : sv.sizeBytes = sz := Nat.eq_of_beq_eq_true hEq
       have ⟨hLen, hInit⟩ := encodeScalarBytes_length_and_init sv none bs hEnc
       exact ⟨hSvSz ▸ hLen, hInit⟩
+  | _ => simp only [hSz] at hEnc; nomatch hEnc
 
 private theorem int_encode_anyFuel
     (fuel : Nat) (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx)
@@ -2129,30 +2167,48 @@ theorem checkIntoBytes_struct_u8_bool_strict
 
 /-! ## 6. `ScalarLayout.validRange` & `wrappingRangeContains` Bridges -/
 
-/-- Every little-endian byte sequence decodes to a bit pattern strictly below `scalarModulus (length bs)`. -/
-theorem decodeLittleEndianBytes_lt_scalarModulus :
-    ∀ (bs : List AbstractByte) (bits : Nat) (prov : Option (Nat × Nat)),
-      decodeLittleEndianBytes bs = some (bits, prov) →
+/-- Every little-endian byte sequence's bit pattern is strictly below `scalarModulus (length bs)`. -/
+theorem decodeLittleEndianBits_lt_scalarModulus :
+    ∀ (bs : List AbstractByte) (bits : Nat),
+      decodeLittleEndianBits bs = some bits →
       bits < scalarModulus (length bs)
-  | [], bits, _, h => by
-    injection h with hPair
-    injection hPair with hBits _
+  | [], bits, h => by
+    injection h with hBits
     subst hBits
     exact Nat.zero_lt_one
-  | .uninit :: _, _, _, h => nomatch h
-  | .init b _ :: rest, bits, _, h => by
-    unfold decodeLittleEndianBytes at h
-    cases hRest : decodeLittleEndianBytes rest <;> rw [hRest] at h
+  | .uninit :: _, _, h => nomatch h
+  | .init b _ :: rest, bits, h => by
+    unfold decodeLittleEndianBits at h
+    cases hRest : decodeLittleEndianBits rest <;> rw [hRest] at h
     · nomatch h
-    case some bp =>
-      rcases bp with ⟨highBits, restProv⟩
-      injection h with hPair
-      injection hPair with hBits _
-      have hHigh := decodeLittleEndianBytes_lt_scalarModulus rest highBits restProv hRest
+    case some highBits =>
+      injection h with hBits
+      have hHigh := decodeLittleEndianBits_lt_scalarModulus rest highBits hRest
       have hLow : b.toBitVec.toNat < 256 := b.toBitVec.isLt
       subst hBits
       change b.toBitVec.toNat + 256 * highBits < 256 * scalarModulus (length rest)
-      omega
+      have hStep : 256 * (highBits + 1) ≤ 256 * scalarModulus (length rest) :=
+        Nat.mul_le_mul_left 256 (Nat.succ_le_of_lt hHigh)
+      have hAdd : b.toBitVec.toNat + 256 * highBits < 256 + 256 * highBits :=
+        Nat.add_lt_add_right hLow (256 * highBits)
+      have hDist : 256 + 256 * highBits = 256 * (highBits + 1) := by
+        rw [Nat.mul_add, Nat.mul_one, Nat.add_comm]
+      exact Nat.lt_of_lt_of_le (hDist ▸ hAdd) hStep
+
+/-- Every little-endian byte sequence decodes to a bit pattern strictly below `scalarModulus (length bs)`. -/
+theorem decodeLittleEndianBytes_lt_scalarModulus
+    (bs : List AbstractByte) (bits : Nat) (prov : Option (Nat × Nat))
+    (h : decodeLittleEndianBytes bs = some (bits, prov)) :
+    bits < scalarModulus (length bs) := by
+  unfold decodeLittleEndianBytes at h
+  cases hBits : decodeLittleEndianBits bs with
+  | none => rw [hBits] at h; nomatch h
+  | some b =>
+    rw [hBits] at h
+    injection h with hPair
+    injection hPair with hEq _
+    subst hEq
+    exact decodeLittleEndianBits_lt_scalarModulus bs b hBits
 
 /-- Any `ScalarVal` decoded via `decodeScalarBytes` has `sv.sizeBytes = length bs` and `sv.bits < scalarModulus (length bs)`. -/
 theorem decodeScalarBytes_bits_lt
@@ -2173,14 +2229,24 @@ theorem decodeScalarBytes_bits_lt
       exact ⟨rfl, decodeLittleEndianBytes_lt_scalarModulus bs bits p hLE⟩
   · nomatch h
 
-@[simp]
-theorem decodeLittleEndianBytes_zeroInitBytes :
-    ∀ n : Nat, decodeLittleEndianBytes (zeroInitBytes n) = some (0, none)
+private theorem decodeLittleEndianBits_zeroInitBytes :
+    ∀ n : Nat, decodeLittleEndianBits (zeroInitBytes n) = some 0
   | 0 => rfl
   | k + 1 => by
-    unfold zeroInitBytes decodeLittleEndianBytes
-    rw [decodeLittleEndianBytes_zeroInitBytes k]
+    unfold zeroInitBytes decodeLittleEndianBits
+    rw [decodeLittleEndianBits_zeroInitBytes k]
     rfl
+
+private theorem abstractBytesCoherentPtrProv?_zeroInitBytes :
+    ∀ n : Nat, abstractBytesCoherentPtrProv? (zeroInitBytes n) = none
+  | 0 => rfl
+  | _ + 1 => rfl
+
+@[simp]
+theorem decodeLittleEndianBytes_zeroInitBytes (n : Nat) :
+    decodeLittleEndianBytes (zeroInitBytes n) = some (0, none) := by
+  unfold decodeLittleEndianBytes
+  rw [decodeLittleEndianBits_zeroInitBytes n, abstractBytesCoherentPtrProv?_zeroInitBytes n]
 
 theorem decodeScalarBytes_zeroInitBytes
     (sz : Nat) (signed : Bool) (hNz : Nat.beq sz 0 = false) :
@@ -2189,47 +2255,92 @@ theorem decodeScalarBytes_zeroInitBytes
   dsimp only
   rw [length_zeroInitBytes sz, hNz, decodeLittleEndianBytes_zeroInitBytes sz]
 
+private theorem decodeLittleEndianBits_encodePlain_of_lt :
+    ∀ (n bits : Nat), bits < scalarModulus n →
+      decodeLittleEndianBits (encodePlainLittleEndianBytes bits n) = some bits
+  | 0, bits, h => by
+    have h0 : bits = 0 := Nat.eq_zero_of_le_zero (Nat.le_of_lt_succ h)
+    subst h0; rfl
+  | n + 1, bits, h => by
+    have hDiv : bits / 256 < scalarModulus n := by
+      change bits < 256 * scalarModulus n at h
+      exact (Nat.div_lt_iff_lt_mul (Nat.zero_lt_succ 255)).mpr (Nat.mul_comm 256 (scalarModulus n) ▸ h)
+    have hRest := decodeLittleEndianBits_encodePlain_of_lt n (bits / 256) hDiv
+    have hLow : (UInt8.ofNat bits).toBitVec.toNat = bits % 256 := by
+      simp [UInt8.ofNat, BitVec.ofNat]
+    unfold encodePlainLittleEndianBytes decodeLittleEndianBits
+    rw [show Nat.div bits 256 = bits / 256 from rfl, hRest]
+    dsimp only
+    rw [hLow]
+    exact congrArg some (Nat.mod_add_div bits 256)
+
+private theorem decodeLittleEndianBits_encodePtrBytesAux_of_lt
+    (a t orig ptrBytes : Nat) :
+    ∀ (n bits idx : Nat), bits < scalarModulus n →
+      decodeLittleEndianBits (encodePtrBytesAux a t orig ptrBytes bits idx n) = some bits
+  | 0, bits, _, h => by
+    have h0 : bits = 0 := Nat.eq_zero_of_le_zero (Nat.le_of_lt_succ h)
+    subst h0; rfl
+  | n + 1, bits, idx, h => by
+    have hDiv : bits / 256 < scalarModulus n := by
+      change bits < 256 * scalarModulus n at h
+      exact (Nat.div_lt_iff_lt_mul (Nat.zero_lt_succ 255)).mpr (Nat.mul_comm 256 (scalarModulus n) ▸ h)
+    have hRest := decodeLittleEndianBits_encodePtrBytesAux_of_lt a t orig ptrBytes n (bits / 256) (idx + 1) hDiv
+    have hLow : (UInt8.ofNat bits).toBitVec.toNat = bits % 256 := by
+      simp [UInt8.ofNat, BitVec.ofNat]
+    unfold encodePtrBytesAux decodeLittleEndianBits
+    rw [show Nat.div bits 256 = bits / 256 from rfl, show Nat.add idx 1 = idx + 1 from rfl, hRest]
+    dsimp only
+    rw [hLow]
+    exact congrArg some (Nat.mod_add_div bits 256)
+
+private theorem abstractBytesCoherentPtrProvAux_encodePtrBytesAux_bv
+    (a t orig ptrBytes : Nat) :
+    ∀ (k bits idx : Nat), idx + k = ptrBytes →
+      abstractBytesCoherentPtrProvAux a t orig ptrBytes idx
+        (encodePtrBytesAux a t orig ptrBytes bits idx k) = true
+  | 0, _, idx, h => by
+    have hEq : idx = ptrBytes := by simpa using h
+    subst hEq
+    simp [abstractBytesCoherentPtrProvAux]
+  | k + 1, bits, idx, h => by
+    have hNext : (idx + 1) + k = ptrBytes := by
+      rw [Nat.add_right_comm, Nat.add_assoc]; exact h
+    simp only [abstractBytesCoherentPtrProvAux, Nat.beq_refl, Bool.and_self]
+    exact abstractBytesCoherentPtrProvAux_encodePtrBytesAux_bv a t orig ptrBytes k (bits / 256) (idx + 1) hNext
+
+private theorem abstractBytesCoherentPtrProv?_encodePtrBytes_bv
+    (a t bits n : Nat) :
+    abstractBytesCoherentPtrProv? (encodePtrBytes bits (n + 1) a t) =
+      some { allocId := a, tag := t, byteIdx := 0,
+             origOffset := normPtrByteOffset (n + 1) bits, ptrBytes := n + 1 } := by
+  have hPos : Nat.blt 0 (n + 1) = true := Nat.blt_eq.mpr (Nat.succ_pos n)
+  have hSum : 1 + n = n + 1 := Nat.add_comm 1 n
+  have hAux := abstractBytesCoherentPtrProvAux_encodePtrBytesAux_bv a t
+    (normPtrByteOffset (n + 1) bits) (n + 1) n (bits / 256) 1 hSum
+  unfold encodePtrBytes
+  dsimp only [encodePtrBytesAux]
+  unfold abstractBytesCoherentPtrProv?
+  dsimp only
+  rw [hPos, show Nat.div bits 256 = bits / 256 from rfl, hAux]
+  rfl
+
 /-- Little-endian round trip: decoding `encodeLittleEndianBytes bits (n + 1) prov`
 recovers `bits` and `prov` whenever `bits < scalarModulus (n + 1)`. -/
 theorem decodeLittleEndianBytes_encodeLittleEndianBytes_of_lt
-    (prov : Option (Nat × Nat)) :
-    ∀ (n bits : Nat), bits < scalarModulus (n + 1) →
-      decodeLittleEndianBytes (encodeLittleEndianBytes bits (n + 1) prov) = some (bits, prov)
-  | 0, bits, h => by
-    have h256 : bits < 256 := h
-    have hLow : (UInt8.ofNat bits).toBitVec.toNat = bits := by
-      simp [UInt8.ofNat, BitVec.ofNat, Nat.mod_eq_of_lt h256]
-    show
-      (match decodeLittleEndianBytes ([] : List AbstractByte) with
-       | some (highBits, restProv) =>
-         some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 highBits),
-           mergeByteProvenance prov restProv)
-       | none => none) = some (bits, prov)
-    show some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 0),
-      mergeByteProvenance prov none) = some (bits, prov)
-    rw [hLow]
-    cases prov <;> rfl
-  | n + 1, bits, h => by
-    have hDiv : bits / 256 < scalarModulus (n + 1) := by
-      change bits < 256 * scalarModulus (n + 1) at h
-      omega
-    have hRest := decodeLittleEndianBytes_encodeLittleEndianBytes_of_lt prov n (bits / 256) hDiv
-    have hLow : (UInt8.ofNat bits).toBitVec.toNat = bits % 256 := by
-      simp [UInt8.ofNat, BitVec.ofNat]
-    show
-      (match decodeLittleEndianBytes (encodeLittleEndianBytes (Nat.div bits 256) (n + 1) prov) with
-       | some (highBits, restProv) =>
-         some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 highBits),
-           mergeByteProvenance prov restProv)
-       | none => none) = some (bits, prov)
-    rw [show Nat.div bits 256 = bits / 256 from rfl, hRest]
-    show some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 (bits / 256)),
-      mergeByteProvenance prov prov) = some (bits, prov)
-    rw [hLow]
-    have hMerge : mergeByteProvenance prov prov = prov := by cases prov <;> rfl
-    rw [hMerge]
-    congr 2
-    exact Nat.mod_add_div bits 256
+    (prov : Option (Nat × Nat))
+    (n bits : Nat) (h : bits < scalarModulus (n + 1)) :
+    decodeLittleEndianBytes (encodeLittleEndianBytes bits (n + 1) prov) = some (bits, prov) := by
+  cases prov with
+  | none =>
+    unfold decodeLittleEndianBytes encodeLittleEndianBytes
+    rw [decodeLittleEndianBits_encodePlain_of_lt (n + 1) bits h]
+  | some p =>
+    rcases p with ⟨a, t⟩
+    unfold decodeLittleEndianBytes encodeLittleEndianBytes
+    rw [decodeLittleEndianBits_encodePtrBytesAux_of_lt a t (normPtrByteOffset (n + 1) bits) (n + 1)
+          (n + 1) bits 0 h,
+        abstractBytesCoherentPtrProv?_encodePtrBytes_bv a t bits n]
 
 /-- Scalar round trip: `decodeScalarBytes` on `encodeLittleEndianBytes bits sz prov`
 returns `⟨bits, sz⟩` with provenance `prov` whenever `0 < sz` and
@@ -2308,8 +2419,9 @@ theorem wrappingRangeContains_nonZeroRange_zero
 theorem decodeScalarLayoutBytes_initialized_int_eq
     (bitsWidth : Nat) (signed : Bool) (validRange : WrappingRange)
     (sz : Nat) (bs : List AbstractByte)
-    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz) :
-    decodeScalarLayoutBytes (.initialized (.int bitsWidth signed) validRange) bs =
+    (hWidth : primitiveKindByteWidth (.int bitsWidth signed) = some sz)
+    (ptrBytes : Nat := 8) :
+    decodeScalarLayoutBytes (.initialized (.int bitsWidth signed) validRange) bs ptrBytes =
       match Nat.beq (length bs) sz with
       | false => none
       | true =>
@@ -2321,15 +2433,17 @@ theorem decodeScalarLayoutBytes_initialized_int_eq
           | true => some (.scalar sv) := by
   unfold decodeScalarLayoutBytes scalarLayoutByteWidth
   dsimp only
-  rw [hWidth]
+  have hW : primitiveKindByteWidth (.int bitsWidth signed) ptrBytes = some sz := hWidth
+  rw [hW]
   rfl
 
-/-- Exact characterization of when `decodeScalarLayoutBytes (.initialized pk validRange) bs` succeeds. -/
+/-- Exact characterization of when `decodeScalarLayoutBytes (.initialized pk validRange) bs ptrBytes` succeeds. -/
 theorem decodeScalarLayoutBytes_initialized_some_iff
     (pk : PrimitiveKind) (validRange : WrappingRange)
     (sz : Nat) (bs : List AbstractByte)
-    (hWidth : primitiveKindByteWidth pk = some sz) :
-    (∃ v, decodeScalarLayoutBytes (.initialized pk validRange) bs = some v) ↔
+    (ptrBytes : Nat := 8)
+    (hWidth : primitiveKindByteWidth pk ptrBytes = some sz) :
+    (∃ v, decodeScalarLayoutBytes (.initialized pk validRange) bs ptrBytes = some v) ↔
       (length bs = sz ∧
        ∃ sv prov,
          decodeScalarBytes bs false = some (sv, prov) ∧
@@ -2366,35 +2480,42 @@ theorem decodeScalarLayoutBytes_initialized_some_iff
         · intro _
           cases pk with
           | pointer _ =>
-            cases prov <;> exact ⟨_, rfl⟩
+            dsimp only
+            cases abstractBytesCoherentPtrProv? bs with
+            | none => exact ⟨_, rfl⟩
+            | some frag =>
+              dsimp only
+              cases Nat.beq frag.ptrBytes sz <;> exact ⟨_, rfl⟩
           | int _ _ => exact ⟨_, rfl⟩
           | float _ => exact ⟨_, rfl⟩
 
 /-- Any initialized scalar layout whose `validRange` contains `[0, scalarModulus sz)` decodes all initialized `sz`-byte sequences. -/
 theorem decodeScalarLayoutBytes_initialized_fullRange_of_allBytesInitialized
     (pk : PrimitiveKind) (validRange : WrappingRange) (sz : Nat)
-    (hWidth : primitiveKindByteWidth pk = some sz)
+    (ptrBytes : Nat := 8)
+    (hWidth : primitiveKindByteWidth pk ptrBytes = some sz)
     (hNz : Nat.beq sz 0 = false)
     (hFull : ∀ b, b < scalarModulus sz → wrappingRangeContains validRange b = true)
     (bs : List AbstractByte)
     (hLen : length bs = sz)
     (hInit : allBytesInitialized bs = true) :
-    ∃ v, decodeScalarLayoutBytes (.initialized pk validRange) bs = some v := by
+    ∃ v, decodeScalarLayoutBytes (.initialized pk validRange) bs ptrBytes = some v := by
   rcases decodeScalarBytes_of_allBytesInitialized bs false (hLen ▸ hNz) hInit
     with ⟨sv, prov, hSc⟩
   have ⟨_, hLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
   rw [hLen] at hLt
-  exact (decodeScalarLayoutBytes_initialized_some_iff pk validRange sz bs hWidth).mpr
+  exact (decodeScalarLayoutBytes_initialized_some_iff pk validRange sz bs ptrBytes hWidth).mpr
     ⟨hLen, sv, prov, hSc, hFull sv.bits hLt⟩
 
 /-- Zero-byte decoding characterization for `ScalarLayout.initialized`. -/
 theorem decodeScalarLayoutBytes_initialized_zeroInitBytes_iff
     (pk : PrimitiveKind) (validRange : WrappingRange) (sz : Nat)
-    (hWidth : primitiveKindByteWidth pk = some sz)
+    (ptrBytes : Nat := 8)
+    (hWidth : primitiveKindByteWidth pk ptrBytes = some sz)
     (hNz : Nat.beq sz 0 = false) :
-    (∃ v, decodeScalarLayoutBytes (.initialized pk validRange) (zeroInitBytes sz) = some v) ↔
+    (∃ v, decodeScalarLayoutBytes (.initialized pk validRange) (zeroInitBytes sz) ptrBytes = some v) ↔
       wrappingRangeContains validRange 0 = true := by
-  rw [decodeScalarLayoutBytes_initialized_some_iff pk validRange sz (zeroInitBytes sz) hWidth]
+  rw [decodeScalarLayoutBytes_initialized_some_iff pk validRange sz (zeroInitBytes sz) ptrBytes hWidth]
   rw [length_zeroInitBytes sz, decodeScalarBytes_zeroInitBytes sz false hNz]
   constructor
   · rintro ⟨_, sv, prov, hEq, hRange⟩
@@ -2425,7 +2546,7 @@ theorem decodeScalarLayoutBytes_initialized_encode_some_iff
     cases sz with
     | zero => nomatch hNz
     | succ k => exact Nat.succ_pos k
-  rw [decodeScalarLayoutBytes_initialized_some_iff pk validRange sz _ hWidth,
+  rw [decodeScalarLayoutBytes_initialized_some_iff pk validRange sz _ 8 hWidth,
     length_encodeLittleEndianBytes prov sz bits,
     decodeScalarBytes_encodeLittleEndianBytes_of_lt sz bits prov false hPos hBits]
   constructor
@@ -2482,10 +2603,10 @@ theorem decodeValueFromBytes_adt_primitive_scalarLayout
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar s0)
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : scalarLayoutByteWidth s0 = some l.size.bytes)
+    (hWidth : scalarLayoutByteWidth s0 (layoutPointerBytes layouts) = some l.size.bytes)
     (bs : List AbstractByte) :
     decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx } bs =
-      decodeScalarLayoutBytes s0 bs := by
+      decodeScalarLayoutBytes s0 bs (layoutPointerBytes layouts) := by
   unfold decodeValueFromBytes
   simp only [hLookup, hInhab, Bool.false_or, hVar, hFields, hNz, hRepr]
   unfold decodeScalarLayoutBytes
@@ -2508,7 +2629,7 @@ theorem adt_primitive_scalarLayout_decode_some_iff
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes)
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes)
     (bs : List AbstractByte) :
     (∃ v, decodeValueFromBytes defaultCodecFuel layouts
         { kind := .adt defPath args, layoutIdx := idx } bs = some v) ↔
@@ -2519,7 +2640,8 @@ theorem adt_primitive_scalarLayout_decode_some_iff
   rw [show defaultCodecFuel = 15 + 1 from rfl,
     decodeValueFromBytes_adt_primitive_scalarLayout 15 layouts defPath args idx l variantIdx
       (.initialized pk validRange) hLookup hInhab hVar hFields hRepr hNz hWidth bs]
-  exact decodeScalarLayoutBytes_initialized_some_iff pk validRange l.size.bytes bs hWidth
+  exact decodeScalarLayoutBytes_initialized_some_iff pk validRange l.size.bytes bs
+    (layoutPointerBytes layouts) hWidth
 
 /--
 Candidate-validation form of `adt_primitive_scalarLayout_decode_some_iff` for an
@@ -2566,7 +2688,7 @@ theorem adt_primitive_scalarLayout_isFromBytes_of_fullRange
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes)
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes)
     (hFull : ∀ b, b < scalarModulus l.size.bytes → wrappingRangeContains validRange b = true) :
     IsFromBytes layouts { kind := .adt defPath args, layoutIdx := idx } := by
   refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], ?_⟩
@@ -2575,7 +2697,7 @@ theorem adt_primitive_scalarLayout_isFromBytes_of_fullRange
       decodeValueFromBytes_adt_primitive_scalarLayout 15 layouts defPath args idx l variantIdx
         (.initialized pk validRange) hLookup hInhab hVar hFields hRepr hNz hWidth bs]
   exact decodeScalarLayoutBytes_initialized_fullRange_of_allBytesInitialized
-    pk validRange l.size.bytes hWidth hNz hFull bs hLen hInit
+    pk validRange l.size.bytes (layoutPointerBytes layouts) hWidth hNz hFull bs hLen hInit
 
 /--
 A single-variant `.primitive` ADT with full-range `validRange = ⟨0, scalarModulus l.size.bytes - 1⟩`
@@ -2590,7 +2712,7 @@ theorem adt_primitive_scalarLayout_isFromBytes
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar (.initialized pk ⟨0, scalarModulus l.size.bytes - 1⟩))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes) :
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes) :
     IsFromBytes layouts { kind := .adt defPath args, layoutIdx := idx } :=
   adt_primitive_scalarLayout_isFromBytes_of_fullRange
     layouts defPath args idx l variantIdx pk ⟨0, scalarModulus l.size.bytes - 1⟩
@@ -2611,7 +2733,7 @@ theorem adt_primitive_scalarLayout_isFromBytes_iff
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes) :
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes) :
     IsFromBytes layouts { kind := .adt defPath args, layoutIdx := idx } ↔
       ∀ b, b < scalarModulus l.size.bytes → wrappingRangeContains validRange b = true := by
   constructor
@@ -2657,7 +2779,7 @@ theorem adt_primitive_scalarLayout_isFromZeros_iff
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes) :
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes) :
     IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } ↔
       wrappingRangeContains validRange 0 = true := by
   have hSz : rigidTyByteSize layouts { kind := .adt defPath args, layoutIdx := idx } =
@@ -2666,7 +2788,8 @@ theorem adt_primitive_scalarLayout_isFromZeros_iff
   have hRed := decodeValueFromBytes_adt_primitive_scalarLayout 15 layouts defPath args idx
     l variantIdx (.initialized pk validRange) hLookup hInhab hVar hFields hRepr hNz hWidth
     (zeroInitBytes l.size.bytes)
-  rw [← decodeScalarLayoutBytes_initialized_zeroInitBytes_iff pk validRange l.size.bytes hWidth hNz]
+  rw [← decodeScalarLayoutBytes_initialized_zeroInitBytes_iff pk validRange l.size.bytes
+    (layoutPointerBytes layouts) hWidth hNz]
   constructor
   · rintro ⟨sz, v, hSzEq, hDec⟩
     rw [hSz] at hSzEq
@@ -2688,7 +2811,7 @@ theorem adt_primitive_scalarLayout_isFromZeros
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes)
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes)
     (hZero : wrappingRangeContains validRange 0 = true) :
     IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } :=
   (adt_primitive_scalarLayout_isFromZeros_iff layouts defPath args idx l variantIdx pk validRange
@@ -2703,7 +2826,7 @@ theorem adt_primitive_scalarLayout_not_isFromZeros
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes)
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes)
     (hNoZero : wrappingRangeContains validRange 0 = false) :
     ¬ IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } := by
   intro hFZ
@@ -2825,7 +2948,7 @@ theorem adt_primitive_enumTag_isFromZeros
     (hFields : l.fields = .primitive)
     (hRepr : l.backendRepr = .scalar (.initialized pk ⟨0, maxTag⟩))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes) :
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes) :
     IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } :=
   adt_primitive_scalarLayout_isFromZeros layouts defPath args idx l variantIdx pk ⟨0, maxTag⟩
     hLookup hInhab hVar hFields hRepr hNz hWidth
@@ -2882,7 +3005,7 @@ theorem adt_primitive_nonZero_not_isFromZeros
       l.backendRepr =
         .scalar (.initialized pk ⟨1, scalarModulus l.size.bytes - 1⟩))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes) :
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes) :
     ¬ IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } := by
   have hPos : 0 < l.size.bytes := by
     cases h : l.size.bytes with
@@ -2954,13 +3077,13 @@ theorem decodeValueFromBytes_adt_newtype_scalarLayout
     (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
     (hNoFieldLayouts : l.fieldLayouts = [])
     (hRepr : l.backendRepr = .scalar sl)
-    (hWidth : scalarLayoutByteWidth sl = some l.size.bytes)
+    (hWidth : scalarLayoutByteWidth sl (layoutPointerBytes layouts) = some l.size.bytes)
     (bs : List AbstractByte) :
     decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath [], layoutIdx := idx } bs =
       match Nat.beq (length bs) l.size.bytes with
       | false => none
       | true =>
-        match decodeScalarLayoutBytes sl bs with
+        match decodeScalarLayoutBytes sl bs (layoutPointerBytes layouts) with
         | some v0 => some (.aggregate variantIdx [v0])
         | none => none := by
   unfold decodeValueFromBytes
@@ -3183,7 +3306,7 @@ theorem adt_newtype_scalarLayout_not_isFromZeros
     (hNoFieldLayouts : l.fieldLayouts = [])
     (hRepr : l.backendRepr = .scalar (.initialized pk validRange))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes)
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes)
     (hZeroInvalid : wrappingRangeContains validRange 0 = false) :
     ¬ IsFromZeros layouts { kind := .adt defPath [], layoutIdx := idx } := by
   rintro ⟨sz, v, hSz, hDec⟩
@@ -3341,7 +3464,7 @@ theorem adt_newtype_nonZero_not_isFromZeros
       l.backendRepr =
         .scalar (.initialized pk ⟨1, scalarModulus l.size.bytes - 1⟩))
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes) :
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes) :
     ¬ IsFromZeros layouts { kind := .adt defPath [], layoutIdx := idx } := by
   have hPos : 0 < l.size.bytes := by
     cases h : l.size.bytes with
@@ -3366,13 +3489,13 @@ theorem decodeValueFromBytes_adt_multiple_enum_explicit_scalarLayout
     (hInhab : l.isUninhabited = false)
     (hVar : l.variants = .multiple tagLayout 0 variantShapes)
     (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
-    (hWidth : scalarLayoutByteWidth tagLayout = some l.size.bytes)
+    (hWidth : scalarLayoutByteWidth tagLayout (layoutPointerBytes layouts) = some l.size.bytes)
     (bs : List AbstractByte) :
     decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx } bs =
       match Nat.beq (length bs) l.size.bytes with
       | false => none
       | true =>
-        match decodeScalarLayoutBytes tagLayout bs with
+        match decodeScalarLayoutBytes tagLayout bs (layoutPointerBytes layouts) with
         | some (.scalar tagSc) =>
           match resolveEnumVariantIdxByTag l.variantDiscriminants tagSc.bits with
           | some varIdx =>
@@ -3406,7 +3529,7 @@ theorem decodeValueFromBytes_adt_multiple_enum_explicit_scalarLayout
 /--
 Unfolding lemma for `decodeValueFromBytes` on an inhabited multi-variant enum
 `.adt defPath args` (`l.variants = .multiple tagLayout 0 variantShapes`,
-`l.fields = .arbitrary [⟨0⟩] memoryOrder`, `scalarLayoutByteWidth tagLayout = some l.size.bytes`)
+`l.fields = .arbitrary [⟨0⟩] memoryOrder`, `scalarLayoutByteWidth tagLayout (layoutPointerBytes layouts) = some l.size.bytes`)
 with default `0..n-1` discriminants (`l.variantDiscriminants = []`).
 -/
 theorem decodeValueFromBytes_adt_multiple_enum_scalarLayout
@@ -3417,14 +3540,14 @@ theorem decodeValueFromBytes_adt_multiple_enum_scalarLayout
     (hInhab : l.isUninhabited = false)
     (hVar : l.variants = .multiple tagLayout 0 variantShapes)
     (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
-    (hWidth : scalarLayoutByteWidth tagLayout = some l.size.bytes)
+    (hWidth : scalarLayoutByteWidth tagLayout (layoutPointerBytes layouts) = some l.size.bytes)
     (bs : List AbstractByte)
     (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx } bs =
       match Nat.beq (length bs) l.size.bytes with
       | false => none
       | true =>
-        match decodeScalarLayoutBytes tagLayout bs with
+        match decodeScalarLayoutBytes tagLayout bs (layoutPointerBytes layouts) with
         | some (.scalar tagSc) =>
           match get? variantShapes tagSc.bits with
           | some (.arbitrary varOffsets _) =>
@@ -3542,7 +3665,7 @@ theorem adt_multiple_enum_scalarLayout_not_isFromZeros
     (hVar : l.variants = .multiple (.initialized pk validRange) 0 variantShapes)
     (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
     (hNz : Nat.beq l.size.bytes 0 = false)
-    (hWidth : primitiveKindByteWidth pk = some l.size.bytes)
+    (hWidth : primitiveKindByteWidth pk (layoutPointerBytes layouts) = some l.size.bytes)
     (hZeroInvalid : wrappingRangeContains validRange 0 = false) :
     ¬ IsFromZeros layouts { kind := .adt defPath args, layoutIdx := idx } := by
   rintro ⟨sz, v, hSz, hDec⟩
@@ -3643,7 +3766,7 @@ theorem adt_multiple_enum_fieldless_isIntoBytes
     (hInhab : l.isUninhabited = false)
     (hVar : l.variants = .multiple tagLayout 0 variantShapes)
     (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
-    (hWidth : scalarLayoutByteWidth tagLayout = some l.size.bytes)
+    (hWidth : scalarLayoutByteWidth tagLayout (layoutPointerBytes layouts) = some l.size.bytes)
     (hFieldless :
       ∀ (varIdx : Nat) (varOffsets : List Size) (varMemOrder : List Nat),
         get? variantShapes varIdx = some (.arbitrary varOffsets varMemOrder) →
@@ -3799,7 +3922,7 @@ theorem adt_multiple_enum_explicit_discriminant_roundtrip
     dsimp only
     rw [hInhab, hVar]
     dsimp only
-    rw [hFields, show scalarLayoutByteWidth (.initialized (.int bitsWidth signed) validRange) =
+    rw [hFields, show scalarLayoutByteWidth (.initialized (.int bitsWidth signed) validRange) (layoutPointerBytes layouts) =
       some l.size.bytes from hWidth, hGetVar]
     dsimp only
     have hGet0 : get? ([{ bytes := 0 }] : List Size) 0 = some { bytes := 0 } := rfl
@@ -4348,8 +4471,8 @@ provenance-free image of `sl`'s byte width: the width is positive and, for an
 initialized layout, the valid range starts at `0` and reaches the largest bit
 pattern of that width, so neither a niche nor the `char` check applies.
 -/
-def scalarLayoutCoversWidth (sl : ScalarLayout) : Bool :=
-  match scalarLayoutByteWidth sl with
+def scalarLayoutCoversWidth (sl : ScalarLayout) (ptrBytes : Nat := 8) : Bool :=
+  match scalarLayoutByteWidth sl ptrBytes with
   | none => false
   | some w =>
     Nat.blt 0 w &&
@@ -4367,11 +4490,12 @@ Decidable check that `l.backendRepr` imposes no scalar `validRange` niche: a
 pair with a niche at the high end, such as a `NonMax` half, which Stage-1 decoding
 enforces (`checkBackendReprFullRange_scalarPair_nonMax`).
 -/
-def checkBackendReprFullRange (l : TypeLayout) : Bool :=
+def checkBackendReprFullRange (l : TypeLayout) (ptrBytes : Nat := 8) : Bool :=
   match l.backendRepr with
   | .scalar (.initialized _ validRange) =>
     (validRange.start == 0) && Nat.ble (scalarModulus l.size.bytes - 1) validRange.end_
-  | .scalarPair s0 s1 => scalarLayoutCoversWidth s0 && scalarLayoutCoversWidth s1
+  | .scalarPair s0 s1 =>
+    scalarLayoutCoversWidth s0 ptrBytes && scalarLayoutCoversWidth s1 ptrBytes
   | _ => true
 
 /--
@@ -4409,7 +4533,7 @@ def checkFromBytesNicheAware (layouts : LayoutTable) (ty : Ty) : Bool :=
     match ty.kind with
     | .adt _ _ =>
       match LayoutTable.lookup layouts ty.layoutIdx with
-      | some l => checkBackendReprFullRange l
+      | some l => checkBackendReprFullRange l (layoutPointerBytes layouts)
       | none => false
     | _ => true
 
@@ -4521,7 +4645,7 @@ theorem abstractBytesHaveProv_init_none_cons (b : UInt8) (rest : List AbstractBy
 
 @[simp]
 theorem abstractBytesHaveProv_init_some_cons
-    (b : UInt8) (pv : Nat × Nat) (rest : List AbstractByte) :
+    (b : UInt8) (pv : PtrByteFrag) (rest : List AbstractByte) :
     abstractBytesHaveProv (.init b (some pv) :: rest) = true := rfl
 
 @[simp]
@@ -4606,6 +4730,20 @@ theorem abstractBytesHaveProv_of_abstractBytesUniformProv
       cases p with
       | none => nomatch h
       | some pv => rfl
+
+/-- A provenance-free byte image never yields coherent pointer provenance. -/
+theorem abstractBytesCoherentPtrProv?_none_of_provFree
+    {bs : List AbstractByte} (h : abstractBytesHaveProv bs = false) :
+    abstractBytesCoherentPtrProv? bs = none := by
+  cases bs with
+  | nil => rfl
+  | cons b rest =>
+    cases b with
+    | uninit => rfl
+    | init d p =>
+      cases p with
+      | none => rfl
+      | some pv => nomatch h
 
 /-- A provenance-free byte image is never an intact pointer image. -/
 theorem abstractBytesUniformProv_eq_false_of_provFree
@@ -4832,13 +4970,13 @@ initialized provenance-free image of that width to a scalar, for every primitive
 kind: pointer layouts yield the provenance-less address.
 -/
 theorem decodeScalarLayoutBytesNoForge_of_coversWidth
-    (sl : ScalarLayout) (w : Nat) (bs : List AbstractByte)
-    (hCov : scalarLayoutCoversWidth sl = true)
-    (hWidth : scalarLayoutByteWidth sl = some w)
+    (sl : ScalarLayout) (w : Nat) (bs : List AbstractByte) (ptrBytes : Nat := 8)
+    (hCov : scalarLayoutCoversWidth sl ptrBytes = true)
+    (hWidth : scalarLayoutByteWidth sl ptrBytes = some w)
     (hLen : length bs = w)
     (hInit : allBytesInitialized bs = true)
     (hProv : abstractBytesHaveProv bs = false) :
-    ∃ sv, decodeScalarLayoutBytesNoForge sl bs = some (.scalar sv) := by
+    ∃ sv, decodeScalarLayoutBytesNoForge sl bs .strictUcg630Ub ptrBytes = some (.scalar sv) := by
   unfold scalarLayoutCoversWidth at hCov
   rw [hWidth] at hCov
   simp only [Bool.and_eq_true, Nat.blt_eq] at hCov
@@ -4849,10 +4987,20 @@ theorem decodeScalarLayoutBytesNoForge_of_coversWidth
     | zero => omega
     | succ k => rfl
   obtain ⟨sv, prov, hSc⟩ := decodeScalarBytes_of_allBytesInitialized bs false hNz hInit
+  obtain ⟨bits, hBits⟩ := decodeLittleEndianBits_of_allBytesInitialized bs hInit
+  have hSvBits : sv.bits = bits := by
+    unfold decodeScalarBytes decodeLittleEndianBytes at hSc
+    dsimp only at hSc
+    rw [hNz, hBits] at hSc
+    dsimp only at hSc
+    injection hSc with hPair
+    injection hPair with hSv _
+    rw [← hSv]
   obtain ⟨hSvSz, hSvLt⟩ := decodeScalarBytes_bits_lt bs false sv prov hSc
   rw [hLen] at hSvSz hSvLt
   have hBeqLen : Nat.beq (length bs) w = true := by rw [hLen]; exact Nat.beq_refl w
-  have hUni := abstractBytesUniformProv_eq_false_of_provFree hProv
+  have hCoh : abstractBytesCoherentPtrProv? bs = none :=
+    abstractBytesCoherentPtrProv?_none_of_provFree hProv
   refine ⟨sv, ?_⟩
   cases sl with
   | initialized pk vr =>
@@ -4874,11 +5022,14 @@ theorem decodeScalarLayoutBytesNoForge_of_coversWidth
     cases pk with
     | pointer a =>
       dsimp only
-      rw [hSc]
+      rw [hBits]
       dsimp only
-      rw [hUni]
+      rw [hCoh]
       dsimp only
-      rw [hRange]
+      rw [← hSvBits, hRange]
+      have hEqSv : ({ bits := sv.bits, sizeBytes := w } : ScalarInt) = sv := by
+        cases sv; simp_all
+      rw [hEqSv]
     | int b s =>
       dsimp only
       rw [hProv]
@@ -4905,9 +5056,13 @@ theorem decodeScalarLayoutBytesNoForge_of_coversWidth
     cases pk with
     | pointer a =>
       dsimp only
-      rw [hSc]
+      rw [hBits]
       dsimp only
-      rw [hUni]
+      rw [hCoh]
+      dsimp only
+      have hEqSv : ({ bits := bits, sizeBytes := w } : ScalarInt) = sv := by
+        cases sv; simp_all
+      rw [hEqSv]
     | int b s =>
       dsimp only
       rw [hProv]
@@ -4921,25 +5076,43 @@ theorem decodeScalarLayoutBytesNoForge_of_coversWidth
 
 /-! ### 7.3 Stage-1 Base `FromBytes` Kinds -/
 
-/-- Stage-1 decodes unsigned integers with the legacy decoder after rejecting provenance. -/
+/-- Stage-1 decodes unsigned integers with the legacy decoder after rejecting provenance
+(on non-32-bit targets for `usize`). -/
 theorem decodeTypedValueFromBytes_uint_eq
     (fuel : Nat) (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx)
-    (bs : List AbstractByte) :
+    (bs : List AbstractByte)
+    (hNot32 : w = .usize → Nat.beq (layoutPointerBytes layouts) 4 = false) :
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .uint w, layoutIdx := idx } bs =
       match abstractBytesHaveProv bs with
       | true => none
-      | false => decodeValueFromBytes (fuel + 1) layouts { kind := .uint w, layoutIdx := idx } bs :=
-  rfl
+      | false => decodeValueFromBytes (fuel + 1) layouts { kind := .uint w, layoutIdx := idx } bs := by
+  cases w with
+  | usize =>
+    unfold decodeTypedValueFromBytes
+    dsimp only
+    cases abstractBytesHaveProv bs with
+    | true => rfl
+    | false => dsimp only; rw [hNot32 rfl]
+  | u8 | u16 | u32 | u64 | u128 => rfl
 
-/-- Stage-1 decodes signed integers with the legacy decoder after rejecting provenance. -/
+/-- Stage-1 decodes signed integers with the legacy decoder after rejecting provenance
+(on non-32-bit targets for `isize`). -/
 theorem decodeTypedValueFromBytes_int_eq
     (fuel : Nat) (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx)
-    (bs : List AbstractByte) :
+    (bs : List AbstractByte)
+    (hNot32 : w = .isize → Nat.beq (layoutPointerBytes layouts) 4 = false) :
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .int w, layoutIdx := idx } bs =
       match abstractBytesHaveProv bs with
       | true => none
-      | false => decodeValueFromBytes (fuel + 1) layouts { kind := .int w, layoutIdx := idx } bs :=
-  rfl
+      | false => decodeValueFromBytes (fuel + 1) layouts { kind := .int w, layoutIdx := idx } bs := by
+  cases w with
+  | isize =>
+    unfold decodeTypedValueFromBytes
+    dsimp only
+    cases abstractBytesHaveProv bs with
+    | true => rfl
+    | false => dsimp only; rw [hNot32 rfl]
+  | i8 | i16 | i32 | i64 | i128 => rfl
 
 /-- Stage-1 decodes `()` with the legacy decoder. -/
 theorem decodeTypedValueFromBytes_unit_eq
@@ -4983,20 +5156,24 @@ theorem decodeArrayChunksWith_of_allBytesInitialized_provFree
     unfold decodeArrayChunksWith
     simp [hBle, hV, hVs]
 
-/-- Every unsigned integer type satisfies Stage-1 `FromBytes`. -/
-theorem uint_isFromBytesTyped (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx) :
+/-- Every unsigned integer type satisfies Stage-1 `FromBytes` (on non-32-bit targets for `usize`). -/
+theorem uint_isFromBytesTyped (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx)
+    (hNot32 : w = .usize → Nat.beq (layoutPointerBytes layouts) 4 = false) :
     IsFromBytesTyped layouts { kind := .uint w, layoutIdx := idx } := by
   obtain ⟨sz, hSz, hDec⟩ := uint_isFromBytes layouts w idx
   refine ⟨sz, hSz, fun bs hLen hInit hProv => ?_⟩
-  rw [show defaultCodecFuel = 15 + 1 from rfl, decodeTypedValueFromBytes_uint_eq, hProv]
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+    decodeTypedValueFromBytes_uint_eq 15 layouts w idx bs hNot32, hProv]
   exact hDec bs hLen hInit
 
-/-- Every signed integer type satisfies Stage-1 `FromBytes`. -/
-theorem int_isFromBytesTyped (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx) :
+/-- Every signed integer type satisfies Stage-1 `FromBytes` (on non-32-bit targets for `isize`). -/
+theorem int_isFromBytesTyped (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx)
+    (hNot32 : w = .isize → Nat.beq (layoutPointerBytes layouts) 4 = false) :
     IsFromBytesTyped layouts { kind := .int w, layoutIdx := idx } := by
   obtain ⟨sz, hSz, hDec⟩ := int_isFromBytes layouts w idx
   refine ⟨sz, hSz, fun bs hLen hInit hProv => ?_⟩
-  rw [show defaultCodecFuel = 15 + 1 from rfl, decodeTypedValueFromBytes_int_eq, hProv]
+  rw [show defaultCodecFuel = 15 + 1 from rfl,
+    decodeTypedValueFromBytes_int_eq 15 layouts w idx bs hNot32, hProv]
   exact hDec bs hLen hInit
 
 /-- `()` satisfies Stage-1 `FromBytes`. -/
@@ -5008,29 +5185,40 @@ theorem unit_isFromBytesTyped (layouts : LayoutTable) (idx : LayoutIdx) :
   exact hDec bs hLen hInit
 
 /--
-Layout side condition for Stage-1 decoding of an array kind `k = [T; n]` at
-layout index `idx`. When `idx` resolves to an array layout with element field
-layouts, Stage-1 decodes `stride`-byte chunks, so the stride must equal the
-element kind's byte size; for any other layout entry Stage-1 falls back to the
-element kind's own size. Non-array kinds impose no condition.
+Layout side condition for Stage-1 decoding of an array kind `k = [T; n]` (or
+target-pointer-width integer `usize`/`isize`) at layout index `idx`. When `idx`
+resolves to an array layout with element field layouts, Stage-1 decodes
+`stride`-byte chunks, so the stride must equal the element kind's byte size; for
+`usize`/`isize` (direct or array element), requires a 64-bit target layout table
+(`layoutPointerBytes layouts = 8`) matching `rigidTyKindByteSize`.
 -/
 def arrayLayoutStage1Consistent (layouts : LayoutTable) (k : RigidTy) (idx : LayoutIdx) :
     Bool :=
   match k with
+  | .uint .usize => Nat.beq (layoutPointerBytes layouts) 8
+  | .int .isize => Nat.beq (layoutPointerBytes layouts) 8
   | .array elemKind _ =>
-    match LayoutTable.lookup layouts idx with
-    | some { fields := .array stride _, fieldLayouts := _ :: _, .. } =>
-      match rigidTyKindByteSize elemKind with
-      | some elemSz => Nat.beq stride.bytes elemSz
-      | none => false
-    | _ => true
+    let ptrOk : Bool :=
+      match elemKind with
+      | .uint .usize => Nat.beq (layoutPointerBytes layouts) 8
+      | .int .isize => Nat.beq (layoutPointerBytes layouts) 8
+      | _ => true
+    Bool.and ptrOk
+      (match LayoutTable.lookup layouts idx with
+       | some { fields := .array stride _, fieldLayouts := _ :: _, .. } =>
+         match rigidTyKindByteSize elemKind with
+         | some elemSz => Nat.beq stride.bytes elemSz
+         | none => false
+       | _ => true)
   | _ => true
 
-/-- Stage-1 decodes every initialized provenance-free integer image of the kind's size. -/
+/-- Stage-1 decodes every initialized provenance-free integer image of the kind's size
+(on non-32-bit targets for `usize`/`isize`). -/
 theorem decodeTypedValueFromBytes_intKind_anyFuel
     (fuel : Nat) (layouts : LayoutTable) (k : RigidTy) (idx : LayoutIdx) (sz : Nat)
     (hK : (∃ w, k = .uint w) ∨ (∃ w, k = .int w))
     (hSz : rigidTyKindByteSize k = some sz)
+    (hNot32 : (k = .uint .usize ∨ k = .int .isize) → Nat.beq (layoutPointerBytes layouts) 4 = false)
     (bs : List AbstractByte) (hLen : length bs = sz)
     (hInit : allBytesInitialized bs = true) (hProv : abstractBytesHaveProv bs = false) :
     ∃ v, decodeTypedValueFromBytes (fuel + 1) layouts { kind := k, layoutIdx := idx } bs =
@@ -5041,14 +5229,16 @@ theorem decodeTypedValueFromBytes_intKind_anyFuel
       have h : intCastTargetBytes (.uint w) = some sz := hSz
       rw [hSz'] at h; injection h
     subst hEq
-    rw [decodeTypedValueFromBytes_uint_eq, hProv]
+    rw [decodeTypedValueFromBytes_uint_eq fuel layouts w idx bs (fun hw => hNot32 (Or.inl (by rw [hw]))),
+      hProv]
     exact uint_decode_anyFuel fuel layouts w idx sz' hSz' hNz bs hLen hInit
   · obtain ⟨sz', hSz', hNz⟩ := intWidth_targetBytes w
     have hEq : sz' = sz := by
       have h : intCastTargetBytes (.int w) = some sz := hSz
       rw [hSz'] at h; injection h
     subst hEq
-    rw [decodeTypedValueFromBytes_int_eq, hProv]
+    rw [decodeTypedValueFromBytes_int_eq fuel layouts w idx bs (fun hw => hNot32 (Or.inr (by rw [hw]))),
+      hProv]
     exact int_decode_anyFuel fuel layouts w idx sz' hSz' hNz bs hLen hInit
 
 /--
@@ -5065,6 +5255,17 @@ theorem array_intKind_isFromBytesTyped
     rcases hK with ⟨w, rfl⟩ | ⟨w, rfl⟩
     · obtain ⟨s, hs, _⟩ := uintWidth_targetBytes w; exact ⟨s, hs⟩
     · obtain ⟨s, hs, _⟩ := intWidth_targetBytes w; exact ⟨s, hs⟩
+  have hPtr8 : (elemKind = .uint .usize ∨ elemKind = .int .isize) →
+      layoutPointerBytes layouts = 8 := by
+    intro hU
+    unfold arrayLayoutStage1Consistent at hArr
+    rcases hU with rfl | rfl <;> (
+      dsimp only at hArr
+      rw [Bool.and_eq_true] at hArr
+      exact Nat.eq_of_beq_eq_true hArr.1)
+  have hNot32 : (elemKind = .uint .usize ∨ elemKind = .int .isize) →
+      Nat.beq (layoutPointerBytes layouts) 4 = false := fun hU => by
+    rw [hPtr8 hU]; rfl
   have hKindSz : rigidTyKindByteSize (.array elemKind n) = some (elemSz * n) := by
     simp only [rigidTyKindByteSize, hElemSz]; rfl
   refine ⟨elemSz * n, by simp only [rigidTyByteSize, hKindSz], ?_⟩
@@ -5083,19 +5284,39 @@ theorem array_intKind_isFromBytesTyped
     have hFallback :
         ∃ elems,
           decodeArrayChunksWith
-            (decodeTypedValueFromBytes 15 layouts { kind := elemKind, layoutIdx := 0 })
+            (fun chunk => decodeTypedValueFromBytes 15 layouts { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts } chunk)
             elemSz n bs = some elems :=
       decodeArrayChunksWith_of_allBytesInitialized_provFree _ elemSz
         (fun chunk hl hi hp =>
-          decodeTypedValueFromBytes_intKind_anyFuel 14 layouts elemKind 0 elemSz hK hElemSz
+          decodeTypedValueFromBytes_intKind_anyFuel 14 layouts elemKind (unresolvedLayoutIdx layouts) elemSz hK hElemSz hNot32
             chunk hl hi hp) n bs hLen hInit hProv
     have hBeqLen : Nat.beq (length bs) (Nat.mul elemSz n) = true := by
       rw [hLen]; exact Nat.beq_refl _
-    have hBeqLen2 : Nat.beq (length bs) (elemSz * n) = true := hBeqLen
     cases hL : LayoutTable.lookup layouts idx with
     | none =>
       obtain ⟨elems, hElems⟩ := hFallback
-      exact ⟨.aggregate 0 elems, by simp [hElemSz, hBeqLen2, hElems]⟩
+      refine ⟨.aggregate 0 elems, ?_⟩
+      rcases hK with ⟨w, rfl⟩ | ⟨w, rfl⟩
+      · cases w with
+        | usize =>
+          have h8 : elemSz = 8 := by
+            change intCastTargetBytes (.uint .usize) = some elemSz at hElemSz
+            injection hElemSz with hEq; exact hEq.symm
+          simp only [hPtr8 (Or.inl rfl), ← h8, hBeqLen, hElems]
+        | u8 | u16 | u32 | u64 | u128 =>
+          have hEq : elemSz = _ := (Option.some.inj hElemSz).symm
+          subst hEq
+          simp only [decodeTypedKindByteSize, intCastTargetBytes, hBeqLen, hElems]
+      · cases w with
+        | isize =>
+          have h8 : elemSz = 8 := by
+            change intCastTargetBytes (.int .isize) = some elemSz at hElemSz
+            injection hElemSz with hEq; exact hEq.symm
+          simp only [hPtr8 (Or.inr rfl), ← h8, hBeqLen, hElems]
+        | i8 | i16 | i32 | i64 | i128 =>
+          have hEq : elemSz = _ := (Option.some.inj hElemSz).symm
+          subst hEq
+          simp only [decodeTypedKindByteSize, intCastTargetBytes, hBeqLen, hElems]
     | some l =>
       rcases l with ⟨lsize, lalign, lrepr, lfields, lvariants, luninh, lfls⟩
       cases lfields with
@@ -5103,26 +5324,68 @@ theorem array_intKind_isFromBytesTyped
         cases lfls with
         | nil =>
           obtain ⟨elems, hElems⟩ := hFallback
-          exact ⟨.aggregate 0 elems, by simp [hElemSz, hBeqLen2, hElems]⟩
+          refine ⟨.aggregate 0 elems, ?_⟩
+          rcases hK with ⟨w, rfl⟩ | ⟨w, rfl⟩
+          · cases w with
+            | usize =>
+              have h8 : elemSz = 8 := by
+                change intCastTargetBytes (.uint .usize) = some elemSz at hElemSz
+                injection hElemSz with hEq; exact hEq.symm
+              simp only [hPtr8 (Or.inl rfl), ← h8, hBeqLen, hElems]
+            | u8 | u16 | u32 | u64 | u128 =>
+              have hEq : elemSz = _ := (Option.some.inj hElemSz).symm
+              subst hEq
+              simp only [decodeTypedKindByteSize, intCastTargetBytes, hBeqLen, hElems]
+          · cases w with
+            | isize =>
+              have h8 : elemSz = 8 := by
+                change intCastTargetBytes (.int .isize) = some elemSz at hElemSz
+                injection hElemSz with hEq; exact hEq.symm
+              simp only [hPtr8 (Or.inr rfl), ← h8, hBeqLen, hElems]
+            | i8 | i16 | i32 | i64 | i128 =>
+              have hEq : elemSz = _ := (Option.some.inj hElemSz).symm
+              subst hEq
+              simp only [decodeTypedKindByteSize, intCastTargetBytes, hBeqLen, hElems]
         | cons elemFlIdx rest =>
           have hStride : stride.bytes = elemSz := by
             unfold arrayLayoutStage1Consistent at hArr
-            simp only [hL, hElemSz] at hArr
-            exact Nat.eq_of_beq_eq_true hArr
+            simp only [Bool.and_eq_true, hL, hElemSz] at hArr
+            exact Nat.eq_of_beq_eq_true hArr.2
           obtain ⟨elems, hElems⟩ :=
             decodeArrayChunksWith_of_allBytesInitialized_provFree
               (decodeTypedValueFromBytes 15 layouts { kind := elemKind, layoutIdx := elemFlIdx })
               stride.bytes
               (fun chunk hl hi hp =>
                 decodeTypedValueFromBytes_intKind_anyFuel 14 layouts elemKind elemFlIdx elemSz hK
-                  hElemSz chunk (hStride ▸ hl) hi hp) n bs (hStride ▸ hLen) hInit hProv
+                  hElemSz hNot32 chunk (hStride ▸ hl) hi hp) n bs (hStride ▸ hLen) hInit hProv
           have hBeqLen' : Nat.beq (length bs) (Nat.mul stride.bytes n) = true := by
             rw [hStride]; exact hBeqLen
           have hBeqLen2' : Nat.beq (length bs) (stride.bytes * n) = true := hBeqLen'
           exact ⟨.aggregate 0 elems, by simp [hBeqLen2', hElems]⟩
       | _ =>
         obtain ⟨elems, hElems⟩ := hFallback
-        exact ⟨.aggregate 0 elems, by simp [hElemSz, hBeqLen2, hElems]⟩
+        refine ⟨.aggregate 0 elems, ?_⟩
+        rcases hK with ⟨w, rfl⟩ | ⟨w, rfl⟩
+        · cases w with
+          | usize =>
+            have h8 : elemSz = 8 := by
+              change intCastTargetBytes (.uint .usize) = some elemSz at hElemSz
+              injection hElemSz with hEq; exact hEq.symm
+            simp only [hPtr8 (Or.inl rfl), ← h8, hBeqLen, hElems]
+          | u8 | u16 | u32 | u64 | u128 =>
+            have hEq : elemSz = _ := (Option.some.inj hElemSz).symm
+            subst hEq
+            simp only [decodeTypedKindByteSize, intCastTargetBytes, hBeqLen, hElems]
+        · cases w with
+          | isize =>
+            have h8 : elemSz = 8 := by
+              change intCastTargetBytes (.int .isize) = some elemSz at hElemSz
+              injection hElemSz with hEq; exact hEq.symm
+            simp only [hPtr8 (Or.inr rfl), ← h8, hBeqLen, hElems]
+          | i8 | i16 | i32 | i64 | i128 =>
+            have hEq : elemSz = _ := (Option.some.inj hElemSz).symm
+            subst hEq
+            simp only [decodeTypedKindByteSize, intCastTargetBytes, hBeqLen, hElems]
   · have hn0 : n = 0 := Nat.eq_of_beq_eq_true hn
     subst hn0
     have hNil : bs = [] := by
@@ -5142,8 +5405,16 @@ theorem checkBaseFromBytesKind_isFromBytesTyped
     (hArr : arrayLayoutStage1Consistent layouts k idx = true) :
     IsFromBytesTyped layouts { kind := k, layoutIdx := idx } := by
   cases k with
-  | uint w => exact uint_isFromBytesTyped layouts w idx
-  | int w => exact int_isFromBytesTyped layouts w idx
+  | uint w =>
+    exact uint_isFromBytesTyped layouts w idx (fun hw => by
+      subst hw
+      have h8 : layoutPointerBytes layouts = 8 := Nat.eq_of_beq_eq_true hArr
+      rw [h8]; rfl)
+  | int w =>
+    exact int_isFromBytesTyped layouts w idx (fun hw => by
+      subst hw
+      have h8 : layoutPointerBytes layouts = 8 := Nat.eq_of_beq_eq_true hArr
+      rw [h8]; rfl)
   | tuple ks =>
     cases ks with
     | nil => exact unit_isFromBytesTyped layouts idx
@@ -5176,7 +5447,7 @@ theorem decodeTypedValueFromBytes_adt_primitive_scalarLayout
         bs =
       match Nat.beq (length bs) l.size.bytes with
       | false => none
-      | true => decodeScalarLayoutBytesNoForge s0 bs := by
+      | true => decodeScalarLayoutBytesNoForge s0 bs .strictUcg630Ub (layoutPointerBytes layouts) := by
   cases hLen : Nat.beq (length bs) l.size.bytes
   · simp only [decodeTypedValueFromBytes, hLookup, hInhab, hLen, Bool.not_false,
       Bool.or_true]
@@ -5201,14 +5472,14 @@ theorem decodeTypedValueFromBytes_adt_newtype_scalarLayout
     (hFields : l.fields = .arbitrary [⟨0⟩] memoryOrder)
     (hNoFieldLayouts : l.fieldLayouts = [])
     (hRepr : l.backendRepr = .scalar s0)
-    (hWidth : scalarLayoutByteWidth s0 = some l.size.bytes)
+    (hWidth : scalarLayoutByteWidth s0 (layoutPointerBytes layouts) = some l.size.bytes)
     (bs : List AbstractByte) :
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx }
         bs =
       match Nat.beq (length bs) l.size.bytes with
       | false => none
       | true =>
-        match decodeScalarLayoutBytesNoForge s0 bs with
+        match decodeScalarLayoutBytesNoForge s0 bs .strictUcg630Ub (layoutPointerBytes layouts) with
         | some v0 => some (.aggregate variantIdx [v0])
         | none => none := by
   cases hLen : Nat.beq (length bs) l.size.bytes
@@ -5250,7 +5521,7 @@ theorem decodeTypedValueFromBytes_adt_fieldLayout_primitive
       match Nat.beq (length bs) l.size.bytes with
       | false => none
       | true =>
-        match decodeScalarLayoutBytesNoForge s0 bs with
+        match decodeScalarLayoutBytesNoForge s0 bs .strictUcg630Ub (layoutPointerBytes layouts) with
         | some v0 => some (.aggregate variantIdx [v0])
         | none => none := by
   cases hLen : Nat.beq (length bs) l.size.bytes
@@ -5265,7 +5536,7 @@ theorem decodeTypedValueFromBytes_adt_fieldLayout_primitive
     simp only [decodeTypedValueFromBytes, hLookup, hInhab, hLen, Bool.not_true, Bool.or_false,
       hVar, hFields, hFieldLayouts, hB11, decodeFieldsByLayoutIdxs, hFLookup, hSlice, hFInhab,
       hFLen, hFVar, hFFields, hFNz, hFRepr]
-    cases decodeScalarLayoutBytesNoForge s0 bs <;> rfl
+    cases decodeScalarLayoutBytesNoForge s0 bs .strictUcg630Ub (layoutPointerBytes layouts) <;> rfl
 
 /--
 Shared core of the Stage-1 scalar-wrapper theorems: if the executed decoder at
@@ -5568,7 +5839,8 @@ theorem decodeTypedValueFromBytes_adt_size_mismatch
 
 /--
 Stage-1 hands every inhabited multi-variant ADT layout (`VariantsShape.multiple`)
-to the legacy decoder once the image has the layout's size.
+to the legacy decoder once the image has the layout's size and carries no pointer
+provenance.
 -/
 theorem decodeTypedValueFromBytes_adt_multiple_eq_legacy
     (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy)
@@ -5577,13 +5849,257 @@ theorem decodeTypedValueFromBytes_adt_multiple_eq_legacy
     (hLookup : LayoutTable.lookup layouts idx = some l)
     (hInhab : l.isUninhabited = false)
     (hVar : l.variants = .multiple tagLayout tagField variantShapes)
-    (hLen : length bs = l.size.bytes) :
+    (hLen : length bs = l.size.bytes)
+    (hProv : abstractBytesHaveProv bs = false) :
     decodeTypedValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx }
         bs =
       decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx }
         bs := by
   have hBeq : Nat.beq (length bs) l.size.bytes = true := by rw [hLen]; exact Nat.beq_refl _
-  simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeq, Bool.not_true, Bool.or_false, hVar]
+  unfold decodeTypedValueFromBytes
+  dsimp only [normalizeCodecTy]
+  simp only [hLookup, hInhab, hBeq, Bool.not_true, Bool.or_false, hVar, hProv]
+
+private theorem length_stripAbstractBytesProv :
+    ∀ bs : List AbstractByte, length (stripAbstractBytesProv bs) = length bs
+  | [] => rfl
+  | _ :: rest => congrArg Nat.succ (length_stripAbstractBytesProv rest)
+
+private theorem abstractBytesHaveProv_stripAbstractBytesProv :
+    ∀ bs : List AbstractByte, abstractBytesHaveProv (stripAbstractBytesProv bs) = false
+  | [] => rfl
+  | .uninit :: rest => abstractBytesHaveProv_stripAbstractBytesProv rest
+  | .init _ _ :: rest => abstractBytesHaveProv_stripAbstractBytesProv rest
+
+private theorem takeAbstractBytes_stripAbstractBytesProv :
+    ∀ (n : Nat) (bs : List AbstractByte),
+      takeAbstractBytes n (stripAbstractBytesProv bs) =
+        stripAbstractBytesProv (takeAbstractBytes n bs)
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, b :: bs =>
+    congrArg (stripAbstractByteProv b :: ·) (takeAbstractBytes_stripAbstractBytesProv k bs)
+
+private theorem dropAbstractBytes_stripAbstractBytesProv :
+    ∀ (n : Nat) (bs : List AbstractByte),
+      dropAbstractBytes n (stripAbstractBytesProv bs) =
+        stripAbstractBytesProv (dropAbstractBytes n bs)
+  | 0, _ => rfl
+  | _ + 1, [] => rfl
+  | k + 1, _ :: bs => dropAbstractBytes_stripAbstractBytesProv k bs
+
+private theorem sliceAbstractBytes_stripAbstractBytesProv
+    (bs : List AbstractByte) (off len : Nat) :
+    sliceAbstractBytes (stripAbstractBytesProv bs) off len =
+      Option.map stripAbstractBytesProv (sliceAbstractBytes bs off len) := by
+  unfold sliceAbstractBytes
+  rw [length_stripAbstractBytesProv]
+  cases Nat.ble (Nat.add off len) (length bs) with
+  | false => rfl
+  | true =>
+    simp only [Option.map, dropAbstractBytes_stripAbstractBytesProv,
+      takeAbstractBytes_stripAbstractBytesProv]
+
+private theorem decodeLittleEndianBits_stripAbstractBytesProv :
+    ∀ bs : List AbstractByte,
+      decodeLittleEndianBits (stripAbstractBytesProv bs) = decodeLittleEndianBits bs
+  | [] => rfl
+  | .uninit :: _ => rfl
+  | .init b _ :: rest => by
+    simp only [decodeLittleEndianBits]
+    rw [decodeLittleEndianBits_stripAbstractBytesProv rest]
+
+private theorem decodeLittleEndianBytes_stripAbstractBytesProv
+    (bs : List AbstractByte) :
+    decodeLittleEndianBytes (stripAbstractBytesProv bs) =
+      Option.map (fun p => (p.1, none)) (decodeLittleEndianBytes bs) := by
+  unfold decodeLittleEndianBytes
+  rw [decodeLittleEndianBits_stripAbstractBytesProv,
+    abstractBytesCoherentPtrProv?_none_of_provFree (abstractBytesHaveProv_stripAbstractBytesProv bs)]
+  cases decodeLittleEndianBits bs with
+  | none => rfl
+  | some _ => rfl
+
+private theorem decodeScalarBytes_stripAbstractBytesProv
+    (bs : List AbstractByte) (signed : Bool) :
+    decodeScalarBytes (stripAbstractBytesProv bs) signed =
+      Option.map (fun p => (p.1, none)) (decodeScalarBytes bs signed) := by
+  unfold decodeScalarBytes
+  dsimp only
+  rw [length_stripAbstractBytesProv, decodeLittleEndianBytes_stripAbstractBytesProv]
+  cases Nat.beq (length bs) 0 with
+  | true => rfl
+  | false =>
+    cases decodeLittleEndianBytes bs with
+    | none => rfl
+    | some p => rfl
+
+private theorem decodeScalarLayoutBytes_stripAbstractBytesProv_scalar
+    (sl : ScalarLayout) (bs : List AbstractByte) (sv : ScalarInt) (ptrBytes : Nat := 8)
+    (h : decodeScalarLayoutBytes sl bs ptrBytes = some (.scalar sv)) :
+    decodeScalarLayoutBytes sl (stripAbstractBytesProv bs) ptrBytes = some (.scalar sv) := by
+  unfold decodeScalarLayoutBytes at h ⊢
+  rw [length_stripAbstractBytesProv, decodeScalarBytes_stripAbstractBytesProv]
+  cases hW : scalarLayoutByteWidth sl ptrBytes with
+  | none => rw [hW] at h; nomatch h
+  | some sz =>
+    rw [hW] at h; dsimp only at h ⊢
+    cases hL : Nat.beq (length bs) sz with
+    | false => rw [hL] at h; nomatch h
+    | true =>
+      rw [hL] at h; dsimp only at h ⊢
+      cases sl with
+      | initialized pk vr =>
+        cases hD : decodeScalarBytes bs false with
+        | none => rw [hD] at h; nomatch h
+        | some p =>
+          rcases p with ⟨sv', prov⟩
+          rw [hD] at h; dsimp only [Option.map] at h ⊢
+          cases hR : wrappingRangeContains vr sv'.bits with
+          | false => rw [hR] at h; nomatch h
+          | true =>
+            rw [hR] at h; dsimp only at h ⊢
+            cases pk with
+            | pointer _ =>
+              rw [abstractBytesCoherentPtrProv?_none_of_provFree
+                (abstractBytesHaveProv_stripAbstractBytesProv bs)]
+              cases hC : abstractBytesCoherentPtrProv? bs with
+              | none => rw [hC] at h; dsimp only at h; exact h
+              | some frag =>
+                rw [hC] at h; dsimp only at h
+                cases hP : Nat.beq frag.ptrBytes sz with
+                | true => rw [hP] at h; dsimp only at h; nomatch h
+                | false => rw [hP] at h; dsimp only at h; exact h
+            | int _ _ | float _ => exact h
+      | union pk =>
+        cases hD : decodeScalarBytes bs false with
+        | none => rw [hD] at h; nomatch h
+        | some p =>
+          rcases p with ⟨sv', prov⟩
+          rw [hD] at h; dsimp only [Option.map] at h ⊢
+          cases pk with
+          | pointer _ =>
+            rw [abstractBytesCoherentPtrProv?_none_of_provFree
+              (abstractBytesHaveProv_stripAbstractBytesProv bs)]
+            cases hC : abstractBytesCoherentPtrProv? bs with
+            | none => rw [hC] at h; dsimp only at h; exact h
+            | some frag =>
+              rw [hC] at h; dsimp only at h
+              cases hP : Nat.beq frag.ptrBytes sz with
+              | true => rw [hP] at h; dsimp only at h; nomatch h
+              | false => rw [hP] at h; dsimp only at h; exact h
+          | int _ _ | float _ => exact h
+
+private theorem decodeFieldsBySpan_stripAbstractBytesProv
+    (bs : List AbstractByte) (totalSize : Nat) :
+    ∀ offsets : List Size,
+      decodeFieldsBySpan (stripAbstractBytesProv bs) totalSize offsets =
+        decodeFieldsBySpan bs totalSize offsets
+  | [] => rfl
+  | off :: offRest => by
+    unfold decodeFieldsBySpan
+    dsimp only
+    cases offRest with
+    | nil =>
+      dsimp only
+      cases Nat.ble off.bytes totalSize with
+      | false => rfl
+      | true =>
+        dsimp only
+        rw [sliceAbstractBytes_stripAbstractBytesProv]
+        cases sliceAbstractBytes bs off.bytes (Nat.sub totalSize off.bytes) with
+        | none => rfl
+        | some fSlice =>
+          dsimp only [Option.map]
+          cases Nat.beq (Nat.sub totalSize off.bytes) 0 with
+          | true => rfl
+          | false =>
+            dsimp only
+            rw [decodeScalarBytes_stripAbstractBytesProv]
+            cases decodeScalarBytes fSlice false with
+            | none => rfl
+            | some p => rfl
+    | cons next rest =>
+      dsimp only
+      cases Nat.ble off.bytes next.bytes with
+      | false => rfl
+      | true =>
+        dsimp only
+        rw [sliceAbstractBytes_stripAbstractBytesProv]
+        cases sliceAbstractBytes bs off.bytes (Nat.sub next.bytes off.bytes) with
+        | none => rfl
+        | some fSlice =>
+          dsimp only [Option.map]
+          cases Nat.beq (Nat.sub next.bytes off.bytes) 0 with
+          | true =>
+            dsimp only
+            rw [decodeFieldsBySpan_stripAbstractBytesProv bs totalSize (next :: rest)]
+          | false =>
+            dsimp only
+            rw [decodeScalarBytes_stripAbstractBytesProv]
+            cases decodeScalarBytes fSlice false with
+            | none => rfl
+            | some p =>
+              dsimp only [Option.map]
+              rw [decodeFieldsBySpan_stripAbstractBytesProv bs totalSize (next :: rest)]
+
+private theorem decodeValueFromBytes_adt_multiple_stripAbstractBytesProv
+    (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy)
+    (idx : LayoutIdx) (l : TypeLayout) (tagLayout : ScalarLayout) (tagField : Nat)
+    (variantShapes : List FieldsShape) (bs : List AbstractByte) (v : Value)
+    (hLookup : LayoutTable.lookup layouts idx = some l)
+    (hInhab : l.isUninhabited = false)
+    (hVar : l.variants = .multiple tagLayout tagField variantShapes)
+    (hDec : decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx }
+        bs = some v) :
+    decodeValueFromBytes (fuel + 1) layouts { kind := .adt defPath args, layoutIdx := idx }
+        (stripAbstractBytesProv bs) = some v := by
+  unfold decodeValueFromBytes at hDec ⊢
+  simp only [hLookup, hInhab, length_stripAbstractBytesProv, hVar] at hDec ⊢
+  cases hLen : Nat.beq (length bs) l.size.bytes with
+  | false => simp only [hLen, Bool.not_false, Bool.or_true] at hDec; nomatch hDec
+  | true =>
+    simp only [hLen, Bool.not_true, Bool.or_false] at hDec ⊢
+    cases hF : l.fields with
+    | arbitrary outerOffsets memOrd =>
+      simp only [hF] at hDec ⊢
+      cases hW : scalarLayoutByteWidth tagLayout (layoutPointerBytes layouts) with
+      | none => simp only [hW] at hDec; nomatch hDec
+      | some tagSz =>
+        simp only [hW] at hDec ⊢
+        cases hOff : get? outerOffsets tagField with
+        | none => simp only [hOff] at hDec; nomatch hDec
+        | some tagOff =>
+          simp only [hOff] at hDec ⊢
+          rw [sliceAbstractBytes_stripAbstractBytesProv]
+          cases hSl : sliceAbstractBytes bs tagOff.bytes tagSz with
+          | none => simp only [hSl] at hDec; nomatch hDec
+          | some tagSlice =>
+            simp only [hSl, Option.map] at hDec ⊢
+            cases hTag : decodeScalarLayoutBytes tagLayout tagSlice (layoutPointerBytes layouts) with
+            | none => simp only [hTag] at hDec; nomatch hDec
+            | some tagVal =>
+              cases tagVal with
+              | scalar tagSc =>
+                simp only [hTag] at hDec ⊢
+                rw [decodeScalarLayoutBytes_stripAbstractBytesProv_scalar tagLayout tagSlice tagSc
+                  (layoutPointerBytes layouts) hTag]
+                dsimp only
+                cases hRes : resolveEnumVariantIdxByTag l.variantDiscriminants tagSc.bits with
+                | none => simp only [hRes] at hDec; nomatch hDec
+                | some varIdx =>
+                  simp only [hRes] at hDec ⊢
+                  cases hVS : get? variantShapes varIdx with
+                  | none => simp only [hVS] at hDec; nomatch hDec
+                  | some vs =>
+                    cases vs with
+                    | arbitrary varOffsets varMem =>
+                      simp only [hVS] at hDec ⊢
+                      rw [decodeFieldsBySpan_stripAbstractBytesProv]
+                      exact hDec
+                    | _ => simp only [hVS] at hDec; nomatch hDec
+              | _ => simp only [hTag] at hDec; nomatch hDec
+    | _ => simp only [hF] at hDec; nomatch hDec
 
 /--
 Stage-1 `TryFromBytes` and `FromZeros` coincide with their legacy models on
@@ -5603,13 +6119,13 @@ theorem adt_multiple_stage1_iff_legacy
   have hSize : rigidTyByteSize layouts { kind := .adt defPath args, layoutIdx := idx } =
       some l.size.bytes := by
     simp [rigidTyByteSize, hLookup]
-  have hEq : ∀ bs, length bs = l.size.bytes →
+  have hEq : ∀ bs, length bs = l.size.bytes → abstractBytesHaveProv bs = false →
       decodeTypedValueFromBytes defaultCodecFuel layouts
           { kind := .adt defPath args, layoutIdx := idx } bs =
         decodeValueFromBytes defaultCodecFuel layouts
-          { kind := .adt defPath args, layoutIdx := idx } bs := fun bs hLen =>
+          { kind := .adt defPath args, layoutIdx := idx } bs := fun bs hLen hProv =>
     decodeTypedValueFromBytes_adt_multiple_eq_legacy 15 layouts defPath args idx l tagLayout
-      tagField variantShapes bs hLookup hInhab hVar hLen
+      tagField variantShapes bs hLookup hInhab hVar hLen hProv
   have hLegacyLen : ∀ bs v,
       decodeValueFromBytes defaultCodecFuel layouts
           { kind := .adt defPath args, layoutIdx := idx } bs = some v →
@@ -5634,33 +6150,42 @@ theorem adt_multiple_stage1_iff_legacy
     · exact Nat.eq_of_beq_eq_true hLen
   refine ⟨⟨?_, ?_⟩, ⟨?_, ?_⟩⟩
   · rintro ⟨sz, hSz, hPred⟩
-    refine ⟨sz, hSz, fun bs v hDec => hPred bs v ?_⟩
-    rw [hEq bs (hLegacyLen bs v hDec)]
-    exact hDec
+    refine ⟨sz, hSz, fun bs v hDec => hPred (stripAbstractBytesProv bs) v ?_⟩
+    have hLen := hLegacyLen bs v hDec
+    rw [hEq (stripAbstractBytesProv bs) (by rw [length_stripAbstractBytesProv, hLen])
+      (abstractBytesHaveProv_stripAbstractBytesProv bs)]
+    exact decodeValueFromBytes_adt_multiple_stripAbstractBytesProv 15 layouts defPath args idx l
+      tagLayout tagField variantShapes bs v hLookup hInhab hVar hDec
   · rintro ⟨sz, hSz, hPred⟩
     refine ⟨sz, hSz, fun bs v hDec => hPred bs v ?_⟩
-    rw [← hEq bs (hTypedLen bs v hDec)]
-    exact hDec
+    have hLen := hTypedLen bs v hDec
+    have hBeq : Nat.beq (length bs) l.size.bytes = true := by rw [hLen]; exact Nat.beq_refl _
+    rw [show defaultCodecFuel = 15 + 1 from rfl] at hDec ⊢
+    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeq, Bool.not_true, Bool.or_false, hVar] at hDec
+    cases hProv : abstractBytesHaveProv bs with
+    | true => simp only [hProv] at hDec; nomatch hDec
+    | false => simp only [hProv] at hDec; exact hDec
   · rintro ⟨sz, v, hSz, hDec⟩
     rw [hSize] at hSz
     injection hSz with hSzEq
     subst hSzEq
-    exact ⟨_, v, hSize, by rw [← hEq _ (length_zeroInitBytes _)]; exact hDec⟩
+    exact ⟨_, v, hSize,
+      by rw [← hEq _ (length_zeroInitBytes _) (abstractBytesHaveProv_zeroInitBytes _)]; exact hDec⟩
   · rintro ⟨sz, v, hSz, hDec⟩
     rw [hSize] at hSz
     injection hSz with hSzEq
     subst hSzEq
-    exact ⟨_, v, hSize, by rw [hEq _ (length_zeroInitBytes _)]; exact hDec⟩
+    exact ⟨_, v, hSize,
+      by rw [hEq _ (length_zeroInitBytes _) (abstractBytesHaveProv_zeroInitBytes _)]; exact hDec⟩
 
 /--
-**Divergence (pointer provenance in enum tags).** Stage-1 hands multi-variant
-ADTs to the legacy decoder, which ignores provenance on integer tag bytes, so it
-decodes a fieldless enum's tag image even when that image carries pointer
-provenance, although Stage-1 rejects provenance in integer images
-(`decodeTypedValueFromBytes_uint_eq`) and in single-variant scalar wrappers
-(`decodeScalarLayoutBytesNoForge_initialized_nonPtr_of_haveProv`).
+**Resolution (pointer provenance in scalar-tagged enum tags).** Under the default
+`.strictUcg630Ub` policy, Stage-1 rejects pointer-provenance tag bytes on
+non-pointer scalar-tagged multi-variant enums (consistent with integer and
+single-variant scalar wrappers), while under `.stripProvenance` it strips
+provenance and decodes `.aggregate varIdx []`.
 -/
-theorem adt_multiple_enum_stage1_accepts_tag_provenance
+theorem adt_multiple_enum_stage1_rejects_tag_provenance
     (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy) (idx : LayoutIdx)
     (l : TypeLayout) (bitsWidth varIdx : Nat) (signed : Bool) (validRange : WrappingRange)
     (variantShapes : List FieldsShape) (memoryOrder varMemOrder : List Nat) (pv : Nat × Nat)
@@ -5674,11 +6199,15 @@ theorem adt_multiple_enum_stage1_accepts_tag_provenance
     (hVarLt : varIdx < scalarModulus l.size.bytes)
     (hInRange : wrappingRangeContains validRange varIdx = true)
     (hGetVar : get? variantShapes varIdx = some (.arbitrary [] varMemOrder))
+    (_hNoPtr : backendReprHasPointer l.backendRepr = false := by rfl)
     (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     abstractBytesHaveProv (encodeLittleEndianBytes varIdx l.size.bytes (some pv)) = true ∧
     decodeTypedValueFromBytes defaultCodecFuel layouts
         { kind := .adt defPath args, layoutIdx := idx }
-        (encodeLittleEndianBytes varIdx l.size.bytes (some pv)) =
+        (encodeLittleEndianBytes varIdx l.size.bytes (some pv)) = none ∧
+    decodeTypedValueFromBytes defaultCodecFuel layouts
+        { kind := .adt defPath args, layoutIdx := idx }
+        (encodeLittleEndianBytes varIdx l.size.bytes (some pv)) .stripProvenance =
       some (.aggregate varIdx []) := by
   have hPos : 0 < l.size.bytes := by
     cases h : l.size.bytes with
@@ -5688,19 +6217,27 @@ theorem adt_multiple_enum_stage1_accepts_tag_provenance
   have hBeqLen : Nat.beq (length (encodeLittleEndianBytes varIdx l.size.bytes (some pv)))
       l.size.bytes = true := by
     rw [hLen]; exact Nat.beq_refl _
-  refine ⟨?_, ?_⟩
-  · obtain ⟨k, hk⟩ : ∃ k, l.size.bytes = k + 1 := ⟨l.size.bytes - 1, by omega⟩
+  have hProvTrue :
+      abstractBytesHaveProv (encodeLittleEndianBytes varIdx l.size.bytes (some pv)) = true := by
+    obtain ⟨k, hk⟩ : ∃ k, l.size.bytes = k + 1 := ⟨l.size.bytes - 1, by omega⟩
     rw [hk]
-  · rw [show defaultCodecFuel = 15 + 1 from rfl,
-      decodeTypedValueFromBytes_adt_multiple_eq_legacy 15 layouts defPath args idx l _ 0
-        variantShapes _ hLookup hInhab hVar hLen,
-      decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
+  have hWidthP :
+      scalarLayoutByteWidth (.initialized (.int bitsWidth signed) validRange) (layoutPointerBytes layouts) =
+        some l.size.bytes := hWidth
+  refine ⟨hProvTrue, ?_, ?_⟩
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true, Bool.or_false,
+      hVar, hProvTrue]
+  · rw [show defaultCodecFuel = 15 + 1 from rfl]
+    simp only [decodeTypedValueFromBytes, hLookup, hInhab, hBeqLen, Bool.not_true, Bool.or_false,
+      hVar]
+    rw [decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
         (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
-        hLookup hInhab hVar hFields hWidth _ hNoDiscr,
+        hLookup hInhab hVar hFields hWidthP _ hNoDiscr,
       hBeqLen]
     dsimp only
     rw [decodeScalarLayoutBytes_initialized_int_eq bitsWidth signed validRange l.size.bytes _
-      hWidth, hBeqLen]
+      hWidth (layoutPointerBytes layouts), hBeqLen]
     dsimp only
     rw [decodeScalarBytes_encodeLittleEndianBytes_of_lt l.size.bytes varIdx (some pv) false hPos
       hVarLt]
@@ -5770,7 +6307,8 @@ theorem adt_multiple_fieldless_enum_stage1
     have hLen := length_encodeLittleEndianBytes none l.size.bytes bits
     rw [show defaultCodecFuel = 15 + 1 from rfl,
       decodeTypedValueFromBytes_adt_multiple_eq_legacy 15 layouts defPath args idx l _ 0
-        variantShapes _ hLookup hInhab hVar hLen]
+        variantShapes _ hLookup hInhab hVar hLen
+        (abstractBytesHaveProv_encodeLittleEndianBytes_none _ _)]
     exact adt_multiple_enum_scalarLayout_decode_encode_eq layouts defPath args idx l bitsWidth
       signed validRange variantShapes memoryOrder hLookup hInhab hVar hFields hNz hWidth hFieldless
       bits none hBits hNoDiscr
@@ -5815,7 +6353,7 @@ theorem adt_multiple_fieldless_enum_fullRange_isFromBytesTyped
         ∃ varMemOrder, get? variantShapes tag = some (.arbitrary [] varMemOrder))
     (hNoDiscr : l.variantDiscriminants = [] := by rfl) :
     IsFromBytesTyped layouts { kind := .adt defPath args, layoutIdx := idx } := by
-  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], fun bs hLen hInit _hProv => ?_⟩
+  refine ⟨l.size.bytes, by simp [rigidTyByteSize, hLookup], fun bs hLen hInit hProv => ?_⟩
   have hBeqLen : Nat.beq (length bs) l.size.bytes = true := by
     rw [hLen]; exact Nat.beq_refl _
   have hNzBs : Nat.beq (length bs) 0 = false := by rw [hLen]; exact hNz
@@ -5831,7 +6369,7 @@ theorem adt_multiple_fieldless_enum_fullRange_isFromBytesTyped
   refine ⟨.aggregate sv.bits [], ?_⟩
   rw [show defaultCodecFuel = 15 + 1 from rfl,
     decodeTypedValueFromBytes_adt_multiple_eq_legacy 15 layouts defPath args idx l _ 0
-      variantShapes bs hLookup hInhab hVar hLen,
+      variantShapes bs hLookup hInhab hVar hLen hProv,
     decodeValueFromBytes_adt_multiple_enum_scalarLayout 15 layouts defPath args idx l
       (.initialized (.int bitsWidth signed) validRange) variantShapes memoryOrder
       hLookup hInhab hVar hFields hWidth bs hNoDiscr,
@@ -5855,7 +6393,7 @@ inhabited single-variant `.primitive` layout `fl`: `fl` is zero-sized, or has a
 `.scalar` backend of exactly its size covering that width, or has another
 backend (raw integer decoding).
 -/
-def checkStage1PrimitiveFieldLayout (fl : TypeLayout) : Bool :=
+def checkStage1PrimitiveFieldLayout (fl : TypeLayout) (ptrBytes : Nat := 8) : Bool :=
   match fl.isUninhabited, fl.variants, fl.fields with
   | false, .single _, .primitive =>
     match Nat.beq fl.size.bytes 0 with
@@ -5863,8 +6401,8 @@ def checkStage1PrimitiveFieldLayout (fl : TypeLayout) : Bool :=
     | false =>
       match fl.backendRepr with
       | .scalar s0 =>
-        match scalarLayoutByteWidth s0 with
-        | some w => Nat.beq w fl.size.bytes && scalarLayoutCoversWidth s0
+        match scalarLayoutByteWidth s0 ptrBytes with
+        | some w => Nat.beq w fl.size.bytes && scalarLayoutCoversWidth s0 ptrBytes
         | none => false
       | _ => true
   | _, _, _ => false
@@ -5891,7 +6429,7 @@ its offset.
 -/
 def checkStage1FieldLayouts (layouts : LayoutTable) (size : Nat) :
     List Size → List Nat → Bool :=
-  checkStage1FieldLayoutsWith checkStage1PrimitiveFieldLayout layouts size
+  checkStage1FieldLayoutsWith (fun fl => checkStage1PrimitiveFieldLayout fl (layoutPointerBytes layouts)) layouts size
 
 /-- `true` when the field offsets are non-decreasing and none exceeds `size`. -/
 def checkSpansSorted (size : Nat) : List Size → Bool
@@ -5900,8 +6438,8 @@ def checkSpansSorted (size : Nat) : List Size → Bool
   | off :: next :: rest => Nat.ble off.bytes next.bytes && checkSpansSorted size (next :: rest)
 
 /-- `true` when the scalar layout `s` has positive width and fits at `off` within `size` bytes. -/
-def scalarFitsAt (s : ScalarLayout) (off : Size) (size : Nat) : Bool :=
-  match scalarLayoutByteWidth s with
+def scalarFitsAt (s : ScalarLayout) (off : Size) (size : Nat) (ptrBytes : Nat := 8) : Bool :=
+  match scalarLayoutByteWidth s ptrBytes with
   | some w => Nat.blt 0 w && Nat.ble (off.bytes + w) size
   | none => false
 
@@ -5919,7 +6457,7 @@ def checkStage1LayoutAux : Nat → LayoutTable → TypeLayout → Bool
     match l.isUninhabited, l.variants with
     | false, .single _ =>
       match l.fields with
-      | .primitive => checkStage1PrimitiveFieldLayout l
+      | .primitive => checkStage1PrimitiveFieldLayout l (layoutPointerBytes layouts)
       | .array stride count =>
         match Nat.beq count 0 with
         | true => Nat.beq l.size.bytes 0
@@ -5940,11 +6478,12 @@ def checkStage1LayoutAux : Nat → LayoutTable → TypeLayout → Bool
           checkStage1FieldLayoutsWith (checkStage1LayoutAux fuel layouts) layouts
             l.size.bytes (o :: os) l.fieldLayouts
         | false =>
-          checkBackendReprFullRange l &&
+          checkBackendReprFullRange l (layoutPointerBytes layouts) &&
             match o :: os, l.backendRepr with
-            | [off0], .scalar s0 => scalarFitsAt s0 off0 l.size.bytes
+            | [off0], .scalar s0 => scalarFitsAt s0 off0 l.size.bytes (layoutPointerBytes layouts)
             | [off0, off1], .scalarPair s0 s1 =>
-              scalarFitsAt s0 off0 l.size.bytes && scalarFitsAt s1 off1 l.size.bytes
+              scalarFitsAt s0 off0 l.size.bytes (layoutPointerBytes layouts) &&
+                scalarFitsAt s1 off1 l.size.bytes (layoutPointerBytes layouts)
             | _, _ => checkSpansSorted l.size.bytes (o :: os)
       | .union _ => false
     | _, _ => false
@@ -5968,9 +6507,10 @@ def checkAdtStage1Decodable (layouts : LayoutTable) (l : TypeLayout) : Bool :=
         l.size.bytes (o :: os) l.fieldLayouts
     | false =>
       match o :: os, l.backendRepr with
-      | [off0], .scalar s0 => scalarFitsAt s0 off0 l.size.bytes
+      | [off0], .scalar s0 => scalarFitsAt s0 off0 l.size.bytes (layoutPointerBytes layouts)
       | [off0, off1], .scalarPair s0 s1 =>
-        scalarFitsAt s0 off0 l.size.bytes && scalarFitsAt s1 off1 l.size.bytes
+        scalarFitsAt s0 off0 l.size.bytes (layoutPointerBytes layouts) &&
+          scalarFitsAt s1 off1 l.size.bytes (layoutPointerBytes layouts)
       | _, _ => checkSpansSorted l.size.bytes (o :: os)
   | .array stride count =>
     match Nat.beq count 0 with
@@ -5985,7 +6525,7 @@ def checkAdtStage1Decodable (layouts : LayoutTable) (l : TypeLayout) : Bool :=
               checkStage1LayoutAux 15 layouts elemFl
           | none => false
         | [] => Nat.blt 0 stride.bytes
-  | .primitive => checkStage1PrimitiveFieldLayout l
+  | .primitive => checkStage1PrimitiveFieldLayout l (layoutPointerBytes layouts)
   | .union _ => false
 
 /-- Stage-1 companion of `checkFromBytesNicheAware` for every type. -/
@@ -6079,7 +6619,7 @@ theorem decodeTypedValueFromBytes_of_checkStage1PrimitiveFieldLayout
     (fuel : Nat) (layouts : LayoutTable) (defPath : DefPath) (args : List RigidTy)
     (fIdx : LayoutIdx) (fl : TypeLayout) (bs : List AbstractByte)
     (hFLookup : LayoutTable.lookup layouts fIdx = some fl)
-    (hCheck : checkStage1PrimitiveFieldLayout fl = true)
+    (hCheck : checkStage1PrimitiveFieldLayout fl (layoutPointerBytes layouts) = true)
     (hLen : length bs = fl.size.bytes)
     (hInit : allBytesInitialized bs = true)
     (hProv : abstractBytesHaveProv bs = false) :
@@ -6096,14 +6636,14 @@ theorem decodeTypedValueFromBytes_of_checkStage1PrimitiveFieldLayout
       cases frepr with
       | scalar s0 =>
         dsimp only at hCheck
-        cases hW : scalarLayoutByteWidth s0 <;> rw [hW] at hCheck
+        cases hW : scalarLayoutByteWidth s0 (layoutPointerBytes layouts) <;> rw [hW] at hCheck
         · nomatch hCheck
         case some w =>
           simp only [Bool.and_eq_true] at hCheck
           have hWEq : w = sz := Nat.eq_of_beq_eq_true hCheck.1
           subst hWEq
-          obtain ⟨sv, hSv⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s0 w bs hCheck.2 hW
-            hLen hInit hProv
+          obtain ⟨sv, hSv⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s0 w bs
+            (layoutPointerBytes layouts) hCheck.2 hW hLen hInit hProv
           refine ⟨.scalar sv, ?_⟩
           simp only [decodeTypedValueFromBytes, hFLookup, hBeqLen, Bool.not_true, Bool.or_false,
             hZ, hSv]
@@ -6186,7 +6726,7 @@ theorem decodeFieldsByLayoutIdxs_of_checkStage1FieldLayouts
             { kind := .adt "" [], layoutIdx := fIdx } fSlice)
         layouts bs offs fIdxs = some vals :=
   decodeFieldsByLayoutIdxs_of_checkStage1FieldLayoutsWith
-    checkStage1PrimitiveFieldLayout
+    (fun fl => checkStage1PrimitiveFieldLayout fl (layoutPointerBytes layouts))
     (fun fIdx fSlice =>
       decodeTypedValueFromBytes (fuel + 1) layouts { kind := .adt "" [], layoutIdx := fIdx } fSlice)
     layouts bs
@@ -6206,11 +6746,11 @@ A lone `.scalar` backend that fits inside the layout covers its own width once
 narrower range check.
 -/
 theorem scalarLayoutCoversWidth_of_scalar_fullRange
-    (l : TypeLayout) (s0 : ScalarLayout) (w : Nat)
+    (l : TypeLayout) (s0 : ScalarLayout) (w : Nat) (ptrBytes : Nat := 8)
     (hRepr : l.backendRepr = .scalar s0)
-    (hFull : checkBackendReprFullRange l = true)
-    (hWidth : scalarLayoutByteWidth s0 = some w) (hPos : 0 < w) (hLe : w ≤ l.size.bytes) :
-    scalarLayoutCoversWidth s0 = true := by
+    (hFull : checkBackendReprFullRange l ptrBytes = true)
+    (hWidth : scalarLayoutByteWidth s0 ptrBytes = some w) (hPos : 0 < w) (hLe : w ≤ l.size.bytes) :
+    scalarLayoutCoversWidth s0 ptrBytes = true := by
   unfold checkBackendReprFullRange at hFull
   rw [hRepr] at hFull
   unfold scalarLayoutCoversWidth
@@ -6347,17 +6887,19 @@ theorem decodeTypedValueFromBytes_of_checkStage1LayoutAux :
                   rw [hR] at hStage1
                   dsimp only at hStage1
                   unfold scalarFitsAt at hStage1
-                  cases hW : scalarLayoutByteWidth s0 <;> rw [hW] at hStage1
+                  cases hW : scalarLayoutByteWidth s0 (layoutPointerBytes layouts) <;> rw [hW] at hStage1
                   · nomatch hStage1
                   case some w =>
                     simp only [Bool.and_eq_true, Nat.blt_eq] at hStage1
                     obtain ⟨hPos, hFit⟩ := hStage1
                     have hIn : o.bytes + w ≤ length bs := by
                       have := Nat.le_of_ble_eq_true hFit; omega
-                    have hCov := scalarLayoutCoversWidth_of_scalar_fullRange l s0 w hR hFull hW hPos
-                      (by omega)
+                    have hCov := scalarLayoutCoversWidth_of_scalar_fullRange l s0 w
+                      (layoutPointerBytes layouts) hR hFull hW hPos
+                      (Nat.le_trans (Nat.le_add_left w o.bytes) (Nat.le_of_ble_eq_true hFit))
                     obtain ⟨sv, hSv⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s0 w
-                      ((bs.drop o.bytes).take w) hCov hW (length_drop_take_of_le bs _ _ hIn)
+                      ((bs.drop o.bytes).take w) (layoutPointerBytes layouts) hCov hW
+                      (length_drop_take_of_le bs _ _ hIn)
                       (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
                       (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
                     refine ⟨.aggregate variantIdx [.scalar sv], ?_⟩
@@ -6390,10 +6932,10 @@ theorem decodeTypedValueFromBytes_of_checkStage1LayoutAux :
                   rw [hR] at hStage1
                   dsimp only at hStage1
                   unfold scalarFitsAt at hStage1
-                  cases hW0 : scalarLayoutByteWidth s0 <;> rw [hW0] at hStage1
+                  cases hW0 : scalarLayoutByteWidth s0 (layoutPointerBytes layouts) <;> rw [hW0] at hStage1
                   · simp only [Bool.false_and, Bool.false_eq_true] at hStage1
                   case some w0 =>
-                  cases hW1 : scalarLayoutByteWidth s1 <;> rw [hW1] at hStage1
+                  cases hW1 : scalarLayoutByteWidth s1 (layoutPointerBytes layouts) <;> rw [hW1] at hStage1
                   · simp only [Bool.and_false, Bool.false_eq_true] at hStage1
                   case some w1 =>
                   simp only [Bool.and_eq_true, Nat.blt_eq] at hStage1
@@ -6406,11 +6948,13 @@ theorem decodeTypedValueFromBytes_of_checkStage1LayoutAux :
                   rw [hR] at hFull
                   simp only [Bool.and_eq_true] at hFull
                   obtain ⟨sv0, hSv0⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s0 w0
-                    ((bs.drop o.bytes).take w0) hFull.1 hW0 (length_drop_take_of_le bs _ _ hIn0)
+                    ((bs.drop o.bytes).take w0) (layoutPointerBytes layouts) hFull.1 hW0
+                    (length_drop_take_of_le bs _ _ hIn0)
                     (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
                     (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
                   obtain ⟨sv1, hSv1⟩ := decodeScalarLayoutBytesNoForge_of_coversWidth s1 w1
-                    ((bs.drop o1.bytes).take w1) hFull.2 hW1 (length_drop_take_of_le bs _ _ hIn1)
+                    ((bs.drop o1.bytes).take w1) (layoutPointerBytes layouts) hFull.2 hW1
+                    (length_drop_take_of_le bs _ _ hIn1)
                     (allBytesInitialized_take _ (allBytesInitialized_drop _ hInit))
                     (abstractBytesHaveProv_take _ (abstractBytesHaveProv_drop _ hProv))
                   refine ⟨.aggregate variantIdx [.scalar sv0, .scalar sv1], ?_⟩
@@ -6465,7 +7009,7 @@ theorem adt_isFromBytesTyped_of_checkAdtStage1Decodable
     (hLookup : LayoutTable.lookup layouts idx = some l)
     (hInhab : l.isUninhabited = false)
     (hVar : l.variants = .single variantIdx)
-    (hFull : checkBackendReprFullRange l = true)
+    (hFull : checkBackendReprFullRange l (layoutPointerBytes layouts) = true)
     (hStage1 : checkAdtStage1Decodable layouts l = true) :
     IsFromBytesTyped layouts { kind := .adt defPath args, layoutIdx := idx } := by
   have hAux : checkStage1LayoutAux defaultCodecFuel layouts l = true := by
@@ -6637,7 +7181,7 @@ theorem checkFromBytesNicheAware_ignores_fieldLayouts
     dsimp only
     rw [hLookup]
     rfl
-  have hFullR : checkBackendReprFullRange l = true := by
+  have hFullR : checkBackendReprFullRange l (layoutPointerBytes layouts) = true := by
     unfold checkBackendReprFullRange
     rw [hRepr, hSz]
     simp
@@ -6702,7 +7246,7 @@ theorem checkFromBytesNicheAware_composite_fieldLayouts_stage1_sound
     (hFields : l.fields = .arbitrary [⟨0⟩, ⟨4⟩] [0, 1])
     (hFieldLayouts : l.fieldLayouts = [arrFlIdx, u32FlIdx])
     (hSz : l.size.bytes = 8)
-    (hFull : checkBackendReprFullRange l = true)
+    (hFull : checkBackendReprFullRange l (layoutPointerBytes layouts) = true)
     (hArrLookup : LayoutTable.lookup layouts arrFlIdx = some arrFl)
     (hArrInhab : arrFl.isUninhabited = false)
     (hArrVar : arrFl.variants = .single 0)
@@ -6797,7 +7341,7 @@ theorem adt_nested_struct_fieldLayouts_isFromBytesTyped
     (hFields : l.fields = .arbitrary [⟨0⟩] [0])
     (hFieldLayouts : l.fieldLayouts = [innerFlIdx])
     (hSz : l.size.bytes = 4)
-    (hFull : checkBackendReprFullRange l = true)
+    (hFull : checkBackendReprFullRange l (layoutPointerBytes layouts) = true)
     (hInLookup : LayoutTable.lookup layouts innerFlIdx = some innerFl)
     (hInInhab : innerFl.isUninhabited = false)
     (hInVar : innerFl.variants = .single 0)

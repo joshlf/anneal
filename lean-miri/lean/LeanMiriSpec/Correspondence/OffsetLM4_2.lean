@@ -281,7 +281,7 @@ theorem WellTypedScalarOperand.prestate_of_evalOperand_ok {body : CapturedMir}
     injection hv with hsc
     subst hsc
     exact Or.inl ⟨cc, rfl, hval⟩
-  | copyLocal idx _ _ _ _ =>
+  | copyLocal idx _ _ _ _ _ =>
     right
     refine ⟨idx, rfl, ?_⟩
     cases hslot : get? locals idx with

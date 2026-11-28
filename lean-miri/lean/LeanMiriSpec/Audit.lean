@@ -60,6 +60,8 @@ import LeanMiriSpec.Correspondence.WitLM4_2
 import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
+import LeanMiriSpec.ClosureFnPtrLM
+import LeanMiriSpec.PtrByteCoherenceLM
 
 /-!
 # Axiom Audit (`LeanMiriSpec.Audit`)
@@ -2171,10 +2173,11 @@ example {body : CapturedMir} {topFrame : Miri.Interpreter.Frame AnnealProv
     (hty : dstDecl.ty = srcDecl.ty)
     (hsz : (translateTy srcDecl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO)
     (himm_src : IsImmediateFrameLocal topFrame srcIdx)
-    (himm_dst : IsImmediateFrameLocal topFrame dstIdx) :
+    (himm_dst : IsImmediateFrameLocal topFrame dstIdx)
+    (hkind : IsScalarOrPtrTyKind srcDecl.ty.kind = true) :
     WellTypedLM1_4Stmt body topFrame
       ⟨.assign ⟨dstIdx, .nil⟩ (.use (.move ⟨srcIdx, .nil⟩)), span⟩ :=
-  .assignMove dstIdx srcIdx dstDecl srcDecl span hdst hsrc hty hsz himm_src himm_dst
+  .assignMove dstIdx srcIdx dstDecl srcDecl span hdst hsrc hty hsz himm_src himm_dst hkind
 
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     (hstate : StateRel body s m) (hphase : ∀ p, body.phase ≠ .other p)
@@ -3888,7 +3891,10 @@ example
     (hsrc_not_arr :
       arrayPtrOrRefElemLen? (operandTy localDecls layouts (.copy ⟨srcLoc, .nil⟩)) dstPointee =
         none)
-    (hptr8 : layoutPointerBytes layouts = 8)  :
+    (hptr8 : layoutPointerBytes layouts = 8)
+    (hsrc_valid :
+      validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨srcLoc, .nil⟩)
+        (.ptr ptrVal 8) = true) :
     evalRvalue locals (.cast .ptrToPtr (.copy ⟨srcLoc, .nil⟩) dstTy) mem localDecls layouts =
       .ok (.ptr ptrVal 8) locals mem ∧
     Miri.Interpreter.Cast.ptrToPtr
@@ -3903,7 +3909,7 @@ example
     ImmediateRelLM3_1 allocMap dstTy layouts
       (.ptr ptrVal 8)
       (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)) :=
-  evalCast_ptrToPtr_simulation locals mem localDecls layouts m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy hsrc_slot hptr_rel hdst_thin hsrc_not_arr hptr8
+  evalCast_ptrToPtr_simulation locals mem localDecls layouts m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy hsrc_slot hptr_rel hdst_thin hsrc_not_arr hptr8 hsrc_valid
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -4647,12 +4653,13 @@ example
     (hfind_la : m.machine.memory.live.find? (fun x => x.1 == e.allocId) =
       some (e.allocId, localAlloc))
     (hoob : localAlloc.allocation.byteSize.bytes.toNat <
-      ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat) :
+      ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub :=
-  step_deref_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hoob
+  step_deref_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ptr hdst_prim hptr_ty himm_ptr hslot_p he htag hfind_la hoob hptr8
 
 example (pointee : RigidTy) (hthin : isThinRawPtrPointee pointee = true) :
     ∃ inner, castTypeInfoOfEncodedTyId (encodeRawPtrTyId pointee) = .ok (.rawPointer inner) :=
@@ -5230,7 +5237,10 @@ example
     (hsrc_not_arr :
       arrayPtrOrRefElemLen? (operandTy localDecls layouts (.copy ⟨srcLoc, .nil⟩)) dstPointee =
         none)
-    (hptr8 : layoutPointerBytes layouts = 8)  :
+    (hptr8 : layoutPointerBytes layouts = 8)
+    (hsrc_valid :
+      validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨srcLoc, .nil⟩)
+        (.ptr ptrVal 8) = true) :
     evalRvalue locals (.cast .ptrToPtr (.copy ⟨srcLoc, .nil⟩) dstTy) mem localDecls layouts =
       .ok (.ptr ptrVal 8) locals mem ∧
     Miri.Interpreter.Cast.ptrToPtr
@@ -5245,7 +5255,7 @@ example
     ImmediateRelLM3_1 allocMap dstTy layouts
       (.ptr ptrVal 8)
       (.scalar (Miri.Memory.Scalar.fromPointer annealTargetDataLayout mptr)) :=
-  evalCast_ptrToPtr_annealCastHooks_simulation locals mem localDecls layouts m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy hsrc_thin hdst_thin hsrc_slot hptr_rel hsrc_not_arr hptr8
+  evalCast_ptrToPtr_annealCastHooks_simulation locals mem localDecls layouts m srcLoc ptrVal mptr srcMut dstMut srcPointee dstPointee srcTy dstTy hsrcTy hdstTy hsrc_thin hdst_thin hsrc_slot hptr_rel hsrc_not_arr hptr8 hsrc_valid
 
 example
     {localDecls : List MirAst.LocalDecl} {layouts : Layout.LayoutTable}
@@ -6852,12 +6862,13 @@ example
     (hfind_la : m.machine.memory.live.find? (fun x => x.1 == e.allocId) =
       some (e.allocId, localAlloc))
     (hoob : localAlloc.allocation.byteSize.bytes.toNat <
-      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat) :
+      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub :=
-  step_deref_write_oob_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hfind_la hoob
+  step_deref_write_oob_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty hval_prim hval_kind hop himm_ptr hslot_p he htag hfind_la hoob hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -8195,13 +8206,14 @@ example
     (hdecl_tgt : get? body.localDecls e.localIdx = some tgtDecl)
     (htgt_live : get? s.frame.locals e.localIdx ≠ some .dead)
     (hoob : (translateTy tgtDecl.ty body.layouts).layout.size.bytes.toNat <
-      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat) :
+      ptrVal.offsetBytes + (translateTy valTy body.layouts).layout.size.bytes.toNat)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_1 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
     stepMirFn body s = MirStepNode.fail .ub :=
   step_deref_write_narrower_partial_oob_simulation hstate hphase hbb hstmt hdecl_ptr hptr_ty
-    hval_prim hval_kind hop himm_ptr hslot_p he htag hdecl_tgt htgt_live hoob
+    hval_prim hval_kind hop himm_ptr hslot_p he htag hdecl_tgt htgt_live hoob hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -10868,7 +10880,8 @@ example
     (htarget : get? s.frame.locals e.localIdx = some (.init (.scalar sc)))
     (hoob : (translateTy allocDecl.ty body.layouts).layout.size.bytes.toNat <
       ptrVal.offsetBytes + (translateTy dstDecl.ty body.layouts).layout.size.bytes.toNat)
-    (h_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)  :
+    (h_hdst_live : get? s.frame.locals dstIdx ≠ some .dead)
+    (hptr8 : layoutPointerBytes body.layouts = 8) :
     StepRelLM3_2 body m allocMap
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
@@ -10876,7 +10889,7 @@ example
     ∃ m',
       Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior "dereferencing a dangling reference")) :=
-  step_safeRef_deref_read_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag h_hperm hdecl_a htarget hoob h_hdst_live
+  step_safeRef_deref_read_oob_simulation hstate hphase hopKind hbb hstmt hdecl_dst hdecl_ref href_ty hdst_prim himm_ref hslot_r he htag h_hperm hdecl_a htarget hoob h_hdst_live hptr8
 
 open Trusted.Rustc.V2026_06_01.Layout in
 example
@@ -13264,14 +13277,16 @@ example
           (Miri.Memory.allocRange Miri.ABI.Size.ZERO
             (translateTy decl.ty body.layouts).layout.size)
           Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 8) true true
-          localAlloc.allocation = .error .copyRangesOverlap alloc') :
+          localAlloc.allocation = .error .copyRangesOverlap alloc')
+    (hread_valid :
+      validateValueForTy? body.layouts (placeTyResolved body.localDecls body.layouts ⟨idx, .nil⟩) rootVal = true) :
     stepMirFn body s =
       MirStepNode.step (advanceStmt s (s.frame.locals.set idx (.init rootVal)) s.memory) ∧
     ∃ m_err,
       Miri.Interpreter.Step.step (annealStepHooksLM2_2 body.localDecls body.layouts) () m =
         (m_err, .error (.undefinedBehavior "whole-value copy between overlapping ranges")) :=
   step_assign_self_copy_memory_struct_divergence hstate hphase hbb hstmt hdecl henv
-    hmem_repr harb hnz_sz hslot hcopy_err
+    hmem_repr harb hnz_sz hslot hcopy_err hread_valid
 
 example
     {body : CapturedMir} {env : StructTypeEnv} {stEnv : LM2_2StaticEnv} {k_bud : Nat}
@@ -23302,8 +23317,7 @@ example :
       stepMirFn b s₂ = .step s₃ ∧
       Miri.Interpreter.Step.step hooks () m₂ = (m₃, .ok true) ∧
       StateRelLM3_1 b s₃ m₃ [e₂, e₁] ∧
-      (∃ s₄', stepMirFn b s₃ = .step s₄' ∧
-        get? s₄'.frame.locals 2 = some (.init (.scalar ⟨42, 8⟩))) ∧
+      stepMirFn b s₃ = MirStepNode.unsupported ∧
       get? b.localDecls 2 = some (declOf u32K) ∧
       Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
       (∃ s₄, StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
@@ -23434,10 +23448,9 @@ example :
     (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0) (.copy ⟨3, []⟩) (.copy ⟨4, []⟩)
         (.constant (constInt usizeK 2 8)) partialCopyDecls emptyLayoutTable = .step s' ∧
       get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0708, 8⟩))) ∧
-    (∃ s', evalCopyNonOverlapping (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
+    evalCopyNonOverlapping (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
         (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
-        .step s' ∧
-      get? s'.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩))) ∧
+        MirStepNode.unsupported ∧
     (∃ s', evalCopyNonOverlappingLM4_2 (partialCopyState 0xFFFFFFFFFFFFFFFF) (.copy ⟨3, []⟩)
         (.copy ⟨4, []⟩) (.constant (constInt usizeK 1 8)) partialCopyDecls emptyLayoutTable =
         .step s' ∧
@@ -23703,13 +23716,14 @@ example :
 example (p : ProvenancePtr) (hoff : p.offsetBytes < scalarModulus 8)
     (mutability : Mutability) (pk : RigidTy) (idx : Nat) (layouts : Layout.LayoutTable)
     (hthin : (match pk with | .slice _ => true | .str => true | .dynamic _ => true | _ => false) =
-      false) :
+      false)
+    (hptr : layoutPointerBytes layouts = 8) :
     ∃ bs,
       encodeUntypedValueToBytes defaultCodecFuel (.ptr p 8) = some bs ∧
       decodeValueFromBytes defaultCodecFuel layouts
         { kind := .rawPtr mutability pk, layoutIdx := idx } bs = some (.ptr p 8) :=
   encodeUntypedValueToBytes_ptr_decode_roundtrip p hoff mutability pk idx layouts
-    (by cases pk <;> exact hthin)
+    (by cases pk <;> exact hthin) hptr
 
 example {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -23767,7 +23781,7 @@ example :
      let hooks := annealStepHooks b.localDecls b.layouts
      let e₁ := rawPtrAllocMapEntry b.localDecls b.layouts .not 1 1 Witness.lm31AllocId1
      let e₂ := rawPtrAllocMapEntry b.localDecls b.layouts .mut 2 2 Witness.lm31AllocId2
-     ∃ (s₁ s₂ s₃ s₄ s₅_stage1 s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
+     ∃ (s₁ s₂ s₃ s₄ s₅_miri : MachineState) (m₁ m₂ m₃ m₄ m₅ : AnnealStepState),
        stepMirFn b (partialCopyLockstepAnnealPre b 0xFFFFFFFFFFFFFFFF) = .step s₁ ∧
        Miri.Interpreter.Step.step hooks () (partialCopyLockstepMiriPre b lm42ScalarMax) =
          (m₁, .ok true) ∧
@@ -23781,8 +23795,7 @@ example :
        stepMirFn b s₃ = .step s₄ ∧
        Miri.Interpreter.Step.step hooks () m₃ = (m₄, .ok true) ∧
        StateRelLM3_1 b s₄ m₄ [e₂, e₁] ∧
-       stepMirFn b s₄ = .step s₅_stage1 ∧
-       get? s₅_stage1.frame.locals 2 = some (.init (.scalar ⟨0x0102030405060708, 8⟩)) ∧
+       stepMirFn b s₄ = MirStepNode.unsupported ∧
        Miri.Interpreter.Step.step hooks () m₄ = (m₅, .ok true) ∧
        StateRelLM3_1 b s₅_miri m₅ [e₂, e₁] ∧
        get? s₅_miri.frame.locals 2 = some (.init (.scalar ⟨0xFFFFFFFFFFFFFF08, 8⟩))) :=
@@ -23924,7 +23937,8 @@ example
     (hw_eq : integerKindByteWidth dstKind = integerKindByteWidth srcKind)
     (hfull : countSc.bits * elemBytes = integerKindByteWidth srcKind)
     (hsc_sz : srcSc.sizeBytes = integerKindByteWidth srcKind)
-    (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind)) :
+    (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind))
+    (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl) :
     StepRelLM3_1 body m
       (copyStage1FullBytesNextAllocMap s.frame.locals allocMap srcIdx dstIdx countOp elemBytes)
       (stepMirFn body s)
@@ -23933,7 +23947,7 @@ example
     hstate hphase hbb hstmt hprim hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm
     hcountInt hcountOp hpt hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos
     he_s het_s he_d het_d hperm_s hperm_d hne_loc hunion_s hunion_d
-    hslot_s hslot_d hdecl_s hsrcInt hdecl_d hdstInt hw_eq hfull hsc_sz hsc_lt
+    hslot_s hslot_d hdecl_s hsrcInt hdecl_d hdstInt hw_eq hfull hsc_sz hsc_lt hptr8
 
 open LeanMiriSpec.Correspondence in
 #assert_standard_axioms
@@ -23995,7 +24009,7 @@ open LeanMiriSpec.Correspondence in
   step_intrinsic_copyNonOverlapping_perm_range_divergence
   evalCopySingleDirect_rawPtr_distinct_ok
   stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance
-  mergeByteProvenance_some_left
+  mergeByteProvenance_some_agree
   decodeLittleEndianBytes_encodeLittleEndianBytes_some
   encodeUntypedValueToBytes_ptr_decode_roundtrip
   step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported
@@ -27096,6 +27110,713 @@ example :
   div_ptrMetadata_invalidSafeWideRef
 
 end StatementPins
+
+-- Episode 2 closure function-pointer correspondence (`LeanMiriSpec.ClosureFnPtrLM`).
+open LeanMiriSpec.ClosureFnPtrLM in
+#assert_standard_axioms
+  cfStepHooks
+  cfStepHooksDirectUnwind
+  cfCastHooks
+  cfCallHooks
+  cfStepHooks_eq_K
+  cfStepHooksDirectUnwind_eq_K
+  cfMiriStutter_sound
+  cfStutterCheck_sound
+  cfCertificate_sound
+  cfStutterSim_zero_lockstep
+  cfStutterSim_trusted_run
+  cfStutterSim_miri_run
+  cfInstanceOfAllocNat_item
+  cfInstanceOfAllocNat_shim
+  cfFnAllocNat_injective
+  cfResolveClosure_fnOnce_is_item
+  cfResolveClosure_fn_is_shim
+  cfResolveClosure_generic_unsupported
+  cfNonCapturingClosure_vendored_law
+  cfCast_closureFnPointer_vendored_law
+  cfCast_unsafeFnPointer_and_fnPtrToPtr_identity
+  cfCall_passArgument_abiMismatch_vendored_law
+  cfCall_initStackFrame_convMismatch_vendored_law
+  cfCall_initStackFrame_forged_closure_self_vendored_law
+  cfCall_initStackFrame_zero_arg_closure_vendored_law
+  cf_fn_once_certificate
+  cf_fn_once_lockstep
+  cf_closure_entry_frames_witness
+  cfCall_passArgument_abiMismatch_instance
+  cfCall_initStackFrame_convMismatch_instance
+  cfCall_initStackFrame_forged_closure_self_instance
+  cfCall_initStackFrame_zero_arg_closure_instance
+  cfVendored_cast_and_nonCapturing_instances
+  cf_finding_0007_driver_stutter_sim
+  cf_finding_0007_main_stutter_sim
+  cf_trusted_finding_parity
+  cf_fn_shared_stutter_sim
+  cf_fn_mut_stutter_sim
+  cf_zero_and_two_arg_stutter_sim
+  cf_unsafe_and_widen_identity_stutter_sim
+  cf_mixed_ces_and_tail_stutter_sim
+  cf_w_c8_e2e_closure_stutter_sim
+  cf_unwind_through_closure_witness
+  cf_generic_closure_r1_unsupported
+  cf_direct_closure_call_witness
+  cf_neg_capturing_fail_closed
+  cf_neg_forged_call_ub
+  cf_neg_transmuted_sig_ub
+  cf_neg_extern_c_ub
+  cf_neg_safety_boundary
+  cf_normal_spelling_boundary
+  cf_ptr_and_usize_abi_divergence_witness
+  cf_abi_divergence_not_closure_specific_witness
+
+open LeanMiriSpec.ClosureFnPtrLM in
+example :
+    cfCertificate (cfStepHooks cfProgFnOnce) cfProgFnOnce cfFx_fn_once_kind
+      [cfFx_id_once, cfFx_fn_once_kind_closure_0] [cfU32 5] [cfU32Imm 5] 200 =
+      some (.scalar 8 4, 0) :=
+  cf_fn_once_certificate
+
+open LeanMiriSpec.ClosureFnPtrLM in
+example :
+    cfCertificate (cfStepHooks cfProgFinding) cfProgFinding cfFx_finding_main
+      [cfFx_finding_driver, cfFx_finding_closure_0, cfFx_finding_closure_1] [] [] 600 =
+      some (.scalar 9147 4, 15) :=
+  cf_finding_0007_main_stutter_sim.1
+
+-- Episode 2 pointer-byte coherence correspondence (`LeanMiriSpec.PtrByteCoherenceLM`).
+#assert_standard_axioms
+  LeanMiriSpec.PtrByteCoherenceLM.ptrImage_inj
+  LeanMiriSpec.PtrByteCoherenceLM.mem_qsort
+  LeanMiriSpec.PtrByteCoherenceLM.pvRt_concrete
+  LeanMiriSpec.PtrByteCoherenceLM.pvRt_ne_wildcard
+  LeanMiriSpec.PtrByteCoherenceLM.pvRt_inj
+  LeanMiriSpec.PtrByteCoherenceLM.clear_partial_mid_strips_8
+  LeanMiriSpec.PtrByteCoherenceLM.clear_partial_mid_strips_4
+  LeanMiriSpec.PtrByteCoherenceLM.clear_partial_7bytes_strips_8
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_intact_8
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_splice_p_p256
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_intact_8_symbolic
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_intact_4_symbolic
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_splice_q_q256_4
+  LeanMiriSpec.PtrByteCoherenceLM.trRead_empty
+  LeanMiriSpec.PtrByteCoherenceLM.trRead_empty_at
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr_missing_byte_strips
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr_missing_byte_strips_at
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr4_missing_byte_strips
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr8_missing_byte_strips
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr8_runtime
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr8_ctfe
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr4_runtime
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr4_ctfe
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr8_shifted_runtime
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr8_shifted_ctfe
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr4_shifted_runtime
+  LeanMiriSpec.PtrByteCoherenceLM.readPtr4_shifted_ctfe
+  LeanMiriSpec.PtrByteCoherenceLM.w_lm_misaligned
+  LeanMiriSpec.PtrByteCoherenceLM.w_lm_wildcard
+  LeanMiriSpec.PtrByteCoherenceLM.w_lm_ctfe_tag_blind
+  LeanMiriSpec.PtrByteCoherenceLM.w_lm_kani5205_miri
+  LeanMiriSpec.PtrByteCoherenceLM.miri_checkPrimitive_bool_iff
+  LeanMiriSpec.PtrByteCoherenceLM.miri_checkPrimitive_char_iff
+  LeanMiriSpec.PtrByteCoherenceLM.w_lm_kani5205_alloc_e2e
+  LeanMiriSpec.PtrByteCoherenceLM.clear_and_prepareCopy_instance
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity_instance
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity_at
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity_at_instance
+  LeanMiriSpec.PtrByteCoherenceLM.clear_partial_mid_strips_8_at
+  LeanMiriSpec.PtrByteCoherenceLM.clear_partial_mid_strips_4_at
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_intact_8_at_symbolic
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_splice_8_symbolic
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_splice_4_symbolic
+  LeanMiriSpec.PtrByteCoherenceLM.globalAlloc_parity
+  LeanMiriSpec.PtrByteCoherenceLM.globalAlloc_parity_instance
+  LeanMiriSpec.PtrByteCoherenceLM.decodePtrBytesNoForge_parity
+  LeanMiriSpec.PtrByteCoherenceLM.kani5205_parity
+  LeanMiriSpec.PtrByteCoherenceLM.ep2_b4_parity_instance
+  LeanMiriSpec.PtrByteCoherenceLM.V06.normOffset_image_inj
+  LeanMiriSpec.PtrByteCoherenceLM.V06.encodePtrBytes_wf
+  LeanMiriSpec.PtrByteCoherenceLM.V06.coh_iff8
+  LeanMiriSpec.PtrByteCoherenceLM.V06.coh_iff4
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_at_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_at_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_at_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_at_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_at_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_at_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_at_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_at_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr_allBytes_ctfe_iff_instance
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.intact_roundtrip_8
+  LeanMiriSpec.PtrByteCoherenceLM.V06.intact_roundtrip_4
+  LeanMiriSpec.PtrByteCoherenceLM.V06.rawCarrier_ptr_roundtrip_8
+  LeanMiriSpec.PtrByteCoherenceLM.V06.rawCarrier_ptr_roundtrip_4
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_reversal
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_splice_p_p256
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_splice32_q_q256
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_missing_and_uninit
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_kani5205_trusted
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_wide_slice_and_str
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_wide_dyn
+  LeanMiriSpec.PtrByteCoherenceLM.V06.kani5205_bool_validity_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.kani5205_char_validity_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_kani5205_e2e
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_reloc_correspondence_8
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_reloc_correspondence_4
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_misaligned_reloc_strips_8
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_misaligned_reloc_strips_4
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_global_reloc_and_copyMemory
+  LeanMiriSpec.PtrByteCoherenceLM.V06.w_lm_copyMemory_32
+  LeanMiriSpec.PtrByteCoherenceLM.V06.ep2_b1_non_vacuity_instances
+  LeanMiriSpec.PtrByteCoherenceLM.V06.ep2_b2_iff_non_vacuity_instances
+  LeanMiriSpec.PtrByteCoherenceLM.V06.ep2_b3_non_vacuity_instances
+  LeanMiriSpec.PtrByteCoherenceLM.V06.ep2_b4_non_vacuity_instances
+  LeanMiriSpec.PtrByteCoherenceLM.V08.normOffset_image_inj
+  LeanMiriSpec.PtrByteCoherenceLM.V08.encodePtrBytes_wf
+  LeanMiriSpec.PtrByteCoherenceLM.V08.coh_iff8
+  LeanMiriSpec.PtrByteCoherenceLM.V08.coh_iff4
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_at_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_at_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_at_runtime_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_at_ctfe_corr
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_at_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_at_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_at_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_at_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr_allBytes_ctfe_iff_instance
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.intact_roundtrip_8
+  LeanMiriSpec.PtrByteCoherenceLM.V08.intact_roundtrip_4
+  LeanMiriSpec.PtrByteCoherenceLM.V08.rawCarrier_ptr_roundtrip_8
+  LeanMiriSpec.PtrByteCoherenceLM.V08.rawCarrier_ptr_roundtrip_4
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_reversal
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_splice_p_p256
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_splice32_q_q256
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_missing_and_uninit
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_kani5205_trusted
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_wide_slice_and_str
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_wide_dyn
+  LeanMiriSpec.PtrByteCoherenceLM.V08.kani5205_bool_validity_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.kani5205_char_validity_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_kani5205_e2e
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_reloc_correspondence_8
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_reloc_correspondence_4
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_misaligned_reloc_strips_8
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_misaligned_reloc_strips_4
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_global_reloc_and_copyMemory
+  LeanMiriSpec.PtrByteCoherenceLM.V08.w_lm_copyMemory_32
+  LeanMiriSpec.PtrByteCoherenceLM.V08.ep2_b1_non_vacuity_instances
+  LeanMiriSpec.PtrByteCoherenceLM.V08.ep2_b2_iff_non_vacuity_instances
+  LeanMiriSpec.PtrByteCoherenceLM.V08.ep2_b3_non_vacuity_instances
+  LeanMiriSpec.PtrByteCoherenceLM.V08.ep2_b4_non_vacuity_instances
+
+-- Statement pins for `LeanMiriSpec.PtrByteCoherenceLM`.
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {α : Type} (as : Array α) (lt : α → α → Bool) (lo hi : Nat) (x : α) :
+    x ∈ as.qsort lt lo hi ↔ x ∈ as :=
+  mem_qsort as lt lo hi x
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (prov : Prov) (data : Array UInt8) (hdata : data.size = 8) :
+    clearRead #[(Size.ofBytes 0, prov)] 1 7 data 8 0 8 =
+      (if PointerProvenance.offsetIsAddr (Prov := Prov) then .ok none
+       else .error (.readPartialPointer (Size.ofBytes 0))) :=
+  clear_partial_7bytes_strips_8 prov data hdata
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (prov : Prov) (hnw : ¬ some prov = PointerProvenance.wildcard (Prov := Prov)) :
+    let data : Array UInt8 := #[
+      0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    ]
+    ∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov), (Size.ofBytes 8, prov)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 8) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 9, Size.ofBytes 7⟩ data (Size.ofBytes 8) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 7⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 8) =
+        (if PointerProvenance.offsetIsAddr (Prov := Prov) then .ok none
+         else .error (.readPartialPointer (Size.ofBytes 0))) :=
+  prepareCopy_applyCopy_splice_p_p256 prov hnw
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example (b : UInt8) :
+    Validity.checkPrimitive (Prov := Provenance) (MachineError := Unit) (HookState := Unit)
+      .boolean ⟨Size.ofBytes 1, ⟨0, 1⟩⟩ (Scalar.fromScalarInt (ScalarInt.ofUInt8 b))
+      (fun _ s => .ok false s) () =
+      (if b.toNat ≤ 1 then .ok .valid () else .error (.failure (.invalidBool b)) ()) :=
+  miri_checkPrimitive_bool_iff b
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example (c : UInt32) :
+    Validity.checkPrimitive (Prov := Provenance) (MachineError := Unit) (HookState := Unit)
+      .character ⟨Size.ofBytes 4, ⟨0, 0x10FFFF⟩⟩ (Scalar.fromScalarInt (ScalarInt.ofUInt32 c))
+      (fun _ s => .ok false s) () =
+      (if c.toNat < 0xD800 ∨ (0xE000 ≤ c.toNat ∧ c.toNat ≤ 0x10FFFF) then .ok .valid ()
+       else .error (.failure (.invalidChar c)) ()) :=
+  miri_checkPrimitive_char_iff c
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = true)
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) → V06.WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8)
+      (fi fj : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    trRead (V06.trEntries pv bs) 0 8 =
+      .ok ((Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? bs).map
+        fun f => pv f.allocId f.tag) :=
+  V06.readPtr8_allBytes_runtime_corr pv hoff bs hlen hwf hnw hinj
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = true)
+    (bs : List Trusted.Rustc.V2026_08_01.MirSemantics.AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) → V08.WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8)
+      (fi fj : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    trRead (V08.trEntries pv bs) 0 8 =
+      .ok ((Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? bs).map
+        fun f => pv f.allocId f.tag) :=
+  V08.readPtr8_allBytes_runtime_corr pv hoff bs hlen hwf hnw hinj
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte)
+    (off n : UInt64) :
+    V08.trEntries pv (bs.map byte68) = V06.trEntries pv bs ∧
+    trRead (V08.trEntries pv (bs.map byte68)) off n = trRead (V06.trEntries pv bs) off n ∧
+    (Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? (bs.map byte68)).isSome =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? bs).isSome :=
+  lm_lockstep_parity pv bs off n
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (prov : Prov) (hnw : ¬ some prov = PointerProvenance.wildcard (Prov := Prov))
+    (data : Array UInt8) (hdata : data.size = 8) :
+    ∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 8) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 1, Size.ofBytes 7⟩ data (Size.ofBytes 8) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 7⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 8) = .ok (some prov) :=
+  prepareCopy_applyCopy_intact_8_symbolic prov hnw data hdata
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (prov : Prov) (hnw : ¬ some prov = PointerProvenance.wildcard (Prov := Prov))
+    (data : Array UInt8) (hdata : data.size = 4) :
+    ∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 4) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 1, Size.ofBytes 3⟩ data (Size.ofBytes 4) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 3⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 4) = .ok (some prov) :=
+  prepareCopy_applyCopy_intact_4_symbolic prov hnw data hdata
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = true)
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) → V06.WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8)
+      (fi fj : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    trRead (V06.trEntriesAt pv base bs) (UInt64.ofNat base) 8 =
+      .ok ((Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? bs).map
+        fun f => pv f.allocId f.tag) :=
+  V06.readPtr8_allBytes_at_runtime_corr pv hoff base hbd bs hlen hwf hnw hinj
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = true)
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (bs : List Trusted.Rustc.V2026_08_01.MirSemantics.AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) → V08.WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8)
+      (fi fj : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    trRead (V08.trEntriesAt pv base bs) (UInt64.ofNat base) 8 =
+      .ok ((Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? bs).map
+        fun f => pv f.allocId f.tag) :=
+  V08.readPtr8_allBytes_at_runtime_corr pv hoff base hbd bs hlen hwf hnw hinj
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (prov : Prov) (data : Array UInt8) (hdata : base + 8 ≤ data.size) :
+    ∃ pm pm',
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes (UInt64.ofNat base), prov)] = .ok pm ∧
+      ProvenanceMap.clear ⟨Size.ofBytes (UInt64.ofNat (base + 1)), Size.ofBytes 1⟩ data (Size.ofBytes 8) pm = .ok () pm' ∧
+      pm'.ptrs = #[] ∧
+      (∃ frags, pm'.byteFragments = some frags ∧
+        (∀ e, e ∈ frags ↔
+          ∃ k, k < 8 ∧ k ≠ 1 ∧
+            e = (Size.ofBytes (UInt64.ofNat (base + k)),
+                 ⟨UInt8.ofNat k, prov, Vector.ofFn fun idx =>
+                   if hi : idx.val < 8 then data[base + idx.val]'(by omega) else 0⟩))) ∧
+      pm'.readPtr (Size.ofBytes (UInt64.ofNat base)) (Size.ofBytes 8) =
+        (if PointerProvenance.offsetIsAddr (Prov := Prov) then .ok none
+         else .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) :=
+  clear_partial_mid_strips_8_at base hbd prov data hdata
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (prov : Prov) (hnw : ¬ some prov = PointerProvenance.wildcard (Prov := Prov))
+    (data : Array UInt8) (hdata : data.size = 16)
+    (hdiff : ∃ j : Fin 8, data[j.val]'(by omega) ≠ data[8 + j.val]'(by omega)) :
+    ∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov), (Size.ofBytes 8, prov)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 8) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 9, Size.ofBytes 7⟩ data (Size.ofBytes 8) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes 0, Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes 1, Size.ofBytes 7⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes 0) (Size.ofBytes 8) =
+        (if PointerProvenance.offsetIsAddr (Prov := Prov) then .ok none
+         else .error (.readPartialPointer (Size.ofBytes 0))) :=
+  prepareCopy_applyCopy_splice_8_symbolic prov hnw data hdata hdiff
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) → V06.WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8)
+      (fi fj : Trusted.Rustc.V2026_06_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (V06.trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok (some p)) ∧
+    ((Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? bs = none ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesHaveProv bs = true) ↔
+      trRead (V06.trEntriesAt pv base bs) (UInt64.ofNat base) 8 =
+        .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) ∧
+    ((Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesCoherentPtrProv? bs = none ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.abstractBytesHaveProv bs = false) ↔
+      trRead (V06.trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok none) :=
+  V06.readPtr8_allBytes_at_ctfe_iff pv hoff base hbd bs hlen hwf hnw hinj
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (base : Nat) (hbd : base + 8 < 2 ^ 64)
+    (bs : List Trusted.Rustc.V2026_08_01.MirSemantics.AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) → V08.WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8)
+      (fi fj : Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (V08.trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok (some p)) ∧
+    ((Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? bs = none ∧
+      Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesHaveProv bs = true) ↔
+      trRead (V08.trEntriesAt pv base bs) (UInt64.ofNat base) 8 =
+        .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) ∧
+    ((Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv? bs = none ∧
+      Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesHaveProv bs = false) ↔
+      trRead (V08.trEntriesAt pv base bs) (UInt64.ofNat base) 8 = .ok none) :=
+  V08.readPtr8_allBytes_at_ctfe_iff pv hoff base hbd bs hlen hwf hnw hinj
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (base : Nat)
+    (alloc : Trusted.Rustc.V2026_06_01.MirAst.CapturedAllocation)
+    (off len pb : Nat) (rdOff rdLen : UInt64) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.globalAllocSliceToAbstractBytes (alloc68 alloc) off len pb =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc off len pb).map
+        (List.map byte68) ∧
+    (∀ bs, Trusted.Rustc.V2026_06_01.MirSemantics.globalAllocSliceToAbstractBytes alloc off len pb = some bs →
+      V08.trEntriesAt pv base (bs.map byte68) = V06.trEntriesAt pv base bs ∧
+      trRead (V08.trEntriesAt pv base (bs.map byte68)) rdOff rdLen =
+        trRead (V06.trEntriesAt pv base bs) rdOff rdLen) :=
+  globalAlloc_parity pv base alloc off len pb rdOff rdLen
+
+-- `[adv ep2-A3]` statement pins (exact signatures) for B3 / A2 headline theorems.
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V06 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_06_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_06_01.MirAst.Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 64)
+    (ha : targetPtr.allocId + 1 < 2 ^ 64) (ht : targetPtr.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 8, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 8 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 8 = .ok (some (pvRt targetPtr.allocId targetPtr.tag)) ∧
+    trRead (trEntries pvCt bs) 0 8 = .ok (some (pvCt targetPtr.allocId targetPtr.tag)) ∧
+    ptrsRead #[(Size.ofBytes 0, pvRt targetPtr.allocId targetPtr.tag)] 0 8 =
+      .ok (some (pvRt targetPtr.allocId targetPtr.tag)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_reloc_correspondence_8 gId al mutbl targetPtr addr haddr ha ht
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V06 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_06_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_06_01.MirAst.Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 32)
+    (ha : targetPtr.allocId + 1 < 2 ^ 64) (ht : targetPtr.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 4, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 4 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 4 4 = some bs ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 4) [] ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 4) [] ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .uint .u32, layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 4 = .ok (some (pvRt targetPtr.allocId targetPtr.tag)) ∧
+    trRead (trEntries pvCt bs) 0 4 = .ok (some (pvCt targetPtr.allocId targetPtr.tag)) ∧
+    ptrsRead #[(Size.ofBytes 0, pvRt targetPtr.allocId targetPtr.tag)] 0 4 =
+      .ok (some (pvRt targetPtr.allocId targetPtr.tag)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_reloc_correspondence_4 gId al mutbl targetPtr addr haddr ha ht
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V08 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_08_01.MirAst Trusted.Rustc.V2026_08_01.MirSemantics Trusted.Rustc.V2026_08_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_08_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_08_01.MirAst.Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 64)
+    (ha : targetPtr.allocId + 1 < 2 ^ 64) (ht : targetPtr.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 8, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 8 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 8 8 = some bs ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 8) [] ∧
+    evalGlobalDerefRead [] alloc 0 8 [] wLayouts (some { kind := .uint .u64, layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 8 = .ok (some (pvRt targetPtr.allocId targetPtr.tag)) ∧
+    trRead (trEntries pvCt bs) 0 8 = .ok (some (pvCt targetPtr.allocId targetPtr.tag)) ∧
+    ptrsRead #[(Size.ofBytes 0, pvRt targetPtr.allocId targetPtr.tag)] 0 8 =
+      .ok (some (pvRt targetPtr.allocId targetPtr.tag)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_reloc_correspondence_8 gId al mutbl targetPtr addr haddr ha ht
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V08 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_08_01.MirAst Trusted.Rustc.V2026_08_01.MirSemantics Trusted.Rustc.V2026_08_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_08_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_08_01.MirAst.Mutability) (targetPtr : ProvenancePtr)
+    (addr : Nat) (haddr : addr < 2 ^ 32)
+    (ha : targetPtr.allocId + 1 < 2 ^ 64) (ht : targetPtr.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes addr 4, relocations := [(0, targetPtr)],
+        align := al, mutability := mutbl }
+    let bs := encodePtrBytes addr 4 targetPtr.allocId targetPtr.tag
+    globalAllocSliceToAbstractBytes alloc 0 4 4 = some bs ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 4) [] ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.ptr { allocId := targetPtr.allocId, offsetBytes := addr } 4) [] ∧
+    evalGlobalDerefRead [] alloc 0 4 [] wLayouts32 (some { kind := .uint .u32, layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 4 = .ok (some (pvRt targetPtr.allocId targetPtr.tag)) ∧
+    trRead (trEntries pvCt bs) 0 4 = .ok (some (pvCt targetPtr.allocId targetPtr.tag)) ∧
+    ptrsRead #[(Size.ofBytes 0, pvRt targetPtr.allocId targetPtr.tag)] 0 4 =
+      .ok (some (pvRt targetPtr.allocId targetPtr.tag)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_reloc_correspondence_4 gId al mutbl targetPtr addr haddr ha ht
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (base : Nat)
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) (off n : UInt64) :
+    V08.trEntriesAt pv base (bs.map byte68) = V06.trEntriesAt pv base bs ∧
+    trRead (V08.trEntriesAt pv base (bs.map byte68)) off n =
+      trRead (V06.trEntriesAt pv base bs) off n :=
+  LeanMiriSpec.PtrByteCoherenceLM.lm_lockstep_parity_at pv base bs off n
+
+-- `[adv ep2-B4]` statement pins (exact signatures) for B4 headline theorems.
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (base : Nat) (hbd : base + 4 < 2 ^ 64)
+    (prov : Prov) (data : Array UInt8) (hdata : base + 4 ≤ data.size) :
+    ∃ pm pm',
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes (UInt64.ofNat base), prov)] = .ok pm ∧
+      ProvenanceMap.clear ⟨Size.ofBytes (UInt64.ofNat (base + 1)), Size.ofBytes 1⟩ data (Size.ofBytes 4) pm = .ok () pm' ∧
+      pm'.ptrs = #[] ∧
+      (∃ frags, pm'.byteFragments = some frags ∧
+        (∀ e, e ∈ frags ↔
+          ∃ k, k < 4 ∧ k ≠ 1 ∧
+            e = (Size.ofBytes (UInt64.ofNat (base + k)),
+                 ⟨UInt8.ofNat k, prov, Vector.ofFn fun idx =>
+                   if hi : idx.val < 4 then data[base + idx.val]'(by omega) else 0⟩))) ∧
+      pm'.readPtr (Size.ofBytes (UInt64.ofNat base)) (Size.ofBytes 4) =
+        (if PointerProvenance.offsetIsAddr (Prov := Prov) then .ok none
+         else .error (.readPartialPointer (Size.ofBytes (UInt64.ofNat base)))) :=
+  LeanMiriSpec.PtrByteCoherenceLM.clear_partial_mid_strips_4_at base hbd prov data hdata
+
+open LeanMiriSpec.PtrByteCoherenceLM Miri.ABI Miri.Memory in
+example {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (dst : Nat) (hbd : dst + 8 < 2 ^ 64)
+    (prov : Prov) (hnw : ¬ some prov = PointerProvenance.wildcard (Prov := Prov))
+    (data : Array UInt8) (hdata : data.size = 8) :
+    ∃ src c0 c1 dst1 dst2,
+      ProvenanceMap.fromPresortedPtrs #[(Size.ofBytes 0, prov)] = .ok src ∧
+      src.prepareCopy ⟨Size.ofBytes 0, Size.ofBytes 1⟩ data (Size.ofBytes 8) = .ok c0 ∧
+      src.prepareCopy ⟨Size.ofBytes 1, Size.ofBytes 7⟩ data (Size.ofBytes 8) = .ok c1 ∧
+      ProvenanceMap.applyCopy c0 ⟨Size.ofBytes (UInt64.ofNat dst), Size.ofBytes 1⟩ 1 ProvenanceMap.new = .ok () dst1 ∧
+      ProvenanceMap.applyCopy c1 ⟨Size.ofBytes (UInt64.ofNat (dst + 1)), Size.ofBytes 7⟩ 1 dst1 = .ok () dst2 ∧
+      dst2.readPtr (Size.ofBytes (UInt64.ofNat dst)) (Size.ofBytes 8) = .ok (some prov) :=
+  LeanMiriSpec.PtrByteCoherenceLM.prepareCopy_applyCopy_intact_8_at_symbolic dst hbd prov hnw data hdata
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V06 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_06_01.Layout.Align)
+    (mutbl : Trusted.Rustc.V2026_06_01.MirAst.Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 64) (ha2 : a2 < 2 ^ 64)
+    (hp1a : p1.allocId + 1 < 2 ^ 64) (hp1t : p1.tag + 1 < 2 ^ 64)
+    (hp2a : p2.allocId + 1 < 2 ^ 64) (hp2t : p2.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 8 ++ leOptBytes a2 8,
+        relocations := [(0, p1), (8, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 8 p1.allocId p1.tag).drop 4 ++
+              (encodePtrBytes a2 8 p2.allocId p2.tag).take 4
+    let misAddr : Nat := (a1 / 256 ^ 4) + (a2 % 256 ^ 4) * 256 ^ 4
+    globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 8 = .ok none ∧
+    trRead (trEntries pvCt bs) 0 8 = .error (.readPartialPointer (Size.ofBytes 0)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_misaligned_reloc_strips_8 gId al mutbl p1 p2 a1 a2 ha1 ha2 hp1a hp1t hp2a hp2t
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V08 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_08_01.MirAst Trusted.Rustc.V2026_08_01.MirSemantics Trusted.Rustc.V2026_08_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_08_01.Layout.Align)
+    (mutbl : Trusted.Rustc.V2026_08_01.MirAst.Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 32) (ha2 : a2 < 2 ^ 32)
+    (hp1a : p1.allocId + 1 < 2 ^ 64) (hp1t : p1.tag + 1 < 2 ^ 64)
+    (hp2a : p2.allocId + 1 < 2 ^ 64) (hp2t : p2.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 4 ++ leOptBytes a2 4,
+        relocations := [(0, p1), (4, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 4 p1.allocId p1.tag).drop 2 ++
+              (encodePtrBytes a2 4 p2.allocId p2.tag).take 2
+    let misAddr : Nat := (a1 / 256 ^ 2) + (a2 % 256 ^ 2) * 256 ^ 2
+    globalAllocSliceToAbstractBytes alloc 2 4 4 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    evalGlobalDerefRead [] alloc 2 4 [] wLayouts32 (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.scalar ⟨misAddr, 4⟩) [] ∧
+    evalGlobalDerefRead [] alloc 2 4 [] wLayouts32 (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 4 = .ok none ∧
+    trRead (trEntries pvCt bs) 0 4 = .error (.readPartialPointer (Size.ofBytes 0)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_misaligned_reloc_strips_4 gId al mutbl p1 p2 a1 a2 ha1 ha2 hp1a hp1t hp2a hp2t
+
+open LeanMiriSpec.PtrByteCoherenceLM in
+example (isRef : Bool) (pb : Nat)
+    (bs : List Trusted.Rustc.V2026_06_01.MirSemantics.AbstractByte) :
+    thinView08 (Trusted.Rustc.V2026_08_01.MirSemantics.decodePtrBytesNoForge isRef (.uint .u8) pb (bs.map byte68)) =
+      thinView06 (Trusted.Rustc.V2026_06_01.MirSemantics.decodePtrBytesNoForge isRef (.uint .u8) pb bs) :=
+  LeanMiriSpec.PtrByteCoherenceLM.decodePtrBytesNoForge_parity isRef pb bs
+
+open LeanMiriSpec.PtrByteCoherenceLM in
+example (b : UInt8) (c : UInt32) :
+    Trusted.Rustc.V2026_08_01.MirSemantics.validateValueForTy? V08.wLayouts (some V08.wTyBool) (.scalar ⟨b.toNat, 1⟩) =
+      Trusted.Rustc.V2026_06_01.MirSemantics.validateValueForTy? V06.wLayouts (some V06.wTyBool) (.scalar ⟨b.toNat, 1⟩) ∧
+    (Trusted.Rustc.V2026_08_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_08_01.MirSemantics.defaultCodecFuel V08.wLayouts V08.wTyBool [.init b none]).isSome =
+      (Trusted.Rustc.V2026_06_01.MirSemantics.decodeTypedValueFromBytes
+        Trusted.Rustc.V2026_06_01.MirSemantics.defaultCodecFuel V06.wLayouts V06.wTyBool [.init b none]).isSome ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.isValidCharCode c.toNat =
+      Trusted.Rustc.V2026_06_01.MirSemantics.isValidCharCode c.toNat ∧
+    Trusted.Rustc.V2026_08_01.MirSemantics.validateValueForTy? V08.wLayouts (some V08.wTyChar) (.scalar ⟨c.toNat, 4⟩) =
+      Trusted.Rustc.V2026_06_01.MirSemantics.validateValueForTy? V06.wLayouts (some V06.wTyChar) (.scalar ⟨c.toNat, 4⟩) :=
+  LeanMiriSpec.PtrByteCoherenceLM.kani5205_parity b c
+
+-- `[adv ep2-A4]` mirror statement pins for V06/V08 symmetry.
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V06 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_06_01.MirAst Trusted.Rustc.V2026_06_01.MirSemantics Trusted.Rustc.V2026_06_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_06_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_06_01.MirAst.Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 32) (ha2 : a2 < 2 ^ 32)
+    (hp1a : p1.allocId + 1 < 2 ^ 64) (hp1t : p1.tag + 1 < 2 ^ 64)
+    (hp2a : p2.allocId + 1 < 2 ^ 64) (hp2t : p2.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 4 ++ leOptBytes a2 4,
+        relocations := [(0, p1), (4, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 4 p1.allocId p1.tag).drop 2 ++
+              (encodePtrBytes a2 4 p2.allocId p2.tag).take 2
+    let misAddr : Nat := (a1 / 256 ^ 2) + (a2 % 256 ^ 2) * 256 ^ 2
+    globalAllocSliceToAbstractBytes alloc 2 4 4 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    evalGlobalDerefRead [] alloc 2 4 [] wLayouts32 (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.scalar ⟨misAddr, 4⟩) [] ∧
+    evalGlobalDerefRead [] alloc 2 4 [] wLayouts32 (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 4 = .ok none ∧
+    trRead (trEntries pvCt bs) 0 4 = .error (.readPartialPointer (Size.ofBytes 0)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V06.globalAlloc_misaligned_reloc_strips_4 gId al mutbl p1 p2 a1 a2 ha1 ha2 hp1a hp1t hp2a hp2t
+
+open LeanMiriSpec.PtrByteCoherenceLM LeanMiriSpec.PtrByteCoherenceLM.V08 Miri.ABI Miri.Memory Trusted.Sequence Trusted.Rustc.V2026_08_01.MirAst Trusted.Rustc.V2026_08_01.MirSemantics Trusted.Rustc.V2026_08_01.Layout in
+example (gId : Nat) (al : Trusted.Rustc.V2026_08_01.Layout.Align) (mutbl : Trusted.Rustc.V2026_08_01.MirAst.Mutability) (p1 p2 : ProvenancePtr)
+    (a1 a2 : Nat) (ha1 : a1 < 2 ^ 64) (ha2 : a2 < 2 ^ 64)
+    (hp1a : p1.allocId + 1 < 2 ^ 64) (hp1t : p1.tag + 1 < 2 ^ 64)
+    (hp2a : p2.allocId + 1 < 2 ^ 64) (hp2t : p2.tag + 1 < 2 ^ 64) :
+    let alloc : CapturedAllocation :=
+      { allocId := gId, bytes := leOptBytes a1 8 ++ leOptBytes a2 8,
+        relocations := [(0, p1), (8, p2)], align := al, mutability := mutbl }
+    let bs := (encodePtrBytes a1 8 p1.allocId p1.tag).drop 4 ++
+              (encodePtrBytes a2 8 p2.allocId p2.tag).take 4
+    let misAddr : Nat := (a1 / 256 ^ 4) + (a2 % 256 ^ 4) * 256 ^ 4
+    globalAllocSliceToAbstractBytes alloc 4 8 8 = some bs ∧
+    abstractBytesCoherentPtrProv? bs = none ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .rawPtr .not (.uint .u8), layoutIdx := 0 }) =
+      .ok (.scalar ⟨misAddr, 8⟩) [] ∧
+    evalGlobalDerefRead [] alloc 4 8 [] wLayouts (some { kind := .ref .not (.uint .u8), layoutIdx := 0 }) = .ub ∧
+    trRead (trEntries pvRt bs) 0 8 = .ok none ∧
+    trRead (trEntries pvCt bs) 0 8 = .error (.readPartialPointer (Size.ofBytes 0)) :=
+  LeanMiriSpec.PtrByteCoherenceLM.V08.globalAlloc_misaligned_reloc_strips_8 gId al mutbl p1 p2 a1 a2 ha1 ha2 hp1a hp1t hp2a hp2t
 
 -- Exhaustively verify standard axioms across all imported `LeanMiriSpec.*` and
 -- `Miri.*` modules AND every constant elaborated in `LeanMiriSpec.Audit` itself.

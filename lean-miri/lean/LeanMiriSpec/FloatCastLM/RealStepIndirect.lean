@@ -529,8 +529,8 @@ theorem step_cast_float_copy_anyLocal_simulation_mode
           rw [evalRvalue_floatCast_eq hsig]; unfold evalFloatCastRvalue
           have hop : evalOperand s.frame.locals (.copy ⟨srcIdx, .nil⟩) s.memory.borrows
               s.memory.globals body.layouts s.memory.callerLocals body.localDecls
-              s.memory.callStack = .ok (.scalar sc) s.frame.locals := by
-            unfold evalOperand readProjectedValue; dsimp only []; rw [hslot_s]
+              s.memory.callStack = .ok (.scalar sc) s.frame.locals :=
+            hsig.src_scalar.evalOperand_copy_eq hdecl_src hslot_s
           rw [hop]; dsimp only []; rw [operandTy_copy_local hdecl_src, hev]
         have hm_write : Miri.Interpreter.Step.evalStatement
             (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()
@@ -625,8 +625,8 @@ theorem step_cast_float_copy_anyLocal_simulation_mode
           rw [evalRvalue_floatCast_eq hsig]; unfold evalFloatCastRvalue
           have hop : evalOperand s.frame.locals (.copy ⟨es.localIdx, .nil⟩) s.memory.borrows
               s.memory.globals body.layouts s.memory.callerLocals body.localDecls
-              s.memory.callStack = .ok (.scalar sc) s.frame.locals := by
-            unfold evalOperand readProjectedValue; dsimp only []; rw [hslot_s, hss]
+              s.memory.callStack = .ok (.scalar sc) s.frame.locals :=
+            hsig.src_scalar.evalOperand_copy_eq hdecl_src (hss ▸ hslot_s)
           rw [hop]; dsimp only []; rw [operandTy_copy_local hdecl_src, hev]
         have hm_write : Miri.Interpreter.Step.evalStatement
             (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()
@@ -786,8 +786,8 @@ theorem step_cast_float_move_anyLocal_simulation_mode
       rw [evalRvalue_floatCast_eq hsig]; unfold evalFloatCastRvalue
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
-          .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]; rfl
+          .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) :=
+        hsig.src_scalar.evalOperand_move_eq hdecl_src hslot_s hlt_af_s
       rw [hop]; dsimp only []; rw [operandTy_move_local hdecl_src, hev]
     have hm_write : Miri.Interpreter.Step.evalStatement
         (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()
@@ -1512,8 +1512,8 @@ theorem step_cast_float_copy_indirect_float_simulation_mode
       rw [evalRvalue_floatCast_eq hsig]; unfold evalFloatCastRvalue
       have hop : evalOperand s.frame.locals (.copy ⟨srcIdx, .nil⟩) s.memory.borrows
           s.memory.globals body.layouts s.memory.callerLocals body.localDecls
-          s.memory.callStack = .ok (.scalar sc) s.frame.locals := by
-        unfold evalOperand readProjectedValue; dsimp only []; rw [hslot_s, hss]
+          s.memory.callStack = .ok (.scalar sc) s.frame.locals :=
+        hsig.src_scalar.evalOperand_copy_eq hdecl_src (hss ▸ hslot_s)
       rw [hop]; dsimp only []; rw [operandTy_copy_local hdecl_src, hev]
     have hm_write : Miri.Interpreter.Step.evalStatement
         (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()
@@ -1844,8 +1844,8 @@ theorem step_cast_float_move_indirect_float_simulation_mode
       rw [evalRvalue_floatCast_eq hsig]; unfold evalFloatCastRvalue
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows
           s.memory.globals body.layouts s.memory.callerLocals body.localDecls
-          s.memory.callStack = .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hslot_s, hss, set?_eq_some_set hlt_af_s]; rfl
+          s.memory.callStack = .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) :=
+        hsig.src_scalar.evalOperand_move_eq hdecl_src (hss ▸ hslot_s) hlt_af_s
       rw [hop]; dsimp only []; rw [operandTy_move_local hdecl_src, hev]
     have hm_write : Miri.Interpreter.Step.evalStatement
         (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()
@@ -2568,8 +2568,8 @@ theorem step_cast_float_copy_indirect_dst_simulation_mode
       rw [evalRvalue_floatCast_eq hsig]; unfold evalFloatCastRvalue
       have hop : evalOperand s.frame.locals (.copy ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
-          .ok (.scalar sc) s.frame.locals := by
-        unfold evalOperand readProjectedValue; dsimp only []; rw [hslot_s]
+          .ok (.scalar sc) s.frame.locals :=
+        hsig.src_scalar.evalOperand_copy_eq hdecl_src hslot_s
       rw [hop]; dsimp only []; rw [operandTy_copy_local hdecl_src, hev]
     have hm_write : Miri.Interpreter.Step.evalStatement
         (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()
@@ -2759,8 +2759,8 @@ theorem step_cast_float_move_indirect_dst_simulation_mode
       rw [evalRvalue_floatCast_eq hsig]; unfold evalFloatCastRvalue
       have hop : evalOperand s.frame.locals (.move ⟨srcIdx, .nil⟩) s.memory.borrows s.memory.globals
           body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
-          .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) := by
-        unfold evalOperand; dsimp only []; rw [hslot_s, set?_eq_some_set hlt_af_s]; rfl
+          .ok (.scalar sc) (s.frame.locals.set srcIdx .uninit) :=
+        hsig.src_scalar.evalOperand_move_eq hdecl_src hslot_s hlt_af_s
       rw [hop]; dsimp only []; rw [operandTy_move_local hdecl_src, hev]
     have hm_write : Miri.Interpreter.Step.evalStatement
         (annealStepHooksFloat body.localDecls body.layouts nondet chooseNaN) ()

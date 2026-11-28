@@ -2167,6 +2167,48 @@ def readLittleEndianBytes
     | _ => .none
 
 /--
+Test whether the byte window `[offset .. offset + sizeBytes)` overlaps any
+`ptrBytes`-wide pointer relocation entry `(relocOff, _)` in `relocs`.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/allocation.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/allocation.rs#L53-L63>
+
+> "pub struct Allocation<Prov = AllocId, Extra = (), Bytes = Box<[u8]>>"
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation. (And even outside const, such transmutation is
+> touching on many unspecified aspects of the Rust memory model and should be
+> avoided. See below for alternatives.)"
+
+Modeling choice (`agent_docs/trusted-rust.md`): scalar reads from global
+allocations (`evalGlobalDerefRead`) check `globalRelocsOverlapRange` so reading
+any byte covered by a pointer relocation at a non-pointer integer type faults
+with `.ub` under `.strictUcg630Ub` instead of stripping relocation provenance
+into a plain `ScalarInt`.
+-/
+def globalRelocsOverlapRange :
+    List (Nat × ProvenancePtr) → Nat → Nat → Nat → Bool
+  | .nil, _, _, _ => false
+  | (relocOff, _) :: rest, offset, sizeBytes, ptrBytes =>
+    match
+      Bool.and
+        (Bool.and (Nat.blt 0 sizeBytes) (Nat.blt 0 ptrBytes))
+        (Bool.and
+          (Nat.blt relocOff (Nat.add offset sizeBytes))
+          (Nat.blt offset (Nat.add relocOff ptrBytes)))
+    with
+    | true => true
+    | false => globalRelocsOverlapRange rest offset sizeBytes ptrBytes
+
+/--
 Read a `ScalarInt` of width `sizeBytes` in little-endian byte order from global
 allocation `alloc` at `offset`.
 
@@ -2194,77 +2236,6 @@ def tyScalarBytes (ty : Ty) : Option Nat :=
   | .bool => .some 1
   | .char => .some 4
   | k => intCastTargetBytes k
-
-/--
-Byte width of a thin pointer or fat-pointer metadata word in `layouts`,
-defaulting to `8` bytes (64-bit target) when `layouts.pointerBits == 0`.
--/
-@[reducible]
-def layoutPointerBytes (layouts : LayoutTable) : Nat :=
-  match layouts.pointerBits with
-  | 0 => 8
-  | n + 1 => Nat.div (n + 1) 8
-
-/--
-Evaluate a `ConstValue` to a runtime `Value`, decoding `ConstValue.slice` to the
-2-element fat-pointer aggregate `Value.aggregate 0 [dataVal, Value.scalar ⟨meta, ptrBytes⟩]`
-and `ConstValue.indirect allocId offset` by decoding `ty` from `globals` via
-`decodeValueFromBytes`.
-
-Reference (`compiler/rustc_middle/src/mir/interpret/value.rs` at commit
-`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/value.rs#L31-L65>
-
-> "pub enum ConstValue {
->     ZeroSized,
->     Scalar(Scalar),
->     Slice { alloc_id: AllocId, meta: u64 },
->     Indirect { alloc_id: AllocId, offset: Size },
-> }"
--/
-def evalConstValue
-    (cv : ConstValue)
-    (ty : Ty := { kind := .tuple .nil, layoutIdx := 0 })
-    (globals : List CapturedAllocation := .nil)
-    (layouts : LayoutTable := emptyLayoutTable) :
-    Option Value :=
-  let ptrBytes := layoutPointerBytes layouts
-  match cv with
-  | .zeroSized => .some .unit
-  | .scalar (.int s) => .some (.scalar s)
-  | .scalar (.ptr p sz) => .some (.ptr p sz)
-  | .slice (.ptr p sz) lenMeta =>
-    .some (.aggregate 0 (.ptr p sz :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
-  | .slice (.int s) lenMeta =>
-    let p : ProvenancePtr := {
-      allocId := Nat.div s.bits 65536
-      offsetBytes := Nat.mod s.bits 65536
-    }
-    .some (.aggregate 0 (.ptr p ptrBytes :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
-  | .indirect allocId offset =>
-    match lookupGlobalAlloc globals allocId with
-    | .none => .none
-    | .some alloc =>
-      let sz :=
-        match rigidTyByteSize layouts ty with
-        | .some n => n
-        | .none =>
-          match tyScalarBytes ty with
-          | .some n => n
-          | .none => Nat.sub (length alloc.bytes) offset
-      match globalAllocSliceToAbstractBytes alloc offset sz with
-      | .some absBytes =>
-        match decodeValueFromBytes defaultCodecFuel layouts ty absBytes with
-        | .some v => .some v
-        | .none =>
-          match intCastTargetBytes ty.kind with
-          | .some n =>
-            match readGlobalScalar alloc offset n with
-            | .some sc => .some (.scalar sc)
-            | .none => .none
-          | .none => .none
-      | .none => .none
-  | .unevaluated _ => .none
 
 /--
 Drop the first `n` elements of a `List Value`.
@@ -2631,128 +2602,9 @@ def uintRigidTyOfStride (strideBytes : Nat) : RigidTy :=
   | _ => .uint .u8
 
 /--
-Decode and project a dereferenced global allocation `alloc` at `offset` with
-pointer/access width `sz` and trailing projections `restProj`.
-
-When `pointeeTyOpt` resolves to a scalar type (or when `pointeeTyOpt` is `.none`,
-`layouts` has no aggregate entry at index `0`, `restProj` is scalar-compatible,
-and `readGlobalScalar alloc offset sz` succeeds), reads the scalar directly via
-`readGlobalScalar`. When `readGlobalScalar` does not apply (non-scalar aggregate,
-tuple, or array `pointeeTy`, non-primitive layout in `layouts`, non-scalar width
-`sz`, or aggregate/array projection in `restProj`), decodes the global bytes via
-`decodeValueFromBytes` and projects `restProj`.
--/
-def evalGlobalDerefRead
-    (locals : List LocalSlot)
-    (alloc : CapturedAllocation)
-    (offset sz : Nat)
-    (restProj : List ProjectionElem)
-    (layouts : LayoutTable := emptyLayoutTable)
-    (pointeeTyOpt : Option Ty := .none) :
-    PlaceReadResult :=
-  match pointeeTyOpt with
-  | .some pointeeTy =>
-    match intCastTargetBytes pointeeTy.kind with
-    | .some n =>
-      match readGlobalScalar alloc offset n with
-      | .some sc =>
-        match readProjectedValue locals (.scalar sc) restProj with
-        | .ok fieldVal => .ok fieldVal locals
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .none => .ub
-    | .none =>
-      let byteSz :=
-        match rigidTyByteSize layouts pointeeTy with
-        | .some n => n
-        | .none => Nat.sub (length alloc.bytes) offset
-      match globalAllocSliceToAbstractBytes alloc offset byteSz with
-      | .some absBytes =>
-        match decodeValueFromBytes defaultCodecFuel layouts pointeeTy absBytes with
-        | .some decodedVal =>
-          match readProjectedValue locals decodedVal restProj with
-          | .ok fieldVal => .ok fieldVal locals
-          | .ub => .ub
-          | .unsupported => .unsupported
-        | .none => .ub
-      | .none => .ub
-  | .none =>
-    let nonPrimLayoutOpt : Option (Ty × Nat) :=
-      match LayoutTable.lookup layouts 0 with
-      | .some l =>
-        match l.fields with
-        | .primitive => .none
-        | .array stride count =>
-          .some
-            ({ kind := .array (uintRigidTyOfStride stride.bytes) count, layoutIdx := 0 },
-             l.size.bytes)
-        | _ =>
-          .some ({ kind := .adt "" .nil, layoutIdx := 0 }, l.size.bytes)
-      | .none => .none
-    match nonPrimLayoutOpt with
-    | .some (inferredTy, byteSz) =>
-      match globalAllocSliceToAbstractBytes alloc offset byteSz with
-      | .some absBytes =>
-        match decodeValueFromBytes defaultCodecFuel layouts inferredTy absBytes with
-        | .some decodedVal =>
-          match readProjectedValue locals decodedVal restProj with
-          | .ok fieldVal => .ok fieldVal locals
-          | .ub => .ub
-          | .unsupported => .unsupported
-        | .none => .ub
-      | .none => .ub
-    | .none =>
-      match isScalarCompatibleProj restProj with
-      | true =>
-        match readGlobalScalar alloc offset sz with
-        | .some sc =>
-          match readProjectedValue locals (.scalar sc) restProj with
-          | .ok fieldVal => .ok fieldVal locals
-          | .ub => .ub
-          | .unsupported => .unsupported
-        | .none =>
-          match Nat.beq sz 0 with
-          | true =>
-            match Nat.ble offset (length alloc.bytes) with
-            | true =>
-              match readProjectedValue locals .unit restProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | false => .ub
-          | false =>
-            match globalAllocSliceToAbstractBytes alloc offset sz with
-            | .some absBytes =>
-              let arrTy : Ty := { kind := .array (.uint .u8) sz, layoutIdx := 0 }
-              match decodeValueFromBytes defaultCodecFuel layouts arrTy absBytes with
-              | .some decodedVal =>
-                match readProjectedValue locals decodedVal restProj with
-                | .ok fieldVal => .ok fieldVal locals
-                | .ub => .ub
-                | .unsupported => .unsupported
-              | .none => .ub
-            | .none => .ub
-      | false =>
-        match Nat.ble offset (length alloc.bytes) with
-        | false => .ub
-        | true =>
-          let remBytes := Nat.sub (length alloc.bytes) offset
-          match globalAllocSliceToAbstractBytes alloc offset remBytes with
-          | .some absBytes =>
-            let arrTy : Ty := { kind := .array (.uint .u8) remBytes, layoutIdx := 0 }
-            match decodeValueFromBytes defaultCodecFuel layouts arrTy absBytes with
-            | .some decodedVal =>
-              match readProjectedValue locals decodedVal restProj with
-              | .ok fieldVal => .ok fieldVal locals
-              | .ub => .ub
-              | .unsupported => .unsupported
-            | .none => .ub
-          | .none => .ub
-
-/--
 Compute the total byte size of a runtime `Value` using structural recursion on
 `fuel` (supporting nested tuple, struct, and multi-dimensional array
-aggregates).
+aggregates, and recognizing 1-byte raw provenance-fragment carriers).
 -/
 @[reducible]
 def inferValueByteSizeAux : Nat → Value → Option Nat
@@ -2762,7 +2614,10 @@ def inferValueByteSizeAux : Nat → Value → Option Nat
   | _, .aggregate _ .nil => .some 0
   | .zero, .aggregate _ (_ :: _) => .none
   | .succ fuel, .aggregate 0 (f :: fs) =>
-    match inferValueByteSizeAux fuel f, inferValueByteSizeAux fuel (.aggregate 0 fs) with
+    match isRawFragByteVal (.aggregate 0 (f :: fs)) with
+    | true => .some 1
+    | false =>
+      match inferValueByteSizeAux fuel f, inferValueByteSizeAux fuel (.aggregate 0 fs) with
     | .some szF, .some szFs => .some (Nat.add szF szFs)
     | _, _ => .none
   | _, .aggregate (.succ _) (_ :: _) => .none
@@ -3831,7 +3686,14 @@ def tyByteSizeAndAlignAux
           .some (l.size.bytes, a)
       | .none => findArrayElemStrideAndAlign? layouts localDecls rTy.kind
     | _ =>
-      match rigidTyByteSize layouts rTy with
+      let szOpt : Option Nat :=
+        match Nat.beq (layoutPointerBytes layouts) 4 with
+        | true =>
+          match rigidTyKindByteSizeFor 4 rTy.kind with
+          | .some sz => .some sz
+          | .none => rigidTyByteSize layouts rTy
+        | false => rigidTyByteSize layouts rTy
+      match szOpt with
       | .none => .none
       | .some sz =>
         let a :=
@@ -6531,11 +6393,219 @@ def checkGlobalAllocAlign
           Nat.beq rem 0
 
 /--
+Validate a scalar or pointer leaf `v` against a compiler `ScalarLayout` `sl`
+for read-time `validateValueForTy?`:
+- `.union _`: always `true` (unions permit any bit pattern);
+- `.initialized (.pointer _) vr`: accepts `.ptr _ _` (valid allocation pointer),
+  and checks `wrappingRangeContains vr sc.bits` on provenance-free `.scalar sc`;
+- `.initialized pk vr` (non-pointer): rejects `.ptr _ _` and raw-byte fragment
+  carriers, requires `.scalar sc` satisfying `wrappingRangeContains vr sc.bits`,
+  and rejects UTF-16 surrogates on 4-byte `0..=0x10FFFF` (`char`-shaped) layouts.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+> "- A `bool` that isn't 0 or 1."
+> "- A `char` that is a surrogate or above `char::MAX`."
+-/
+@[reducible]
+def validateScalarLayoutValForTy?
+    (sl : ScalarLayout)
+    (v : Value) :
+    Bool :=
+  match sl with
+  | .union _ => true
+  | .initialized (.pointer _) vr =>
+    match v with
+    | .ptr _ _ => true
+    | .scalar sc => wrappingRangeContains vr sc.bits
+    | _ => false
+  | .initialized _ vr =>
+    match v with
+    | .scalar sc =>
+      match wrappingRangeContains vr sc.bits with
+      | false => false
+      | true =>
+        match
+          Bool.and
+            (Nat.beq sc.sizeBytes 4)
+            (Bool.and (Nat.beq vr.start 0) (Nat.beq vr.end_ 0x10FFFF))
+        with
+        | true => isValidCharCode sc.bits
+        | false => true
+    | _ => false
+
+/--
+Apply a validation predicate `f` to every element in a `List Value`.
+-/
+@[reducible]
+def validateTyValueListWith (f : Value → Bool) : List Value → Bool
+  | .nil => true
+  | x :: xs =>
+    match f x with
+    | true => validateTyValueListWith f xs
+    | false => false
+
+/--
+Apply a field-layout validation predicate `f` pairwise across layout indices and field values.
+-/
+@[reducible]
+def validateTyValueByLayoutIdxsWith (f : Nat → Value → Bool) : List Nat → List Value → Bool
+  | .nil, .nil => true
+  | fIdx :: fRest, fv :: vRest =>
+    match f fIdx fv with
+    | true => validateTyValueByLayoutIdxsWith f fRest vRest
+    | false => false
+  | _, _ => false
+
+/--
+Apply a tuple-field validation predicate `f` across element kinds, optional field layout indices,
+and runtime field values.
+-/
+@[reducible]
+def validateTyTupleFieldsWith
+    (f : RigidTy → Nat → Value → Bool)
+    (defaultLayoutIdx : Nat) :
+    List RigidTy → List Nat → List Value → Bool
+  | .nil, _, .nil => true
+  | k :: kRest, fIdx :: fRest, fv :: vRest =>
+    match f k fIdx fv with
+    | true => validateTyTupleFieldsWith f defaultLayoutIdx kRest fRest vRest
+    | false => false
+  | k :: kRest, .nil, fv :: vRest =>
+    match f k defaultLayoutIdx fv with
+    | true => validateTyTupleFieldsWith f defaultLayoutIdx kRest .nil vRest
+    | false => false
+  | _, _, _ => false
+
+/--
+Fuel-bounded recursive helper for `validateValueForTy?`, validating `.bool`,
+`.char`, integer/float non-pointer leaves, `.array` elements, `.tuple` fields,
+and non-union `.adt` structs (using `TypeLayout.fieldLayouts` and `backendRepr`),
+while explicitly leaving `FieldsShape.union` values unvalidated until a typed
+non-union field is read (`Kani#5205` / `#5196`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+> "Note: Uninitialized memory is also implicitly invalid for any type that has a restricted set of valid values. In other words, the only cases in which reading uninitialized memory is permitted are inside `union`s and in “padding” (the gaps between the fields of a type)."
+-/
+@[reducible]
+def validateValueForTyAux
+    (layouts : LayoutTable) :
+    Nat → Ty → Value → Bool
+  | .zero, _, _ => true
+  | .succ fuel', ty, v =>
+    match ty.kind with
+    | .bool =>
+      match v with
+      | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 1) (Nat.ble sc.bits 1)
+      | _ => false
+    | .char =>
+      match v with
+      | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 4) (isValidCharCode sc.bits)
+      | _ => false
+    | .uint _ | .int _ | .float _ =>
+      match v with
+      | .scalar _ => true
+      | .ptr _ _ => false
+      | .aggregate varIdx fields =>
+        match isRawFragByteVal (.aggregate varIdx fields) with
+        | true => false
+        | false => true
+      | _ => true
+    | .array elemKind _ =>
+      match v with
+      | .aggregate 0 elems =>
+        let elemFlIdx : Nat :=
+          match LayoutTable.lookup layouts ty.layoutIdx with
+          | .some { fields := .array _ _, fieldLayouts := flIdx :: _, .. } => flIdx
+          | _ => unresolvedLayoutIdx layouts
+        validateTyValueListWith
+          (validateValueForTyAux layouts fuel' { kind := elemKind, layoutIdx := elemFlIdx })
+          elems
+      | _ => true
+    | .tuple ks =>
+      match v with
+      | .aggregate 0 fieldVals =>
+        match Nat.beq (length fieldVals) (length ks) with
+        | false => true
+        | true =>
+          let fls : List Nat :=
+            match LayoutTable.lookup layouts ty.layoutIdx with
+            | .some l =>
+              match Nat.beq (length l.fieldLayouts) (length ks) with
+              | true => l.fieldLayouts
+              | false => .nil
+            | .none => .nil
+          validateTyTupleFieldsWith
+            (fun k lIdx fv => validateValueForTyAux layouts fuel' { kind := k, layoutIdx := lIdx } fv)
+            (unresolvedLayoutIdx layouts)
+            ks
+            fls
+            fieldVals
+      | _ => true
+    | .adt _ _ =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | .none => true
+      | .some l =>
+        match l.isUninhabited with
+        | true => false
+        | false =>
+          match l.variants with
+          | .empty => false
+          | .single _ =>
+            match l.fields with
+            | .union _ => true
+            | .primitive =>
+              match Nat.beq l.size.bytes 0 with
+              | true => true
+              | false =>
+                match l.backendRepr with
+                | .scalar s0 => validateScalarLayoutValForTy? s0 v
+                | _ => true
+            | .arbitrary offsets _ =>
+              match v with
+              | .aggregate _ fieldVals =>
+                match Nat.beq (length l.fieldLayouts) (length fieldVals) with
+                | true =>
+                  validateTyValueByLayoutIdxsWith
+                    (fun fIdx fv => validateValueForTyAux layouts fuel' { kind := .adt "" .nil, layoutIdx := fIdx } fv)
+                    l.fieldLayouts
+                    fieldVals
+                | false =>
+                  match offsets, fieldVals, l.backendRepr with
+                  | _ :: .nil, v0 :: .nil, .scalar s0 =>
+                    validateScalarLayoutValForTy? s0 v0
+                  | _ :: _ :: .nil, v0 :: v1 :: .nil, .scalarPair s0 s1 =>
+                    Bool.and
+                      (validateScalarLayoutValForTy? s0 v0)
+                      (validateScalarLayoutValForTy? s1 v1)
+                  | _, _, _ => true
+              | .scalar _ =>
+                match offsets, l.backendRepr with
+                | _ :: .nil, .scalar s0 => validateScalarLayoutValForTy? s0 v
+                | _, _ => true
+              | _ => true
+            | .array _ _ =>
+              match v, l.fieldLayouts with
+              | .aggregate _ elems, elemFlIdx :: _ =>
+                validateTyValueListWith
+                  (validateValueForTyAux layouts fuel' { kind := .adt "" .nil, layoutIdx := elemFlIdx })
+                  elems
+              | _, _ => true
+          | .multiple _ _ _ => true
+    | _ => true
+
+/--
 Validate that runtime `Value` `v` satisfies the bit-level validity invariant of
-static type `tyOpt`:
-- `RigidTy.bool`: `v` is `.scalar sc` with `sc.sizeBytes == 1 ∧ sc.bits ≤ 1`.
-- `RigidTy.char`: `v` is `.scalar sc` with `sc.sizeBytes == 4 ∧ isValidCharCode sc.bits`.
-- All other types (or `tyOpt = .none`): returns `true`.
+static type `tyOpt` (recursively checking `.bool`, `.char`, integer/float
+non-pointer leaves, `.array`, `.tuple`, and non-union `.adt` layouts, while
+permitting unvalidated/uninitialized payloads inside `FieldsShape.union` until
+a typed non-union field is read).
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
@@ -6546,20 +6616,13 @@ Reference (The Rust Reference, "Behavior considered undefined"):
 -/
 @[reducible]
 def validateValueForTy?
-    (_layouts : LayoutTable)
+    (layouts : LayoutTable)
     (tyOpt : Option Ty)
     (v : Value) :
     Bool :=
   match tyOpt with
-  | .some { kind := .bool, .. } =>
-    match v with
-    | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 1) (Nat.ble sc.bits 1)
-    | _ => false
-  | .some { kind := .char, .. } =>
-    match v with
-    | .scalar sc => Bool.and (Nat.beq sc.sizeBytes 4) (isValidCharCode sc.bits)
-    | _ => false
-  | _ => true
+  | .some ty => validateValueForTyAux layouts defaultCodecFuel ty v
+  | .none => true
 
 /--
 Extract a `targetBytes`-wide little-endian sub-scalar from `sc` at `byteOffset`
@@ -6791,13 +6854,12 @@ def placeTouchesUnion
         | .none => false
 
 /--
-Structural equality on `AbstractByte` provenance pairs `Option (Nat × Nat)`.
+Structural equality on `AbstractByte` optional `PtrByteFrag` provenance.
 -/
 @[reducible]
-def abstractByteProvEq : Option (Nat × Nat) → Option (Nat × Nat) → Bool
+def abstractByteProvEq : Option PtrByteFrag → Option PtrByteFrag → Bool
   | .none, .none => true
-  | .some (a₁, t₁), .some (a₂, t₂) =>
-    Bool.and (Nat.beq a₁ a₂) (Nat.beq t₁ t₂)
+  | .some f₁, .some f₂ => PtrByteFrag.beq f₁ f₂
   | _, _ => false
 
 /--
@@ -6822,41 +6884,34 @@ def abstractByteListEq : List AbstractByte → List AbstractByte → Bool
   | _, _ => false
 
 /--
-Encode a `List AbstractByte` image as per-byte `Value`s for the optional
-trailing raw-byte overlay slot of a union aggregate (`.scalar ⟨0, 0⟩` for
-`.uninit`, `.scalar ⟨b, 1⟩` for `.init b .none`, and `.ptr { allocId := a,
-offsetBytes := b } 1` for `.init b (.some (a, _))`).
+Encode a `List AbstractByte` image as per-byte lossless `Value` carriers for the
+optional trailing raw-byte overlay slot of a union aggregate, preserving full
+`PtrByteFrag` metadata (`allocId`, `tag`, `byteIdx`, `origOffset`, `ptrBytes`)
+across `MaybeUninit<*const T>` and `FieldsShape.union` overlays.
+
+Reference (The Rust Reference 1.98.0, "Unions"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html>
+
+> "The key property of unions is that all fields of a union share common
+> storage. As a result, writes to one field of a union can overwrite its other
+> fields, and size of a union is determined by the size of its largest field."
 -/
 def encodeRawAbstractByteVals : List AbstractByte → List Value
   | .nil => .nil
-  | .uninit :: rest => .scalar ⟨0, 0⟩ :: encodeRawAbstractByteVals rest
-  | .init b .none :: rest =>
-    .scalar ⟨b.toBitVec.toNat, 1⟩ :: encodeRawAbstractByteVals rest
-  | .init b (.some (a, _)) :: rest =>
-    .ptr { allocId := a, offsetBytes := b.toBitVec.toNat } 1 ::
-      encodeRawAbstractByteVals rest
+  | b :: rest => encodeRawAbstractByteVal b :: encodeRawAbstractByteVals rest
 
 /--
-Overlay per-byte `Value`s encoded by `encodeRawAbstractByteVals` onto `buf`.
+Overlay per-byte lossless `Value` carriers encoded by `encodeRawAbstractByteVals`
+onto `buf`, restoring exact `AbstractByte`s including full `PtrByteFrag` metadata.
 -/
 def overlayRawAbstractByteVals :
     List Value → List AbstractByte → Option (List AbstractByte)
   | .nil, buf => .some buf
   | _, .nil => .none
-  | .scalar ⟨0, 0⟩ :: vRest, _ :: bRest =>
-    match overlayRawAbstractByteVals vRest bRest with
-    | .some tail => .some (.uninit :: tail)
-    | .none => .none
-  | .scalar ⟨bits, 1⟩ :: vRest, _ :: bRest =>
-    match overlayRawAbstractByteVals vRest bRest with
-    | .some tail => .some (.init (UInt8.ofNat bits) .none :: tail)
-    | .none => .none
-  | .ptr p 1 :: vRest, _ :: bRest =>
-    match overlayRawAbstractByteVals vRest bRest with
-    | .some tail =>
-      .some (.init (UInt8.ofNat p.offsetBytes) (.some (p.allocId, p.tag)) :: tail)
-    | .none => .none
-  | _, _ => .none
+  | v :: vRest, _ :: bRest =>
+    match decodeRawAbstractByteVal? v, overlayRawAbstractByteVals vRest bRest with
+    | .some b, .some tail => .some (b :: tail)
+    | _, _ => .none
 
 /--
 Construct a list of `n` copies of `b : Bool`.
@@ -7675,55 +7730,239 @@ def decodeTypedKindsAndLayoutsAtOffsets
   | _, _, _ => .none
 
 /--
-`true` when some byte of `bytes` is initialized with pointer provenance
-(`AbstractByte.init _ (.some _)`).
+`true` when `policy` rejects a byte sequence carrying pointer provenance as
+invalid for a non-pointer target type (integer, `bool`, `char`, float, or
+non-pointer scalar/enum layout):
+- `.strictUcg630Ub` rejects whenever `abstractBytesHaveProv bytes = true`
+  (conservative UCG #630 / `const`-context UB semantics);
+- `.stripProvenance` returns `false`, discarding provenance from initialized
+  bytes (Rust Reference #1752 / MiniRust stripping semantics).
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation. (And even outside const, such transmutation is
+> touching on many unspecified aspects of the Rust memory model and should be
+> avoided. See below for alternatives.)"
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
 -/
 @[reducible]
-def abstractBytesHaveProv : List AbstractByte → Bool
-  | .nil => false
-  | .init _ (.some _) :: _ => true
-  | _ :: rest => abstractBytesHaveProv rest
+def policyRejectsProv
+    (policy : Ptr2IntTransmutePolicy)
+    (bytes : List AbstractByte) :
+    Bool :=
+  match policy with
+  | .strictUcg630Ub => abstractBytesHaveProv bytes
+  | .stripProvenance => false
 
 /--
-`true` when every byte of `bytes` is initialized with exactly the provenance pair
-`(allocId, tag)`.
+Discard pointer provenance from a single `AbstractByte`, leaving `.uninit`
+unchanged and mapping `.init b _` to `.init b .none`.
 -/
-def abstractBytesAllProvAux (allocId tag : Nat) : List AbstractByte → Bool
-  | .nil => true
-  | .init _ (.some (a, t)) :: rest =>
-    Bool.and
-      (Bool.and (Nat.beq a allocId) (Nat.beq t tag))
-      (abstractBytesAllProvAux allocId tag rest)
-  | _ :: _ => false
+@[reducible]
+def stripAbstractByteProv : AbstractByte → AbstractByte
+  | .uninit => .uninit
+  | .init b _ => .init b .none
 
 /--
-`true` when `bytes` is non-empty and every byte carries the same pointer
-provenance as its first byte, i.e. `bytes` is an intact (non-spliced) pointer
-image. Pointer bytes with no provenance, or with mixed provenance, yield a
-provenance-less address.
+Discard pointer provenance from every byte in a `List AbstractByte` while
+preserving initialized byte values and `.uninit` positions.
+-/
+@[reducible]
+def stripAbstractBytesProv : List AbstractByte → List AbstractByte
+  | .nil => .nil
+  | b :: rest => stripAbstractByteProv b :: stripAbstractBytesProv rest
+
+mutual
+  /--
+  `true` when `v` is a provenance-carrying pointer (`Value.ptr _ _`) or an
+  aggregate recursively containing a `Value.ptr` leaf.
+  -/
+  def valueHasProv : Value → Bool
+    | .unit => false
+    | .scalar _ => false
+    | .ptr _ _ => true
+    | .aggregate _ fields => valueListHasProv fields
+
+  /--
+  `true` when some element of `vs` satisfies `valueHasProv`.
+  -/
+  def valueListHasProv : List Value → Bool
+    | .nil => false
+    | v :: rest => Bool.or (valueHasProv v) (valueListHasProv rest)
+end
+
+/--
+`true` when `ScalarLayout` `sl` has a pointer `PrimitiveKind`.
+-/
+@[reducible]
+def scalarLayoutIsPointer : ScalarLayout → Bool
+  | .initialized (.pointer _) _ => true
+  | .union (.pointer _) => true
+  | _ => false
+
+/--
+`true` when `BackendRepr` `repr` contains a pointer scalar layout.
+-/
+@[reducible]
+def backendReprHasPointer : BackendRepr → Bool
+  | .scalar s => scalarLayoutIsPointer s
+  | .scalarPair s0 s1 => Bool.or (scalarLayoutIsPointer s0) (scalarLayoutIsPointer s1)
+  | .memory => false
+
+/--
+Target-width-aware byte size of a layout-less `RigidTy` `k` for
+`decodeTypedValueFromBytes`'s `.array` and `.tuple` fallbacks, respecting
+`layoutPointerBytes layouts` for `usize`/`isize` and thin/wide pointers as well
+as IEEE-754 float widths (`f16`/`f32`/`f64`/`f128`) without reading
+`layouts.entries[0]`.
+
+Reference (The Rust Reference, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "The size of most primitives is given in this table.
+>
+> Type            size_of::<Type>()
+> bool            1
+> u8 / i8         1
+> u16 / i16       2
+> u32 / i32       4
+> u64 / i64       8
+> u128 / i128     16
+> usize / isize   See below
+> f32             4
+> f64             8
+> char            4"
+>
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers and references have the same layout. Mutability of the pointer or
+> reference does not change the layout."
+>
+> "Pointers to sized types have the same size and alignment as usize."
+>
+> "Pointers to unsized types are sized. The size and alignment of a pointer to
+> an unsized type are each guaranteed to be greater than or equal to those of a
+> pointer to a sized type."
+>
+> (Note) "Though you should not rely on this, all pointers to DSTs are currently
+> twice the size of the size of usize and have the same alignment."
+
+Correspondence: `usize` / `isize` and pointers to sized types take
+`layoutPointerBytes layouts` bytes ("the same size and alignment as usize"),
+`f32` / `f64` take the tabulated `4` / `8` bytes, and every other kind defers
+to `rigidTyKindByteSize` / `tupleFieldsByteSize`.
+
+Modeling choices (not documented guarantees): (1) the `2 * ptrBytes` size of
+`.slice` / `.str` / `.dynamic` pointers follows the quoted non-normative Note
+(current `rustc` behavior), which the Reference asks programs not to rely on;
+the guarantee is only "greater than or equal to". (2) `f16` (2 bytes) and
+`f128` (16 bytes) do not appear in the quoted table and use their IEEE 754
+interchange widths. (3) Function pointers are assigned `ptrBytes`; the quoted
+sections do not state a function-pointer size. (4) Pointers to any other
+unsized pointee (custom-DST structs) are sized as thin here;
+`decodePtrBytesRichNoForge` / `richTyByteSize` consult the compiler-supplied
+layout instead. (5) Tuple sizes from `tupleFieldsByteSize` ignore padding and
+are used only when no compiler layout is available.
+-/
+@[reducible]
+def decodeTypedKindByteSize (layouts : LayoutTable) (k : RigidTy) : Option Nat :=
+  let ptrBytes := layoutPointerBytes layouts
+  match k with
+  | .uint .usize => .some ptrBytes
+  | .int .isize => .some ptrBytes
+  | .float .f16 => .some 2
+  | .float .f32 => .some 4
+  | .float .f64 => .some 8
+  | .float .f128 => .some 16
+  | .fnPtr _ _ _ _ => .some ptrBytes
+  | .ref _ pointee | .rawPtr _ pointee =>
+    match pointee with
+    | .slice _ | .str | .dynamic _ => .some (Nat.add ptrBytes ptrBytes)
+    | _ => .some ptrBytes
+  | _ =>
+    match rigidTyKindByteSize k with
+    | .some sz => .some sz
+    | .none =>
+      match k with
+      | .tuple ks => tupleFieldsByteSize ks
+      | _ => .none
+
+/--
+Alias for `abstractBytesCoherentPtrProv`: `true` iff `bytes` is a non-empty,
+positionally coherent, intact little-endian pointer byte image (UCG #558 /
+rust-lang/rust#148259). Any reversal (including all-zero `offsetBytes = 0`),
+swap, duplication, cross-offset splice, cross-width splice, missing provenance,
+or `.uninit` byte returns `false`.
 
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
 > "Accessing (loading from or storing to) a place that is dangling or based on
 > a misaligned pointer."
+
+Reference (Rust `core::ptr` provenance documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/index.html#provenance>
+
+> "The provenance of a pointer is used to identify which memory allocation it
+> is allowed to access."
 -/
 @[reducible]
-def abstractBytesUniformProv : List AbstractByte → Bool
-  | .init _ (.some (a, t)) :: rest => abstractBytesAllProvAux a t rest
-  | _ => false
+def abstractBytesUniformProv (bytes : List AbstractByte) : Bool :=
+  abstractBytesCoherentPtrProv bytes
 
 /--
 Decode a raw pointer or reference image `bytes` of pointee `pointee` at pointer
-width `ptrBytes`, without fabricating provenance:
-- an intact pointer image (`abstractBytesUniformProv`) decodes to
-  `Value.ptr { allocId, offsetBytes := bits } ptrBytes`;
-- a provenance-less (or spliced) raw pointer image decodes to the provenance-less
-  address `Value.scalar ⟨bits, ptrBytes⟩`;
-- a provenance-less (or spliced) reference image is invalid (`.none`);
-- wide pointers decode their data half as above and their metadata half as
-  `Value.scalar ⟨meta, ptrBytes⟩` (slice/`str` lengths must not carry provenance;
-  `dyn` vtable pointers keep intact provenance).
+width `ptrBytes`, without fabricating provenance and enforcing UCG #558
+pointer-byte fragment coherence (`abstractBytesCoherentPtrProv?`):
+- zero pointer width (`ptrBytes = 0`) is rejected (`.none`);
+- an intact, positionally coherent pointer image with `frag.ptrBytes = ptrBytes`
+  decodes to `Value.ptr { allocId := frag.allocId, offsetBytes := bits, tag := frag.tag } ptrBytes`;
+- a provenance-less or incoherent (reversed, swapped, duplicated, or spliced)
+  raw pointer image (`isRef = false`) strips provenance to
+  `Value.scalar ⟨bits, ptrBytes⟩`;
+- a provenance-less or incoherent reference / `fnPtr` image (`isRef = true`) is
+  invalid (`.none`);
+- wide pointers decode their data half as above and their metadata half as:
+  - for `.dynamic _`: an intact coherent vtable pointer (`Value.ptr`) when
+    coherent at `ptrBytes`; otherwise `.none` when `isRef = true` (`&dyn Trait`
+    requires a valid vtable pointer) and `.scalar ⟨metaBits, ptrBytes⟩` when
+    `isRef = false` (`*const dyn Trait`);
+  - for `.slice _` / `.str`: provenance-free `Value.scalar ⟨metaBits, ptrBytes⟩`
+    (rejecting any provenance byte in slice/`str` metadata).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution
+> are “valid”, and producing an invalid value is hence immediate UB."
+
+Reference (Rust `core::ptr` provenance documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/index.html#provenance>
+
+> "The provenance of a pointer is used to identify which memory allocation it
+> is allowed to access."
+
+Modeling note (`agent_docs/trusted-rust.md`): stripping provenance to
+`Value.scalar` on incoherent raw pointer bytes and rejecting incoherent `&T`,
+`fn()`, and `&dyn Trait` vtable bytes enforces the UCG #558 /
+rust-lang/rust#148259 pointer-byte fragment coherence rule conservatively.
 -/
 def decodePtrBytesNoForge
     (isRef : Bool)
@@ -7732,16 +7971,22 @@ def decodePtrBytesNoForge
     (bytes : List AbstractByte) :
     Option Value :=
   let dataOf (dataBytes : List AbstractByte) : Option Value :=
-    match Nat.beq (length dataBytes) ptrBytes, decodeScalarBytes dataBytes false with
-    | true, .some (sv, prov) =>
-      match abstractBytesUniformProv dataBytes, prov with
-      | true, .some (allocId, _) =>
-        .some (.ptr { allocId := allocId, offsetBytes := sv.bits } ptrBytes)
-      | _, _ =>
+    match Nat.blt 0 ptrBytes, Nat.beq (length dataBytes) ptrBytes, decodeLittleEndianBits dataBytes with
+    | true, true, .some bits =>
+      match abstractBytesCoherentPtrProv? dataBytes with
+      | .some frag =>
+        match Nat.beq frag.ptrBytes ptrBytes with
+        | true =>
+          .some (.ptr { allocId := frag.allocId, offsetBytes := bits } ptrBytes)
+        | false =>
+          match isRef with
+          | true => .none
+          | false => .some (.scalar ⟨bits, ptrBytes⟩)
+      | .none =>
         match isRef with
         | true => .none
-        | false => .some (.scalar ⟨sv.bits, ptrBytes⟩)
-    | _, _ => .none
+        | false => .some (.scalar ⟨bits, ptrBytes⟩)
+    | _, _, _ => .none
   let wideMetaIsDyn : Option Bool :=
     match pointee with
     | .slice _ => .some false
@@ -7751,36 +7996,64 @@ def decodePtrBytesNoForge
   match wideMetaIsDyn with
   | .none => dataOf bytes
   | .some isDyn =>
-    match Nat.beq (length bytes) (Nat.add ptrBytes ptrBytes) with
-    | false => .none
-    | true =>
+    match Nat.blt 0 ptrBytes, Nat.beq (length bytes) (Nat.add ptrBytes ptrBytes) with
+    | true, true =>
       let metaBytes := dropAbstractBytes ptrBytes bytes
       let metaOpt : Option Value :=
-        match decodeScalarBytes metaBytes false with
+        match decodeLittleEndianBits metaBytes with
         | .none => .none
-        | .some (metaSv, metaProv) =>
-          match isDyn, abstractBytesUniformProv metaBytes, metaProv with
-          | true, true, .some (vtAllocId, _) =>
-            .some (.ptr { allocId := vtAllocId, offsetBytes := metaSv.bits } ptrBytes)
-          | true, _, _ => .some (.scalar ⟨metaSv.bits, ptrBytes⟩)
-          | false, _, _ =>
+        | .some metaBits =>
+          match isDyn with
+          | true =>
+            match abstractBytesCoherentPtrProv? metaBytes with
+            | .some vtFrag =>
+              match Nat.beq vtFrag.ptrBytes ptrBytes with
+              | true =>
+                .some
+                  (.ptr { allocId := vtFrag.allocId, offsetBytes := metaBits } ptrBytes)
+              | false =>
+                match isRef with
+                | true => .none
+                | false => .some (.scalar ⟨metaBits, ptrBytes⟩)
+            | .none =>
+              match isRef with
+              | true => .none
+              | false => .some (.scalar ⟨metaBits, ptrBytes⟩)
+          | false =>
             match abstractBytesHaveProv metaBytes with
             | true => .none
-            | false => .some (.scalar ⟨metaSv.bits, ptrBytes⟩)
+            | false => .some (.scalar ⟨metaBits, ptrBytes⟩)
       match dataOf (takeAbstractBytes ptrBytes bytes), metaOpt with
       | .some dataVal, .some metaVal => .some (.aggregate 0 (dataVal :: metaVal :: .nil))
       | _, _ => .none
+    | _, _ => .none
 
 /--
-Decode `bytes` according to `ScalarLayout` `sl` without fabricating pointer
-provenance from provenance-less bytes and without permitting pointer-provenance
-bytes to decode into non-pointer scalar layouts.
+Decode `bytes` according to `ScalarLayout` `sl` at target pointer width
+`ptrBytes` without fabricating pointer provenance from provenance-less or
+fragment-incoherent bytes (`abstractBytesCoherentPtrProv?`), enforcing
+`Ptr2IntTransmutePolicy` `policy` on non-pointer scalar layouts (defaulting to
+`.strictUcg630Ub`, which rejects bytes carrying pointer provenance).
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation. (And even outside const, such transmutation is
+> touching on many unspecified aspects of the Rust memory model and should be
+> avoided. See below for alternatives.)"
 -/
 def decodeScalarLayoutBytesNoForge
     (sl : ScalarLayout)
-    (bytes : List AbstractByte) :
+    (bytes : List AbstractByte)
+    (policy : Ptr2IntTransmutePolicy := .strictUcg630Ub)
+    (ptrBytes : Nat := 8) :
     Option Value :=
-  match scalarLayoutByteWidth sl with
+  match scalarLayoutByteWidth sl ptrBytes with
   | .none => .none
   | .some sz =>
     match Nat.beq (length bytes) sz with
@@ -7788,18 +8061,29 @@ def decodeScalarLayoutBytesNoForge
     | true =>
       match sl with
       | .initialized (.pointer _) vr =>
-        match decodeScalarBytes bytes false with
+        match decodeLittleEndianBits bytes with
         | .none => .none
-        | .some (sv, prov) =>
-          match abstractBytesUniformProv bytes, prov with
-          | true, .some (allocId, _) =>
-            .some (.ptr { allocId := allocId, offsetBytes := sv.bits } sz)
-          | _, _ =>
-            match wrappingRangeContains vr sv.bits with
+        | .some bits =>
+          let sv : ScalarInt := ⟨bits, sz⟩
+          match abstractBytesCoherentPtrProv? bytes with
+          | .some frag =>
+            match Nat.beq frag.ptrBytes sz with
+            | true =>
+              .some (.ptr { allocId := frag.allocId, offsetBytes := bits } sz)
+            | false =>
+              match wrappingRangeContains vr bits with
+              | true => .some (.scalar sv)
+              | false => .none
+          | .none =>
+            match wrappingRangeContains vr bits with
             | true => .some (.scalar sv)
             | false => .none
       | .initialized _ vr =>
-        match abstractBytesHaveProv bytes with
+        match
+          (match policy with
+           | .strictUcg630Ub => abstractBytesHaveProv bytes
+           | .stripProvenance => false)
+        with
         | true => .none
         | false =>
           match decodeScalarBytes bytes false with
@@ -7819,15 +8103,23 @@ def decodeScalarLayoutBytesNoForge
                 | false => .none
               | false => .some (.scalar sv)
       | .union (.pointer _) =>
-        match decodeScalarBytes bytes false with
+        match decodeLittleEndianBits bytes with
         | .none => .none
-        | .some (sv, prov) =>
-          match abstractBytesUniformProv bytes, prov with
-          | true, .some (allocId, _) =>
-            .some (.ptr { allocId := allocId, offsetBytes := sv.bits } sz)
-          | _, _ => .some (.scalar sv)
+        | .some bits =>
+          let sv : ScalarInt := ⟨bits, sz⟩
+          match abstractBytesCoherentPtrProv? bytes with
+          | .some frag =>
+            match Nat.beq frag.ptrBytes sz with
+            | true =>
+              .some (.ptr { allocId := frag.allocId, offsetBytes := bits } sz)
+            | false => .some (.scalar sv)
+          | .none => .some (.scalar sv)
       | .union _ =>
-        match abstractBytesHaveProv bytes with
+        match
+          (match policy with
+           | .strictUcg630Ub => abstractBytesHaveProv bytes
+           | .stripProvenance => false)
+        with
         | true => .none
         | false =>
           match decodeScalarBytes bytes false with
@@ -7838,24 +8130,64 @@ def decodeScalarLayoutBytesNoForge
 Fuel-bounded layout- and type-aware byte decoder extending `decodeValueFromBytes`
 with union raw-byte preservation (`decodeUnionBytesWithCount`), per-element
 `fieldLayouts` propagation on arrays/tuples/structs, `char` UTF-16 surrogate
-rejection on layout-only `.primitive` fields, and provenance-faithful scalar
-decoding:
-- integer, `bool`, and `char` images carrying pointer provenance are rejected
-  (the abstract address of a pointer is not recoverable from its byte image);
-- raw pointer images without intact provenance decode to provenance-less
-  addresses (`Value.scalar`), and reference / `fnPtr` images without intact
-  provenance are rejected, so transmutes and union reads never fabricate
-  provenance;
+rejection on layout-only `.primitive` fields, 32-bit `usize`/`isize` width
+decoding, unresolved-slot-0 tuple guards, `VariantsShape.multiple` non-pointer
+tag provenance enforcement, and `Ptr2IntTransmutePolicy`-parametric provenance
+handling:
+- under `.strictUcg630Ub` (default), integer, float, `bool`, `char`, and
+  non-pointer scalar/enum tag/payload images carrying pointer provenance are
+  rejected;
+- under `.stripProvenance`, pointer provenance is discarded on those non-pointer
+  targets while bit-validity invariants remain enforced;
+- raw pointer images without positionally coherent provenance decode to
+  provenance-less addresses (`Value.scalar`), and reference / `fnPtr` images
+  without coherent provenance are always rejected under every policy, so
+  transmutes and union reads never fabricate provenance;
 - ADT fields are decoded by their `fieldLayouts` (generic arguments are not
   field types).
+- Known `TypeLayout` schema limitation (`VariantsShape.multiple`): `TypeLayout`
+  (`Layout.lean`) records `variants : List FieldsShape` without per-variant
+  `LayoutIdx` lists or `TagEncoding::Niche` metadata, so pointer-payload vs
+  integer-payload variants of a multi-variant enum cannot be distinguished from
+  `TypeLayout` alone. Consequently, `.multiple` conservatively rejects any
+  provenance-bearing byte buffer under `.strictUcg630Ub` (failing closed rather
+  than stripping pointer provenance into an integer variant via
+  `decodeFieldsBySpan`; niche/tagged enums with explicit `RichAdtSpec` metadata
+  decode per-variant pointer payloads via `decodeRichValueFromBytes`).
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation. (And even outside const, such transmutation is
+> touching on many unspecified aspects of the Rust memory model and should be
+> avoided. See below for alternatives.)"
 -/
-def decodeTypedValueFromBytes :
-    Nat → LayoutTable → Ty → List AbstractByte → Option Value
-  | .zero, _, _, _ => .none
-  | .succ fuel', layouts, ty, bytes =>
+def decodeTypedValueFromBytes
+    (fuel : Nat)
+    (layouts : LayoutTable)
+    (ty : Ty)
+    (bytes : List AbstractByte)
+    (policy : Ptr2IntTransmutePolicy := .strictUcg630Ub) :
+    Option Value :=
+  match fuel with
+  | .zero => .none
+  | .succ fuel' =>
     let rTy := normalizeCodecTy ty
+    let ptrBytes := layoutPointerBytes layouts
     let decodeChild := fun (cTy : Ty) (bs : List AbstractByte) =>
-      decodeTypedValueFromBytes fuel' layouts cTy bs
+      decodeTypedValueFromBytes fuel' layouts cTy bs policy
     match rTy.kind with
     | .array elemKind n =>
       match Nat.beq n 0 with
@@ -7880,15 +8212,12 @@ def decodeTypedValueFromBytes :
             | .none => .none
         | _ =>
           let elemSzOpt : Option Nat :=
-            match rigidTyKindByteSize elemKind with
+            match decodeTypedKindByteSize layouts elemKind with
             | .some sz => .some sz
             | .none =>
               match LayoutTable.lookup layouts rTy.layoutIdx with
               | .some { fields := .array stride _, .. } => .some stride.bytes
-              | _ =>
-                match elemKind with
-                | .tuple ks => tupleFieldsByteSize ks
-                | _ => .none
+              | _ => .none
           match elemSzOpt with
           | .none => .none
           | .some elemSz =>
@@ -7897,7 +8226,7 @@ def decodeTypedValueFromBytes :
             | true =>
               match
                 decodeArrayChunksWith
-                  (decodeChild { kind := elemKind, layoutIdx := 0 })
+                  (decodeChild { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts })
                   elemSz
                   n
                   bytes
@@ -7907,47 +8236,59 @@ def decodeTypedValueFromBytes :
     | .tuple (kHead :: kTail) =>
       let ks := kHead :: kTail
       let decodeTypedKind := fun (k : RigidTy) (bs : List AbstractByte) =>
-        decodeChild { kind := k, layoutIdx := 0 } bs
+        decodeChild { kind := k, layoutIdx := unresolvedLayoutIdx layouts } bs
       let sizeOfKind := fun (k : RigidTy) =>
-        rigidTyByteSize layouts { kind := k, layoutIdx := 0 }
-      match LayoutTable.lookup layouts rTy.layoutIdx with
-      | .some l =>
-        match Nat.beq (length bytes) l.size.bytes, l.fields with
-        | true, .arbitrary offsets _ =>
-          match
-            Bool.and
-              (Nat.beq (length ks) (length offsets))
-              (Nat.beq (length l.fieldLayouts) (length offsets))
-          with
+        decodeTypedKindByteSize layouts k
+      match Bool.not (isUnresolvedLayoutIdx layouts rTy.layoutIdx) with
+      | true =>
+        match LayoutTable.lookup layouts rTy.layoutIdx with
+        | .some l =>
+          match layoutMatchesAggregateVariant l 0 (length ks) with
           | true =>
-            match
-              decodeTypedKindsAndLayoutsAtOffsets
-                decodeChild
-                layouts
-                bytes
-                offsets
-                ks
-                l.fieldLayouts
-            with
-            | .some vals => .some (.aggregate 0 vals)
-            | .none => .none
+            match Nat.beq (length bytes) l.size.bytes, l.fields with
+            | true, .arbitrary offsets _ =>
+              match
+                Bool.and
+                  (Nat.beq (length ks) (length offsets))
+                  (Nat.beq (length l.fieldLayouts) (length offsets))
+              with
+              | true =>
+                match
+                  decodeTypedKindsAndLayoutsAtOffsets
+                    decodeChild
+                    layouts
+                    bytes
+                    offsets
+                    ks
+                    l.fieldLayouts
+                with
+                | .some vals => .some (.aggregate 0 vals)
+                | .none => .none
+              | false =>
+                match
+                  decodeFieldsAtOffsetsWith
+                    decodeTypedKind
+                    sizeOfKind
+                    bytes
+                    offsets
+                    ks
+                with
+                | .some vals => .some (.aggregate 0 vals)
+                | .none => .none
+            | true, _ =>
+              match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
+              | .some vals => .some (.aggregate 0 vals)
+              | .none => .none
+            | false, _ => .none
           | false =>
-            match
-              decodeFieldsAtOffsetsWith
-                decodeTypedKind
-                sizeOfKind
-                bytes
-                offsets
-                ks
-            with
+            match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
             | .some vals => .some (.aggregate 0 vals)
             | .none => .none
-        | true, _ =>
+        | .none =>
           match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
           | .some vals => .some (.aggregate 0 vals)
           | .none => .none
-        | false, _ => .none
-      | .none =>
+      | false =>
         match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
         | .some vals => .some (.aggregate 0 vals)
         | .none => .none
@@ -7984,17 +8325,17 @@ def decodeTypedValueFromBytes :
             | false =>
               match offsets, l.backendRepr with
               | off0 :: .nil, .scalar s0 =>
-                match scalarLayoutByteWidth s0 with
+                match scalarLayoutByteWidth s0 ptrBytes with
                 | .none => .none
                 | .some sz0 =>
                   match sliceAbstractBytes bytes off0.bytes sz0 with
                   | .none => .none
                   | .some slice0 =>
-                    match decodeScalarLayoutBytesNoForge s0 slice0 with
+                    match decodeScalarLayoutBytesNoForge s0 slice0 policy ptrBytes with
                     | .some v0 => .some (.aggregate variantIdx (v0 :: .nil))
                     | .none => .none
               | off0 :: off1 :: .nil, .scalarPair s0 s1 =>
-                match scalarLayoutByteWidth s0, scalarLayoutByteWidth s1 with
+                match scalarLayoutByteWidth s0 ptrBytes, scalarLayoutByteWidth s1 ptrBytes with
                 | .some sz0, .some sz1 =>
                   match
                     sliceAbstractBytes bytes off0.bytes sz0,
@@ -8002,8 +8343,8 @@ def decodeTypedValueFromBytes :
                   with
                   | .some slice0, .some slice1 =>
                     match
-                      decodeScalarLayoutBytesNoForge s0 slice0,
-                      decodeScalarLayoutBytesNoForge s1 slice1
+                      decodeScalarLayoutBytesNoForge s0 slice0 policy ptrBytes,
+                      decodeScalarLayoutBytesNoForge s1 slice1 policy ptrBytes
                     with
                     | .some v0, .some v1 =>
                       .some (.aggregate variantIdx (v0 :: v1 :: .nil))
@@ -8011,7 +8352,11 @@ def decodeTypedValueFromBytes :
                   | _, _ => .none
                 | _, _ => .none
               | _, _ =>
-                match abstractBytesHaveProv bytes with
+                match
+                  (match policy with
+                   | .strictUcg630Ub => abstractBytesHaveProv bytes
+                   | .stripProvenance => false)
+                with
                 | true => .none
                 | false =>
                   match decodeFieldsBySpan bytes l.size.bytes offsets with
@@ -8036,7 +8381,11 @@ def decodeTypedValueFromBytes :
                 | .some vals => .some (.aggregate variantIdx vals)
                 | .none => .none
               | .nil =>
-                match abstractBytesHaveProv bytes with
+                match
+                  (match policy with
+                   | .strictUcg630Ub => abstractBytesHaveProv bytes
+                   | .stripProvenance => false)
+                with
                 | true => .none
                 | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
           | .single _, .primitive =>
@@ -8044,26 +8393,889 @@ def decodeTypedValueFromBytes :
             | true => .some .unit
             | false =>
               match l.backendRepr with
-              | .scalar s0 => decodeScalarLayoutBytesNoForge s0 bytes
+              | .scalar s0 => decodeScalarLayoutBytesNoForge s0 bytes policy ptrBytes
               | _ =>
-                match abstractBytesHaveProv bytes with
+                match
+                  (match policy with
+                   | .strictUcg630Ub => abstractBytesHaveProv bytes
+                   | .stripProvenance => false)
+                with
                 | true => .none
                 | false =>
                   match decodeScalarBytes bytes false with
                   | .some (sv, _) => .some (.scalar sv)
                   | .none => .none
+          | .multiple _ _ _, _ =>
+            match
+              (match policy with
+               | .strictUcg630Ub => abstractBytesHaveProv bytes
+               | .stripProvenance => false)
+            with
+            | true => .none
+            | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
           | _, _ => decodeValueFromBytes (.succ fuel') layouts rTy bytes
-    | .bool | .char | .int _ | .uint _ =>
-      match abstractBytesHaveProv bytes with
+    | .uint .usize =>
+      match
+        (match policy with
+         | .strictUcg630Ub => abstractBytesHaveProv bytes
+         | .stripProvenance => false)
+      with
+      | true => .none
+      | false =>
+        match Nat.beq (layoutPointerBytes layouts) 4 with
+        | true =>
+          match Nat.beq (length bytes) 4 with
+          | false => .none
+          | true =>
+            match decodeScalarBytes bytes false with
+            | .some (sv, _) => .some (.scalar sv)
+            | .none => .none
+        | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+    | .int .isize =>
+      match
+        (match policy with
+         | .strictUcg630Ub => abstractBytesHaveProv bytes
+         | .stripProvenance => false)
+      with
+      | true => .none
+      | false =>
+        match Nat.beq (layoutPointerBytes layouts) 4 with
+        | true =>
+          match Nat.beq (length bytes) 4 with
+          | false => .none
+          | true =>
+            match decodeScalarBytes bytes true with
+            | .some (sv, _) => .some (.scalar sv)
+            | .none => .none
+        | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+    | .bool | .char | .int _ | .uint _ | .float _ =>
+      match
+        (match policy with
+         | .strictUcg630Ub => abstractBytesHaveProv bytes
+         | .stripProvenance => false)
+      with
       | true => .none
       | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
     | .fnPtr _ _ _ _ =>
-      decodePtrBytesNoForge true (.tuple .nil) (layoutPointerBytes layouts) bytes
+      decodePtrBytesNoForge true (.tuple .nil) ptrBytes bytes
     | .rawPtr _ pointee =>
-      decodePtrBytesNoForge false pointee (layoutPointerBytes layouts) bytes
+      decodePtrBytesNoForge false pointee ptrBytes bytes
     | .ref _ pointee =>
-      decodePtrBytesNoForge true pointee (layoutPointerBytes layouts) bytes
+      decodePtrBytesNoForge true pointee ptrBytes bytes
     | _ => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+
+/--
+Decode raw bytes `bytes` into an in-memory `Value` for untyped byte writes
+(`copy_nonoverlapping`, `write_bytes`, untyped `*mut u8` splices) without
+triggering premature write-time UB on invalid scalar bit patterns (`2u8` in
+`bool` or `Unaligned<bool>`, surrogate/out-of-range `char` patterns) and without
+fabricating pointer provenance:
+- scalar `bool` and `char` accept any initialized byte pattern (validity is
+  enforced at read time by `evalOperand` / `evalPlaceRead` /
+  `decodeTypedValueFromBytes`);
+- `[u8; N]` preserves per-byte `PtrByteFrag` metadata losslessly via
+  `encodeRawAbstractByteVals` so bytewise pointer copies retain coherence;
+- thin raw pointers decode coherent fragments to `Value.ptr`; when
+  `preservePartialPtrFrags = true` (partial sub-pointer byte splices),
+  partially written pointer fragments are retained via
+  `encodeRawAbstractByteVals` and materialized strictly on read;
+- non-pointer integer/bool/char/float targets enforce `policyRejectsProv`;
+- union ADTs preserve all raw bytes via `decodeUnionBytesWithCountOpt`.
+
+Reference (`core::ptr::copy_nonoverlapping` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "The copy is \"untyped\" in the sense that data may be uninitialized or
+> otherwise violate the requirements of `T`. The initialization state is
+> preserved exactly."
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L664-L666>
+
+> "/// Additionally, note that changing `*dst` in this way can easily lead to undefined behavior (UB)
+> /// later if the written bytes are not a valid representation of some `T`."
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+-/
+def decodeUntypedStorageBytes
+    (fuel : Nat)
+    (layouts : LayoutTable)
+    (ty : Ty)
+    (bytes : List AbstractByte)
+    (policy : Ptr2IntTransmutePolicy := .strictUcg630Ub)
+    (preservePartialPtrFrags : Bool := false) :
+    Option Value :=
+  match fuel with
+  | .zero => .none
+  | .succ fuel' =>
+    let rTy := normalizeCodecTy ty
+    let ptrBytes := layoutPointerBytes layouts
+    let decodeChild := fun (cTy : Ty) (bs : List AbstractByte) =>
+      decodeUntypedStorageBytes fuel' layouts cTy bs policy preservePartialPtrFrags
+    match rTy.kind with
+    | .bool =>
+      match Nat.beq (length bytes) 1, policyRejectsProv policy bytes with
+      | true, false =>
+        match decodeLittleEndianBits bytes with
+        | .some bits => .some (.scalar ⟨bits, 1⟩)
+        | .none => .none
+      | _, _ => .none
+    | .char =>
+      match Nat.beq (length bytes) 4, policyRejectsProv policy bytes with
+      | true, false =>
+        match decodeLittleEndianBits bytes with
+        | .some bits => .some (.scalar ⟨bits, 4⟩)
+        | .none => .none
+      | _, _ => .none
+    | .uint .usize =>
+      match Nat.beq (length bytes) ptrBytes, policyRejectsProv policy bytes with
+      | true, false =>
+        match decodeLittleEndianBits bytes with
+        | .some bits => .some (.scalar ⟨bits, ptrBytes⟩)
+        | .none => .none
+      | _, _ => .none
+    | .int .isize =>
+      match Nat.beq (length bytes) ptrBytes, policyRejectsProv policy bytes with
+      | true, false =>
+        match decodeScalarBytes bytes true with
+        | .some (sv, _) => .some (.scalar sv)
+        | .none => .none
+      | _, _ => .none
+    | .uint _ | .int _ | .float _ =>
+      decodeTypedValueFromBytes (.succ fuel') layouts rTy bytes policy
+    | .rawPtr _ pointee =>
+      match pointee with
+      | .slice _ | .str | .dynamic _ =>
+        match preservePartialPtrFrags with
+        | false => decodePtrBytesNoForge false pointee ptrBytes bytes
+        | true =>
+          let wideBytes := Nat.add ptrBytes ptrBytes
+          match Nat.blt 0 ptrBytes, Nat.beq (length bytes) wideBytes with
+          | true, true =>
+            let dataBytes := takeAbstractBytes ptrBytes bytes
+            let metaBytes := dropAbstractBytes ptrBytes bytes
+            let dataIncohWithProv : Bool :=
+              Bool.and
+                (abstractBytesHaveProv dataBytes)
+                (Bool.not (abstractBytesCoherentPtrProv dataBytes))
+            let metaIncohWithProv : Bool :=
+              match pointee with
+              | .dynamic _ =>
+                Bool.and
+                  (abstractBytesHaveProv metaBytes)
+                  (Bool.not (abstractBytesCoherentPtrProv metaBytes))
+              | _ => abstractBytesHaveProv metaBytes
+            let anyUninit : Bool :=
+              match decodeLittleEndianBits bytes with
+              | .none => true
+              | .some _ => false
+            match Bool.or anyUninit (Bool.or dataIncohWithProv metaIncohWithProv) with
+            | true => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+            | false => decodePtrBytesNoForge false pointee ptrBytes bytes
+          | _, _ => .none
+      | _ =>
+        match preservePartialPtrFrags with
+        | false => decodePtrBytesNoForge false pointee ptrBytes bytes
+        | true =>
+          match Nat.blt 0 ptrBytes, Nat.beq (length bytes) ptrBytes with
+          | true, true =>
+            match decodeLittleEndianBits bytes with
+            | .some bits =>
+              match abstractBytesCoherentPtrProv? bytes with
+              | .some frag =>
+                match Nat.beq frag.ptrBytes ptrBytes with
+                | true =>
+                  .some
+                    (.ptr { allocId := frag.allocId, offsetBytes := bits } ptrBytes)
+                | false => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+              | .none =>
+                match abstractBytesHaveProv bytes with
+                | true => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+                | false => .some (.scalar ⟨bits, ptrBytes⟩)
+            | .none => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+          | _, _ => .none
+    | .ref _ pointee =>
+      let ptrWidthBytes :=
+        match pointee with
+        | .slice _ | .str | .dynamic _ => Nat.add ptrBytes ptrBytes
+        | _ => ptrBytes
+      match preservePartialPtrFrags with
+      | false => decodePtrBytesNoForge true pointee ptrBytes bytes
+      | true =>
+        match decodePtrBytesNoForge true pointee ptrBytes bytes with
+        | .some v => .some v
+        | .none =>
+          match Nat.blt 0 ptrBytes, Nat.beq (length bytes) ptrWidthBytes with
+          | true, true => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+          | _, _ => .none
+    | .fnPtr _ _ _ _ =>
+      match preservePartialPtrFrags with
+      | false => decodePtrBytesNoForge true (.tuple .nil) ptrBytes bytes
+      | true =>
+        match decodePtrBytesNoForge true (.tuple .nil) ptrBytes bytes with
+        | .some v => .some v
+        | .none =>
+          match Nat.blt 0 ptrBytes, Nat.beq (length bytes) ptrBytes with
+          | true, true => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+          | _, _ => .none
+    | .array (.uint .u8) n =>
+      match Nat.beq (length bytes) n with
+      | false => .none
+      | true => .some (.aggregate 0 (encodeRawAbstractByteVals bytes))
+    | .array elemKind n =>
+      match Nat.beq n 0 with
+      | true =>
+        match bytes with
+        | .nil => .some (.aggregate 0 .nil)
+        | _ :: _ => .none
+      | false =>
+        match LayoutTable.lookup layouts rTy.layoutIdx with
+        | .some { fields := .array stride _, fieldLayouts := elemFlIdx :: _, .. } =>
+          match Nat.beq (length bytes) (Nat.mul stride.bytes n) with
+          | false => .none
+          | true =>
+            match
+              decodeArrayChunksWith
+                (decodeChild { kind := elemKind, layoutIdx := elemFlIdx })
+                stride.bytes
+                n
+                bytes
+            with
+            | .some elems => .some (.aggregate 0 elems)
+            | .none => .none
+        | _ =>
+          let elemSzOpt : Option Nat :=
+            match decodeTypedKindByteSize layouts elemKind with
+            | .some sz => .some sz
+            | .none =>
+              match LayoutTable.lookup layouts rTy.layoutIdx with
+              | .some { fields := .array stride _, .. } => .some stride.bytes
+              | _ => .none
+          match elemSzOpt with
+          | .none => .none
+          | .some elemSz =>
+            match Nat.beq (length bytes) (Nat.mul elemSz n) with
+            | false => .none
+            | true =>
+              match
+                decodeArrayChunksWith
+                  (decodeChild { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts })
+                  elemSz
+                  n
+                  bytes
+              with
+              | .some elems => .some (.aggregate 0 elems)
+              | .none => .none
+    | .tuple .nil =>
+      match bytes with
+      | .nil => .some .unit
+      | _ :: _ => .none
+    | .tuple (kHead :: kTail) =>
+      let ks := kHead :: kTail
+      let decodeUntypedKind := fun (k : RigidTy) (bs : List AbstractByte) =>
+        decodeChild { kind := k, layoutIdx := unresolvedLayoutIdx layouts } bs
+      let sizeOfKind := fun (k : RigidTy) =>
+        decodeTypedKindByteSize layouts k
+      match Bool.not (isUnresolvedLayoutIdx layouts rTy.layoutIdx) with
+      | true =>
+        match LayoutTable.lookup layouts rTy.layoutIdx with
+        | .some l =>
+          match layoutMatchesAggregateVariant l 0 (length ks) with
+          | true =>
+            match Nat.beq (length bytes) l.size.bytes, l.fields with
+            | true, .arbitrary offsets _ =>
+              match
+                Bool.and
+                  (Nat.beq (length ks) (length offsets))
+                  (Nat.beq (length l.fieldLayouts) (length offsets))
+              with
+              | true =>
+                match
+                  decodeTypedKindsAndLayoutsAtOffsets
+                    decodeChild
+                    layouts
+                    bytes
+                    offsets
+                    ks
+                    l.fieldLayouts
+                with
+                | .some vals => .some (.aggregate 0 vals)
+                | .none => .none
+              | false =>
+                match
+                  decodeFieldsAtOffsetsWith
+                    decodeUntypedKind
+                    sizeOfKind
+                    bytes
+                    offsets
+                    ks
+                with
+                | .some vals => .some (.aggregate 0 vals)
+                | .none => .none
+            | true, _ =>
+              match decodeSeqFieldsWith decodeUntypedKind sizeOfKind ks bytes with
+              | .some vals => .some (.aggregate 0 vals)
+              | .none => .none
+            | false, _ => .none
+          | false =>
+            match decodeSeqFieldsWith decodeUntypedKind sizeOfKind ks bytes with
+            | .some vals => .some (.aggregate 0 vals)
+            | .none => .none
+        | .none =>
+          match decodeSeqFieldsWith decodeUntypedKind sizeOfKind ks bytes with
+          | .some vals => .some (.aggregate 0 vals)
+          | .none => .none
+      | false =>
+        match decodeSeqFieldsWith decodeUntypedKind sizeOfKind ks bytes with
+        | .some vals => .some (.aggregate 0 vals)
+        | .none => .none
+    | .adt _ _ =>
+      match LayoutTable.lookup layouts rTy.layoutIdx with
+      | .none => decodeTypedValueFromBytes (.succ fuel') layouts rTy bytes policy
+      | .some l =>
+        match Bool.or l.isUninhabited (Bool.not (Nat.beq (length bytes) l.size.bytes)) with
+        | true => .none
+        | false =>
+          match l.variants, l.fields with
+          | .single 0, .union count =>
+            decodeUnionBytesWithCountOpt layouts rTy.layoutIdx count bytes
+          | .single variantIdx, .arbitrary .nil _ =>
+            .some (.aggregate variantIdx .nil)
+          | .single variantIdx, .arbitrary offsets _ =>
+            match Nat.beq (length l.fieldLayouts) (length offsets) with
+            | true =>
+              match
+                decodeFieldsByLayoutIdxs
+                  (fun fIdx fSlice =>
+                    decodeChild { kind := .adt "" .nil, layoutIdx := fIdx } fSlice)
+                  layouts
+                  bytes
+                  offsets
+                  l.fieldLayouts
+              with
+              | .some vals => .some (.aggregate variantIdx vals)
+              | .none => .none
+            | false =>
+              let decodeRawScalarLayout (sl : ScalarLayout) (bs : List AbstractByte) : Option Value :=
+                match sl with
+                | .initialized (.pointer _) _ | .union (.pointer _) =>
+                  decodeScalarLayoutBytesNoForge sl bs policy ptrBytes
+                | _ =>
+                  match policyRejectsProv policy bs with
+                  | true => .none
+                  | false =>
+                    match decodeScalarBytes bs false with
+                    | .some (sv, _) => .some (.scalar sv)
+                    | .none => .none
+              match offsets, l.backendRepr with
+              | off0 :: .nil, .scalar s0 =>
+                match scalarLayoutByteWidth s0 ptrBytes with
+                | .none => .none
+                | .some sz0 =>
+                  match sliceAbstractBytes bytes off0.bytes sz0 with
+                  | .none => .none
+                  | .some slice0 =>
+                    match decodeRawScalarLayout s0 slice0 with
+                    | .some v0 => .some (.aggregate variantIdx (v0 :: .nil))
+                    | .none => .none
+              | off0 :: off1 :: .nil, .scalarPair s0 s1 =>
+                match scalarLayoutByteWidth s0 ptrBytes, scalarLayoutByteWidth s1 ptrBytes with
+                | .some sz0, .some sz1 =>
+                  match
+                    sliceAbstractBytes bytes off0.bytes sz0,
+                    sliceAbstractBytes bytes off1.bytes sz1
+                  with
+                  | .some slice0, .some slice1 =>
+                    match decodeRawScalarLayout s0 slice0, decodeRawScalarLayout s1 slice1 with
+                    | .some v0, .some v1 => .some (.aggregate variantIdx (v0 :: v1 :: .nil))
+                    | _, _ => .none
+                  | _, _ => .none
+                | _, _ => .none
+              | _, _ =>
+                match policyRejectsProv policy bytes with
+                | true => .none
+                | false =>
+                  match decodeFieldsBySpan bytes l.size.bytes offsets with
+                  | .some vals => .some (.aggregate variantIdx vals)
+                  | .none => .none
+          | .single variantIdx, .array stride count =>
+            match Nat.beq count 0 with
+            | true =>
+              match bytes with
+              | .nil => .some (.aggregate variantIdx .nil)
+              | _ :: _ => .none
+            | false =>
+              match l.fieldLayouts with
+              | elemFlIdx :: _ =>
+                match
+                  decodeArrayChunksWith
+                    (decodeChild { kind := .adt "" .nil, layoutIdx := elemFlIdx })
+                    stride.bytes
+                    count
+                    bytes
+                with
+                | .some vals => .some (.aggregate variantIdx vals)
+                | .none => .none
+              | .nil =>
+                match policyRejectsProv policy bytes with
+                | true => .none
+                | false => decodeValueFromBytes (.succ fuel') layouts rTy bytes
+          | .single _, .primitive =>
+            match Nat.beq l.size.bytes 0 with
+            | true => .some .unit
+            | false =>
+              match l.backendRepr with
+              | .scalar (.initialized (.pointer addrSp) vr) =>
+                decodeScalarLayoutBytesNoForge (.initialized (.pointer addrSp) vr) bytes policy ptrBytes
+              | .scalar (.union (.pointer addrSp)) =>
+                decodeScalarLayoutBytesNoForge (.union (.pointer addrSp)) bytes policy ptrBytes
+              | _ =>
+                match policyRejectsProv policy bytes with
+                | true => .none
+                | false =>
+                  match decodeScalarBytes bytes false with
+                  | .some (sv, _) => .some (.scalar sv)
+                  | .none => .none
+          | _, _ => decodeTypedValueFromBytes (.succ fuel') layouts rTy bytes policy
+    | _ => decodeTypedValueFromBytes (.succ fuel') layouts rTy bytes policy
+
+/--
+Typed field and niche-enum specification for `decodeTypedValueRichWithPolicy`,
+carrying explicit source-level field `Ty`s alongside byte offsets so struct and
+enum byte decodes enforce full Rust validity invariants — in particular
+unconditional `.ref` and `.fnPtr` no-forgery under every `Ptr2IntTransmutePolicy`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- An `enum` must have a valid discriminant, and all fields of the variant indicated by that discriminant must be valid at their respective type."
+>
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+
+Reference (`compiler/rustc_abi/src/lib.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_abi/src/lib.rs#L1964-L2001>
+
+> "pub enum TagEncoding<VariantIdx: Idx> {
+>     /// The tag directly stores the discriminant, but possibly with a smaller layout
+>     /// (so converting the tag to the discriminant can require sign extension).
+>     Direct,"
+>
+> "    /// Niche (values invalid for a type) encoding the discriminant."
+>
+> "    /// For example, `Option<(usize, &T)>`  is represented such that the tag for
+>     /// `None` is the null pointer in the second tuple field, and
+>     /// `Some` is the identity function (with a non-null reference)
+>     /// and has no additional tag, i.e. the reference being non-null uniquely identifies this variant."
+>
+> "    Niche {
+>         untagged_variant: VariantIdx,
+>         /// This range *may* contain `untagged_variant` or uninhabited variants;
+>         /// these are then just \"dead values\" and not used to encode anything.
+>         niche_variants: RangeInclusive<VariantIdx>,
+>         /// This is inbounds of the type of the niche field
+>         /// (not sign-extended, i.e., all bits beyond the niche field size are 0).
+>         niche_start: u128,
+>     },
+> }"
+
+Modeling note (`agent_docs/trusted-rust.md`): `rustc_abi::LayoutData` represents
+`*const T`, `&T`, and `fn()` identically via `Primitive::Pointer`; `RichAdtSpec`
+supplies the field `Ty`s and niche encoding metadata needed to enforce reference
+and function-pointer provenance validity inside composite ADTs.
+
+Modeling choices and unsupported cases: a `RichAdtSpec` is a caller-supplied
+model-side description; nothing in this file checks that it agrees with the
+compiler's `LayoutData` for the ADT, so every result obtained through it is
+conditional on that agreement (a supplied compiler fact). `.taggedEnum` models
+`TagEncoding::Direct` with an unsigned tag compared by exact value (no sign
+extension of a narrower tag). `.nichePointerEnum` and `.nicheScalarEnum` model
+only the two-variant special case of `TagEncoding::Niche` with a single niche
+value (the null pointer, respectively one scalar `nicheValue`); general
+`niche_variants` ranges with `niche_start` wrapping arithmetic are not modeled.
+-/
+inductive RichAdtSpec : Type where
+  /-- Single-variant struct with explicit `(fieldOffset, fieldBytes, fieldTy)` triples. -/
+  | structFields
+      (variantIdx : VariantIdx)
+      (totalBytes : Nat)
+      (fields : List (Nat × Nat × Ty)) :
+      RichAdtSpec
+  /-- Direct-tagged enum (`TagEncoding::Direct`): tag at `(tagOff, tagBytes)`
+      mapped by `(tagVal, variantIdx, payloadFields)` entries. -/
+  | taggedEnum
+      (totalBytes : Nat)
+      (tagOff : Nat)
+      (tagBytes : Nat)
+      (variants : List (Nat × VariantIdx × List (Nat × Nat × Ty))) :
+      RichAdtSpec
+  /-- Null-pointer niche enum (`Option<&T>`, `Option<fn()>`, or multi-field
+      pointer-niche enums): tests `abstractBytesUniformProv` BEFORE `bits == 0`
+      so an intact pointer at offset `0` decodes the payload variant rather than
+      collapsing into the null niche, while provenance-less non-zero bits fail
+      closed under every policy. -/
+  | nichePointerEnum
+      (totalBytes : Nat)
+      (nicheOff : Nat)
+      (nicheBytes : Nat)
+      (noneVariantIdx : VariantIdx)
+      (noneFields : List (Nat × Nat × Ty))
+      (someVariantIdx : VariantIdx)
+      (someFields : List (Nat × Nat × Ty)) :
+      RichAdtSpec
+  /-- Scalar niche enum (`Option<bool>`, `Option<NonZero<u32>>`, etc.):
+      checks `policyRejectsProv` on the niche slice, branching on
+      `bits == nicheValue` to decode either `nicheFields` or `payloadFields`. -/
+  | nicheScalarEnum
+      (totalBytes : Nat)
+      (nicheOff : Nat)
+      (nicheBytes : Nat)
+      (nicheValue : Nat)
+      (nicheVariantIdx : VariantIdx)
+      (nicheFields : List (Nat × Nat × Ty))
+      (payloadVariantIdx : VariantIdx)
+      (payloadFields : List (Nat × Nat × Ty)) :
+      RichAdtSpec
+
+/--
+Look up the `RichAdtSpec` associated with ADT `defPath` in `specs` using
+`stringEq`.
+-/
+def lookupRichAdtSpec (defPath : DefPath) : List (DefPath × RichAdtSpec) → Option RichAdtSpec
+  | .nil => .none
+  | entry :: rest =>
+    match stringEq entry.1 defPath with
+    | true => .some entry.2
+    | false => lookupRichAdtSpec defPath rest
+
+/--
+Decode typed `(fieldOff, fieldBytes, fieldTy)` field specs from `bytes` using
+recursive field decoder `decodeField`.
+-/
+def decodeRichFieldSpecs
+    (decodeField : Ty → List AbstractByte → Option Value)
+    (bytes : List AbstractByte) :
+    List (Nat × Nat × Ty) → Option (List Value)
+  | .nil => .some .nil
+  | spec :: rest =>
+    match sliceAbstractBytes bytes spec.1 spec.2.1 with
+    | .none => .none
+    | .some fSlice =>
+      match decodeField spec.2.2 fSlice with
+      | .none => .none
+      | .some v =>
+        match decodeRichFieldSpecs decodeField bytes rest with
+        | .none => .none
+        | .some vs => .some (v :: vs)
+
+/--
+Look up the `(variantIdx, payloadFields)` entry matching discriminant `tagVal`
+in a `RichAdtSpec.taggedEnum` table.
+-/
+def findRichTaggedVariant
+    (tagVal : Nat) :
+    List (Nat × VariantIdx × List (Nat × Nat × Ty)) →
+      Option (VariantIdx × List (Nat × Nat × Ty))
+  | .nil => .none
+  | entry :: rest =>
+    match Nat.beq entry.1 tagVal with
+    | true => .some entry.2
+    | false => findRichTaggedVariant tagVal rest
+
+/--
+Decode a raw pointer (`isRef = false`) or reference (`isRef = true`) image
+`bytes` of pointee `pointee` at `layoutIdx` under `layouts`, supporting both
+standard wide pointers (`.slice _`, `.str`, `.dynamic _`) and custom DST wide
+pointers (`2 * ptrBytes` `.scalarPair` layouts) while guarding against
+unresolved `layoutIdx = 0` slot collisions (`isUnresolvedLayoutIdx`).
+
+Always independent of `Ptr2IntTransmutePolicy`: references never forge
+provenance and raw pointers preserve intact provenance or strip spliced/missing
+provenance.
+
+Reference (The Rust Reference, "Dynamically Sized Types"):
+<https://doc.rust-lang.org/1.98.0/reference/dynamically-sized-types.html>
+
+> "Most types have a fixed size that is known at compile time and implement the
+> trait `Sized`. A type with a size that is known only at run-time is called a
+> dynamically sized type (DST) or, informally, an unsized type."
+
+Reference (The Rust Reference, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers and references have the same layout. Mutability of the pointer or
+> reference does not change the layout."
+>
+> "Pointers to sized types have the same size and alignment as usize."
+>
+> "Pointers to unsized types are sized. The size and alignment of a pointer to
+> an unsized type are each guaranteed to be greater than or equal to those of a
+> pointer to a sized type."
+>
+> (Note) "Though you should not rely on this, all pointers to DSTs are currently
+> twice the size of the size of usize and have the same alignment."
+
+Correspondence: `layoutIdx` is the layout of the POINTER type itself. A pointer
+to a sized pointee occupies `ptrBytes` bytes ("the same size and alignment as
+usize"); a pointer to an unsized pointee is "greater than or equal to" that.
+
+Modeling choices and supplied compiler facts (not documented guarantees): the
+wide-pointer size `2 * ptrBytes` follows the quoted non-normative Note (current
+`rustc` behavior). For a pointee that is not syntactically `.slice` / `.str` /
+`.dynamic`, wideness is taken from the compiler-supplied `TypeLayout` at
+`layoutIdx` (size `2 * ptrBytes` with a `.scalarPair` backend representation);
+the metadata half is decoded as a vtable pointer when its scalar layout is a
+pointer and as a provenance-free length otherwise. An unresolved `layoutIdx`
+(`0` or out of range) is treated as thin, so a wide custom-DST pointer whose
+layout index was not resolved is rejected (fail closed) rather than decoded.
+-/
+def decodePtrBytesRichNoForge
+    (isRef : Bool)
+    (layouts : LayoutTable)
+    (layoutIdx : LayoutIdx)
+    (pointee : RigidTy)
+    (bytes : List AbstractByte) :
+    Option Value :=
+  let ptrBytes := layoutPointerBytes layouts
+  match pointee with
+  | .slice _ | .str | .dynamic _ =>
+    decodePtrBytesNoForge isRef pointee ptrBytes bytes
+  | _ =>
+    match Bool.not (isUnresolvedLayoutIdx layouts layoutIdx) with
+    | true =>
+      match LayoutTable.lookup layouts layoutIdx with
+      | .some l =>
+        match Nat.beq l.size.bytes (Nat.add ptrBytes ptrBytes), l.backendRepr with
+        | true, .scalarPair _ sMeta =>
+          match scalarLayoutIsPointer sMeta with
+          | true => decodePtrBytesNoForge isRef (.dynamic "") ptrBytes bytes
+          | false => decodePtrBytesNoForge isRef (.slice (.uint .u8)) ptrBytes bytes
+        | _, _ => decodePtrBytesNoForge isRef pointee ptrBytes bytes
+      | .none => decodePtrBytesNoForge isRef pointee ptrBytes bytes
+    | false => decodePtrBytesNoForge isRef pointee ptrBytes bytes
+
+/--
+Mode-parametric typed byte decoder extending `decodeTypedValueFromBytes` with
+explicit `RichAdtSpec` field/variant validation (`structFields`, `taggedEnum`,
+`nichePointerEnum`, `nicheScalarEnum`) and resolved custom-DST `2 * ptrBytes`
+`.scalarPair` pointer decoding (`decodePtrBytesRichNoForge`).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- An `enum` must have a valid discriminant, and all fields of the variant indicated by that discriminant must be valid at their respective type."
+>
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+-/
+def decodeTypedValueRichWithPolicy
+    (fuel : Nat)
+    (layouts : LayoutTable)
+    (richSpecs : List (DefPath × RichAdtSpec))
+    (ty : Ty)
+    (bytes : List AbstractByte)
+    (policy : Ptr2IntTransmutePolicy := .strictUcg630Ub) :
+    Option Value :=
+  match fuel with
+  | .zero => .none
+  | .succ fuel' =>
+    let rTy := normalizeCodecTy ty
+    let decodeChild := fun (cTy : Ty) (bs : List AbstractByte) =>
+      decodeTypedValueRichWithPolicy fuel' layouts richSpecs cTy bs policy
+    match rTy.kind with
+    | .adt defPath _ =>
+      match lookupRichAdtSpec defPath richSpecs with
+      | .some (.structFields variantIdx totalBytes fields) =>
+        match Nat.beq (length bytes) totalBytes with
+        | false => .none
+        | true =>
+          match decodeRichFieldSpecs decodeChild bytes fields with
+          | .some vals => .some (.aggregate variantIdx vals)
+          | .none => .none
+      | .some (.taggedEnum totalBytes tagOff tagBytes variants) =>
+        match Nat.beq (length bytes) totalBytes with
+        | false => .none
+        | true =>
+          match sliceAbstractBytes bytes tagOff tagBytes with
+          | .none => .none
+          | .some tagSlice =>
+            match policyRejectsProv policy tagSlice with
+            | true => .none
+            | false =>
+              match decodeScalarBytes tagSlice false with
+              | .none => .none
+              | .some tagRes =>
+                match findRichTaggedVariant tagRes.1.bits variants with
+                | .none => .none
+                | .some varEntry =>
+                  match decodeRichFieldSpecs decodeChild bytes varEntry.2 with
+                  | .some vals => .some (.aggregate varEntry.1 vals)
+                  | .none => .none
+      | .some (.nichePointerEnum totalBytes nicheOff nicheBytes noneVar noneFields someVar someFields) =>
+        match Nat.beq (length bytes) totalBytes with
+        | false => .none
+        | true =>
+          match sliceAbstractBytes bytes nicheOff nicheBytes with
+          | .none => .none
+          | .some nicheSlice =>
+            match abstractBytesUniformProv nicheSlice with
+            | true =>
+              match decodeRichFieldSpecs decodeChild bytes someFields with
+              | .some vals => .some (.aggregate someVar vals)
+              | .none => .none
+            | false =>
+              match policyRejectsProv policy nicheSlice with
+              | true => .none
+              | false =>
+                match decodeScalarBytes nicheSlice false with
+                | .none => .none
+                | .some nicheRes =>
+                  match Nat.beq nicheRes.1.bits 0 with
+                  | true =>
+                    match decodeRichFieldSpecs decodeChild bytes noneFields with
+                    | .some vals => .some (.aggregate noneVar vals)
+                    | .none => .none
+                  | false => .none
+      | .some (.nicheScalarEnum totalBytes nicheOff nicheBytes nicheValue nicheVar nicheFields payloadVar payloadFields) =>
+        match Nat.beq (length bytes) totalBytes with
+        | false => .none
+        | true =>
+          match sliceAbstractBytes bytes nicheOff nicheBytes with
+          | .none => .none
+          | .some nicheSlice =>
+            match policyRejectsProv policy nicheSlice with
+            | true => .none
+            | false =>
+              match decodeScalarBytes nicheSlice false with
+              | .none => .none
+              | .some nicheRes =>
+                match Nat.beq nicheRes.1.bits nicheValue with
+                | true =>
+                  match decodeRichFieldSpecs decodeChild bytes nicheFields with
+                  | .some vals => .some (.aggregate nicheVar vals)
+                  | .none => .none
+                | false =>
+                  match decodeRichFieldSpecs decodeChild bytes payloadFields with
+                  | .some vals => .some (.aggregate payloadVar vals)
+                  | .none => .none
+      | .none =>
+        decodeTypedValueFromBytes (.succ fuel') layouts ty bytes policy
+    | .ref _ pointee =>
+      decodePtrBytesRichNoForge true layouts rTy.layoutIdx pointee bytes
+    | .rawPtr _ pointee =>
+      decodePtrBytesRichNoForge false layouts rTy.layoutIdx pointee bytes
+    | .fnPtr _ _ _ _ =>
+      decodePtrBytesNoForge true (.tuple .nil) (layoutPointerBytes layouts) bytes
+    | .array elemKind n =>
+      match Nat.beq n 0 with
+      | true =>
+        match bytes with
+        | .nil => .some (.aggregate 0 .nil)
+        | _ :: _ => .none
+      | false =>
+        match LayoutTable.lookup layouts rTy.layoutIdx with
+        | .some { fields := .array stride _, fieldLayouts := elemFlIdx :: _, .. } =>
+          match Nat.beq (length bytes) (Nat.mul stride.bytes n) with
+          | false => .none
+          | true =>
+            match
+              decodeArrayChunksWith
+                (decodeChild { kind := elemKind, layoutIdx := elemFlIdx })
+                stride.bytes
+                n
+                bytes
+            with
+            | .some elems => .some (.aggregate 0 elems)
+            | .none => .none
+        | _ =>
+          let elemSzOpt : Option Nat :=
+            match decodeTypedKindByteSize layouts elemKind with
+            | .some sz => .some sz
+            | .none =>
+              match LayoutTable.lookup layouts rTy.layoutIdx with
+              | .some { fields := .array stride _, .. } => .some stride.bytes
+              | _ => .none
+          match elemSzOpt with
+          | .none => .none
+          | .some elemSz =>
+            match Nat.beq (length bytes) (Nat.mul elemSz n) with
+            | false => .none
+            | true =>
+              match
+                decodeArrayChunksWith
+                  (decodeChild { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts })
+                  elemSz
+                  n
+                  bytes
+              with
+              | .some elems => .some (.aggregate 0 elems)
+              | .none => .none
+    | .tuple (kHead :: kTail) =>
+      let ks := kHead :: kTail
+      let decodeTypedKind := fun (k : RigidTy) (bs : List AbstractByte) =>
+        decodeChild { kind := k, layoutIdx := unresolvedLayoutIdx layouts } bs
+      let sizeOfKind := fun (k : RigidTy) =>
+        decodeTypedKindByteSize layouts k
+      match Bool.not (isUnresolvedLayoutIdx layouts rTy.layoutIdx) with
+      | true =>
+        match LayoutTable.lookup layouts rTy.layoutIdx with
+        | .some l =>
+          match layoutMatchesAggregateVariant l 0 (length ks) with
+          | true =>
+            match Nat.beq (length bytes) l.size.bytes, l.fields with
+            | true, .arbitrary offsets _ =>
+              match
+                Bool.and
+                  (Nat.beq (length ks) (length offsets))
+                  (Nat.beq (length l.fieldLayouts) (length offsets))
+              with
+              | true =>
+                match
+                  decodeTypedKindsAndLayoutsAtOffsets
+                    decodeChild
+                    layouts
+                    bytes
+                    offsets
+                    ks
+                    l.fieldLayouts
+                with
+                | .some vals => .some (.aggregate 0 vals)
+                | .none => .none
+              | false =>
+                match
+                  decodeFieldsAtOffsetsWith
+                    decodeTypedKind
+                    sizeOfKind
+                    bytes
+                    offsets
+                    ks
+                with
+                | .some vals => .some (.aggregate 0 vals)
+                | .none => .none
+            | true, _ =>
+              match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
+              | .some vals => .some (.aggregate 0 vals)
+              | .none => .none
+            | false, _ => .none
+          | false =>
+            match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
+            | .some vals => .some (.aggregate 0 vals)
+            | .none => .none
+        | .none =>
+          match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
+          | .some vals => .some (.aggregate 0 vals)
+          | .none => .none
+      | false =>
+        match decodeSeqFieldsWith decodeTypedKind sizeOfKind ks bytes with
+        | .some vals => .some (.aggregate 0 vals)
+        | .none => .none
+    | _ =>
+      decodeTypedValueFromBytes (.succ fuel') layouts ty bytes policy
 
 /--
 Encode `v` of type `ty` using `encodeByLayoutIdxAux` when `ty` is a union or
@@ -8078,15 +9290,297 @@ def encodeTypedValueToBytes
   match isUnionLayout layouts rTy with
   | true => encodeByLayoutIdxAux 8 layouts rTy.layoutIdx v
   | false =>
-    match encodeValueToBytes defaultCodecFuel layouts rTy v with
-    | .some bs => .some bs
+    match rTy.kind, Nat.beq (layoutPointerBytes layouts) 4, v with
+    | .uint .usize, true, .scalar sv =>
+      match Nat.beq sv.sizeBytes 4 with
+      | true => encodeScalarBytes sv .none
+      | false => .none
+    | .int .isize, true, .scalar sv =>
+      match Nat.beq sv.sizeBytes 4 with
+      | true => encodeScalarBytes sv .none
+      | false => .none
+    | _, _, _ =>
+      match encodeValueToBytes defaultCodecFuel layouts rTy v with
+      | .some bs => .some bs
+      | .none =>
+        match rTy.kind with
+        | .adt _ _ | .tuple (_ :: _) | .array _ _ =>
+          match LayoutTable.lookup layouts rTy.layoutIdx with
+          | .some _ => encodeByLayoutIdxAux 8 layouts rTy.layoutIdx v
+          | .none => .none
+        | _ => .none
+
+/--
+Evaluate a `ConstValue` to a runtime `Value`, decoding `ConstValue.slice` to the
+2-element fat-pointer aggregate `Value.aggregate 0 [dataVal, Value.scalar ⟨meta, ptrBytes⟩]`
+and `ConstValue.indirect allocId offset` by decoding `ty` from `globals` via
+`decodeTypedValueFromBytes` without fabricating pointer provenance from integer
+bits (`UCG#558` / `rust#148259`) and without stripping relocation provenance
+into non-pointer types under `.strictUcg630Ub`.
+
+Reference (`compiler/rustc_middle/src/mir/interpret/value.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/interpret/value.rs#L31-L65>
+
+> "pub enum ConstValue {
+>     ZeroSized,
+>     Scalar(Scalar),
+>     Slice { alloc_id: AllocId, meta: u64 },
+>     Indirect { alloc_id: AllocId, offset: Size },
+> }"
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to sized types have the same size and alignment as usize."
+
+Modeling choice (`agent_docs/trusted-rust.md`): `ConstValue.slice (.int s) lenMeta`
+never forges `Value.ptr` from `s.bits / 65536`; for non-reference targets (and
+dangling non-null zero-length slice references `&[]`) it yields a provenance-free
+`Value.scalar` address half, and for non-empty or null reference slices it fails
+with `.none`. `ConstValue.indirect` computes `sz` using `rigidTyKindByteSizeFor`
+and `tyByteSize .nil layouts` (covering 32-bit `usize`/`isize`, pointers, arrays,
+and layout-free tuples), decodes via `decodeTypedValueFromBytes` under
+`.strictUcg630Ub`, and never falls back to `readGlobalScalar` when
+`abstractBytesHaveProv` or `globalRelocsOverlapRange` holds.
+-/
+def evalConstValue
+    (cv : ConstValue)
+    (ty : Ty := { kind := .tuple .nil, layoutIdx := 0 })
+    (globals : List CapturedAllocation := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    Option Value :=
+  let ptrBytes := layoutPointerBytes layouts
+  match cv with
+  | .zeroSized => .some .unit
+  | .scalar (.int s) => .some (.scalar s)
+  | .scalar (.ptr p sz) => .some (.ptr p sz)
+  | .slice (.ptr p sz) lenMeta =>
+    .some (.aggregate 0 (.ptr p sz :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
+  | .slice (.int s) lenMeta =>
+    match ty.kind with
+    | .ref _ _ =>
+      match Bool.and (Nat.beq lenMeta 0) (Bool.not (Nat.beq s.bits 0)) with
+      | true =>
+        .some (.aggregate 0 (.scalar ⟨s.bits, ptrBytes⟩ :: .scalar ⟨0, ptrBytes⟩ :: .nil))
+      | false => .none
+    | _ =>
+      .some (.aggregate 0 (.scalar ⟨s.bits, ptrBytes⟩ :: .scalar ⟨lenMeta, ptrBytes⟩ :: .nil))
+  | .indirect allocId offset =>
+    match lookupGlobalAlloc globals allocId with
+    | .none => .none
+    | .some alloc =>
+      let sz :=
+        match rigidTyKindByteSizeFor ptrBytes ty.kind with
+        | .some n => n
+        | .none =>
+          match tyByteSize .nil layouts ty with
+          | .some n => n
+          | .none =>
+            match rigidTyByteSize layouts ty with
+            | .some n => n
+            | .none =>
+              match tyScalarBytes ty with
+              | .some n => n
+              | .none => Nat.sub (length alloc.bytes) offset
+      match globalAllocSliceToAbstractBytes alloc offset sz ptrBytes with
+      | .some absBytes =>
+        match decodeTypedValueFromBytes defaultCodecFuel layouts ty absBytes with
+        | .some v => .some v
+        | .none =>
+          match abstractBytesHaveProv absBytes with
+          | true => .none
+          | false =>
+            match intCastTargetBytes ty.kind ptrBytes with
+            | .some n =>
+              match globalRelocsOverlapRange alloc.relocations offset n ptrBytes with
+              | true => .none
+              | false =>
+                match readGlobalScalar alloc offset n with
+                | .some sc => .some (.scalar sc)
+                | .none => .none
+            | .none => .none
+      | .none => .none
+  | .unevaluated _ => .none
+
+/--
+Decode and project a dereferenced global allocation `alloc` at `offset` with
+pointer/access width `sz` and trailing projections `restProj`.
+
+Scalar global reads (`readGlobalScalar`) first verify via
+`globalRelocsOverlapRange` that no byte in `[offset .. offset + width)` overlaps
+a pointer relocation entry (rejecting pointer-to-integer global reads with `.ub`
+under `.strictUcg630Ub`), and non-scalar global reads decode through
+`decodeTypedValueFromBytes` at `layoutPointerBytes layouts` (enforcing
+provenance rejection on non-pointer types and non-pointer `VariantsShape.multiple`
+enums, `char` surrogate niche checks, coherent `PtrByteFrag` pointer decoding,
+and 32-bit `usize`/`isize`/pointer compound widths via `tyByteSize .nil layouts`).
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.)"
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers to sized types have the same size and alignment as usize."
+
+Modeling choice (`agent_docs/trusted-rust.md`): target width is
+`layoutPointerBytes layouts`, and global dereference reads enforce the same
+`.strictUcg630Ub` pointer-to-integer UB policy and `decodeTypedValueFromBytes`
+bit-validity rules as stack/union typed dereference reads.
+-/
+def evalGlobalDerefRead
+    (locals : List LocalSlot)
+    (alloc : CapturedAllocation)
+    (offset sz : Nat)
+    (restProj : List ProjectionElem)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (pointeeTyOpt : Option Ty := .none) :
+    PlaceReadResult :=
+  let ptrBytes := layoutPointerBytes layouts
+  match pointeeTyOpt with
+  | .some pointeeTy =>
+    match intCastTargetBytes pointeeTy.kind ptrBytes with
+    | .some n =>
+      match globalRelocsOverlapRange alloc.relocations offset n ptrBytes with
+      | true => .ub
+      | false =>
+        match readGlobalScalar alloc offset n with
+        | .some sc =>
+          match readProjectedValue locals (.scalar sc) restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none => .ub
     | .none =>
-      match rTy.kind with
-      | .adt _ _ | .tuple (_ :: _) | .array _ _ =>
-        match LayoutTable.lookup layouts rTy.layoutIdx with
-        | .some _ => encodeByLayoutIdxAux 8 layouts rTy.layoutIdx v
-        | .none => .none
-      | _ => .none
+      let byteSz :=
+        match rigidTyKindByteSizeFor ptrBytes pointeeTy.kind with
+        | .some n => n
+        | .none =>
+          match tyByteSize .nil layouts pointeeTy with
+          | .some n => n
+          | .none =>
+            match rigidTyByteSize layouts pointeeTy with
+            | .some n => n
+            | .none => Nat.sub (length alloc.bytes) offset
+      match globalAllocSliceToAbstractBytes alloc offset byteSz ptrBytes with
+      | .some absBytes =>
+        match decodeTypedValueFromBytes defaultCodecFuel layouts pointeeTy absBytes with
+        | .some decodedVal =>
+          match readProjectedValue locals decodedVal restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none => .ub
+      | .none => .ub
+  | .none =>
+    let nonPrimLayoutOpt : Option (Ty × Nat) :=
+      match LayoutTable.lookup layouts 0 with
+      | .some l =>
+        match Bool.and (Nat.beq l.size.bytes 0) (Nat.blt offset (length alloc.bytes)) with
+        | true => .none
+        | false =>
+          match l.fields with
+          | .primitive => .none
+          | .array stride count =>
+            .some
+              ({ kind := .array (uintRigidTyOfStride stride.bytes) count, layoutIdx := 0 },
+               l.size.bytes)
+          | _ =>
+            .some ({ kind := .adt "" .nil, layoutIdx := 0 }, l.size.bytes)
+      | .none => .none
+    match nonPrimLayoutOpt with
+    | .some (inferredTy, byteSz) =>
+      match globalAllocSliceToAbstractBytes alloc offset byteSz ptrBytes with
+      | .some absBytes =>
+        match decodeTypedValueFromBytes defaultCodecFuel layouts inferredTy absBytes with
+        | .some decodedVal =>
+          match readProjectedValue locals decodedVal restProj with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .none => .ub
+      | .none => .ub
+    | .none =>
+      match isScalarCompatibleProj restProj with
+      | true =>
+        match globalRelocsOverlapRange alloc.relocations offset sz ptrBytes with
+        | true => .ub
+        | false =>
+          match readGlobalScalar alloc offset sz with
+          | .some sc =>
+            match readProjectedValue locals (.scalar sc) restProj with
+            | .ok fieldVal => .ok fieldVal locals
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | .none =>
+            match Nat.beq sz 0 with
+            | true =>
+              match Nat.ble offset (length alloc.bytes) with
+              | true =>
+                match readProjectedValue locals .unit restProj with
+                | .ok fieldVal => .ok fieldVal locals
+                | .ub => .ub
+                | .unsupported => .unsupported
+              | false => .ub
+            | false =>
+              match globalAllocSliceToAbstractBytes alloc offset sz ptrBytes with
+              | .some absBytes =>
+                let arrTy : Ty := { kind := .array (.uint .u8) sz, layoutIdx := 0 }
+                match decodeTypedValueFromBytes defaultCodecFuel layouts arrTy absBytes with
+                | .some decodedVal =>
+                  match readProjectedValue locals decodedVal restProj with
+                  | .ok fieldVal => .ok fieldVal locals
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                | .none => .ub
+              | .none => .ub
+      | false =>
+        match Nat.ble offset (length alloc.bytes) with
+        | false => .ub
+        | true =>
+          let remBytes := Nat.sub (length alloc.bytes) offset
+          match globalAllocSliceToAbstractBytes alloc offset remBytes ptrBytes with
+          | .some absBytes =>
+            let arrTy : Ty := { kind := .array (.uint .u8) remBytes, layoutIdx := 0 }
+            match decodeTypedValueFromBytes defaultCodecFuel layouts arrTy absBytes with
+            | .some decodedVal =>
+              match readProjectedValue locals decodedVal restProj with
+              | .ok fieldVal => .ok fieldVal locals
+              | .ub => .ub
+              | .unsupported => .unsupported
+            | .none => .ub
+          | .none => .ub
 
 /--
 Resolve dynamic `.index idxLocal` projections in `proj` into `.constantIndex
@@ -8278,10 +9772,208 @@ def wrapFullWidthInitChain?
   | _, _, _ => .none
 
 /--
+Test whether predicate `p` holds on every `Value` in `vs`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+-/
+@[reducible]
+def allValuesSatisfy (p : Value → Bool) : List Value → Bool
+  | .nil => true
+  | v :: vs =>
+    match p v with
+    | true => allValuesSatisfy p vs
+    | false => false
+
+/--
+Test whether binary predicate `p` holds pairwise on tuple field kinds `ks` and
+runtime field values `vs` (returning `true` on mismatched lengths so structural
+fallbacks remain unaffected).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+-/
+@[reducible]
+def allTupleFieldsSatisfy (p : RigidTy → Value → Bool) : List RigidTy → List Value → Bool
+  | .nil, .nil => true
+  | k :: ks, v :: vs =>
+    match p k v with
+    | true => allTupleFieldsSatisfy p ks vs
+    | false => false
+  | _, _ => true
+
+/--
+Test whether predicate `p` holds on at least one `RigidTy` in `ks`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+-/
+@[reducible]
+def anyRigidTySatisfies (p : RigidTy → Bool) : List RigidTy → Bool
+  | .nil => false
+  | k :: ks =>
+    match p k with
+    | true => true
+    | false => anyRigidTySatisfies p ks
+
+/--
+Fuel-bounded check for whether `RigidTy` `k` is or structurally contains (via
+`.array` or `.tuple`) a `.ref` or `.fnPtr` type requiring coherent pointer
+provenance on union field reads.
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Reading a union field reads the bits of the union at the field's type. ...
+> Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def rigidTyMentionsRefOrFnPtr : Nat → RigidTy → Bool
+  | .zero, _ => true
+  | .succ fuel', k =>
+    match k with
+    | .ref _ _ => true
+    | .fnPtr _ _ _ _ => true
+    | .array ek _ => rigidTyMentionsRefOrFnPtr fuel' ek
+    | .tuple ks => anyRigidTySatisfies (rigidTyMentionsRefOrFnPtr fuel') ks
+    | _ => false
+
+/--
+Test whether a trailing projection chain `rest` below a union `.field` step
+projects through or to a `.ref` or `.fnPtr` type (so a cached `.scalar`-bearing
+aggregate union slot such as `RefWrap(&T)` decoded solely from `ScalarLayout`
+must be re-decoded from the union's storage bytes at the projected leaf type).
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Reading a union field reads the bits of the union at the field's type. ...
+> Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def projChainMentionsRefOrFnPtr : List ProjectionElem → Bool
+  | .nil => false
+  | .field _ fTy :: rest =>
+    match rigidTyMentionsRefOrFnPtr defaultCodecFuel fTy.kind with
+    | true => true
+    | false => projChainMentionsRefOrFnPtr rest
+  | .opaqueCast cTy :: rest =>
+    match rigidTyMentionsRefOrFnPtr defaultCodecFuel cTy.kind with
+    | true => true
+    | false => projChainMentionsRefOrFnPtr rest
+  | .unwrapUnsafeBinder iTy :: rest =>
+    match rigidTyMentionsRefOrFnPtr defaultCodecFuel iTy.kind with
+    | true => true
+    | false => projChainMentionsRefOrFnPtr rest
+  | _ :: rest => projChainMentionsRefOrFnPtr rest
+
+/--
+Fuel-bounded check for whether runtime `Value` `v` contains a `Value.scalar`
+leaf (used when a sub-projection below a union field targets a `.ref` or
+`.fnPtr` leaf).
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def valueHasScalarLeaf : Nat → Value → Bool
+  | .zero, _ => true
+  | .succ _, .scalar _ => true
+  | .succ fuel', .aggregate _ fs =>
+    Bool.not (allValuesSatisfy (fun v => Bool.not (valueHasScalarLeaf fuel' v)) fs)
+  | .succ _, _ => false
+
+/--
+Fuel-bounded recursive helper for `unionDirectSlotValidForFieldTy`, checking
+`.ref`, `.fnPtr`, `.array` elements, and `.tuple` fields so provenance-free or
+byte-permuted `.scalar` slots inside compound union fields (`[&T; N]`,
+`(&T, U)`) fall through to `decodeTypedValueFromBytes`.
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Reading a union field reads the bits of the union at the field's type. ...
+> Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def unionDirectSlotValidForFieldTyAux : Nat → RigidTy → Value → Bool
+  | .zero, _, _ => false
+  | .succ fuel', rFieldKind, fv =>
+    match fv with
+    | .scalar _ =>
+      match rFieldKind with
+      | .ref _ _ => false
+      | .fnPtr _ _ _ _ => false
+      | _ => true
+    | .aggregate 0 elems =>
+      match rFieldKind with
+      | .ref _ (.dynamic _) =>
+        match elems with
+        | .ptr _ _ :: .ptr _ _ :: .nil => true
+        | _ => false
+      | .ref _ (.slice _) | .ref _ .str =>
+        match elems with
+        | .ptr _ _ :: .scalar _ :: .nil => true
+        | .scalar addrSc :: .scalar lenSc :: .nil =>
+          Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq addrSc.bits 0))
+        | _ => false
+      | .array elemKind _ =>
+        allValuesSatisfy (unionDirectSlotValidForFieldTyAux fuel' elemKind) elems
+      | .tuple ks =>
+        allTupleFieldsSatisfy (unionDirectSlotValidForFieldTyAux fuel') ks elems
+      | _ => true
+    | _ => true
+
+/--
+Check whether a cached runtime slot value `fv` in a `FieldsShape.union`
+aggregate may be returned directly when reading the union field at static type
+`rFieldKind`, or must be re-decoded from the union's storage bytes at the full
+`rFieldTy`:
+- `TypeLayout.fieldLayouts` decodes union slots without `RigidTy` (distinguishing
+  only `ScalarLayout`, which `NonNull<T>` shares with `&T` and `fn()`), so a
+  provenance-free or byte-permuted pointer image (`UCG#558`) can populate a
+  union slot (or `.array`/`.tuple` union slot) with `Value.scalar`.
+- Reading a `.ref` or `.fnPtr` union field (or `.array`/`.tuple` thereof)
+  requires coherent pointer provenance (except non-null zero-length slice/`str`
+  references `&[]` / `""`), so any cached `.scalar` (or `.scalar`-backed wide
+  `&dyn` / non-empty `&[T]`) slot is not trusted directly and falls through to
+  `decodeTypedValueFromBytes` at `rFieldTy`.
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Reading a union field reads the bits of the union at the field's type. ...
+> Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def unionDirectSlotValidForFieldTy (rFieldKind : RigidTy) (fv : Value) : Bool :=
+  match fv with
+  | .scalar _ =>
+    match rFieldKind with
+    | .ref _ _ => false
+    | .fnPtr _ _ _ _ => false
+    | _ => true
+  | _ => unionDirectSlotValidForFieldTyAux defaultCodecFuel rFieldKind fv
+
+/--
 Read a deref-free projection chain `proj` on `v` of static type `baseTy` with
 union byte-reinterpretation semantics:
 - Reading a union `.field idx fieldTy` whose runtime slot holds a non-`.unit`
-  value returns/projects that value directly.
+  value compatible with `fieldTy` (`unionDirectSlotValidForFieldTy`)
+  returns/projects that value directly.
 - Reading a union `.field idx fieldTy` whose runtime slot is `.unit` (or beyond
   `length fields` while `< unionFieldCount`) encodes the union's initialized
   storage bytes via `encodeByLayoutIdxAux`, slices `[subOff .. subOff + sizeof)`
@@ -8360,7 +10052,16 @@ def readProjectedValueUnionAware
             | .tuple .nil => .some .unit
             | .fnDef _ _ => .some .unit
             | _ => .none
-          | .some fv => .some fv
+          | .some fv =>
+            match unionDirectSlotValidForFieldTy rFieldTy.kind fv with
+            | false => .none
+            | true =>
+              match projChainMentionsRefOrFnPtr rest with
+              | false => .some fv
+              | true =>
+                match valueHasScalarLeaf defaultCodecFuel fv with
+                | true => .none
+                | false => .some fv
           | .none => .none
         -- A union value whose slots (or raw-byte overlay) disagree on some
         -- initialized byte does not determine a storage image (e.g. after a
@@ -9292,7 +10993,8 @@ def decodeSubValueAtByteOffset?
     (accTy : Ty)
     (localDecls : List LocalDecl := .nil)
     (accLayouts : LayoutTable := layouts)
-    (accDecls : List LocalDecl := localDecls) :
+    (accDecls : List LocalDecl := localDecls)
+    (untypedWrite : Bool := false) :
     Option Value :=
   let rAccTy := resolveTyWithLocalDecls accDecls accLayouts accTy
   match tyByteSize accDecls accLayouts rAccTy with
@@ -9314,7 +11016,9 @@ def decodeSubValueAtByteOffset?
       match sliceAbstractBytes encodedBytes offsetBytes reqBytes with
       | .none => .none
       | .some sliceBytes =>
-        decodeTypedValueFromBytes defaultCodecFuel accLayouts rAccTy sliceBytes
+        match untypedWrite with
+        | false => decodeTypedValueFromBytes defaultCodecFuel accLayouts rAccTy sliceBytes
+        | true => decodeUntypedStorageBytes defaultCodecFuel accLayouts rAccTy sliceBytes .strictUcg630Ub true
 
 /--
 Byte-offset decoding fallback for a typed thin-pointer dereference read:
@@ -9787,7 +11491,20 @@ def evalStackThinPtrTypedDerefRead
 /--
 Dereference and project a slice fat pointer
 `Value.aggregate 0 [Value.ptr ptrVal ptrSz, Value.scalar lenSc]` through
-`borrows` or `globals`.
+`borrows` or `globals`, falling back to target-width-aware
+`decodeTypedValueFromBytes` on global allocations when 64-bit
+`decodeValueFromBytes` returns `.none` (e.g., 32-bit `usize`/`isize`/pointer
+slices or IEEE-754 float slices).
+
+Reference (The Rust Reference 1.98.0, "Type Layout — Slices"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#slice-layout>
+
+> "Slices have the same layout as the section of the array they slice."
+
+Modeling choice (`agent_docs/trusted-rust.md`): global slice windows first
+preserve the 64-bit `decodeValueFromBytes` path used by `SliceTypedAt` lenses
+and fall back to `decodeTypedValueFromBytes` at `layoutPointerBytes layouts`
+when `decodeValueFromBytes` returns `.none`.
 -/
 def evalSliceFatPtrDerefRead
     (locals : List LocalSlot)
@@ -9936,13 +11653,23 @@ def evalSliceFatPtrDerefRead
                 { kind := elemKind, layoutIdx := unresolvedLayoutIdx layouts }
             with
             | .some n => n
-            | .none => 1
+            | .none =>
+              match decodeTypedKindByteSize layouts elemKind with
+              | .some n => n
+              | .none => 1
           let totalBytes := Nat.mul lenSc.bits elemSz
-          match globalAllocSliceToAbstractBytes alloc ptrVal.offsetBytes totalBytes with
+          match globalAllocSliceToAbstractBytes alloc ptrVal.offsetBytes totalBytes ptrBytes with
           | .some absBytes =>
             let sliceArrTy : Ty :=
               { kind := .array elemKind lenSc.bits, layoutIdx := unresolvedLayoutIdx layouts }
-            match decodeValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes with
+            let decodedOpt : Option Value :=
+              match abstractBytesHaveProv absBytes with
+              | true => decodeTypedValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes
+              | false =>
+                match decodeValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes with
+                | .some v => .some v
+                | .none => decodeTypedValueFromBytes defaultCodecFuel layouts sliceArrTy absBytes
+            match decodedOpt with
             | .some decodedVal =>
               match readProjectedValue locals decodedVal restProj with
               | .ok fieldVal =>
@@ -9971,6 +11698,51 @@ def evalSliceFatPtrDerefRead
             | false => .ub
           | .ub => .ub
           | .unsupported => .unsupported
+
+/--
+Materialize a typed pointer read from a partially-assembled raw-byte carrier
+(`Value.aggregate 0 rawVals` with `length rawVals > 2`) via
+`decodePtrBytesNoForge`, enforcing UCG #558 fragment coherence on read:
+- coherent pointer fragments materialize to `Value.ptr`;
+- incoherent raw pointer fragments strip provenance to `Value.scalar`;
+- incoherent reference or function-pointer fragments, or any `.uninit` byte,
+  return `.none` (read-time `.ub`).
+Any non-carrier `Value` is returned unchanged.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+-/
+@[reducible]
+def materializeReadPtrValue
+    (layouts : LayoutTable)
+    (tyOpt : Option Ty)
+    (v : Value) :
+    Option Value :=
+  match tyOpt, v with
+  | .some ty, .aggregate 0 rawVals =>
+    match Nat.blt 2 (length rawVals) with
+    | false => .some v
+    | true =>
+      let ptrBytes := layoutPointerBytes layouts
+      match (normalizeCodecTy ty).kind with
+      | .rawPtr _ pointee =>
+        match decodeRawAbstractByteVals? rawVals with
+        | .some bs => decodePtrBytesNoForge false pointee ptrBytes bs
+        | .none => .some v
+      | .ref _ pointee =>
+        match decodeRawAbstractByteVals? rawVals with
+        | .some bs => decodePtrBytesNoForge true pointee ptrBytes bs
+        | .none => .some v
+      | .fnPtr _ _ _ _ =>
+        match decodeRawAbstractByteVals? rawVals with
+        | .some bs => decodePtrBytesNoForge true (.tuple .nil) ptrBytes bs
+        | .none => .some v
+      | _ => .some v
+  | _, _ => .some v
 
 /--
 Evaluate a `Place` read in `locals` with active borrow table `borrows`, global
@@ -10096,13 +11868,35 @@ def evalPlaceRead
         localDecls
         accessedTyOpt
         (callStack := callStack)
+    | .some (.init (.aggregate 0 (.scalar ptrSc :: .scalar lenSc :: .nil))) =>
+      match Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq ptrSc.bits 0)) with
+      | true =>
+        evalSliceFatPtrDerefRead
+          locals
+          { allocId := 0, offsetBytes := ptrSc.bits }
+          ptrSc.sizeBytes
+          lenSc
+          restProj
+          borrows
+          globals
+          layouts
+          callerLocals
+          pointeeTyOpt
+          localDecls
+          accessedTyOpt
+          (callStack := callStack)
+      | false => .ub
     | _ => .ub
   | .nil =>
     match get? locals p.local_ with
     | .some (.init rootVal) =>
-      match validateValueForTy? layouts (placeTy localDecls layouts p) rootVal with
-      | true => .ok rootVal locals
-      | false => .ub
+      let tyOpt := placeTyResolved localDecls layouts p
+      match materializeReadPtrValue layouts tyOpt rootVal with
+      | .none => .ub
+      | .some matVal =>
+        match validateValueForTy? layouts tyOpt matVal with
+        | true => .ok matVal locals
+        | false => .ub
     | .some .uninit => .ub
     | .some .dead => .ub
     | .none => .ub
@@ -10111,9 +11905,13 @@ def evalPlaceRead
     | .some (.init rootVal) =>
       match readProjectedForLocal locals localDecls layouts p.local_ rootVal (proj :: rest) with
       | .ok fieldVal =>
-        match validateValueForTy? layouts (placeTyResolved localDecls layouts p) fieldVal with
-        | true => .ok fieldVal locals
-        | false => .ub
+        let tyOpt := placeTyResolved localDecls layouts p
+        match materializeReadPtrValue layouts tyOpt fieldVal with
+        | .none => .ub
+        | .some matVal =>
+          match validateValueForTy? layouts tyOpt matVal with
+          | true => .ok matVal locals
+          | false => .ub
       | .ub => .ub
       | .unsupported => .unsupported
     | .some .uninit => .ub
@@ -10416,6 +12214,22 @@ def evalOperand
             callerLocals
             .none
             (callStack := callStack)
+        | .some (.init (.aggregate 0 (.scalar ptrSc :: .scalar lenSc :: .nil))) =>
+          match Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq ptrSc.bits 0)) with
+          | true =>
+            evalSliceFatPtrDerefRead
+              locals
+              { allocId := 0, offsetBytes := ptrSc.bits }
+              ptrSc.sizeBytes
+              lenSc
+              restProj
+              borrows
+              globals
+              layouts
+              callerLocals
+              .none
+              (callStack := callStack)
+          | false => .ub
         | _ => .ub
       | _ :: _ =>
         let pointeeTyOpt :=
@@ -10489,7 +12303,13 @@ def evalOperand
                         | .nil => restProj
                         | ph :: pt => ph :: appendProjections pt restProj
                       match readProjectedValue locals targetRootVal fullProj with
-                      | .ok fieldVal => .ok fieldVal locals
+                      | .ok fieldVal =>
+                        match materializeReadPtrValue layouts accessedTyOpt fieldVal with
+                        | .none => .ub
+                        | .some matVal =>
+                          match validateValueForTy? layouts accessedTyOpt matVal with
+                          | true => .ok matVal locals
+                          | false => .ub
                       | .ub => .ub
                       | .unsupported => .unsupported
                     | true => runTypedForeignRead
@@ -10547,12 +12367,40 @@ def evalOperand
             localDecls
             accessedTyOpt
             (callStack := callStack)
+        | .some (.init (.aggregate 0 (.scalar ptrSc :: .scalar lenSc :: .nil))) =>
+          match Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq ptrSc.bits 0)) with
+          | true =>
+            evalSliceFatPtrDerefRead
+              locals
+              { allocId := 0, offsetBytes := ptrSc.bits }
+              ptrSc.sizeBytes
+              lenSc
+              restProj
+              borrows
+              globals
+              layouts
+              callerLocals
+              pointeeTyOpt
+              localDecls
+              accessedTyOpt
+              (callStack := callStack)
+          | false => .ub
         | _ => .ub
     | .nil =>
       match get? locals p.local_ with
       | .some (.init rootVal) =>
         match readProjectedValue locals rootVal .nil with
-        | .ok fieldVal => .ok fieldVal locals
+        | .ok fieldVal =>
+          match localDecls with
+          | .nil => .ok fieldVal locals
+          | _ :: _ =>
+            let tyOpt := placeTyResolved localDecls layouts p
+            match materializeReadPtrValue layouts tyOpt fieldVal with
+            | .none => .ub
+            | .some matVal =>
+              match validateValueForTy? layouts tyOpt matVal with
+              | true => .ok matVal locals
+              | false => .ub
         | .ub => .ub
         | .unsupported => .unsupported
       | .some .uninit => .ub
@@ -10564,15 +12412,29 @@ def evalOperand
         match placeTouchesUnion localDecls layouts p with
         | false =>
           match readProjectedValue locals rootVal (proj :: rest) with
-          | .ok fieldVal => .ok fieldVal locals
+          | .ok fieldVal =>
+            match localDecls with
+            | .nil => .ok fieldVal locals
+            | _ :: _ =>
+              let tyOpt := placeTyResolved localDecls layouts p
+              match materializeReadPtrValue layouts tyOpt fieldVal with
+              | .none => .ub
+              | .some matVal =>
+                match validateValueForTy? layouts tyOpt matVal with
+                | true => .ok matVal locals
+                | false => .ub
           | .ub => .ub
           | .unsupported => .unsupported
         | true =>
           match readProjectedForLocal locals localDecls layouts p.local_ rootVal (proj :: rest) with
           | .ok fieldVal =>
-            match validateValueForTy? layouts (placeTyResolved localDecls layouts p) fieldVal with
-            | true => .ok fieldVal locals
-            | false => .ub
+            let tyOpt := placeTyResolved localDecls layouts p
+            match materializeReadPtrValue layouts tyOpt fieldVal with
+            | .none => .ub
+            | .some matVal =>
+              match validateValueForTy? layouts tyOpt matVal with
+              | true => .ok matVal locals
+              | false => .ub
           | .ub => .ub
           | .unsupported => .unsupported
       | .some .uninit => .ub
@@ -10583,9 +12445,22 @@ def evalOperand
     | .nil =>
       match get? locals p.local_ with
       | .some (.init v) =>
-        match set? locals p.local_ .uninit with
-        | .some locals' => .ok v locals'
-        | .none => .ub
+        match localDecls with
+        | .nil =>
+          match set? locals p.local_ .uninit with
+          | .some locals' => .ok v locals'
+          | .none => .ub
+        | _ :: _ =>
+          let tyOpt := placeTyResolved localDecls layouts p
+          match materializeReadPtrValue layouts tyOpt v with
+          | .none => .ub
+          | .some matVal =>
+            match validateValueForTy? layouts tyOpt matVal with
+            | false => .ub
+            | true =>
+              match set? locals p.local_ .uninit with
+              | .some locals' => .ok matVal locals'
+              | .none => .ub
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub
@@ -10687,6 +12562,22 @@ def evalOperand
             callerLocals
             .none
             (callStack := callStack)
+        | .some (.init (.aggregate 0 (.scalar ptrSc :: .scalar lenSc :: .nil))) =>
+          match Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq ptrSc.bits 0)) with
+          | true =>
+            evalSliceFatPtrDerefRead
+              locals
+              { allocId := 0, offsetBytes := ptrSc.bits }
+              ptrSc.sizeBytes
+              lenSc
+              restProj
+              borrows
+              globals
+              layouts
+              callerLocals
+              .none
+              (callStack := callStack)
+          | false => .ub
         | _ => .ub
       | _ :: _ =>
         let pointeeTyOpt :=
@@ -10760,7 +12651,13 @@ def evalOperand
                         | .nil => restProj
                         | ph :: pt => ph :: appendProjections pt restProj
                       match readProjectedValue locals targetRootVal fullProj with
-                      | .ok fieldVal => .ok fieldVal locals
+                      | .ok fieldVal =>
+                        match materializeReadPtrValue layouts accessedTyOpt fieldVal with
+                        | .none => .ub
+                        | .some matVal =>
+                          match validateValueForTy? layouts accessedTyOpt matVal with
+                          | true => .ok matVal locals
+                          | false => .ub
                       | .ub => .ub
                       | .unsupported => .unsupported
                     | true => runTypedForeignRead
@@ -10818,23 +12715,46 @@ def evalOperand
             localDecls
             accessedTyOpt
             (callStack := callStack)
+        | .some (.init (.aggregate 0 (.scalar ptrSc :: .scalar lenSc :: .nil))) =>
+          match Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq ptrSc.bits 0)) with
+          | true =>
+            evalSliceFatPtrDerefRead
+              locals
+              { allocId := 0, offsetBytes := ptrSc.bits }
+              ptrSc.sizeBytes
+              lenSc
+              restProj
+              borrows
+              globals
+              layouts
+              callerLocals
+              pointeeTyOpt
+              localDecls
+              accessedTyOpt
+              (callStack := callStack)
+          | false => .ub
         | _ => .ub
     | .opaqueCast castTy :: restCast =>
       match stripLeadingOpaqueCast restCast with
       | .nil =>
         match get? locals p.local_ with
         | .some (.init v) =>
-          let tyValid :=
-            match localDecls with
-            | .nil => true
-            | _ :: _ =>
-              validateValueForTy? layouts (placeTyResolved localDecls layouts p) v
-          match tyValid with
-          | false => .ub
-          | true =>
+          match localDecls with
+          | .nil =>
             match set? locals p.local_ .uninit with
             | .some locals' => .ok v locals'
             | .none => .ub
+          | _ :: _ =>
+            let tyOpt := placeTyResolved localDecls layouts p
+            match materializeReadPtrValue layouts tyOpt v with
+            | .none => .ub
+            | .some matVal =>
+              match validateValueForTy? layouts tyOpt matVal with
+              | false => .ub
+              | true =>
+                match set? locals p.local_ .uninit with
+                | .some locals' => .ok matVal locals'
+                | .none => .ub
         | .some .uninit => .ub
         | .some .dead => .ub
         | .none => .ub
@@ -10844,7 +12764,17 @@ def evalOperand
           match placeTouchesUnion localDecls layouts p with
           | false =>
             match readProjectedValue locals rootVal (.opaqueCast castTy :: restCast) with
-            | .ok fieldVal => .ok fieldVal locals
+            | .ok fieldVal =>
+              match localDecls with
+              | .nil => .ok fieldVal locals
+              | _ :: _ =>
+                let tyOpt := placeTyResolved localDecls layouts p
+                match materializeReadPtrValue layouts tyOpt fieldVal with
+                | .none => .ub
+                | .some matVal =>
+                  match validateValueForTy? layouts tyOpt matVal with
+                  | true => .ok matVal locals
+                  | false => .ub
             | .ub => .ub
             | .unsupported => .unsupported
           | true =>
@@ -10858,9 +12788,13 @@ def evalOperand
                 (.opaqueCast castTy :: restCast)
             with
             | .ok fieldVal =>
-              match validateValueForTy? layouts (placeTyResolved localDecls layouts p) fieldVal with
-              | true => .ok fieldVal locals
-              | false => .ub
+              let tyOpt := placeTyResolved localDecls layouts p
+              match materializeReadPtrValue layouts tyOpt fieldVal with
+              | .none => .ub
+              | .some matVal =>
+                match validateValueForTy? layouts tyOpt matVal with
+                | true => .ok matVal locals
+                | false => .ub
             | .ub => .ub
             | .unsupported => .unsupported
         | .some .uninit => .ub
@@ -10872,15 +12806,29 @@ def evalOperand
         match placeTouchesUnion localDecls layouts p with
         | false =>
           match readProjectedValue locals rootVal (proj :: rest) with
-          | .ok fieldVal => .ok fieldVal locals
+          | .ok fieldVal =>
+            match localDecls with
+            | .nil => .ok fieldVal locals
+            | _ :: _ =>
+              let tyOpt := placeTyResolved localDecls layouts p
+              match materializeReadPtrValue layouts tyOpt fieldVal with
+              | .none => .ub
+              | .some matVal =>
+                match validateValueForTy? layouts tyOpt matVal with
+                | true => .ok matVal locals
+                | false => .ub
           | .ub => .ub
           | .unsupported => .unsupported
         | true =>
           match readProjectedForLocal locals localDecls layouts p.local_ rootVal (proj :: rest) with
           | .ok fieldVal =>
-            match validateValueForTy? layouts (placeTyResolved localDecls layouts p) fieldVal with
-            | true => .ok fieldVal locals
-            | false => .ub
+            let tyOpt := placeTyResolved localDecls layouts p
+            match materializeReadPtrValue layouts tyOpt fieldVal with
+            | .none => .ub
+            | .some matVal =>
+              match validateValueForTy? layouts tyOpt matVal with
+              | true => .ok matVal locals
+              | false => .ub
           | .ub => .ub
           | .unsupported => .unsupported
       | .some .uninit => .ub
@@ -11543,25 +13491,57 @@ def spliceSubValueAtByteOffset?
           match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
           | .none => .none
           | .some mergedBytes =>
-            decodeValueFromBytes
+            let dstPtrTy : Ty :=
+              match subTyOpt with
+              | .some st => st
+              | .none => { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
+            decodeUntypedStorageBytes
               defaultCodecFuel
               layouts
-              { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
+              dstPtrTy
               mergedBytes
+              .strictUcg630Ub
+              true
     | .aggregate oldVar oldFields =>
       match subTyOpt with
       | .none => .none
       | .some subTy =>
-        match resolveFaithfulAggregateTy? targetDecls layouts subTy oldVar oldFields with
-        | .none => .none
-        | .some resolvedSubTy =>
-          match encodeTypedValueToBytes layouts resolvedSubTy oldSubVal with
-          | .none => .none
-          | .some oldBytes =>
-            match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
+        let partialPtrSpliceOpt : Option Value :=
+          match Nat.beq oldVar 0, Nat.blt 2 (length oldFields), (normalizeCodecTy subTy).kind with
+          | true, true, .rawPtr _ _ | true, true, .ref _ _ | true, true, .fnPtr _ _ _ _ =>
+            match decodeRawAbstractByteVals? oldFields with
+            | .some rawOldBytes =>
+              match writeAbstractBytesAt rawOldBytes offsetBytes patchBytes with
+              | .some mergedBytes =>
+                decodeUntypedStorageBytes
+                  defaultCodecFuel
+                  layouts
+                  subTy
+                  mergedBytes
+                  .strictUcg630Ub
+                  true
+              | .none => .none
             | .none => .none
-            | .some mergedBytes =>
-              decodeTypedValueFromBytes defaultCodecFuel layouts resolvedSubTy mergedBytes
+          | _, _, _ => .none
+        match partialPtrSpliceOpt with
+        | .some v => .some v
+        | .none =>
+          match resolveFaithfulAggregateTy? targetDecls layouts subTy oldVar oldFields with
+          | .none => .none
+          | .some resolvedSubTy =>
+            match encodeTypedValueToBytes layouts resolvedSubTy oldSubVal with
+            | .none => .none
+            | .some oldBytes =>
+              match writeAbstractBytesAt oldBytes offsetBytes patchBytes with
+              | .none => .none
+              | .some mergedBytes =>
+                decodeUntypedStorageBytes
+                  defaultCodecFuel
+                  layouts
+                  resolvedSubTy
+                  mergedBytes
+                  .strictUcg630Ub
+                  true
 
 /--
 Fit a scalar store `val` into the existing scalar sub-value `oldRead` at byte
@@ -12014,7 +13994,7 @@ def writeStackThinPtrTypedDeref
                         | .nil => localDecls
                         | _ :: _ => effTargetDecls
                       decodeSubValueAtByteOffset? layouts (.some accTy) val 0 declTy localDecls
-                        targetLayouts codecDecls
+                        targetLayouts codecDecls true
                 | _, _ => .none
             | .none, .some decl =>
               let declTy := resolveTyWithLocalDecls effTargetDecls targetLayouts decl.ty
@@ -12319,6 +14299,107 @@ def writePlaceValue
       | .some .uninit => .ub
       | .some .dead => .ub
       | .none => .ub
+
+/--
+Write raw untyped bytes (`val`, produced by `decodeUntypedStorageBytes` for
+`copy_nonoverlapping` or `write_bytes`) to non-deref destination place `dst` in
+`locals` without premature write-time `validateValueForTy?` rejection
+(`Kani#5205` / `#5196`), deferring type bit-validity enforcement to typed reads
+(`evalOperand`, `evalPlaceRead`).
+
+Reference (`core::ptr::copy_nonoverlapping` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "The copy is \"untyped\" in the sense that data may be uninitialized or
+> otherwise violate the requirements of `T`. The initialization state is
+> preserved exactly."
+
+Reference (`core::ptr::write_bytes` documentation, `library/core/src/ptr/mod.rs`
+at commit `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ptr/mod.rs#L664-L666>
+
+> "/// Additionally, note that changing `*dst` in this way can easily lead to undefined behavior (UB)
+> /// later if the written bytes are not a valid representation of some `T`."
+-/
+def writePlaceValueUntyped
+    (locals : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (dst : Place)
+    (val : Value)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (callStack : List SavedCallerFrame := .nil) :
+    PlaceWriteResult :=
+  match dst.projection with
+  | .nil =>
+    match get? locals dst.local_ with
+    | .some .dead => .ub
+    | .some _ =>
+      match set? locals dst.local_ (.init val) with
+      | .some locals' => .ok locals'
+      | .none => .ub
+    | .none => .ub
+  | .deref :: _ =>
+    writePlaceValue locals borrows dst val localDecls layouts callStack
+  | .opaqueCast castTy :: restCast =>
+    match stripLeadingOpaqueCast restCast with
+    | .nil =>
+      match get? locals dst.local_ with
+      | .some .dead => .ub
+      | .some _ =>
+        match set? locals dst.local_ (.init val) with
+        | .some locals' => .ok locals'
+        | .none => .ub
+      | .none => .ub
+    | .deref :: _ => .unsupported
+    | _ :: _ =>
+      match get? locals dst.local_ with
+      | .some (.init rootVal) =>
+        match
+          writeProjectedForLocal
+            locals
+            (eraseLeadingOpaqueCastDecls
+              localDecls
+              layouts
+              dst.local_
+              (.opaqueCast castTy :: restCast))
+            layouts
+            dst.local_
+            rootVal
+            (.opaqueCast castTy :: restCast)
+            val
+        with
+        | .ok rootVal' =>
+          match set? locals dst.local_ (.init rootVal') with
+          | .some locals' => .ok locals'
+          | .none => .ub
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .some .uninit => .ub
+      | .some .dead => .ub
+      | .none => .ub
+  | proj :: rest =>
+    match get? locals dst.local_ with
+    | .some (.init rootVal) =>
+      match
+        writeProjectedForLocal
+          locals
+          localDecls
+          layouts
+          dst.local_
+          rootVal
+          (proj :: rest)
+          val
+      with
+      | .ok rootVal' =>
+        match set? locals dst.local_ (.init rootVal') with
+        | .some locals' => .ok locals'
+        | .none => .ub
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .some .uninit => .ub
+    | .some .dead => .ub
+    | .none => .ub
 
 /--
 Write `val` to `dst` in `locals` while checking active function-entry lifetime
@@ -12843,7 +14924,7 @@ source and destination layout sizes do not match.
 Reference (The Rust Reference, "Behavior considered undefined"):
 <https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
 
-> "Producing an invalid value. Producing a value happens any time a value is
+> "Producing an invalid value. “Producing” a value happens any time a value is
 > assigned to or read from a place, passed to a function/primitive operation or
 > returned from a function/primitive operation."
 
@@ -12871,7 +14952,8 @@ def evalByteCast
     (targetTy : Ty)
     (mem : Memory)
     (localDecls : List LocalDecl)
-    (layouts : LayoutTable) :
+    (layouts : LayoutTable)
+    (policy : Ptr2IntTransmutePolicy := .strictUcg630Ub) :
     RvalueEvalResult :=
   match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
   | .ub => .ub
@@ -12899,7 +14981,7 @@ def evalByteCast
               | false => .ub
               | true =>
                 match
-                  decodeTypedValueFromBytes defaultCodecFuel layouts rTargetTy bs
+                  decodeTypedValueFromBytes defaultCodecFuel layouts rTargetTy bs policy
                 with
                 | .some v' => .ok v' locals' mem
                 | .none => .ub
@@ -12910,7 +14992,178 @@ def evalByteCast
           match Nat.beq (length bs) dstSize with
           | false => .unsupported
           | true =>
-            match decodeTypedValueFromBytes defaultCodecFuel layouts rTargetTy bs with
+            match decodeTypedValueFromBytes defaultCodecFuel layouts rTargetTy bs policy with
+            | .some v' => .ok v' locals' mem
+            | .none => .ub
+
+/--
+Target-width-aware byte size of `rTy` for `evalByteCastRichWithPolicy`,
+honoring explicit `RichAdtSpec` total sizes, resolved custom-DST `2 * ptrBytes`
+`.scalarPair` layouts (ignoring unresolved `layoutIdx = 0` slots),
+`layoutPointerBytes layouts` for `usize`/`isize`/`fnPtr`/references/raw pointers,
+and IEEE-754 float widths (`f16`/`f32`/`f64`/`f128`), falling back to
+`tyByteSize`.
+
+Reference (The Rust Reference, "Type Layout — Primitive data layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#primitive-data-layout>
+
+> "The size of most primitives is given in this table.
+>
+> Type            size_of::<Type>()
+> bool            1
+> u8 / i8         1
+> u16 / i16       2
+> u32 / i32       4
+> u64 / i64       8
+> u128 / i128     16
+> usize / isize   See below
+> f32             4
+> f64             8
+> char            4"
+>
+> "usize and isize have a size big enough to contain every address on the
+> target platform. For example, on a 32 bit target, this is 4 bytes, and on a
+> 64 bit target, this is 8 bytes."
+
+Reference (The Rust Reference, "Type Layout — Pointers and references layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#pointers-and-references-layout>
+
+> "Pointers and references have the same layout. Mutability of the pointer or
+> reference does not change the layout."
+>
+> "Pointers to sized types have the same size and alignment as usize."
+>
+> "Pointers to unsized types are sized. The size and alignment of a pointer to
+> an unsized type are each guaranteed to be greater than or equal to those of a
+> pointer to a sized type."
+>
+> (Note) "Though you should not rely on this, all pointers to DSTs are currently
+> twice the size of the size of usize and have the same alignment."
+
+Modeling choices and supplied facts (not documented guarantees): ADT sizes come
+from the caller-supplied `RichAdtSpec` (`totalBytes`) when one is registered;
+wide pointers use `2 * ptrBytes` per the quoted non-normative Note, with
+custom-DST wideness read from the compiler-supplied `TypeLayout` exactly as in
+`decodePtrBytesRichNoForge`; `f16` / `f128` use their IEEE 754 interchange
+widths and function pointers use `ptrBytes`, neither of which is stated by the
+quoted sections.
+-/
+def richTyByteSize
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (richSpecs : List (DefPath × RichAdtSpec))
+    (rTy : Ty) :
+    Option Nat :=
+  let ptrBytes := layoutPointerBytes layouts
+  match rTy.kind with
+  | .adt defPath _ =>
+    match lookupRichAdtSpec defPath richSpecs with
+    | .some (.structFields _ totalBytes _) => .some totalBytes
+    | .some (.taggedEnum totalBytes _ _ _) => .some totalBytes
+    | .some (.nichePointerEnum totalBytes _ _ _ _ _ _) => .some totalBytes
+    | .some (.nicheScalarEnum totalBytes _ _ _ _ _ _ _) => .some totalBytes
+    | .none => tyByteSize localDecls layouts rTy
+  | .uint .usize => .some ptrBytes
+  | .int .isize => .some ptrBytes
+  | .float .f16 => .some 2
+  | .float .f32 => .some 4
+  | .float .f64 => .some 8
+  | .float .f128 => .some 16
+  | .fnPtr _ _ _ _ => .some ptrBytes
+  | .ref _ pointee | .rawPtr _ pointee =>
+    match pointee with
+    | .slice _ | .str | .dynamic _ => .some (Nat.add ptrBytes ptrBytes)
+    | _ =>
+      match Bool.not (isUnresolvedLayoutIdx layouts rTy.layoutIdx) with
+      | true =>
+        match LayoutTable.lookup layouts rTy.layoutIdx with
+        | .some l =>
+          match Nat.beq l.size.bytes (Nat.add ptrBytes ptrBytes), l.backendRepr with
+          | true, .scalarPair _ _ => .some (Nat.add ptrBytes ptrBytes)
+          | _, _ => .some ptrBytes
+        | .none => .some ptrBytes
+      | false => .some ptrBytes
+  | _ => tyByteSize localDecls layouts rTy
+
+/--
+Evaluate a byte-level representation cast (`CastKind.transmute` or
+`CastKind.subtype`) from operand `op` to `targetTy` under `richSpecs` and
+`Ptr2IntTransmutePolicy` `policy`, decoding with `decodeTypedValueRichWithPolicy`
+so typed struct fields, direct-tagged and niche enums, custom DST wide pointers,
+32-bit `usize`/`isize`, and unconditional `.ref`/`.fnPtr` no-forgery are
+enforced identically across dialects.
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Producing an invalid value. “Producing” a value happens any time a value is
+> assigned to or read from a place, passed to a function/primitive operation or
+> returned from a function/primitive operation."
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer. (That includes this
+> function specifically, integer-to-pointer casts, and helpers like dangling,
+> but also semantically-equivalent conversions such as punning through repr(C)
+> union fields.) Any attempt to use the resulting value for integer operations
+> will abort const-evaluation. (And even outside const, such transmutation is
+> touching on many unspecified aspects of the Rust memory model and should be
+> avoided. See below for alternatives.)"
+-/
+def evalByteCastRichWithPolicy
+    (locals : List LocalSlot)
+    (op : Operand)
+    (targetTy : Ty)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (richSpecs : List (DefPath × RichAdtSpec))
+    (policy : Ptr2IntTransmutePolicy := .strictUcg630Ub) :
+    RvalueEvalResult :=
+  match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+  | .ub => .ub
+  | .unsupported => .unsupported
+  | .ok v locals' =>
+    let rTargetTy := resolveTyWithLocalDecls localDecls layouts targetTy
+    match richTyByteSize localDecls layouts richSpecs rTargetTy with
+    | .none => .unsupported
+    | .some dstSize =>
+      match operandTy localDecls layouts op with
+      | .some srcTy =>
+        let rSrcTy := resolveTyWithLocalDecls localDecls layouts srcTy
+        match richTyByteSize localDecls layouts richSpecs rSrcTy with
+        | .none => .unsupported
+        | .some srcSize =>
+          match Nat.beq srcSize dstSize with
+          | false => .unsupported
+          | true =>
+            let encodedOpt : Option (List AbstractByte) :=
+              encodeByteCastSourceBytes layouts rSrcTy v
+            match encodedOpt with
+            | .none => .ub
+            | .some bs =>
+              match Nat.beq (length bs) dstSize with
+              | false => .ub
+              | true =>
+                match
+                  decodeTypedValueRichWithPolicy
+                    defaultCodecFuel layouts richSpecs rTargetTy bs policy
+                with
+                | .some v' => .ok v' locals' mem
+                | .none => .ub
+      | .none =>
+        match encodeUntypedValueToBytes defaultCodecFuel v with
+        | .none => .unsupported
+        | .some bs =>
+          match Nat.beq (length bs) dstSize with
+          | false => .unsupported
+          | true =>
+            match
+              decodeTypedValueRichWithPolicy
+                defaultCodecFuel layouts richSpecs rTargetTy bs policy
+            with
             | .some v' => .ok v' locals' mem
             | .none => .ub
 
@@ -12921,18 +15174,19 @@ non-capturing closure reification to a function pointer
 
 Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L11-L21>
 
 > "pub enum PointerCoercion {
->     /// Go from a fn-item type to a fn-pointer type.
->     ReifyFnPointer(Safety),
+>     /// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert an unsafe fn-item to a safe fn pointer.
+>     ReifyFnPointer(hir::Safety),
 >
 >     /// Go from a safe fn pointer to an unsafe fn pointer.
 >     UnsafeFnPointer,
 >
->     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
 >     /// It cannot convert a closure that requires unsafe.
->     ClosureFnPointer(Safety),"
+>     ClosureFnPointer(hir::Safety),"
 -/
 def isReifyFnPointerCoercion (coercionKind : String) : Bool :=
   Bool.or
@@ -12989,18 +15243,19 @@ reified into a function pointer via `coercionKind`:
 
 Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L11-L21>
 
 > "pub enum PointerCoercion {
->     /// Go from a fn-item type to a fn-pointer type.
->     ReifyFnPointer(Safety),
+>     /// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert an unsafe fn-item to a safe fn pointer.
+>     ReifyFnPointer(hir::Safety),
 >
 >     /// Go from a safe fn pointer to an unsafe fn pointer.
 >     UnsafeFnPointer,
 >
->     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
 >     /// It cannot convert a closure that requires unsafe.
->     ClosureFnPointer(Safety),"
+>     ClosureFnPointer(hir::Safety),"
 -/
 @[reducible]
 def extractReifyCoercionTarget?
@@ -13404,18 +15659,19 @@ require `fnSafety = .safe`; `"ReifyFnPointer(Unsafe)"` /
 
 Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
-<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L18-L41>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L11-L21>
 
 > "pub enum PointerCoercion {
->     /// Go from a fn-item type to a fn-pointer type.
->     ReifyFnPointer(Safety),
+>     /// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+>     /// It cannot convert an unsafe fn-item to a safe fn pointer.
+>     ReifyFnPointer(hir::Safety),
 >
 >     /// Go from a safe fn pointer to an unsafe fn pointer.
 >     UnsafeFnPointer,
 >
->     /// Go from a non-capturing closure to a fn pointer or an unsafe fn pointer.
+>     /// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
 >     /// It cannot convert a closure that requires unsafe.
->     ClosureFnPointer(Safety),"
+>     ClosureFnPointer(hir::Safety),"
 -/
 def reifyCoercionSafetyCompatible
     (coercionKind : String)
@@ -13983,13 +16239,383 @@ def instantiateLocalDeclKinds
       instantiateLocalDeclKinds subst rest
 
 /--
+Receiver mode of a closure body's environment parameter `_1`: a shared
+reference `&{closure}` (`.sharedRef`, an `Fn` body), a mutable reference
+`&mut {closure}` (`.mutRef`, an `FnMut` body), or the closure value itself
+(`.byValue`, an `FnOnce` body).
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Call traits and coercions"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.intro>
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.fn-mut>
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.call.fn>
+
+> "Closure types all implement `FnOnce`, indicating that they can be called
+> once by consuming ownership of the closure. Additionally, some closures
+> implement more specific call traits:"
+>
+> "A closure which does not move out of any captured variables implements
+> `FnMut`, indicating that it can be called by mutable reference."
+>
+> "A closure which does not mutate or move out of any captured variables
+> implements `Fn`, indicating that it can be called by shared reference."
+
+Reference (`library/core/src/ops/function.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, lines 77–79, 164–166, and 248–250):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L77-L79>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L164-L166>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L248-L250>
+
+> "/// Performs the call operation.
+> #[unstable(feature = "fn_traits", issue = "29625")]
+> extern "rust-call" fn call(&self, args: Args) -> Self::Output;"
+>
+> "/// Performs the call operation.
+> #[unstable(feature = "fn_traits", issue = "29625")]
+> extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;"
+>
+> "/// Performs the call operation.
+> #[unstable(feature = "fn_traits", issue = "29625")]
+> extern "rust-call" fn call_once(self, args: Args) -> Self::Output;"
+
+The three receivers `&self`, `&mut self`, and `self` are the three shapes a
+captured closure body gives its environment local `_1`. Which one a body uses
+is a compiler fact recorded in the captured `_1` declaration; the semantics
+reads it from there and never infers it.
+-/
+inductive ClosureEnvMode : Type where
+  /-- `_1 : &{closure}` (`Fn::call`). -/
+  | sharedRef : ClosureEnvMode
+  /-- `_1 : &mut {closure}` (`FnMut::call_mut`). -/
+  | mutRef : ClosureEnvMode
+  /-- `_1 : {closure}` (`FnOnce::call_once`). -/
+  | byValue : ClosureEnvMode
+
+/--
+Classification of a linked callee body by the type of its own environment
+parameter `_1` (`calleeOwnClosureShape?`):
+- `.nonCapturing mode`: `_1` is `mode` applied to the body's **own** closure
+  type `RigidTy.closure c.defPath .nil` (no captured paths).
+- `.capturing`: `_1` is a receiver of the body's own closure type with at
+  least one captured-path type (`RigidTy.closure c.defPath (_ :: _)`).
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Modeling choice: `rustc-capture` lowers a closure type to
+`RigidTy.closure defPath upvars` with `upvars = ClosureArgs::upvar_tys()`
+(see `trusted/rustc-capture/src/rustc_2026_06_01/mir_lower.rs`), so "captures
+nothing" is exactly `upvars = .nil`; a zero-sized capture such as `()` still
+yields a non-empty `upvars` list and is `.capturing`.
+-/
+inductive CalleeClosureShape : Type where
+  /-- Non-capturing closure body whose environment is received in `mode`. -/
+  | nonCapturing (mode : ClosureEnvMode) : CalleeClosureShape
+  /-- Closure body whose own closure type captures at least one path. -/
+  | capturing : CalleeClosureShape
+
+/--
+Map a closure receiver mode and the closure type's captured-path types
+`upvars` to a `CalleeClosureShape`: `.nil` is `.nonCapturing mode`, any
+non-empty list is `.capturing`.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment."
+-/
+@[reducible]
+def closureShapeOfUpvars (mode : ClosureEnvMode) : List RigidTy → CalleeClosureShape
+  | .nil => .nonCapturing mode
+  | _ :: _ => .capturing
+
+/--
+Classify the type `envTy` of a body's local `_1` against the body's own
+closure path `ownPath`: `&{closure ownPath upvars}`, `&mut {closure ownPath upvars}`,
+or `{closure ownPath upvars}` yield `closureShapeOfUpvars mode upvars`; every
+other type (including a closure type with a different path, e.g. a generic
+`fn` item instantiated at some closure type) yields `.none`.
+
+Reference (`library/core/src/ops/function.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`, lines 77–79, 164–166, and 248–250):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L77-L79>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L164-L166>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/library/core/src/ops/function.rs#L248-L250>
+
+> "extern "rust-call" fn call(&self, args: Args) -> Self::Output;"
+> "extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;"
+> "extern "rust-call" fn call_once(self, args: Args) -> Self::Output;"
+
+Justification: a closure body is the body of the closure type's own call
+method, so its receiver `_1` has that closure type (behind `&`, `&mut`, or by
+value). Comparing the path with the body's own `defPath` is a modeling choice
+that never matches a non-closure item: a `fn` item's own path is never the
+path of a closure type.
+-/
+def classifyOwnClosureEnvTy? (ownPath : DefPath) : RigidTy → Option CalleeClosureShape
+  | .ref .not (.closure p upvars) =>
+    match stringEq p ownPath with
+    | true => .some (closureShapeOfUpvars .sharedRef upvars)
+    | false => .none
+  | .ref .mut (.closure p upvars) =>
+    match stringEq p ownPath with
+    | true => .some (closureShapeOfUpvars .mutRef upvars)
+    | false => .none
+  | .closure p upvars =>
+    match stringEq p ownPath with
+    | true => .some (closureShapeOfUpvars .byValue upvars)
+    | false => .none
+  | _ => .none
+
+/--
+Three-way closure classification of a linked callee body `c` from its **own**
+environment parameter `_1` (`c.argCount ≥ 1` and the type of
+`c.localDecls[1]`), independently of any call site's argument count:
+`.some (.nonCapturing mode)`, `.some .capturing`, or `.none` (not a closure
+body).
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L235-L240>
+
+> "/// Declarations of locals.
+> ///
+> /// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries.
+> pub local_decls: IndexVec<Local, LocalDecl<'tcx>>,"
+
+Reference (`compiler/rustc_ty_utils/src/abi.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_ty_utils/src/abi.rs#L61-L73>
+
+> "ty::Closure(def_id, args) => {
+>     let sig = tcx.instantiate_bound_regions_with_erased(args.as_closure().sig());
+>     let env_ty = tcx.closure_env_ty(
+>         Ty::new_closure(tcx, def_id, args),
+>         args.as_closure().kind(),
+>         tcx.lifetimes.re_erased,
+>     );
+>
+>     tcx.mk_fn_sig(
+>         iter::once(env_ty).chain(sig.inputs().iter().cloned()),
+>         sig.output(),
+>         sig.fn_sig_kind,
+>     )"
+
+Justification: a closure body's first argument local `_1` is its environment
+(`env_ty`), followed by the closure's declared parameters. Compiler-behavior
+citations (MIR layout and closure instance signatures) are supplied compiler
+facts, not Reference guarantees.
+-/
+def calleeOwnClosureShape? (c : CapturedMir) : Option CalleeClosureShape :=
+  match c.argCount with
+  | 0 => .none
+  | .succ _ =>
+    match c.localDecls with
+    | _ :: envDecl :: _ => classifyOwnClosureEnvTy? c.defPath envDecl.ty.kind
+    | _ => .none
+
+/--
+Synthesize the environment argument `_1` passed to a non-capturing closure
+body entered through a function pointer: `.scalar ⟨1, ptrBytes⟩` (a non-null,
+1-aligned address without provenance) for `.sharedRef` / `.mutRef`, and the
+empty aggregate `.aggregate 0 .nil` for `.byValue`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.validity.reference-box>
+
+> "A reference or `Box<T>` must be aligned and non-null, it cannot be
+> dangling, and it must point to a valid value (in case of dynamically sized
+> types, using the actual dynamic type of the pointee as determined by the
+> metadata). Note that the last point (about pointing to a valid value)
+> remains a subject of some debate."
+
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#r-undefined.dangling.zero-size>
+
+> "If the size is 0, then the pointer is trivially never “dangling” (even if
+> it is a null pointer)."
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment."
+
+Justification: a non-capturing closure type has no fields (zero size,
+alignment 1), so address `1` is aligned, non-null, and never dangling for it,
+and the empty aggregate is its only value.
+
+Modeling choices (not Rust guarantees): `rustc` reaches a closure body from a
+`ClosureFnPointer` through a `ClosureOnceShim` that borrows its own
+zero-sized local; that shim frame is elided here, and the borrowed address is
+replaced by the provenance-free address `1`. The substitution is unobservable
+for well-formed non-capturing bodies, which never access the fields of `_1`;
+a forged body that dereferences `_1` faults, because the scalar carries no
+provenance.
+-/
+def synthesizeClosureEnvArg (mode : ClosureEnvMode) (ptrBytes : Nat) : Value :=
+  match mode with
+  | .sharedRef => .scalar ⟨1, ptrBytes⟩
+  | .mutRef => .scalar ⟨1, ptrBytes⟩
+  | .byValue => .aggregate 0 .nil
+
+/--
+Validate a closure body's local declarations against a function-pointer
+signature `(fnInputs, fnOutput)`: `localDecls = _0 :: _1 :: params`, where the
+environment local `_1` is skipped, `_0` matches `fnOutput`, and the first
+`argCount` declarations of `params` match `fnInputs`
+(`calleeLocalDeclsCompatible` on `_0 :: params`). Fails closed when `_1` is
+absent.
+
+Reference (The Rust Reference 1.98.0, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html#r-type.fn-pointer.coercion>
+
+> "Function pointers can be created via a coercion from both function items
+> and non-capturing, non-async closures."
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-async, non-capturing closures can be coerced to function pointers
+> (e.g., `fn()`) with the matching signature."
+
+Reference (`compiler/rustc_middle/src/mir/mod.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/mod.rs#L235-L240>
+
+> "/// The first local is the return value pointer, followed by `arg_count`
+> /// locals for the function arguments, followed by any user-declared
+> /// variables and temporaries."
+
+Justification: "the matching signature" relates the pointer's parameters to
+the closure's declared parameters, which follow the environment local `_1`.
+-/
+def closureCalleeDeclsCompatible
+    (typeArgs : List RigidTy)
+    (localDecls : List LocalDecl)
+    (argCount : Nat)
+    (fnInputs : List RigidTy)
+    (fnOutput : RigidTy) :
+    Bool :=
+  match localDecls with
+  | retDecl :: _ :: paramDecls =>
+    calleeLocalDeclsCompatible typeArgs (retDecl :: paramDecls) argCount fnInputs fnOutput
+  | _ => false
+
+/--
+Outcome of validating a `ClosureFnPointer` coercion target against its
+linked closure body (`checkClosureCalleeSig`).
+-/
+inductive ClosureCoercionCheck : Type where
+  /-- The coercion is well formed; intern the function pointer. -/
+  | ok : ClosureCoercionCheck
+  /-- The coercion is ill formed (undefined behavior). -/
+  | ub : ClosureCoercionCheck
+  /-- The coercion depends on information the captured MIR does not carry. -/
+  | unsupported : ClosureCoercionCheck
+
+/--
+Validate a `PointerCoercion::ClosureFnPointer` reification of the closure
+`p` to the function-pointer type `fn(fnInputs) -> fnOutput` with ABI `fnAbi`:
+1. `fnAbi` must be `CallConv.rust`, otherwise `.ub`.
+2. If no closure body `p` is linked in `callees`, `.ok` (as for unlinked
+   function items in `checkCalleeSig`).
+3. A linked body that is not a closure body (`calleeOwnClosureShape? = .none`)
+   is `.ub` (even if generic).
+4. A linked closure body with `typeParamCount > 0` is `.unsupported`: the
+   closure type carries no parent generic arguments, so the instantiation is
+   unknown.
+5. A non-generic linked closure body must be non-capturing
+   (`calleeOwnClosureShape? = .some (.nonCapturing _)`) with
+   `fnAbi.conv = .rust`, `argCount = length fnInputs + 1`, and declarations
+   `_0 :: _1 :: params` matching `(fnInputs, fnOutput)`
+   (`closureCalleeDeclsCompatible`); a capturing closure body or any mismatch
+   is `.ub`.
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L19-L21>
+
+> "/// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
+> /// It cannot convert a closure that requires unsafe.
+> ClosureFnPointer(hir::Safety),"
+
+Reference (`compiler/rustc_target/src/spec/abi_map.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_target/src/spec/abi_map.rs#L94-L97>
+
+> "(ExternAbi::Rust | ExternAbi::RustCall, _) => CanonAbi::Rust,"
+
+Justification: the Reference admits the coercion only for non-capturing
+closures, to `fn` pointers (the Rust ABI) "with the matching signature"; the
+closure body's own ABI is the Rust calling convention (the `rust-call`
+closure signature canonicalizes to `CanonAbi::Rust`). Step 2 keeps the existing
+leniency for unlinked bodies, which are only reached through external calls.
+Step 4 is a modeling choice that fails closed with `.unsupported`, never
+`.ub`, because a generic closure is well formed in Rust. The `Safety`
+compatibility of the coercion tag is checked by the caller
+(`reifyCoercionSafetyCompatible`).
+-/
+def checkClosureCalleeSig
+    (callees : List CapturedMir)
+    (p : DefPath)
+    (fnInputs : List RigidTy)
+    (fnOutput : RigidTy)
+    (fnAbi : CallConv) :
+    ClosureCoercionCheck :=
+  match callConvEq fnAbi .rust with
+  | false => .ub
+  | true =>
+    match findCallee? callees p with
+    | .none => .ok
+    | .some c =>
+      match calleeOwnClosureShape? c with
+      | .none => .ub
+      | .some .capturing =>
+        match c.typeParamCount with
+        | .succ _ => .unsupported
+        | 0 => .ub
+      | .some (.nonCapturing _) =>
+        match c.typeParamCount with
+        | .succ _ => .unsupported
+        | 0 =>
+          match
+            Bool.and
+              (callConvEq c.fnAbi.conv .rust)
+              (Bool.and
+                (Nat.beq c.argCount (Nat.succ (length fnInputs)))
+                (closureCalleeDeclsCompatible
+                  .nil
+                  c.localDecls
+                  (length fnInputs)
+                  fnInputs
+                  fnOutput))
+          with
+          | true => .ok
+          | false => .ub
+
+/--
 Validate that a linked callee `p` in `callees` or `extraTraitImpls` (when
 present) is compatible with the target function-pointer signature
 `(fnInputs, fnOutput, fnAbi)` during `ReifyFnPointer`:
 1. Resolves `(p, typeArgs)` via `resolveCalleeBodyAndArgs?` across both direct
    `callees` and `TraitImplEntry` tables (`extraTraitImpls` and `c.traitImpls`).
 2. Rejects `CallConv.rustIntrinsic` callees (compiler intrinsics cannot be
-   coerced to function pointers).
+   coerced to function pointers) and linked closure bodies
+   (`calleeOwnClosureShape? c ≠ .none`, which must coerce through
+   `PointerCoercion::ClosureFnPointer`, never `ReifyFnPointer`).
 3. Requires `length fnInputs == c.argCount` and `callConvEq fnAbi c.fnAbi.conv`.
 4. Requires `length effectiveTypeArgs == c.typeParamCount` and checks
    `calleeLocalDeclsCompatible` on `c.localDecls` (instantiated with
@@ -14000,6 +16626,14 @@ Reference (The Rust Reference, "Function pointer types"):
 
 > "Two function pointer types are compatible if they have the same ABI, safety,
 > parameter types, and return type."
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L11-L21>
+
+> "/// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+> /// It cannot convert an unsafe fn-item to a safe fn pointer.
+> ReifyFnPointer(hir::Safety),"
 -/
 def checkCalleeSig
     (callees : List CapturedMir)
@@ -14043,7 +16677,11 @@ def checkCalleeSig
           (Nat.beq (length fnInputs) c.argCount)
           (Bool.and
             (callConvEq fnAbi c.fnAbi.conv)
-            declsCompatible))
+            (Bool.and
+              (match calleeOwnClosureShape? c with
+               | .none => true
+               | .some _ => false)
+              declsCompatible)))
 
 /--
 Evaluate `CastKind.pointerCoercion "UnsafeFnPointer"`, coercing a safe
@@ -14659,12 +17297,38 @@ Evaluate `CastKind.pointerCoercion` for function-pointer reification
 (`"Unsize"`), or pointer-preserving coercions (`"MutToConstPointer"`,
 `"ArrayToPointer"`).
 
-Reference (The Rust Reference, "Function pointer types"):
-<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html>
+Reference (The Rust Reference 1.98.0, "Function pointer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/function-pointer.html#r-type.fn-pointer.coercion>
 
-> "Function pointer types, written using the `fn` keyword, refer to a function
-> whose identity is not necessarily known at compile-time. They can be created
-> via a coercion from both function items and non-capturing closures."
+> "Function pointers can be created via a coercion from both function items
+> and non-capturing, non-async closures."
+
+Reference (The Rust Reference 1.98.0, "Closure types", "Non-capturing closures"):
+<https://doc.rust-lang.org/1.98.0/reference/types/closure.html#r-type.closure.non-capturing>
+
+> "Non-capturing closures are closures that don’t capture anything from their
+> environment. Non-async, non-capturing closures can be coerced to function
+> pointers (e.g., `fn()`) with the matching signature."
+
+Reference (`compiler/rustc_middle/src/ty/adjustment.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/adjustment.rs#L19-L21>
+
+> "/// Go from a non-capturing closure to an fn pointer or an unsafe fn pointer.
+> /// It cannot convert a closure that requires unsafe.
+> ClosureFnPointer(hir::Safety),"
+
+Function-item reification (`"ReifyFnPointer*"`) validates a linked callee with
+`checkCalleeSig`. Closure reification (`"ClosureFnPointer*"`) requires a
+zero-sized operand of a non-capturing closure type
+(`extractReifyCoercionTarget?`, `RigidTy.closure defPath .nil`) and validates a
+linked closure body with `checkClosureCalleeSig`: a non-Rust target ABI, a
+capturing or non-closure body, or a signature mismatch against the body's
+`_0 :: _1 :: params` declarations is `.ub`; a generic closure body
+(`typeParamCount > 0`, whose parent generic arguments the closure type does
+not carry) is `.unsupported`. The coercion tag's `Safety` is checked by
+`reifyCoercionSafetyCompatible` for both kinds, and both intern the pointer
+through the unchanged `internFnPtr`.
 -/
 def evalReifyFnPointer
     (locals : List LocalSlot)
@@ -14788,25 +17452,39 @@ def evalReifyFnPointer
                   (operandTy localDecls layouts op)
               with
               | .some (defPath, typeArgs) =>
-                match
-                  checkCalleeSig
-                    mem.callees
-                    defPath
-                    fnInputs
-                    fnOutput
-                    fnAbi
-                    typeArgs
-                    mem.traitImpls
-                with
-                | false => .ub
+                match isClosureFnPointerCoercion coercionKind with
                 | true =>
-                  let (allocId, mem') :=
-                    internFnPtr mem defPath typeArgs (.some targetTy.kind)
-                  let p : ProvenancePtr := {
-                    allocId := allocId
-                    offsetBytes := 0
-                  }
-                  .ok (.ptr p 8) locals' mem'
+                  match checkClosureCalleeSig mem.callees defPath fnInputs fnOutput fnAbi with
+                  | .ub => .ub
+                  | .unsupported => .unsupported
+                  | .ok =>
+                    let (allocId, mem') :=
+                      internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                    let p : ProvenancePtr := {
+                      allocId := allocId
+                      offsetBytes := 0
+                    }
+                    .ok (.ptr p 8) locals' mem'
+                | false =>
+                  match
+                    checkCalleeSig
+                      mem.callees
+                      defPath
+                      fnInputs
+                      fnOutput
+                      fnAbi
+                      typeArgs
+                      mem.traitImpls
+                  with
+                  | false => .ub
+                  | true =>
+                    let (allocId, mem') :=
+                      internFnPtr mem defPath typeArgs (.some targetTy.kind)
+                    let p : ProvenancePtr := {
+                      allocId := allocId
+                      offsetBytes := 0
+                    }
+                    .ok (.ptr p 8) locals' mem'
               | .none => .ub
           | _ => .ub
 
@@ -20137,6 +22815,172 @@ def evalFloatCastRvalue
   | .unsupported => .unsupported
 
 /--
+`true` when `ty` is any MIR floating-point type (`f16`, `f32`, `f64`, `f128`).
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+-/
+@[reducible]
+def isFloatTy (ty : Ty) : Bool :=
+  match ty.kind with
+  | .float _ => true
+  | _ => false
+
+/--
+`true` when `ty?` is `.some ty` with `isFloatTy ty = true`.
+-/
+@[reducible]
+def isFloatOptTy : Option Ty → Bool
+  | .some ty => isFloatTy ty
+  | .none => false
+
+/--
+Evaluate MIR unary negation `UnOp.neg` on a floating-point scalar `sc` of static
+type `opTy?`.
+
+For `f32` (`binary32`) and `f64` (`binary64`), checks `sc.sizeBytes = f.byteWidth`
+and flips the IEEE-754 sign bit via `evalFloatNeg`, preserving the exponent,
+quiet/signaling bit, and full NaN payload verbatim. Fails closed with
+`.unsupported` on `f16`, `f128`, non-float types, or scalar width mismatches.
+
+Reference (The Rust Reference, "Negation operators"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#negation-operators>
+
+> "This table summarizes the behavior of them on primitive types and which
+> traits are used to overload these operators for other types. Remember that
+> signed integers are always represented using two’s complement."
+>
+> "Symbol  Integer    bool  Floating Point  Overloading Trait
+> -       Negation*        Negation        std::ops::Neg"
+>
+> "* Only for signed integer types."
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "The rules for NaN values differ between arithmetic and non-arithmetic (or
+> “bitwise”) operations. The non-arithmetic operations are unary -, abs,
+> copysign, signum, {to,from}_bits, {to,from}_{be,le,ne}_bytes and
+> is_sign_{positive,negative}. These operations are guaranteed to exactly
+> preserve the bit pattern of their input except for possibly changing the sign
+> bit."
+
+Correspondence: float negation is the documented bitwise sign flip, so the
+result is deterministic (no `FloatArithMode` choice) and never `.ub`.
+Modeling choices: `f16` / `f128` and scalar/type width mismatches return
+`.unsupported` (fail closed) rather than a value; `locals` and `mem` are
+returned unchanged.
+-/
+def evalFloatUnaryNeg
+    (sc : ScalarInt)
+    (opTy? : Option Ty)
+    (locals : List LocalSlot)
+    (mem : Memory) :
+    RvalueEvalResult :=
+  match opTy? with
+  | .some ty =>
+    match ieeeFormatOfTy? ty with
+    | .some f =>
+      match Nat.beq sc.sizeBytes f.byteWidth with
+      | true => .ok (.scalar ⟨evalFloatNeg f sc.bits, f.byteWidth⟩) locals mem
+      | false => .unsupported
+    | .none => .unsupported
+  | .none => .unsupported
+
+/--
+Evaluate a MIR scalar binary operation `op` when at least one operand has a
+floating-point static type (`lhsTy?` or `rhsTy?`).
+
+Both operands must resolve to the same modeled IEEE-754 format (`f32` or `f64`)
+with scalar byte widths equal to `f.byteWidth`. Comparisons (`eq`, `ne`, `lt`,
+`le`, `gt`, `ge`) and arithmetic (`add`, `sub`, `mul`, `div`, `rem`) delegate
+to `evalFloatBinOp`; `f16`, `f128`, mismatched operand formats or widths, and
+unsupported `BinOp`s fail closed with `.unsupported`.
+
+Reference (The Rust Reference, "Numeric types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#floating-point-types>
+
+> "The IEEE 754-2008 “binary32” and “binary64” floating-point types are f32 and
+> f64, respectively."
+
+Reference (`core` documentation, "Primitive Type f32"; superscripts rendered
+with `^`):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html>
+
+> "When a primitive operation (addition, subtraction, multiplication, or
+> division) is performed on this type, the result is rounded according to the
+> roundTiesToEven direction defined in IEEE 754-2008. That means:
+> - The result is the representable value closest to the true value, if there
+>   is a unique closest representable value.
+> - If the true value is exactly half-way between two representable values,
+>   the result is the one with an even least-significant binary digit.
+> - If the true value’s magnitude is ≥ f32::MAX + 2^(f32::MAX_EXP −
+>   f32::MANTISSA_DIGITS − 1), the result is ∞ or −∞ (preserving the true
+>   value’s sign).
+> - If the result of a sum exactly equals zero, the outcome is +0.0 unless
+>   both arguments were negative, then it is -0.0. Subtraction a - b is
+>   regarded as a sum a + (-b)."
+
+Reference (The Rust Reference, "Comparison operators"):
+<https://doc.rust-lang.org/1.98.0/reference/expressions/operator-expr.html#comparison-operators>
+
+> "Comparison operators are also defined both for primitive types and many
+> types in the standard library."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1643-L1657>
+
+> "/// Floating-point division by zero is safe, and does not need guards."
+>
+> "/// Floating-point remainder by zero is safe, and does not need guards."
+
+Correspondence: this is a type-directed dispatcher; the numerical semantics and
+their documentation are those of `evalFloatBinOp` / `evalFloatArithBase` /
+`evalFloatCmp`. No float binary operation is ever `.ub` (division and remainder
+by zero are "safe").
+
+Modeling choices: when an arithmetic operation produces NaN,
+`evalFloatScalarBinOp` returns the deterministic preferred quiet NaN
+(`preferredNaNBits f`); use `EvalRvalueFloatRel` with
+`FloatArithMode.nondeterministic` for Rust's non-deterministic NaN admissibility
+relation. `f16` / `f128`, mixed float/non-float or mixed-format operands,
+untyped operands (`.none`), width mismatches, and non-float `BinOp`s (bitwise,
+shifts, checked/unchecked integer variants, `cmp`, `offset`) return
+`.unsupported` (fail closed) rather than falling through to integer arithmetic.
+-/
+def evalFloatScalarBinOp
+    (op : BinOp)
+    (lhs rhs : ScalarInt)
+    (lhsTy? rhsTy? : Option Ty)
+    (locals : List LocalSlot)
+    (mem : Memory) :
+    RvalueEvalResult :=
+  match lhsTy?, rhsTy? with
+  | .some lTy, .some rTy =>
+    match ieeeFormatOfTy? lTy, ieeeFormatOfTy? rTy with
+    | .some fL, .some fR =>
+      let sameFmt : Bool :=
+        match fL, fR with
+        | .binary32, .binary32 => true
+        | .binary64, .binary64 => true
+        | _, _ => false
+      match
+        Bool.and sameFmt
+          (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth))
+      with
+      | true =>
+        match evalFloatBinOp op fL lhs.bits rhs.bits with
+        | .some outSc => .ok (.scalar outSc) locals mem
+        | .none => .unsupported
+      | false => .unsupported
+    | _, _ => .unsupported
+  | _, _ => .unsupported
+
+/--
 Evaluate an `Rvalue` in `locals` and `mem`, using `localDecls` and `layouts` to
 resolve operand types, signedness, and byte layouts for `Rvalue.binaryOp`,
 `Rvalue.unaryOp`, `Rvalue.cast`, and `Rvalue.aggregate`.
@@ -20315,8 +23159,14 @@ def evalRvalue
           | .offset =>
             evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs
           | _ =>
-            let isSigned := operandIsSigned localDecls lhsOp layouts
-            evalScalarBinOp op lhs rhs locals₂ mem isSigned
+            let lhsTy := operandTy localDecls layouts lhsOp
+            let rhsTy := operandTy localDecls layouts rhsOp
+            match Bool.or (isFloatOptTy lhsTy) (isFloatOptTy rhsTy) with
+            | true =>
+              evalFloatScalarBinOp op lhs rhs lhsTy rhsTy locals₂ mem
+            | false =>
+              let isSigned := operandIsSigned localDecls lhsOp layouts
+              evalScalarBinOp op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
@@ -20555,24 +23405,40 @@ def evalRvalue
   | .unaryOp .neg op =>
     match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
     | .ok (.scalar sc) locals' =>
-      match Nat.beq sc.sizeBytes 0 with
-      | true => .unsupported
+      let opTy := operandTy localDecls layouts op
+      match isFloatOptTy opTy with
+      | true => evalFloatUnaryNeg sc opTy locals' mem
       | false =>
-        let modulus := scalarModulus sc.sizeBytes
-        let canonical := wrapScalarBits sc.bits modulus
-        let negBits := wrapScalarBits (Nat.sub modulus canonical) modulus
-        .ok (.scalar ⟨negBits, sc.sizeBytes⟩) locals' mem
+        match Nat.beq sc.sizeBytes 0 with
+        | true => .unsupported
+        | false =>
+          let modulus := scalarModulus sc.sizeBytes
+          let canonical := wrapScalarBits sc.bits modulus
+          let negBits := wrapScalarBits (Nat.sub modulus canonical) modulus
+          .ok (.scalar ⟨negBits, sc.sizeBytes⟩) locals' mem
     | .ok _ _ => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
   | .unaryOp .ptrMetadata op =>
     evalUnaryPtrMetadata locals op mem localDecls layouts
   | .discriminant place =>
-    match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
-    | .ok val locals' =>
-      evalPlaceDiscriminant val locals' mem place localDecls layouts
-    | .ub => .ub
-    | .unsupported => .unsupported
+    match place.projection, stripLeadingOpaqueCast place.projection with
+    | .nil, _ =>
+      match get? locals place.local_ with
+      | .some (.init val) =>
+        evalPlaceDiscriminant val locals mem place localDecls layouts
+      | _ => .ub
+    | .opaqueCast _ :: _, .nil =>
+      match get? locals place.local_ with
+      | .some (.init val) =>
+        evalPlaceDiscriminant val locals mem place localDecls layouts
+      | _ => .ub
+    | _ :: _, _ =>
+      match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+      | .ok val locals' =>
+        evalPlaceDiscriminant val locals' mem place localDecls layouts
+      | .ub => .ub
+      | .unsupported => .unsupported
   | .aggregate (.array _) ops =>
     match evalOperands locals ops mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
     | .ok vals locals' => .ok (.aggregate 0 vals) locals' mem
@@ -20593,5 +23459,149 @@ def evalRvalue
 Alias for `evalRvalue` with explicit `Memory` threading.
 -/
 abbrev evalRvalueWithMemory := evalRvalue
+
+/--
+Mode- and policy-parametric relational specification of `evalRvalue` for
+floating-point binary arithmetic, `floatToFloat` casts, and byte-level
+representation casts (`transmute` / `subtype`):
+- On `.binaryOp op lhsOp rhsOp` where both operands evaluate to scalars and at
+  least one has a floating-point type: both must share a modeled `IeeeFormat`
+  (`f32`/`f64`) with matching byte widths, and any `outSc` satisfying
+  `EvalFloatBinOpRel mode op fL lhs.bits rhs.bits outSc` is admitted (or
+  `.unsupported` when formats/widths mismatch or `op` is unsupported).
+- On `.cast .floatToFloat op targetTy`: non-NaN inputs return
+  `evalFloatToFloatRoundTiesToEven`, while NaN inputs admit any
+  `cand ∈ nanChoices dst [(src, sc.bits % 2 ^ src.width)] mode`.
+- On `.cast .transmute` and `.cast .subtype`: delegates to `evalByteCast` at
+  `Ptr2IntTransmutePolicy` `policy`.
+- On all other rvalues (including deterministic bitwise NaN-preserving
+  `.unaryOp .neg` on floats): coincides with `evalRvalue`.
+
+Reference (`core` documentation, "Primitive Type f32", "NaN bit patterns"):
+<https://doc.rust-lang.org/1.98.0/core/primitive.f32.html#nan-bit-patterns>
+
+> "The following rules apply when a NaN value is returned from an arithmetic
+> operation:
+> - The result has a non-deterministic sign.
+> - The quiet bit and payload are non-deterministically chosen from the
+>   following set of options"
+
+Reference (`core::mem::transmute` documentation, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/mem/fn.transmute.html>
+
+> "Transmuting pointers to integers in a const context is undefined behavior,
+> unless the pointer was originally created from an integer."
+
+Modeling choice: `.deterministic` picks `preferredNaNBits` for NaN outputs;
+`.nondeterministic` admits all `nanChoices` candidates (`preferredNaNBits`,
+quieted input NaNs, and nonzero-payload unchanged signaling input NaNs with
+either sign), excluding target-specific extra NaNs (see the scope restriction
+on `nanChoices`: on targets with “extra” NaN payloads this relation
+under-approximates the documented outcome set).
+
+Relationship to the executable `evalRvalue` (modeling choices, not Rust
+guarantees):
+- On float `.binaryOp`, `evalRvalue` returns the `evalFloatBinOp` result, which
+  `EvalFloatBinOpRel` admits in both modes (the preferred NaN is always a
+  candidate).
+- On a NaN-input `.cast .floatToFloat`, `evalRvalue` returns the quieting
+  conversion `evalFloatToFloatRoundTiesToEven src dst sc.bits`. That value is
+  one of the `.nondeterministic` candidates, but in general it is NOT the
+  single `.deterministic` candidate `preferredNaNBits dst` (for example for a
+  NaN with a nonzero payload or a negative sign). `.deterministic` follows
+  Miri's deterministic-float mode here, so on such casts `evalRvalue`
+  realizes this relation in `.nondeterministic` mode only.
+- Float dispatch is type-directed in both `evalRvalue` and this relation: an
+  operand whose `operandTy` is `.none` (for example a local without a
+  `LocalDecl` under the default `localDecls := .nil`) is not recognized as
+  floating-point and follows the integer `evalScalarBinOp` path. Float
+  semantics therefore require `localDecls` (or typed constants) that resolve
+  the type of every float operand.
+- `policy` affects only `.cast .transmute` / `.cast .subtype`; `evalRvalue`
+  itself always uses the default `.strictUcg630Ub`.
+-/
+def EvalRvalueFloatRel
+    (mode : FloatArithMode)
+    (policy : Ptr2IntTransmutePolicy)
+    (locals : List LocalSlot)
+    (rv : Rvalue)
+    (mem : Memory := emptyMemory)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (res : RvalueEvalResult) : Prop :=
+  match rv with
+  | .binaryOp op lhsOp rhsOp =>
+    match evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+    | .ub => res = .ub
+    | .unsupported => res = .unsupported
+    | .ok lhsVal locals₁ =>
+      match evalOperand locals₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+      | .ub => res = .ub
+      | .unsupported => res = .unsupported
+      | .ok rhsVal locals₂ =>
+        match lhsVal, rhsVal with
+        | .scalar lhs, .scalar rhs =>
+          match op with
+          | .offset =>
+            res = evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs
+          | _ =>
+            let lhsTy := operandTy localDecls layouts lhsOp
+            let rhsTy := operandTy localDecls layouts rhsOp
+            match Bool.or (isFloatOptTy lhsTy) (isFloatOptTy rhsTy) with
+            | true =>
+              match lhsTy, rhsTy with
+              | .some lTy, .some rTy =>
+                match ieeeFormatOfTy? lTy, ieeeFormatOfTy? rTy with
+                | .some fL, .some fR =>
+                  let sameFmt : Bool :=
+                    match fL, fR with
+                    | .binary32, .binary32 => true
+                    | .binary64, .binary64 => true
+                    | _, _ => false
+                  match
+                    Bool.and sameFmt
+                      (Bool.and (Nat.beq lhs.sizeBytes fL.byteWidth) (Nat.beq rhs.sizeBytes fL.byteWidth))
+                  with
+                  | true =>
+                    match evalFloatBinOp op fL lhs.bits rhs.bits with
+                    | .some _ =>
+                      ∃ outSc,
+                        EvalFloatBinOpRel mode op fL lhs.bits rhs.bits outSc ∧
+                        res = .ok (.scalar outSc) locals₂ mem
+                    | .none => res = .unsupported
+                  | false => res = .unsupported
+                | _, _ => res = .unsupported
+              | _, _ => res = .unsupported
+            | false =>
+              let isSigned := operandIsSigned localDecls lhsOp layouts
+              res = evalScalarBinOp op lhs rhs locals₂ mem isSigned
+        | _, _ =>
+          res = evalRvalue locals (.binaryOp op lhsOp rhsOp) mem localDecls layouts
+  | .cast .floatToFloat op targetTy =>
+    match evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
+    | .ub => res = .ub
+    | .unsupported => res = .unsupported
+    | .ok v locals' =>
+      match operandTy localDecls layouts op, v with
+      | .some srcTy, .scalar sc =>
+        match ieeeFormatOfTy? srcTy, ieeeFormatOfTy? targetTy with
+        | .some src, .some dst =>
+          match Nat.beq sc.sizeBytes src.byteWidth with
+          | true =>
+            if isNaNBits src sc.bits = true then
+              ∃ cand,
+                cand ∈ nanChoices dst [(src, sc.bits % 2 ^ src.width)] mode ∧
+                res = .ok (.scalar ⟨cand, dst.byteWidth⟩) locals' mem
+            else
+              res = .ok (.scalar ⟨evalFloatToFloatRoundTiesToEven src dst sc.bits, dst.byteWidth⟩) locals' mem
+          | false => res = .unsupported
+        | _, _ => res = .unsupported
+      | _, _ => res = .unsupported
+  | .cast .transmute op targetTy =>
+    res = evalByteCast locals op targetTy mem localDecls layouts policy
+  | .cast .subtype op targetTy =>
+    res = evalByteCast locals op targetTy mem localDecls layouts policy
+  | _ =>
+    res = evalRvalue locals rv mem localDecls layouts
 
 end Trusted.Rustc.V2026_08_01.MirSemantics

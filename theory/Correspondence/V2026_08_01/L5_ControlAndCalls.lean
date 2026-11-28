@@ -1388,7 +1388,7 @@ theorem mir_evalRvalue_reifyFnPointer_callee_sig_and_unsafeFnPointer_corresponds
       hSigFalse, evalOperand, evalConstValue]
   · simp [evalRvalue, evalReifyFnPointer, hClosureSafe, hNeUnsafeClosure,
       hSafeCompatClosure, hIsClosureSafe, extractReifyCoercionTarget?,
-      emptyMemory, checkCalleeSig, findFnPtrEntry?, nextFnPtrAllocId,
+      emptyMemory, checkClosureCalleeSig, findCallee?, findFnPtrEntry?, nextFnPtrAllocId,
       evalOperand, evalConstValue, callConvEq]
   · simp [evalRvalue, evalReifyFnPointer, hClosureSafe, hNeUnsafeClosure,
       hSafeCompatClosure, hIsClosureSafe, extractReifyCoercionTarget?,
@@ -1517,12 +1517,13 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         s.memory.callStack = .ok argVals (locals' argVals) →
       lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .some calleeBody →
       checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true →
+      let entryArgs := calleeEntryArgs resolvedTarget calleeBody argVals
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.step
-          (pushCalleeFrame s callerBody (locals' argVals) destination targetBb calleeBody argVals unwind) ∧
+          (pushCalleeFrame s callerBody (locals' argVals) destination targetBb calleeBody entryArgs unwind) ∧
       evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
         MirStepNode.step
-          (pushDivergingCalleeFrame s callerBody (locals' argVals) destination unwind calleeBody argVals) ∧
+          (pushDivergingCalleeFrame s callerBody (locals' argVals) destination unwind calleeBody entryArgs) ∧
       (tailTeardownConflict = false →
         evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
           MirStepNode.step
@@ -1531,8 +1532,8 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
                 s.memory.callStack
                 memAfterTeardown
                 (length s.frame.locals)
-                (length (initLocals calleeBody argVals)))
-              calleeBody argVals)) ∧
+                (length (initLocals calleeBody entryArgs)))
+              calleeBody entryArgs)) ∧
       (tailTeardownConflict = true →
         evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
           MirStepNode.fail .ub)) ∧
@@ -1548,6 +1549,7 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         callerBody.localDecls
         s.memory.callStack = .ok argVals (locals' argVals) →
       lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .none →
+      isGenericClosureArityMismatch s.memory.callees fnEntry.defPath fnEntry.typeArgs = false →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.extCall
           { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs, args := argVals, memory := s.memory }
@@ -1607,10 +1609,10 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
     refine ⟨?_, ?_, fun hTear => ?_, fun hTear => ?_⟩ <;>
       simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, resolveCallTarget,
         Nat.beq_refl, Bool.and_self, *]
-  · intro hLookup hCompatSite hArgs hFindNone
+  · intro hLookup hCompatSite hArgs hFindNone hNotGenClos
     refine ⟨?_, ?_, fun hTear => ?_, fun hTear => ?_⟩ <;>
       simp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf, isDirectExactDivTarget,
-        resolveCallTarget, Nat.beq_refl, Bool.and_self, *]
+        resolveCallTarget, Nat.beq_refl, Bool.and_self, Bool.and_false, *]
   · intro hLookupNone
     refine ⟨?_, ?_, ?_⟩ <;>
       simp only [evalTerminator, bodyLocalDeclsOf, evalTailCallTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
@@ -1763,6 +1765,7 @@ theorem mir_evalTerminator_diverging_call_args_and_unreachable
         .ok target localsAfterFunc →
       target.isIndirect = true →
       lookupCallee s.memory.callees callerBody.layouts target.defPath target.typeArgs s.memory.traitImpls = .none →
+      isGenericClosureArityMismatch s.memory.callees target.defPath target.typeArgs = false →
       evalOperandsWithBodyCast
         localsAfterFunc
         argOps
@@ -1787,8 +1790,8 @@ theorem mir_evalTerminator_diverging_call_args_and_unreachable
     simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgsOk, hFind, hUnreach1]
   · intro argVals locals' hFunc hFind hArgsOk
     simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgsOk, hFind, hUnreach2]
-  · intro target localsAfterFunc argVals locals' hResolveOk hIndirect hFind hArgsOk
-    simp only [evalTerminator, bodyLocalDeclsOf, hResolveOk, hArgsOk, hFind, hIndirect]
+  · intro target localsAfterFunc argVals locals' hResolveOk hIndirect hFind hNotGenClos hArgsOk
+    simp only [evalTerminator, bodyLocalDeclsOf, hResolveOk, hArgsOk, hFind, hIndirect, hNotGenClos]
 
 /--
 Universal characterization of diverging `TerminatorKind.call` (`target = .none`)
@@ -1877,7 +1880,7 @@ theorem mir_evalTerminator_diverging_call_linked_callee_corresponds
   dsimp only
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFind,
-      checkCalleeTargetCompatible]
+      checkCalleeTargetCompatible, calleeEntryArgs]
   · intro calleeLocals
     unfold evalTerminator pushDivergingCalleeFrame
     dsimp only
@@ -2103,6 +2106,8 @@ theorem mir_evalTerminator_diverging_call_external_corresponds
     (hFindNone : lookupCallee s.memory.callees callerBody.layouts defPath (extractCalleeTypeArgs func) s.memory.traitImpls = .none)
     (hNotAbort : isAbortingPanicDefPath defPath = false)
     (hNotPanic : isUnwindingPanicDefPath defPath = false)
+    (hNotIntr : classifyRustIntrinsic? defPath = .none := by rfl)
+    (hNotExact : stringEq defPath "core::intrinsics::exact_div" = false := by rfl)
     (hArgs :
       evalOperandsWithBodyCast
         s.frame.locals
@@ -2129,7 +2134,8 @@ theorem mir_evalTerminator_diverging_call_external_corresponds
     (resumeExternalDivergingCall s locals' unwind .aborted = .halted .abort) := by
   refine ⟨?_, ?_, ?_, ?_⟩
   · simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs,
-      hNotUnreach, hFindNone, hNotAbort, hNotPanic]
+      hNotUnreach, hFindNone, hNotAbort, hNotPanic, evalDivergingRustIntrinsic?,
+      isDirectExactDivTarget, hNotExact, hNotIntr]
   · intro retVal memAfter
     rfl
   · intro memAfter
@@ -2437,6 +2443,8 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
       isUnreachableCallTarget defPath = false →
       isAbortingPanicDefPath defPath = false →
       isUnwindingPanicDefPath defPath = false →
+      classifyRustIntrinsic? defPath = .none →
+      stringEq defPath "core::intrinsics::exact_div" = false →
       evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
         MirStepNode.extCall
           { defPath := defPath, typeArgs := extractCalleeTypeArgs func, args := argVals, memory := s.memory }
@@ -2461,9 +2469,10 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
     simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFindNone,
       hNotUnreach, hNotAbort, hPanic]
     cases applyUnwindAction s locals' s.memory unwind <;> rfl
-  · intro hFindNone hNotUnreach hNotAbort hNotPanic
+  · intro hFindNone hNotUnreach hNotAbort hNotPanic hNotIntr hNotExact
     simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFindNone,
-      hNotUnreach, hNotAbort, hNotPanic]
+      hNotUnreach, hNotAbort, hNotPanic, evalDivergingRustIntrinsic?, isDirectExactDivTarget,
+      hNotExact, hNotIntr]
   · refine ⟨rfl, ?_, ?_, rfl⟩
     · simp [evalTerminator, pushDivergingCalleeFrame, unwindFromCallStack, restoreCallerProtectors]
     · intro hNil hCeil
@@ -2581,7 +2590,8 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
     (hPath0 : calleeBody0.defPath = "core::rt_callee_0")
     (hArgs0 : calleeBody0.argCount = 0)
     (hConv0 : calleeBody0.fnAbi.conv = .rust)
-    (hParams0 : calleeBody0.typeParamCount = 0 := by rfl) :
+    (hParams0 : calleeBody0.typeParamCount = 0 := by rfl)
+    (hNotClos2 : calleeOwnClosureShape? calleeBody2 = .none := by rfl) :
     let dest : Place := { local_ := 0, projection := .nil }
     let constFnOp : Operand :=
       .constant { ty := { kind := .fnDef "core::ct_callee" .nil, layoutIdx := 0 }, val := .zeroSized }
@@ -2698,11 +2708,14 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
   have hExN : stringEq "core::panicking::panic_nounwind" "core::intrinsics::exact_div" = false := rfl
   have hKindP : classifyRustIntrinsic? "core::panicking::panic" = .none := rfl
   have hExP : stringEq "core::panicking::panic" "core::intrinsics::exact_div" = false := rfl
+  have hNotClos0 : calleeOwnClosureShape? calleeBody0 = .none := by
+    unfold calleeOwnClosureShape?; rw [hArgs0]
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl⟩
   · unfold evalTerminator mkIntrinsicCallTerm
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
+      constEvalSelectCalleeCompatible, constEvalSelectEntryArgs, hNotClos2,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, unpackConstEvalSelectArgs?, resolveConstEvalSelectTarget?,
       hMatch2, hArgs2, hConv2, hParams2, callConvEq, length]
@@ -2710,6 +2723,7 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
+      constEvalSelectCalleeCompatible, constEvalSelectEntryArgs, hNotClos0,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, resolveConstEvalSelectTarget?, hMiss20, hMatch0, hArgs0, hConv0,
       hParams0, callConvEq, length]
@@ -2747,6 +2761,7 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
     simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
+      constEvalSelectCalleeCompatible, hNotClos0,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, unpackConstEvalSelectArgs?, resolveConstEvalSelectTarget?,
       hMiss20, hMatch0, hArgs0, hConv0, hParams0, callConvEq, length]

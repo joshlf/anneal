@@ -2196,7 +2196,22 @@ theorem evalRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List LocalD
               intro hk
               rw [hk] at hptd
               cases hptd
-            refine evalRvalue_use_ok (by simp [evalOperand, get?, hp, readProjectedValue]) ?_ rfl
+            have hvalOk : MirSemantics.validateValueForTy? layouts
+                (MirSemantics.placeTyResolved decls layouts ⟨p, []⟩) (.ptr pv 8) = true := by
+              simp only [MirSemantics.placeTyResolved, get?, hdp, MirSemantics.resolveProjectedTyResolved]
+              unfold ptrPointeeOf at hptd
+              cases hk : dp.ty.kind with
+              | rawPtr _ _ | ref _ _ => simp [MirSemantics.validateValueForTy?, MirSemantics.validateValueForTyAux, hk]
+              | _ => rw [hk] at hptd; cases hptd
+            refine evalRvalue_use_ok ?_ ?_ rfl
+            · cases decls with
+              | nil => simp [evalOperand, get?, hp, readProjectedValue]
+              | cons d ds =>
+                have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨p, []⟩ = some dp.ty := by
+                  simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdp]
+                simp only [evalOperand, get?, hp, readProjectedValue, hptR,
+                  MirSemantics.materializeReadPtrValue]
+                rw [← hptR, hvalOk]
             exact validateLoadedValue_of_operandTy (ty := dp.ty)
               (by simp [MirSemantics.operandTy, MirSemantics.placeTy, get?, hdp,
                 MirSemantics.resolveProjectedTy]) hnb hnc
@@ -2302,7 +2317,18 @@ theorem evalRvalue_ptrRvalue {layouts : Layout.LayoutTable} {decls : List LocalD
                   hoff_pre (by simp [ptrOffsetSrcOf, copyRv, copyOp])
                 have hop_l : evalOperand locals (.copy ⟨p, []⟩) mem.borrows mem.globals
                     layouts mem.callerLocals decls mem.callStack = .ok (.ptr pv 8) locals := by
-                  simp [evalOperand, get?, hpv, readProjectedValue]
+                  cases decls with
+                  | nil => simp [evalOperand, get?, hpv, readProjectedValue]
+                  | cons d ds =>
+                    have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨p, []⟩ = some dp.ty := by
+                      simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdp]
+                    have hvalOk : MirSemantics.validateValueForTy? layouts (some dp.ty) (.ptr pv 8) = true := by
+                      unfold rawPtrPointeeOf at hpt_raw
+                      cases hk : dp.ty.kind with
+                      | rawPtr _ _ => simp [MirSemantics.validateValueForTy?, MirSemantics.validateValueForTyAux, hk]
+                      | _ => rw [hk] at hpt_raw; cases hpt_raw
+                    simp only [evalOperand, get?, hpv, readProjectedValue, hptR,
+                      MirSemantics.materializeReadPtrValue, hvalOk]
                 have hop_r : evalOperand locals (.constant c) mem.borrows mem.globals
                     layouts mem.callerLocals decls mem.callStack = .ok (.scalar ⟨0, 8⟩) locals := by
                   simp [evalOperand, hval, evalConstValue]
@@ -4328,7 +4354,18 @@ theorem evalStmt_retag_rawPtr_local (s : MachineState) (decls : List LocalDecl)
   · rcases di with ⟨dmut, ⟨dkind, dlay⟩, dname⟩
     dsimp only at htk
     subst htk
-    simp [evalStmt, evalOperand, get?, hi, readProjectedValue, hpl, MirStepNode.step, advanceStmt]
+    have hop : evalOperand s.frame.locals (.copy ⟨i, []⟩) s.memory.borrows s.memory.globals
+        layouts s.memory.callerLocals decls s.memory.callStack =
+        .ok (.ptr ptrVal sz) s.frame.locals := by
+      cases decls with
+      | nil => simp [evalOperand, get?, hi, readProjectedValue]
+      | cons d ds =>
+        have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨i, []⟩ =
+            some { kind := .rawPtr mutbl pointee, layoutIdx := dlay } := by
+          simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdi]
+        simp only [evalOperand, get?, hi, readProjectedValue, hptR,
+          MirSemantics.materializeReadPtrValue]
+    simp [evalStmt, hop, hpl, MirStepNode.step, advanceStmt]
   · rcases hu with hu | hu <;> simp [evalStmt, evalOperand, get?, hu]
 
 theorem evalStmt_retag_ref_local (s : MachineState) (decls : List LocalDecl)
@@ -4402,7 +4439,14 @@ theorem evalStmt_retag_ref_local (s : MachineState) (decls : List LocalDecl)
     subst htk
     have hop : evalOperand s.frame.locals (.copy ⟨i, []⟩) s.memory.borrows s.memory.globals
         layouts s.memory.callerLocals decls s.memory.callStack = .ok (.ptr ptrVal 8) s.frame.locals := by
-      simp [evalOperand, get?, hi, readProjectedValue]
+      cases decls with
+      | nil => simp [evalOperand, get?, hi, readProjectedValue]
+      | cons d ds =>
+        have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨i, []⟩ =
+            some { kind := .ref mutbl pointee, layoutIdx := dlay } := by
+          simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdi]
+        simp only [evalOperand, get?, hi, readProjectedValue, hptR,
+          MirSemantics.materializeReadPtrValue]
     cases hperm : entry.perm with
     | disabled => exact absurd hperm hndis
     | unique | reservedFrz _ | reservedIM | frozen | cell =>
@@ -4827,7 +4871,24 @@ theorem evalStmt_assign_expose (s : MachineState) (decls : List LocalDecl)
   refine ⟨fun pv fullAddr hp haddr hlt hnd => ?_, fun hu => ?_⟩
   · have hop : evalOperand s.frame.locals (.copy ⟨p, []⟩) s.memory.borrows s.memory.globals
         layouts s.memory.callerLocals decls s.memory.callStack = .ok (.ptr pv 8) s.frame.locals := by
-      simp [evalOperand, get?, hp, readProjectedValue]
+      cases decls with
+      | nil => simp [evalOperand, get?, hp, readProjectedValue]
+      | cons d ds =>
+        cases hdp : (d :: ds)[p]? with
+        | none =>
+          have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨p, []⟩ = none := by
+            simp [MirSemantics.placeTyResolved, get?, hdp]
+          simp [evalOperand, get?, hp, readProjectedValue, hptR, MirSemantics.materializeReadPtrValue]
+        | some dp =>
+          have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨p, []⟩ = some dp.ty := by
+            simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdp]
+          have hvalOk : MirSemantics.validateValueForTy? layouts (some dp.ty) (.ptr pv 8) = true := by
+            simp only [MirSemantics.operandTy, MirSemantics.placeTy, MirSemantics.resolveProjectedTy,
+              get?, hdp, MirSemantics.isExposePtrSourceTy, MirSemantics.isThinRawPtrTy] at hsrc
+            cases hk : dp.ty.kind <;>
+              simp [hk, MirSemantics.validateValueForTy?, MirSemantics.validateValueForTyAux] at hsrc ⊢
+          simp only [evalOperand, get?, hp, readProjectedValue, hptR,
+            MirSemantics.materializeReadPtrValue, hvalOk]
     have hrv := evalRvalue_expose s.frame.locals (.copy ⟨p, []⟩) targetTy s.memory decls layouts
       pv s.frame.locals fullAddr hop hty hsrc haddr hlt hptr8
     have hlive' : s.frame.locals[i] ≠ .dead := fun h => hnd (by rw [hs, h])
@@ -4876,7 +4937,25 @@ theorem evalStmt_assign_withExposed (s : MachineState) (decls : List LocalDecl)
   refine ⟨fun sc recoveredVal hu hsz hlt hrec hnd => ?_, fun hu => ?_⟩
   · have hop : evalOperand s.frame.locals (.copy ⟨u, []⟩) s.memory.borrows s.memory.globals
         layouts s.memory.callerLocals decls s.memory.callStack = .ok (.scalar sc) s.frame.locals := by
-      simp [evalOperand, get?, hu, readProjectedValue]
+      cases decls with
+      | nil => simp [evalOperand, get?, hu, readProjectedValue]
+      | cons d ds =>
+        cases hdu : (d :: ds)[u]? with
+        | none =>
+          have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨u, []⟩ = none := by
+            simp [MirSemantics.placeTyResolved, get?, hdu]
+          simp [evalOperand, get?, hu, readProjectedValue, hptR]
+        | some du =>
+          have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨u, []⟩ = some du.ty := by
+            simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdu]
+          have hvalOk : MirSemantics.validateValueForTy? layouts (some du.ty) (.scalar sc) = true := by
+            simp only [MirSemantics.operandTy, MirSemantics.placeTy, MirSemantics.resolveProjectedTy,
+              get?, hdu, MirSemantics.isExposeIntSourceTy, MirSemantics.exposeTargetBytes?] at hsrc
+            cases hk : du.ty.kind <;>
+              simp [hk, MirSemantics.intCastTargetBytes, MirSemantics.validateValueForTy?,
+                MirSemantics.validateValueForTyAux] at hsrc ⊢
+          simp only [evalOperand, get?, hu, readProjectedValue, hptR,
+            MirSemantics.materializeReadPtrValue, hvalOk]
     have hrv := evalRvalue_withExposed s.frame.locals (.copy ⟨u, []⟩) targetTy s.memory decls layouts
       sc s.frame.locals recoveredVal hop hsz hlt hbad hsrc hsigned hrec hptr8
     have hlive' : s.frame.locals[i] ≠ .dead := fun h => hnd (by rw [hs, h])
@@ -4957,9 +5036,30 @@ theorem evalStmt_assign_expose_op (s : MachineState) (decls : List LocalDecl)
       have hop : evalOperand s.frame.locals (.move ⟨p, []⟩) s.memory.borrows s.memory.globals
           layouts s.memory.callerLocals decls s.memory.callStack =
           .ok (.ptr pv 8) (opPost s.frame.locals (.move ⟨p, []⟩)) := by
-        dsimp only [evalOperand, get?, opPost, opMoved]
-        rw [hp]
-        simp [readProjectedValue, set?, hp_lt]
+        cases decls with
+        | nil =>
+          dsimp only [evalOperand, get?, opPost, opMoved]
+          rw [hp]
+          simp [readProjectedValue, set?, hp_lt]
+        | cons d ds =>
+          cases hdp : (d :: ds)[p]? with
+          | none =>
+            have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨p, []⟩ = none := by
+              simp [MirSemantics.placeTyResolved, get?, hdp]
+            dsimp only [evalOperand, get?, opPost, opMoved]
+            rw [hp]
+            simp [readProjectedValue, hptR, MirSemantics.materializeReadPtrValue, set?, hp_lt]
+          | some dp =>
+            have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨p, []⟩ = some dp.ty := by
+              simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdp]
+            have hvalOk : MirSemantics.validateValueForTy? layouts (some dp.ty) (.ptr pv 8) = true := by
+              simp only [MirSemantics.operandTy, MirSemantics.placeTy, MirSemantics.resolveProjectedTy,
+                get?, hdp, MirSemantics.isExposePtrSourceTy, MirSemantics.isThinRawPtrTy] at hsrc
+              cases hk : dp.ty.kind <;>
+                simp [hk, MirSemantics.validateValueForTy?, MirSemantics.validateValueForTyAux] at hsrc ⊢
+            dsimp only [evalOperand, get?, opPost, opMoved]
+            rw [hp]
+            simp [readProjectedValue, hptR, MirSemantics.materializeReadPtrValue, hvalOk, set?, hp_lt]
       have hrv := evalRvalue_expose s.frame.locals (.move ⟨p, []⟩) targetTy s.memory decls layouts
         pv (opPost s.frame.locals (.move ⟨p, []⟩)) fullAddr hop hty hsrc haddr hlt hptr8
       simp only [evalStmt, hrv, get?, exposeMem]
@@ -5022,9 +5122,31 @@ theorem evalStmt_assign_withExposed_op (s : MachineState) (decls : List LocalDec
       have hop : evalOperand s.frame.locals (.move ⟨u, []⟩) s.memory.borrows s.memory.globals
           layouts s.memory.callerLocals decls s.memory.callStack =
           .ok (.scalar sc) (opPost s.frame.locals (.move ⟨u, []⟩)) := by
-        dsimp only [evalOperand, get?, opPost, opMoved]
-        rw [hu]
-        simp [readProjectedValue, set?, hu_lt]
+        cases decls with
+        | nil =>
+          dsimp only [evalOperand, get?, opPost, opMoved]
+          rw [hu]
+          simp [readProjectedValue, set?, hu_lt]
+        | cons d ds =>
+          cases hdu : (d :: ds)[u]? with
+          | none =>
+            have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨u, []⟩ = none := by
+              simp [MirSemantics.placeTyResolved, get?, hdu]
+            dsimp only [evalOperand, get?, opPost, opMoved]
+            rw [hu]
+            simp [readProjectedValue, hptR, set?, hu_lt]
+          | some du =>
+            have hptR : MirSemantics.placeTyResolved (d :: ds) layouts ⟨u, []⟩ = some du.ty := by
+              simp [MirSemantics.placeTyResolved, MirSemantics.resolveProjectedTyResolved, get?, hdu]
+            have hvalOk : MirSemantics.validateValueForTy? layouts (some du.ty) (.scalar sc) = true := by
+              simp only [MirSemantics.operandTy, MirSemantics.placeTy, MirSemantics.resolveProjectedTy,
+                get?, hdu, MirSemantics.isExposeIntSourceTy, MirSemantics.exposeTargetBytes?] at hsrc
+              cases hk : du.ty.kind <;>
+                simp [hk, MirSemantics.intCastTargetBytes, MirSemantics.validateValueForTy?,
+                  MirSemantics.validateValueForTyAux] at hsrc ⊢
+            dsimp only [evalOperand, get?, opPost, opMoved]
+            rw [hu]
+            simp [readProjectedValue, hptR, MirSemantics.materializeReadPtrValue, hvalOk, set?, hu_lt]
       have hrv := evalRvalue_withExposed s.frame.locals (.move ⟨u, []⟩) targetTy s.memory decls layouts
         sc (opPost s.frame.locals (.move ⟨u, []⟩)) recoveredVal hop hsz hlt hbad hsrc hsigned hrec hptr8
       simp only [evalStmt, hrv, get?]

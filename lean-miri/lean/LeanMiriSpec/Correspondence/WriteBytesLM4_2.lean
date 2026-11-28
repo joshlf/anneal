@@ -1695,7 +1695,7 @@ private theorem writeBytesScalarVal?_of_evalOperand_ok
     injection hv with hsc
     subst hsc
     exact ⟨by simp [writeBytesScalarVal?, hval], Or.inl ⟨c, rfl, hval⟩⟩
-  | copyLocal idx _ _ _ _ =>
+  | copyLocal idx _ _ _ _ _ =>
     rw [wbEvalOperand_copy_local_eq] at heval
     cases hslot : get? locals idx with
     | none => rw [hslot] at heval; cases heval

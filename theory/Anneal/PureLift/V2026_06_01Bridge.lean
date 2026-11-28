@@ -5306,22 +5306,31 @@ theorem boolEmbed_refines (tagOf : LoanId → Nat) (layouts : LayoutTable) (b : 
     StdValRefines tagOf (boolEmbed b) ((boolMirCodec layouts).toValue b) :=
   .bool b
 
-/-- The trusted little-endian decoder succeeds on every fully initialized byte
-list. -/
-theorem decodeLittleEndianBytes_isSome_of_init : ∀ (bs : List AbstractByte),
+private theorem decodeLittleEndianBits_isSome_of_init : ∀ (bs : List AbstractByte),
     Anneal.BitValidity.allBytesInitialized bs = true →
-    Exists fun r => decodeLittleEndianBytes bs = some r
-  | [], _ => ⟨_, rfl⟩
+    Exists fun bits => decodeLittleEndianBits bs = some bits
+  | [], _ => ⟨0, rfl⟩
   | .uninit :: _, h => nomatch h
-  | .init b p :: rest, h => by
-    obtain ⟨⟨hi, rp⟩, hr⟩ := decodeLittleEndianBytes_isSome_of_init rest h
-    refine ⟨(Nat.add b.toBitVec.toNat (Nat.mul 256 hi), mergeByteProvenance p rp), ?_⟩
-    show (match decodeLittleEndianBytes rest with
-      | some (highBits, restProv) =>
-        some (Nat.add b.toBitVec.toNat (Nat.mul 256 highBits),
-          mergeByteProvenance p restProv)
+  | .init b _ :: rest, h => by
+    obtain ⟨hi, hr⟩ := decodeLittleEndianBits_isSome_of_init rest h
+    refine ⟨Nat.add b.toBitVec.toNat (Nat.mul 256 hi), ?_⟩
+    show (match decodeLittleEndianBits rest with
+      | some highBits => some (Nat.add b.toBitVec.toNat (Nat.mul 256 highBits))
       | none => none) = _
     rw [hr]
+
+/-- The trusted little-endian decoder succeeds on every fully initialized byte
+list. -/
+theorem decodeLittleEndianBytes_isSome_of_init (bs : List AbstractByte)
+    (h : Anneal.BitValidity.allBytesInitialized bs = true) :
+    Exists fun r => decodeLittleEndianBytes bs = some r := by
+  obtain ⟨bits, hb⟩ := decodeLittleEndianBits_isSome_of_init bs h
+  refine ⟨(bits, match abstractBytesCoherentPtrProv? bs with
+    | some frag => some (frag.allocId, frag.tag)
+    | none => none), ?_⟩
+  unfold decodeLittleEndianBytes
+  rw [hb]
+  rfl
 
 /-- `u32` is `zerocopy::FromBytes` (every initialized 4-byte window decodes). -/
 theorem u32_isFromBytes (layouts : LayoutTable) :
@@ -7149,7 +7158,25 @@ theorem StdValRefines.wideSlice_from_raw_parts_roundtrip {α : Type} {n : Nat}
     (hNoUnion0 : placeTouchesUnion localDecls layouts
       { local_ := loc, projection := [.field 0 dataTy] } = false)
     (hNoUnion1 : placeTouchesUnion localDecls layouts
-      { local_ := loc, projection := [.field 1 metaTy] } = false) :
+      { local_ := loc, projection := [.field 1 metaTy] } = false)
+    (hValid0 :
+      localDecls = .nil ∨
+        (materializeReadPtrValue layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 0 dataTy] })
+            (.ptr wide.1 (layoutPointerBytes layouts)) = .some (.ptr wide.1 (layoutPointerBytes layouts)) ∧
+          validateValueForTy? layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 0 dataTy] })
+            (.ptr wide.1 (layoutPointerBytes layouts)) = true) := by
+      exact Or.inl rfl)
+    (hValid1 :
+      localDecls = .nil ∨
+        (materializeReadPtrValue layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 1 metaTy] })
+            (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) = .some (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) ∧
+          validateValueForTy? layouts
+            (placeTyResolved localDecls layouts { local_ := loc, projection := [.field 1 metaTy] })
+            (.scalar ⟨elems.length, layoutPointerBytes layouts⟩) = true) := by
+      exact Or.inl rfl) :
     evalRvalue locals
         (.aggregate (.rawPtr { kind := dstTy, layoutIdx := lIdx } mutability)
           [.copy { local_ := loc, projection := [.field 0 dataTy] },
@@ -7158,7 +7185,7 @@ theorem StdValRefines.wideSlice_from_raw_parts_roundtrip {α : Type} {n : Nat}
       StdValRefines tagOf (stdWideSliceVal lid elems.length) fatVal ∧
       UnsizedSliceDstAt c (layoutPointerBytes layouts) dstTy mem wide fatVal elems bytes := by
   obtain ⟨hEv, hDst'⟩ := hDst.evalRvalue_aggregate_rawPtr_roundtrip locals loc lIdx dataTy metaTy
-    mutability localDecls layouts hSlot hNoUnion0 hNoUnion1
+    mutability localDecls layouts hSlot hNoUnion0 hNoUnion1 hValid0 hValid1
   exact ⟨hEv, hRef, hDst'⟩
 
 /-! ### Spatial-Pin & Loan-Binding Preservation Across Live Metadata & Layout Queries -/

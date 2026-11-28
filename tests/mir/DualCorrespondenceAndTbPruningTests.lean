@@ -8382,8 +8382,11 @@ theorem stage1_exact_trusted_lookup :
           target.defPath target.typeArgs callerAtCall.memory.traitImpls =
         some emptyFnAssignUnit ∧
       checkCalleeTargetCompatible target emptyFnAssignUnit 0 = true := by
-  obtain ⟨_, target, locals, hRes, _, hLookup, hCompat⟩ :=
+  obtain ⟨_, target, locals, rawArgVals, hRes, hArgs, hLookup, hCompat, _⟩ :=
     prepResolveAndArgs_ok stage1_resolves_empty_fn
+  have hNil : rawArgVals = [] := by
+    cases hArgs; rfl
+  subst hNil
   exact ⟨target, locals, hRes, hLookup, hCompat⟩
 
 /-- Stage 1 fails closed with `.unsupported` when the callee has no linked

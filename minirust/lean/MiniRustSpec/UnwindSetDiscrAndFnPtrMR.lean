@@ -656,33 +656,110 @@ theorem mergeByteProvenance_self (prov : Option (Nat × Nat)) : mergeByteProvena
   cases prov with
   | none => rfl
   | some p => rcases p with ⟨a, t⟩; simp [mergeByteProvenance]
-theorem decodeLittleEndianBytes_encode (v : Nat) :
-    ∀ n (prov : Option (Nat × Nat)), decodeLittleEndianBytes (encodeLittleEndianBytes v n prov) = some (v % 256 ^ n, if n = 0 then none else prov)
-  | 0, _ => by simp [decodeLittleEndianBytes, Nat.mod_one]
-  | n + 1, prov => by
-    have ih := decodeLittleEndianBytes_encode (Nat.div v 256) n prov
+theorem decodeLittleEndianBits_encodePlain (v : Nat) :
+    ∀ n, decodeLittleEndianBits (encodePlainLittleEndianBytes v n) = some (v % 256 ^ n)
+  | 0 => by simp [decodeLittleEndianBits, encodePlainLittleEndianBytes, Nat.mod_one]
+  | n + 1 => by
+    have ih := decodeLittleEndianBits_encodePlain (Nat.div v 256) n
     have hByte : (UInt8.ofNat v).toBitVec.toNat = v % 256 := by
       change (UInt8.ofNat v).toNat = v % 256; exact UInt8.toNat_ofNat'
-    have hProv : mergeByteProvenance prov (if n = 0 then none else prov) = prov := by
-      cases n with | zero => cases prov <;> rfl | succ _ => exact mergeByteProvenance_self prov
-    change (match decodeLittleEndianBytes (encodeLittleEndianBytes (Nat.div v 256) n prov) with
-      | some (highBits, restProv) => some (Nat.add (UInt8.ofNat v).toBitVec.toNat (Nat.mul 256 highBits),
-              mergeByteProvenance prov restProv)
-      | none => none) = some (v % 256 ^ (n + 1), prov)
+    change (match decodeLittleEndianBits (encodePlainLittleEndianBytes (Nat.div v 256) n) with
+      | some highBits => some (Nat.add (UInt8.ofNat v).toBitVec.toNat (Nat.mul 256 highBits))
+      | none => none) = some (v % 256 ^ (n + 1))
     rw [ih]
-    change some ((UInt8.ofNat v).toBitVec.toNat + 256 * (v / 256 % 256 ^ n),
-      mergeByteProvenance prov (if n = 0 then none else prov)) = some (v % 256 ^ (n + 1), prov)
-    rw [hByte, mod_256_succ v n, hProv]
-theorem abstractBytesAllProvAux_encode (a t v : Nat) : ∀ n, abstractBytesAllProvAux a t (encodeLittleEndianBytes v n (some (a, t))) = true
+    change some ((UInt8.ofNat v).toBitVec.toNat + 256 * (v / 256 % 256 ^ n)) = some (v % 256 ^ (n + 1))
+    rw [hByte, mod_256_succ v n]
+theorem decodeLittleEndianBits_encodePtrAux (a t origOff ptrBytes : Nat) :
+    ∀ (v n idx : Nat),
+      decodeLittleEndianBits (encodePtrBytesAux a t origOff ptrBytes v idx n) =
+        some (v % 256 ^ n)
+  | v, 0, _ => by simp [decodeLittleEndianBits, encodePtrBytesAux, Nat.mod_one]
+  | v, n + 1, idx => by
+    have ih := decodeLittleEndianBits_encodePtrAux a t origOff ptrBytes (Nat.div v 256) n (Nat.add idx 1)
+    have hByte : (UInt8.ofNat v).toBitVec.toNat = v % 256 := by
+      change (UInt8.ofNat v).toNat = v % 256; exact UInt8.toNat_ofNat'
+    change (match decodeLittleEndianBits (encodePtrBytesAux a t origOff ptrBytes (Nat.div v 256) (Nat.add idx 1) n) with
+      | some highBits => some (Nat.add (UInt8.ofNat v).toBitVec.toNat (Nat.mul 256 highBits))
+      | none => none) = some (v % 256 ^ (n + 1))
+    rw [ih]
+    change some ((UInt8.ofNat v).toBitVec.toNat + 256 * (v / 256 % 256 ^ n)) = some (v % 256 ^ (n + 1))
+    rw [hByte, mod_256_succ v n]
+theorem abstractBytesCoherentPtrProvAux_encodePtrAux (a t origOff ptrBytes : Nat) :
+    ∀ (v n idx : Nat),
+      abstractBytesCoherentPtrProvAux a t origOff ptrBytes idx
+        (encodePtrBytesAux a t origOff ptrBytes v idx n) = Nat.beq (Nat.add idx n) ptrBytes
+  | _, 0, _ => rfl
+  | v, n + 1, idx => by
+    change
+      Bool.and
+        (Bool.and (Nat.beq a a)
+          (Bool.and (Nat.beq t t)
+            (Bool.and (Nat.beq idx idx)
+              (Bool.and (Nat.beq origOff origOff)
+                (Nat.beq ptrBytes ptrBytes)))))
+        (abstractBytesCoherentPtrProvAux a t origOff ptrBytes (Nat.add idx 1)
+          (encodePtrBytesAux a t origOff ptrBytes (Nat.div v 256) (Nat.add idx 1) n)) =
+      Nat.beq (Nat.add idx (n + 1)) ptrBytes
+    rw [Nat.beq_refl, Nat.beq_refl, Nat.beq_refl, Nat.beq_refl, Nat.beq_refl,
+      abstractBytesCoherentPtrProvAux_encodePtrAux a t origOff ptrBytes (Nat.div v 256) n (Nat.add idx 1)]
+    have hIdx : Nat.add (Nat.add idx 1) n = Nat.add idx (n + 1) := by
+      show (idx + 1) + n = idx + (n + 1); omega
+    rw [hIdx]
+    rfl
+theorem abstractBytesAllProvAux_encode (a t v : Nat) (n : Nat) :
+    abstractBytesCoherentPtrProv? (encodeLittleEndianBytes v (n + 1) (some (a, t))) =
+      some ({ allocId := a, tag := t, byteIdx := 0, origOffset := normPtrByteOffset (n + 1) v, ptrBytes := n + 1 } : PtrByteFrag) := by
+  change
+    (match Bool.and (Nat.blt 0 (n + 1))
+        (Bool.and (Nat.beq 0 0)
+          (abstractBytesCoherentPtrProvAux a t (normPtrByteOffset (n + 1) v) (n + 1) 1
+            (encodePtrBytesAux a t (normPtrByteOffset (n + 1) v) (n + 1) (Nat.div v 256) 1 n))) with
+     | true => some ({ allocId := a, tag := t, byteIdx := 0, origOffset := normPtrByteOffset (n + 1) v, ptrBytes := n + 1 } : PtrByteFrag)
+     | false => none) = _
+  rw [abstractBytesCoherentPtrProvAux_encodePtrAux a t (normPtrByteOffset (n + 1) v) (n + 1) (Nat.div v 256) n 1]
+  have hLen : Nat.add 1 n = n + 1 := Nat.add_comm 1 n
+  have hPos : Nat.blt 0 (n + 1) = true := Nat.blt_eq.mpr (Nat.succ_pos n)
+  rw [hLen, hPos, Nat.beq_refl, Nat.beq_refl]
+  rfl
+theorem decodeLittleEndianBytes_encode (v : Nat) (n : Nat) (prov : Option (Nat × Nat)) :
+    decodeLittleEndianBytes (encodeLittleEndianBytes v n prov) =
+      some (v % 256 ^ n, if n = 0 then none else prov) := by
+  cases prov with
+  | none =>
+    cases n with
+    | zero => simp [decodeLittleEndianBytes, encodeLittleEndianBytes, Nat.mod_one]
+    | succ m =>
+      unfold encodeLittleEndianBytes decodeLittleEndianBytes
+      rw [decodeLittleEndianBits_encodePlain v (m + 1)]
+      rfl
+  | some p =>
+    rcases p with ⟨a, t⟩
+    cases n with
+    | zero => simp [decodeLittleEndianBytes, encodeLittleEndianBytes, Nat.mod_one]
+    | succ m =>
+      unfold decodeLittleEndianBytes
+      rw [abstractBytesAllProvAux_encode a t v m]
+      have hBits : decodeLittleEndianBits (encodeLittleEndianBytes v (m + 1) (some (a, t))) = some (v % 256 ^ (m + 1)) :=
+        decodeLittleEndianBits_encodePtrAux a t (normPtrByteOffset (m + 1) v) (m + 1) v (m + 1) 0
+      rw [hBits]
+      rfl
+theorem encodePlainLittleEndianBytes_len (v : Nat) :
+    ∀ n, Trusted.Sequence.length (encodePlainLittleEndianBytes v n) = n
   | 0 => rfl
   | n + 1 => by
-    change (Bool.and (Nat.beq a a) (Nat.beq t t) && abstractBytesAllProvAux a t (encodeLittleEndianBytes (Nat.div v 256) n (some (a, t)))) = true
-    rw [Nat.beq_refl, Nat.beq_refl, abstractBytesAllProvAux_encode a t (Nat.div v 256) n]; rfl
-theorem encodeLittleEndianBytes_len (v : Nat) : ∀ n prov, Trusted.Sequence.length (encodeLittleEndianBytes v n prov) = n
-  | 0, _ => rfl
-  | n + 1, prov => by
-    change Trusted.Sequence.length (encodeLittleEndianBytes (Nat.div v 256) n prov) + 1 = n + 1
-    rw [encodeLittleEndianBytes_len (Nat.div v 256) n prov]
+    change Trusted.Sequence.length (encodePlainLittleEndianBytes (Nat.div v 256) n) + 1 = n + 1
+    rw [encodePlainLittleEndianBytes_len (Nat.div v 256) n]
+theorem encodePtrBytesAux_len (a t origOff ptrBytes : Nat) :
+    ∀ (v n idx : Nat), Trusted.Sequence.length (encodePtrBytesAux a t origOff ptrBytes v idx n) = n
+  | _, 0, _ => rfl
+  | v, n + 1, idx => by
+    change Trusted.Sequence.length (encodePtrBytesAux a t origOff ptrBytes (Nat.div v 256) (Nat.add idx 1) n) + 1 = n + 1
+    rw [encodePtrBytesAux_len a t origOff ptrBytes (Nat.div v 256) n (Nat.add idx 1)]
+theorem encodeLittleEndianBytes_len (v : Nat) (n : Nat) (prov : Option (Nat × Nat)) :
+    Trusted.Sequence.length (encodeLittleEndianBytes v n prov) = n := by
+  cases prov with
+  | none => exact encodePlainLittleEndianBytes_len v n
+  | some p => rcases p with ⟨a, t⟩; exact encodePtrBytesAux_len a t (normPtrByteOffset n v) n v n 0
 
 /-! ## §1 (`C1`): `StatementKind.setDiscriminant` (`Mach` & `MachTB`) -/
 /-- Variant table of `twoVarEnumMrTy`. -/
@@ -2342,12 +2419,20 @@ theorem subtype_thinPtr_and_u32_coupled_lockstep (locals locals' : List LocalSlo
     have hLen : length (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = 8 := encodeLittleEndianBytes_len p.offsetBytes 8 _
     have h256 : p.offsetBytes < 256 ^ 8 := by
       rw [show (256 : Nat) ^ 8 = 2 ^ 64 by decide]; exact hpOff
-    have hDecAux : ∀ bs, length bs = 8 → decodeLittleEndianBytes bs = some (p.offsetBytes, some (p.allocId, p.tag)) →
-        abstractBytesUniformProv bs = true → decodePtrBytesNoForge false (.uint .u32) 8 bs = some (.ptr p 8) := by
-      intro bs hl hd hu; unfold decodePtrBytesNoForge decodeScalarBytes; simp [hl, hd, hu]
+    have hDecAux : ∀ bs, length bs = 8 → decodeLittleEndianBits bs = some p.offsetBytes →
+        abstractBytesCoherentPtrProv? bs =
+          some ({ allocId := p.allocId, tag := p.tag, byteIdx := 0, origOffset := normPtrByteOffset 8 p.offsetBytes, ptrBytes := 8 } : PtrByteFrag) →
+        decodePtrBytesNoForge false (.uint .u32) 8 bs = some (.ptr p 8) := by
+      intro bs hl hd hc; unfold decodePtrBytesNoForge; simp [hl, hd, hc]; rfl
     have hDec : decodeTypedValueFromBytes defaultCodecFuel emptyLayoutTable rawConstU32MirTy
         (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = some (.ptr p 8) :=
-      hDecAux _ hLen (by rw [decodeLittleEndianBytes_encode, Nat.mod_eq_of_lt h256]; rfl) (abstractBytesAllProvAux_encode p.allocId p.tag (Nat.div p.offsetBytes 256) 7)
+      hDecAux _ hLen
+        (by
+          have hBits := decodeLittleEndianBits_encodePtrAux p.allocId p.tag
+            (normPtrByteOffset 8 p.offsetBytes) 8 p.offsetBytes 8 0
+          rw [Nat.mod_eq_of_lt h256] at hBits
+          exact hBits)
+        (abstractBytesAllProvAux_encode p.allocId p.tag p.offsetBytes 7)
     have hResD : resolveTyWithLocalDecls declsPtr emptyLayoutTable rawConstU32MirTy = rawConstU32MirTy := rfl
     have hDstSz : tyByteSize declsPtr emptyLayoutTable rawConstU32MirTy = some 8 := rfl
     have hSrcSz : resolveByteCastSrcTyAndSize declsPtr emptyLayoutTable op rawMutU32MirTy = some (rawMutU32MirTy, 8) := rfl
@@ -2530,7 +2615,9 @@ theorem reify_and_closure_fnPointer_lockstep_M {M : Type} [Gen.Memory M] [Memory
       stringEq ck "UnsafeFnPointer" = false → evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals
         (callStack := mem.callStack) = .ok zstVal locals' → callConvEq fnAbi .rustIntrinsic = false →
       reifyCoercionSafetyCompatible ck fnSaf = true → extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) →
-      checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true → mapIndex m.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok mrPtr →
+      (match isClosureFnPointerCoercion ck with
+        | true => checkClosureCalleeSig mem.callees dp fnIns fnOut fnAbi = .ok
+        | false => checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true) → mapIndex m.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok mrPtr →
       let (allocId, mem') := internFnPtr mem dp targs (some targetTy.kind)
       evalRvalue locals (.cast (.pointerCoercion ck) op targetTy) mem decls layouts = .ok (.ptr { allocId := allocId, offsetBytes := 0 } 8) locals' mem' ∧
       evalConstantM m (.FnPointer fnNm) = .ok (.Ptr (ThinPointer.widen mrPtr none)) ∧
@@ -2547,8 +2634,9 @@ theorem reify_and_closure_fnPointer_lockstep_M {M : Type} [Gen.Memory M] [Memory
     refine ⟨?_, ?_⟩
     · show evalReifyFnPointer locals op targetTy mem decls layouts ck = _
       unfold evalReifyFnPointer
+      cases hC : isClosureFnPointerCoercion ck <;> simp only [hC] at hSig <;>
       rcases hZst with rfl | rfl <;>
-        simp only [hReify, hNotUnsafe, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hSig]
+        simp only [hReify, hNotUnsafe, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hC, hSig]
     · unfold evalValueM evalConstantM
       simp only [hLookup, bind, Except.bind, pure, Except.pure, and_self]
   · intro hOp
@@ -2688,7 +2776,9 @@ theorem reify_unsafe_fnPtrToPtr_pipeline (locals locals1 locals2 locals3 : List 
     (provBM : Option Prov) (provTB : Option TreeBorrowsProvenance) (mBM : Mach) (mTB : MachTB) (hZst : zstVal = .unit ∨ zstVal = .aggregate 0 [])
     (hReify : isReifyFnPointerCoercion ck = true) (hNotUnsafe : stringEq ck "UnsafeFnPointer" = false) (hSaf : reifyCoercionSafetyCompatible ck .safe = true)
     (hExt : extractReifyCoercionTarget? ck (operandTy decls layouts opReify) = some (dp, targs))
-    (hSig : checkCalleeSig mem.callees dp [.uint .u32] (.uint .u32) .rust targs mem.traitImpls = true)
+    (hSig : match isClosureFnPointerCoercion ck with
+      | true => checkClosureCalleeSig mem.callees dp [.uint .u32] (.uint .u32) .rust = .ok
+      | false => checkCalleeSig mem.callees dp [.uint .u32] (.uint .u32) .rust targs mem.traitImpls = true)
     (hFresh : findFnPtrEntry? mem.fnPtrs dp targs (some fnPtrSafeU32MirTy.kind) = none) (hNoB : lookupBorrow mem.borrows (nextFnPtrAllocId mem.fnPtrs) = none)
     (hMapBM : mapIndex mBM.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok { addr := addr, provenance := provBM })
     (hMapTB : mapIndex mTB.fn_ptrs fnNm "self.fn_ptrs[fn_name]" = .ok { addr := addr, provenance := provTB })
@@ -2752,7 +2842,10 @@ theorem reify_cached_and_fnFromPtrM_roundtrip {M : Type} [Gen.Memory M] [MemoryO
       ∀ zstVal, (zstVal = .unit ∨ zstVal = .aggregate 0 []) → isReifyFnPointerCoercion ck = true → stringEq ck "UnsafeFnPointer" = false →
         evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals (callStack := mem.callStack) = .ok zstVal locals' →
         callConvEq fnAbi .rustIntrinsic = false → reifyCoercionSafetyCompatible ck fnSaf = true →
-        extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) → checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true →
+        extractReifyCoercionTarget? ck (operandTy decls layouts op) = some (dp, targs) →
+        (match isClosureFnPointerCoercion ck with
+          | true => checkClosureCalleeSig mem.callees dp fnIns fnOut fnAbi = .ok
+          | false => checkCalleeSig mem.callees dp fnIns fnOut fnAbi targs mem.traitImpls = true) →
         evalRvalue locals (.cast (.pointerCoercion ck) op targetTy) mem decls layouts = .ok (.ptr { allocId := existing.allocId, offsetBytes := 0 } 8) locals' mem) ∧
     (m.fn_ptrs.entries.find? (fun x => decide (x.2 = mrPtr)) = some (fnNm, mrPtr) →
       mapIndex m.prog.functions fnNm "self.prog.functions[func_name]" = .ok calleeFn → fnFromPtrM m (.Ptr (ThinPointer.widen mrPtr none)) = .ok calleeFn) ∧
@@ -2764,8 +2857,9 @@ theorem reify_cached_and_fnFromPtrM_roundtrip {M : Type} [Gen.Memory M] [MemoryO
   · intro zstVal hZst hReify hNotU hOp hAbi hSaf hExt hSig
     have hInt : internFnPtr mem dp targs (some targetTy.kind) = (existing.allocId, mem) := by unfold internFnPtr; simp [hHit]
     show evalReifyFnPointer locals op targetTy mem decls layouts ck = _; unfold evalReifyFnPointer
+    cases hC : isClosureFnPointerCoercion ck <;> simp only [hC] at hSig <;>
     rcases hZst with rfl | rfl <;>
-      simp only [hReify, hNotU, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hSig, hInt]
+      simp only [hReify, hNotU, hOp, targetTy, hAbi, Bool.not_false, hSaf, Bool.and_self, hExt, hC, hSig, hInt]
   · intro hFind hFn; unfold fnFromPtrM
     have hF' : List.find? (fun x : Gen.FnName × ThinPointer (Gen.Memory.Provenance M) => decide (x.2 = mrPtr)) m.fn_ptrs.entries = some (fnNm, mrPtr) := hFind
     dsimp only [ThinPointer.widen, Option.isSome, Bool.false_eq_true, ↓reduceIte]; rw [hF']; exact hFn
@@ -4287,6 +4381,10 @@ theorem unwrapUnsafeBinder_uninit_assign_and_move (s : MachineState) (dstLoc : N
       evalStatementM mTB (.Assign (.Field base 0) src) = .ok mTBf ∧ MachTB.wfLive mTBf) ∧
     (get? locals1 dstLoc = some (.init val) → valueContainsUninit val = false → set? locals1 dstLoc .uninit = some localsUninit →
       placeTouchesUnion decls layouts (locPlace dstLoc [.unwrapUnsafeBinder innerMirTy]) = false →
+      materializeReadPtrValue layouts (placeTyResolved decls layouts (locPlace dstLoc [.unwrapUnsafeBinder innerMirTy])) val = some val →
+      validateValueForTy? layouts (placeTyResolved decls layouts (locPlace dstLoc [.unwrapUnsafeBinder innerMirTy])) val = true →
+      materializeReadPtrValue layouts (placeTyResolved decls layouts (locPlace dstLoc)) val = some val →
+      validateValueForTy? layouts (placeTyResolved decls layouts (locPlace dstLoc)) val = true →
       evalOperand locals1 (.copy (locPlace dstLoc [.unwrapUnsafeBinder innerMirTy]))
         mem1.borrows mem1.globals layouts mem1.callerLocals decls mem1.callStack = .ok val locals1 ∧
       evalOperand locals1 (.move (locPlace dstLoc [.unwrapUnsafeBinder innerMirTy]))
@@ -4302,10 +4400,10 @@ theorem unwrapUnsafeBinder_uninit_assign_and_move (s : MachineState) (dstLoc : N
       dsimp only [evalStatementM]; rw [hFTB, ok_bind, hvTB, ok_bind]; exact hstTB
     exact ⟨by simp only [evalStmt, hRv, locPlace, hUn, uninitFieldWriteShell?],
            by rw [← evalStatementM_bm_eq]; exact hBM, hTB, evalStatementM_tb_wfLive hwf hTB⟩
-  · intro hInit hValInit hSetU hNoU
-    exact ⟨by unfold evalOperand; simp only [locPlace, hInit, hNoU, readProjectedValue, hValInit],
-           by unfold evalOperand; simp only [locPlace, hInit, hNoU, readProjectedValue, hValInit],
-           by unfold evalOperand; simp only [locPlace, hInit, readProjectedValue, hValInit, hSetU]⟩
+  · intro hInit hValInit hSetU hNoU hMatB hValB hMatR hValR
+    exact ⟨by unfold evalOperand; cases decls <;> simp only [locPlace, hInit, hNoU, readProjectedValue, hValInit, hMatB, hValB],
+           by unfold evalOperand; cases decls <;> simp only [locPlace, hInit, hNoU, readProjectedValue, hValInit, hMatB, hValB],
+           by unfold evalOperand; cases decls <;> simp only [locPlace, hInit, readProjectedValue, hValInit, hSetU, hMatR, hValR]⟩
 def c9BinderReadWriteMir : MirAst.CapturedMir := mkMirBody "ep2::c9_binder_rw"
     [mkDecl u32MirTy, mkDecl u32MirTy, mkDecl rawMutU32MirTy, mkDecl rawMutU32MirTy, mkDecl rawConstSliceU32MirTy] 1
     [mkBb [mkSt (.storageLive 2), mkSt (.storageLive 3), mkSt (.assign (locPlace 1 [.unwrapUnsafeBinder u32MirTy]) (.use (constU32 55))),

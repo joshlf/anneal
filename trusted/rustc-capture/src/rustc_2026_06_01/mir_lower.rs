@@ -505,6 +505,47 @@ pub fn lower_mir_body<'tcx>(
 /// >```
 ///
 /// Source: https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/generics.rs#L17-L76
+///
+/// Closure-like items (`DefKind::Closure`) contribute no type parameters of
+/// their own: their `own_params` are placeholders that `rustc` appends after
+/// the parent's parameters. `rustc` (`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`)
+/// creates them in
+/// [`compiler/rustc_hir_analysis/src/collect/generics_of.rs` lines 322–346](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_hir_analysis/src/collect/generics_of.rs#L322-L346):
+///
+/// >```text
+/// >    // provide junk type parameter defs - the only place that
+/// >    // cares about anything but the length is instantiation,
+/// >    // and we don't do that for closures.
+/// >    if let Node::Expr(&hir::Expr {
+/// >        kind: hir::ExprKind::Closure(hir::Closure { kind, .. }), ..
+/// >    }) = node
+/// >    {
+/// >        // See `ClosureArgsParts`, `CoroutineArgsParts`, and `CoroutineClosureArgsParts`
+/// >        // for info on the usage of each of these fields.
+/// >        let len = match kind {
+/// >            // The args are: closure_kind, closure_signature, upvars.
+/// >            ClosureKind::Closure => 3,
+/// >            ...
+/// >        own_params.extend((0..len).map(|_| ty::GenericParamDef {
+/// >```
+///
+/// and `TyCtxt::is_closure_like` is defined in
+/// [`compiler/rustc_middle/src/ty/util.rs` line 593–595](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/util.rs#L593-L595):
+///
+/// >```text
+/// >    pub fn is_closure_like(self, def_id: DefId) -> bool {
+/// >        matches!(self.def_kind(def_id), DefKind::Closure)
+/// >    }
+/// >```
+///
+/// Those placeholders stand for the closure-kind marker, the tupled signature,
+/// and the tupled upvars, which `IrRigidTy::Closure` does not carry (it carries
+/// only `upvar_tys()`, see `lower_rigid_ty`). Every `DefKind::Closure` link of
+/// the parent chain is therefore skipped, so a non-generic closure reports
+/// `typeParamCount = 0` and a closure nested in a generic item reports exactly
+/// the parent items' type parameters (`typeParamCount = parent type-param
+/// count`). The placeholders never occur as `TyKind::Param` inside a closure
+/// body after type checking, so no `param_index_map` entry is lost.
 fn collect_generic_type_params(
     tcx: TyCtxt<'_>,
     def_id: DefId,
@@ -520,6 +561,9 @@ fn collect_generic_type_params(
     let mut generic_params = Vec::new();
     let mut param_index_map = BTreeMap::new();
     for did in chain {
+        if tcx.is_closure_like(did) {
+            continue;
+        }
         let generics = tcx.generics_of(did);
         for param in &generics.own_params {
             if let rustc_middle::ty::GenericParamDefKind::Type { .. } = param.kind {
@@ -806,13 +850,63 @@ impl<'tcx> MirLowerCtx<'tcx> {
                 let conv = lower_extern_abi(hdr.abi());
                 IrRigidTy::FnPtr(inputs, output, safety, conv)
             }
+            // Closure types lower to `IrRigidTy::Closure(def_path, upvars)`,
+            // where `upvars` are exactly the closure's captured-path types
+            // (`ClosureArgs::upvar_tys`), never the raw generic-argument list
+            // `args.types()`.
+            //
+            // `rustc` (`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) documents
+            // the closure generic-argument layout in
+            // [`compiler/rustc_type_ir/src/ty_kind/closure.rs` lines 119–131](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_type_ir/src/ty_kind/closure.rs#L119-L131)
+            // and the accessor in
+            // [lines 157–168](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_type_ir/src/ty_kind/closure.rs#L157-L168):
+            //
+            // >```text
+            // >pub struct ClosureArgsParts<I: Interner> {
+            // >    /// This is the args of the typeck root.
+            // >    pub parent_args: I::GenericArgsSlice,
+            // >    /// Represents the maximum calling capability of the closure.
+            // >    pub closure_kind_ty: I::Ty,
+            // >    /// Captures the closure's signature. This closure signature is "tupled", and
+            // >    /// thus has a peculiar signature of `extern "rust-call" fn((Args, ...)) -> Ty`.
+            // >    pub closure_sig_as_fn_ptr_ty: I::Ty,
+            // >    /// The upvars captured by the closure. Remains an inference variable
+            // >    /// until the upvar analysis, which happens late in HIR typeck.
+            // >    pub tupled_upvars_ty: I::Ty,
+            // >}
+            // >
+            // >    /// Returns an iterator over the list of types of captured paths by the closure.
+            // >    /// In case there was a type error in figuring out the types of the captured path, an
+            // >    /// empty iterator is returned.
+            // >    #[inline]
+            // >    pub fn upvar_tys(self) -> I::Tys {
+            // >```
+            //
+            // `args.types()` therefore yields the parent type arguments followed by
+            // the synthetic closure-kind marker, the tupled `extern "rust-call"`
+            // signature, and the tupled upvars. `upvar_tys()` yields only the
+            // captured-path types: `[]` for a non-capturing closure and one entry
+            // per captured path otherwise (including zero-sized captures such as
+            // `()`), which is the payload `RigidTy.closure defPath upvars` in
+            // `Trusted.Rustc.V2026_06_01.MirAst` expects (non-capturing coercions
+            // match `RigidTy.closure defPath .nil`).
+            //
+            // Modeling choice: the parent generic arguments (`parent_args`) are
+            // dropped. Two monomorphizations of a closure inside a generic item
+            // therefore lower to the same `RigidTy.closure`; the Lean semantics
+            // fails closed with `.unsupported` whenever such a closure body is
+            // generic (`typeParamCount > 0`), never with `.ub`. The upvar types of
+            // such a closure may still mention the parent's `TyKind::Param`s,
+            // which lower through `param_index_map` like any other parameter.
             TyKind::Closure(def_id, args) => {
                 let def_path = canonical_def_path(self.tcx, *def_id);
-                let ty_args = args
-                    .types()
+                let upvars = args
+                    .as_closure()
+                    .upvar_tys()
+                    .iter()
                     .map(|t| self.lower_rigid_ty(t))
                     .collect::<Vec<_>>();
-                IrRigidTy::Closure(def_path, ty_args)
+                IrRigidTy::Closure(def_path, upvars)
             }
             TyKind::Dynamic(preds, _) => {
                 if let Some(principal_def_id) = preds.principal_def_id() {
@@ -2618,12 +2712,89 @@ fn format_span(tcx: TyCtxt<'_>, span: rustc_span::Span) -> String {
     tcx.sess.source_map().span_to_diagnostic_string(span)
 }
 
+/// Returns `true` if `def_id` is a local closure (not a coroutine or
+/// coroutine-closure) whose MIR body should be captured as a
+/// `CapturedItemKind::Callee` once a captured item references it.
+///
+/// `rustc` (`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) groups closures,
+/// coroutines, and coroutine-closures under one `DefKind`, in
+/// [`compiler/rustc_hir/src/def.rs` lines 194–200](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_hir/src/def.rs#L194-L200):
+///
+/// >```text
+/// >    /// A closure, coroutine, or coroutine-closure.
+/// >    ///
+/// >    /// These are all represented with the same `ExprKind::Closure` in the AST and HIR,
+/// >    /// which makes it difficult to distinguish these during def collection. Therefore,
+/// >    /// we treat them all the same, and code which needs to distinguish them can match
+/// >    /// on `hir::ClosureKind` or `type_of`.
+/// >    Closure,
+/// >```
+///
+/// and distinguishes plain closures by their type in
+/// [`compiler/rustc_middle/src/ty/sty.rs` lines 1454–1457](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L1454-L1457):
+///
+/// >```text
+/// >    #[inline]
+/// >    pub fn is_closure(self) -> bool {
+/// >        matches!(self.kind(), Closure(..))
+/// >    }
+/// >```
+///
+/// Only plain closures are admitted (`type_of` is `TyKind::Closure`), because
+/// only they can reach a call through `ClosureFnPointer` reification or a
+/// direct `Fn*` call with the MIR shape the Lean semantics models.
+pub fn is_capturable_local_closure(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    def_id.is_local()
+        && tcx.is_closure_like(def_id)
+        && tcx
+            .type_of(def_id)
+            .instantiate_identity()
+            .skip_norm_wip()
+            .is_closure()
+}
+
 /// Returns `true` if `def_id` is a non-local function or method whose `.rmeta`
 /// MIR body is available and should be extracted into `Mir/<CalleeCrate>/<Item>.lean`.
 ///
 /// Compiler intrinsics (`#[rustc_intrinsic]`) and foreign items (`extern "C"`)
 /// are excluded so that intrinsic calls continue to dispatch through
 /// `CallConv.rustIntrinsic` in `trusted/lean/Rustc/V2026_06_01/Terminators.lean`.
+///
+/// Closure-like items are never intrinsics and have no item name, so the
+/// intrinsic test is skipped for them (`tcx.item_name` panics with
+/// `item_name: no name` on a closure `DefId`). As in
+/// [`is_capturable_local_closure`], only plain closures (`Ty::is_closure`) are
+/// admitted among `DefKind::Closure` items, excluding non-local coroutines and
+/// coroutine-closures (`async fn` bodies and `async ||` closures). `rustc`
+/// (`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`) documents closure-like items in
+/// [`compiler/rustc_middle/src/ty/util.rs` lines 586–595](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/util.rs#L586-L595):
+///
+/// >```text
+/// >    /// Returns `true` if `def_id` refers to a closure, coroutine, or coroutine-closure
+/// >    /// (i.e. an async closure). These are all represented by `hir::Closure`, and all
+/// >    /// have the same `DefKind`.
+/// >    ///
+/// >    /// Note that closures have a `DefId`, but the closure *expression* also has a
+/// >    /// `HirId` that is located within the context where the closure appears. The
+/// >    /// parent of the closure's `DefId` will also be the context where it appears.
+/// >    pub fn is_closure_like(self, def_id: DefId) -> bool {
+/// >        matches!(self.def_kind(def_id), DefKind::Closure)
+/// >    }
+/// >```
+///
+/// and distinguishes plain closures in
+/// [`compiler/rustc_middle/src/ty/sty.rs` lines 1454–1457](https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/ty/sty.rs#L1454-L1457):
+///
+/// >```text
+/// >    #[inline]
+/// >    pub fn is_closure(self) -> bool {
+/// >        matches!(self.kind(), Closure(..))
+/// >    }
+/// >```
+///
+/// The guard must ship together with the closure branch of
+/// `extract_fn_conv_and_unwind` (`layout_lower.rs`), which keeps lowering of a
+/// captured non-local closure body from calling `tcx.fn_sig` on it.
 pub fn should_capture_non_local_callee(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     if def_id.is_local() {
         return false;
@@ -2637,7 +2808,16 @@ pub fn should_capture_non_local_callee(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     if tcx.is_foreign_item(def_id) || tcx.is_constructor(def_id) {
         return false;
     }
-    if tcx.is_intrinsic(def_id, tcx.item_name(def_id)) {
+    if tcx.is_closure_like(def_id) {
+        if !tcx
+            .type_of(def_id)
+            .instantiate_identity()
+            .skip_norm_wip()
+            .is_closure()
+        {
+            return false;
+        }
+    } else if tcx.is_intrinsic(def_id, tcx.item_name(def_id)) {
         return false;
     }
     if !tcx.is_mir_available(def_id) {

@@ -1204,9 +1204,22 @@ theorem evalOperand_move_nil_eq (locals : List LocalSlot) (idx : LocalIdx)
       | false =>
         match Trusted.Sequence.get? locals idx with
         | .some (.init v) =>
-          match Trusted.Sequence.set? locals idx .uninit with
-          | .some locals' => .ok v locals'
-          | .none => .ub
+          match localDecls with
+          | .nil =>
+            match Trusted.Sequence.set? locals idx .uninit with
+            | .some locals' => .ok v locals'
+            | .none => .ub
+          | _ :: _ =>
+            let tyOpt := placeTyResolved localDecls layouts { local_ := idx, projection := .nil }
+            match materializeReadPtrValue layouts tyOpt v with
+            | .none => .ub
+            | .some matVal =>
+              match validateValueForTy? layouts tyOpt matVal with
+              | false => .ub
+              | true =>
+                match Trusted.Sequence.set? locals idx .uninit with
+                | .some locals' => .ok matVal locals'
+                | .none => .ub
         | .some .uninit => .ub
         | .some .dead => .ub
         | .none => .ub := by
@@ -1237,7 +1250,17 @@ theorem evalOperand_copy_nil_eq (locals : List LocalSlot) (idx : LocalIdx)
       | true => .ub
       | false =>
         match Trusted.Sequence.get? locals idx with
-        | .some (.init v) => .ok v locals
+        | .some (.init v) =>
+          match localDecls with
+          | .nil => .ok v locals
+          | _ :: _ =>
+            let tyOpt := placeTyResolved localDecls layouts { local_ := idx, projection := .nil }
+            match materializeReadPtrValue layouts tyOpt v with
+            | .none => .ub
+            | .some matVal =>
+              match validateValueForTy? layouts tyOpt matVal with
+              | true => .ok matVal locals
+              | false => .ub
         | .some .uninit => .ub
         | .some .dead => .ub
         | .none => .ub := by

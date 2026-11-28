@@ -607,33 +607,40 @@ theorem sim_lm3_3_retag_uninhabited_ref_ub_step
     (huninhab : rigidTyIsUninhabited 16 pointee = true) :
     stepMirFn (retagPointeeRefBody rk mutability pointee)
       (simState [.uninit, .init .unit, .init val] borrows isProtected) = .fail .ub := by
-  cases val with
-  | uninit => rfl
-  | aggregate v fs =>
-    change
-      (match
-         match
-           match valueListContainsUninit fs with
-           | false => ProjReadResult.ok (Value.aggregate v fs)
-           | true => ProjReadResult.ub with
-         | .ok v' => PlaceReadResult.ok v' [.uninit, .init .unit, .init (Value.aggregate v fs)]
-         | .ub => PlaceReadResult.ub
-         | .unsupported => PlaceReadResult.unsupported with
-       | .ok _ _ =>
-         match rigidTyIsUninhabited 16 pointee with
-         | true => MirStepNode.fail .ub
-         | false => _
-       | .ub => MirStepNode.fail .ub
-       | .unsupported => MirStepNode.fail .unsupported) = .fail .ub
-    cases valueListContainsUninit fs
-    · dsimp only []; rw [huninhab]
-    · rfl
-  | _ =>
-    change
-      (match rigidTyIsUninhabited 16 pointee with
-       | true => MirStepNode.fail .ub
-       | false => _) = .fail .ub
+  change evalStmt (simState [.uninit, .init .unit, .init val] borrows isProtected)
+    (stmt (.retag rk (loc 2)))
+    (retagPointeeRefBody rk mutability pointee).localDecls
+    (retagPointeeRefBody rk mutability pointee).layouts = .fail .ub
+  unfold evalStmt
+  dsimp only [retagPointeeRefBody, witBody, simState, emptyMemory, stmt, loc]
+  cases h : evalOperand [.uninit, .init .unit, .init val]
+      (.copy { local_ := 2, projection := [] }) borrows [] emptyLayoutTable []
+      [declOf unitT, declOf { kind := pointee, layoutIdx := 0 },
+        declOf { kind := .ref mutability pointee, layoutIdx := 0 }] [] with
+  | ok val' locals' =>
+    change (match rigidTyIsUninhabited 16 pointee with
+      | true => MirStepNode.fail .ub
+      | false => _) = .fail .ub
     rw [huninhab]
+  | ub => rfl
+  | unsupported =>
+    unfold evalOperand readProjectedValue at h
+    simp only [get?, List.getElem?_cons_succ, List.getElem?_cons_zero] at h
+    cases hv : valueContainsUninit val
+    · rw [hv] at h; dsimp only at h
+      cases hm : materializeReadPtrValue emptyLayoutTable
+          (placeTyResolved [declOf unitT, declOf { kind := pointee, layoutIdx := 0 },
+            declOf { kind := .ref mutability pointee, layoutIdx := 0 }]
+            emptyLayoutTable { local_ := 2, projection := [] }) val with
+      | none => rw [hm] at h; cases h
+      | some matVal =>
+        rw [hm] at h; dsimp only at h
+        cases hval : validateValueForTy? emptyLayoutTable
+            (placeTyResolved [declOf unitT, declOf { kind := pointee, layoutIdx := 0 },
+              declOf { kind := .ref mutability pointee, layoutIdx := 0 }]
+              emptyLayoutTable { local_ := 2, projection := [] }) matVal <;>
+          (rw [hval] at h; cases h)
+    · rw [hv] at h; cases h
 
 /-- **`sim_lm3_3_retag_inhabited_never_container_zst_step`**: in contrast to
 `sim_lm3_3_retag_uninhabited_ref_ub_step` on `!` and `[!; 1]`, zero-sized
@@ -939,7 +946,7 @@ private theorem evalOperand_borrows_irrel_of_wtScalar
       evalOperand locals op b₂ globals body.layouts callerLocals := by
   cases hop with
   | constScalar _ _ _ _ _ _ _ _ _ => rfl
-  | copyLocal _ _ _ _ _ => rfl
+  | copyLocal _ _ _ _ _ _ => rfl
 
 private theorem writeStackThinPtrTypedDeref_of_dead
     {locals : List LocalSlot} {entry : BorrowEntry} {ptrVal : ProvenancePtr}
@@ -1122,7 +1129,7 @@ theorem sim_lm3_3_interpreter_deref_write_step
         | constScalar c sc hcv _ _ _ _ _ _ =>
           unfold evalOperand at hop_res; dsimp only [] at hop_res
           rw [hcv] at hop_res; injection hop_res with _ hl; exact hl.symm
-        | copyLocal idx _ _ _ _ =>
+        | copyLocal idx _ _ _ _ _ =>
           unfold evalOperand at hop_res; dsimp only [] at hop_res
           cases hgi : get? s.frame.locals idx with
           | none => rw [hgi] at hop_res; cases hop_res

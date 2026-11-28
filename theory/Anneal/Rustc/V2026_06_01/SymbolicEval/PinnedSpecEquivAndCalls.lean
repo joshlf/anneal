@@ -2297,7 +2297,8 @@ theorem evalTerminatorSymTree_call_inlined_of_calleeCtx
     .leaf
       (MirStepNode.step
         (pushCalleeFrame
-          s currentBody locals' destination targetBb calleeBody argVals unwind)) := by
+          s currentBody locals' destination targetBb calleeBody
+          (calleeEntryArgs resolvedTarget calleeBody argVals) unwind)) := by
   dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
   rw [h_res]
   dsimp only []
@@ -2377,8 +2378,8 @@ theorem evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
                   (length s.memory.callStack)
                   (length s.frame.locals) }
             (length s.frame.locals)
-            (length (initLocals calleeBody argVals)))
-          calleeBody argVals)) := by
+            (length (initLocals calleeBody (calleeEntryArgs resolvedTarget calleeBody argVals))))
+          calleeBody (calleeEntryArgs resolvedTarget calleeBody argVals))) := by
   dsimp only [evalTerminatorSymTree, evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
   rw [h_res]
   dsimp only []
@@ -2488,7 +2489,8 @@ theorem evalTerminatorSymTree_diverging_call_inlined_of_calleeCtx
     .leaf
       (MirStepNode.step
         (pushDivergingCalleeFrame
-          s currentBody locals' destination unwind calleeBody argVals)) := by
+          s currentBody locals' destination unwind calleeBody
+          (calleeEntryArgs resolvedTarget calleeBody argVals))) := by
   dsimp only [evalTerminatorSymTree, evalTerminator, evalCallTerminator, bodyLocalDeclsOf]
   rw [h_res]
   dsimp only []
@@ -2540,7 +2542,11 @@ theorem evalTerminatorSymTree_diverging_extCall
       .none)
     (h_not_unreach : isUnreachableCallTarget resolvedTarget.defPath = false)
     (h_not_abort : isAbortingPanicDefPath resolvedTarget.defPath = false)
-    (h_not_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false) :
+    (h_not_unwind : isUnwindingPanicDefPath resolvedTarget.defPath = false)
+    (h_not_exact : stringEq resolvedTarget.defPath "core::intrinsics::exact_div" = false := by decide)
+    (h_not_intrinsic : classifyRustIntrinsic? resolvedTarget.defPath = none := by decide)
+    (h_not_gen_clos :
+      isGenericClosureArityMismatch s.memory.callees resolvedTarget.defPath resolvedTarget.typeArgs = false := by rfl) :
     evalTerminatorSymTree
       s
       { kind := .call func argOps destination .none unwind, span := span }
@@ -2559,10 +2565,11 @@ theorem evalTerminatorSymTree_diverging_extCall
   dsimp only []
   rw [h_none]
   dsimp only []
-  cases resolvedTarget.isIndirect
+  cases h_ind : resolvedTarget.isIndirect
+  · dsimp only [evalDivergingRustIntrinsic?, isDirectExactDivTarget]
+    rw [h_not_unreach, h_not_abort, h_not_unwind, h_ind, h_not_exact, h_not_intrinsic]
   · dsimp only []
-    rw [h_not_unreach, h_not_abort, h_not_unwind]
-  · rfl
+    rw [h_not_gen_clos]
 
 /--
 Verify a universally quantified polymorphic stateless claim

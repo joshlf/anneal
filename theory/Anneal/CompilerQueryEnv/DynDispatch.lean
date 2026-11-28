@@ -791,7 +791,7 @@ theorem stepTerminatorWith_of_stepDynTerminator_step {resolve : CalleeResolver}
                 cases tgt <;>
                   simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
                     hind, Bool.false_eq_true, ite_false, hev, hres, hcomp, ite_true] at h <;>
-                  simp only [stepTerminatorWith, bodyLocalDeclsOf, hrt, hev, hres, hchk, h]
+                  simp only [stepTerminatorWith, bodyLocalDeclsOf, hrt, hev, hres, hchk, calleeEntryArgs, hind, h]
     · cases tgt <;>
         simp only [stepDynTerminator, ite_eq_right_of_eq_false _ _ (eq_false har)] at h <;>
         simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
@@ -850,7 +850,7 @@ theorem stepTerminatorWith_of_stepDynTerminator_step {resolve : CalleeResolver}
                   simp only [stepDynTerminator, ite_eq_left_of_eq_true _ _ (eq_true har), hrt,
                     hind, Bool.false_eq_true, ite_false, hev, hpc, hres, hcomp, ite_true] at h
                   simp only [stepTerminatorWith, tailCallWith, bodyLocalDeclsOf, hrt, hev, hpc,
-                    hres, hchk, h]
+                    hres, hchk, calleeEntryArgs, hind, h]
     · simp only [stepDynTerminator, ite_eq_right_of_eq_false _ _ (eq_false har)] at h
       simp [MirStepNode.unsupported, MirStepNode.fail, MirStepNode.step] at h
   | _ =>

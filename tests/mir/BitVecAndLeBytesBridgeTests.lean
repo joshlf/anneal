@@ -167,21 +167,31 @@ theorem zero_length_array_and_zero_width_chunk_edges (layouts : LayoutTable)
     decodeArrayChunksWith_zero_width
       (fun bs => match bs with | [] => some .unit | _ :: _ => none) rfl 3⟩
 
-/-- Provenance edges: `decodeLittleEndianBytes` collapses provenance to `none` on `[]` while
-preserving uniform provenance on non-empty lists; mixed-provenance initialized buffers still
-decode through `decodeScalarBytes_of_init` to `fromLeBytes` of their extracted payload. -/
+/-- Provenance edges (`UCG#558` fragment coherence): `decodeLittleEndianBytes` collapses provenance
+to `none` on `[]` AND strips provenance when a single `PtrByteFrag` (`byteIdx = 0`) is duplicated
+across multiple bytes (`[b0, b1]`), while preserving coherent provenance from `encodeLittleEndianBytes`
+and decoding mixed-provenance initialized buffers through `decodeScalarBytes_of_init` to
+`fromLeBytes` of their extracted payload. -/
 theorem provenance_byte_edges (b0 b1 : BitVec 8) :
-    decodeLittleEndianBytes (([] : List (BitVec 8)).map (bvByteToAbstract (some (7, 1)))) =
+    decodeLittleEndianBytes
+          (([] : List (BitVec 8)).map (bvByteToAbstract (some ⟨7, 1, 0, 0, 2⟩))) =
         some (0, none) ∧
-      decodeLittleEndianBytes ([b0, b1].map (bvByteToAbstract (some (7, 1)))) =
-        some (Anneal.LeBytes.fromLeBytes [b0, b1], some (7, 1)) ∧
+      decodeLittleEndianBytes
+          ([b0, b1].map (bvByteToAbstract (some ⟨7, 1, 0, 0, 2⟩))) =
+        some (Anneal.LeBytes.fromLeBytes [b0, b1], none) ∧
+      decodeLittleEndianBytes (encodeLittleEndianBytes (Anneal.LeBytes.fromLeBytes [b0, b1]) 2 (some (7, 1))) =
+        some (Anneal.LeBytes.fromLeBytes [b0, b1] % 2 ^ (2 * 8), some (7, 1)) ∧
       (∃ prov, decodeScalarBytes
-          [bvByteToAbstract (some (1, 0)) b0, bvByteToAbstract (some (2, 0)) b1] false =
+          [bvByteToAbstract (some ⟨1, 0, 0, 0, 2⟩) b0,
+           bvByteToAbstract (some ⟨2, 0, 1, 0, 2⟩) b1] false =
         some (⟨Anneal.LeBytes.fromLeBytes [b0, b1], 2⟩, prov)) := by
-  refine ⟨decodeLittleEndianBytes_map (some (7, 1)) [],
-    decodeLittleEndianBytes_map (some (7, 1)) [b0, b1], ?_⟩
+  refine ⟨decodeLittleEndianBytes_map (some ⟨7, 1, 0, 0, 2⟩) [],
+    decodeLittleEndianBytes_map (some ⟨7, 1, 0, 0, 2⟩) [b0, b1],
+    decodeLittleEndianBytes_encodeLittleEndianBytes 2 (Anneal.LeBytes.fromLeBytes [b0, b1]) (some (7, 1)),
+    ?_⟩
   have h := decodeScalarBytes_of_init
-    (bs := [bvByteToAbstract (some (1, 0)) b0, bvByteToAbstract (some (2, 0)) b1])
+    (bs := [bvByteToAbstract (some ⟨1, 0, 0, 0, 2⟩) b0,
+            bvByteToAbstract (some ⟨2, 0, 1, 0, 2⟩) b1])
     (by simp) rfl false
   simpa [extractInitBvBytes, bvByteToAbstract] using h
 
@@ -3262,27 +3272,27 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.encodeLittleEndianBytes_toLeBytes
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_map' does not depend on any axioms -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_map' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_map
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_map_none' does not depend on any axioms -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_map_none' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_map_none
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_of_init' does not depend on any axioms -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_of_init' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_of_init
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_eq_none_of_uninit' does not depend on any axioms -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_eq_none_of_uninit' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_eq_none_of_uninit
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_eq_none_iff' does not depend on any axioms -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_eq_none_iff' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_eq_none_iff
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_encodeLittleEndianBytes' depends on axioms: [propext] -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_encodeLittleEndianBytes' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeLittleEndianBytes_encodeLittleEndianBytes
 
@@ -3298,15 +3308,15 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeScalarBytes_map_none
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeScalarBytes_nil' does not depend on any axioms -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeScalarBytes_nil' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeScalarBytes_nil
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeScalarBytes_eq_none_of_uninit' does not depend on any axioms -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeScalarBytes_eq_none_of_uninit' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeScalarBytes_eq_none_of_uninit
 
-/-- info: 'Anneal.BitVecScalarsBridge.decodeScalarBytes_of_init' does not depend on any axioms -/
+/-- info: 'Anneal.BitVecScalarsBridge.decodeScalarBytes_of_init' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeScalarBytes_of_init
 

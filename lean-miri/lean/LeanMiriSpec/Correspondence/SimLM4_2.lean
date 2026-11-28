@@ -117,16 +117,6 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 
 /-! ## 1. `NonDivergingIntrinsic.Assume` -/
 
-private theorem WellTypedScalarOperand.evalOperand_localDecls_eq
-    {body : CapturedMir}
-    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
-    {op : MirAst.Operand} {ty : Ty} (hop : WellTypedScalarOperand body tf op ty)
-    (locals : List LocalSlot) (borrows : List BorrowEntry)
-    (globals : List CapturedAllocation) (callerLocals : List LocalSlot) :
-    evalOperand locals op borrows globals body.layouts callerLocals body.localDecls =
-      evalOperand locals op borrows globals body.layouts callerLocals := by
-  cases hop <;> rfl
-
 /-- **`step_intrinsic_assume_simulation` (`LM-4.2`)**: one real step of
 `StatementKind.intrinsic (.assume op)` in both machines, from any
 `StateRelLM3_1`-related states, for a constant or a copied immediate local
@@ -196,10 +186,11 @@ theorem step_intrinsic_assume_simulation
         MirStepNode.fail .ub := by
       unfold evalStmt
       dsimp only
-      rw [hstate.callStack_nil, (hop tf hframes).evalOperand_localDecls_eq, ha]
+      rw [hstate.callStack_nil, (hop tf hframes).evalOperand_ub_of_nil_ub ha]
     rw [ha']
     exact .ub _ _
   · -- The operand is the one-byte scalar `sc` in Anneal and `msc` in `lean-miri`.
+    have himm_orig : ImmediateRel ty body.layouts (.scalar sc) (.scalar (.fromScalarInt msc)) := himm
     cases himm with
     | scalar _ _ hrel hsz _ _ =>
     have hsc1 : sc.sizeBytes = 1 :=
@@ -215,7 +206,7 @@ theorem step_intrinsic_assume_simulation
         | false => MirStepNode.fail .ub := by
       unfold evalStmt
       dsimp only
-      rw [hstate.callStack_nil, (hop tf hframes).evalOperand_localDecls_eq, ha]
+      rw [hstate.callStack_nil, (hop tf hframes).evalOperand_scalar_ok_of_nil_ok ha himm_orig]
       rfl
     rw [hanneal, hsc1]
     have hbeq1 : Nat.beq 1 1 = true := rfl

@@ -859,7 +859,7 @@ theorem ValidEnumLayout.enumLayoutHasDisjointDirectTag_true
             · by_cases h64 : bits = 64
               · subst h64; rcases htb with rfl | rfl | rfl | rfl <;> cases habi <;> rfl
               · have h128 : translateAbiIntegerBits bits = .I128 := by
-                  simp [translateAbiIntegerBits, h8, h16, h32, h64]
+                  simp [translateAbiIntegerBits]
                 rw [h128] at habi
                 rcases htb with rfl | rfl | rfl | rfl <;> cases habi
   have hafter_all : allVariantFieldsAfterTag tagBytes rawShapes = true := by
@@ -2944,13 +2944,87 @@ theorem evalProjection_downcast_field_simulation
               · obtain ⟨hsz, hv⟩ := hchar_fty hk_f
                 simp [hsz, hv]
             }
+          have hrTy : ∃ rTy,
+              placeTyResolved body.localDecls body.layouts
+                ⟨srcIdx, [.downcast vName variantIdx, .field fieldIdx fieldTy]⟩ = some rTy ∧
+              rTy.kind = fieldTy.kind := by
+            unfold placeTyResolved; dsimp only
+            rw [hsrc_decl]
+            dsimp only [resolveProjectedTyResolved]
+            refine ⟨_, rfl, ?_⟩
+            have hk := resolveTyWithLocalDecls_kind_eq_sim body.localDecls body.layouts fieldTy
+            cases isUnresolvedLayoutIdx body.layouts fieldTy.layoutIdx
+            · rfl
+            · dsimp only
+              cases LayoutTable.lookup body.layouts srcDecl.ty.layoutIdx with
+              | none => exact hk
+              | some l =>
+                dsimp only
+                cases l.variants with
+                | single _ =>
+                  dsimp only
+                  cases get? l.fieldLayouts fieldIdx with
+                  | some _ => rfl
+                  | none => exact hk
+                | _ => exact hk
+          obtain ⟨rTy, hrTy_eq, hrTy_kind⟩ := hrTy
+          have hval_ty :
+              validateValueForTy? body.layouts
+                (placeTyResolved body.localDecls body.layouts
+                  ⟨srcIdx, [.downcast vName variantIdx, .field fieldIdx fieldTy]⟩)
+                (.scalar sc) = true := by
+            rw [hrTy_eq]
+            rcases rTy with ⟨rk, rl⟩
+            dsimp only at hrTy_kind
+            unfold validateValueForTy? validateValueForTyAux
+            dsimp only
+            rcases hprim_fty with hk_f | hk_f | ⟨it, hk_f⟩ | ⟨ut, hk_f⟩
+            · rw [hrTy_kind, hk_f]; dsimp only
+              obtain ⟨hsz, hb⟩ := hbool_fty hk_f
+              rcases hb with hb | hb <;> (rw [hsz, hb]; rfl)
+            · rw [hrTy_kind, hk_f]; dsimp only
+              obtain ⟨hsz, hv⟩ := hchar_fty hk_f
+              rw [hsz, hv]; rfl
+            · rw [hrTy_kind, hk_f]
+            · rw [hrTy_kind, hk_f]
+          have hev_op_cp : ∀ cs,
+              evalOperand s.frame.locals
+                (.copy ⟨srcIdx, [.downcast vName variantIdx, .field fieldIdx fieldTy]⟩)
+                .nil s.memory.globals body.layouts .nil body.localDecls cs =
+              .ok (.scalar sc) s.frame.locals := by
+            intro cs
+            cases hld : body.localDecls with
+            | nil => rw [hld] at hsrc_decl; cases hsrc_decl
+            | cons d0 ds =>
+              unfold evalOperand; dsimp only
+              rw [hslot_s, ← hld, hptu]
+              dsimp only [readProjectedValue]
+              rw [hbeq_v]; dsimp only [readProjectedValue]; rw [hget_fv]
+              dsimp only [readProjectedValue]
+              rw [hrTy_eq]; dsimp only [materializeReadPtrValue]
+              rw [← hrTy_eq, hval_ty]
+          have hev_op_mv : ∀ cs,
+              evalOperand s.frame.locals
+                (.move ⟨srcIdx, [.downcast vName variantIdx, .field fieldIdx fieldTy]⟩)
+                .nil s.memory.globals body.layouts .nil body.localDecls cs =
+              .ok (.scalar sc) s.frame.locals := by
+            intro cs
+            cases hld : body.localDecls with
+            | nil => rw [hld] at hsrc_decl; cases hsrc_decl
+            | cons d0 ds =>
+              unfold evalOperand; dsimp only
+              rw [hslot_s, ← hld, hptu]
+              dsimp only [readProjectedValue]
+              rw [hbeq_v]; dsimp only [readProjectedValue]; rw [hget_fv]
+              dsimp only [readProjectedValue]
+              rw [hrTy_eq]; dsimp only [materializeReadPtrValue]
+              rw [← hrTy_eq, hval_ty]
           unfold evalStmt; rw [hkind]
           have hval_mv := hval_sc _ (Or.inl rfl)
           have hval_cp := hval_sc _ (Or.inr rfl)
           cases isMove
-          · simp only [Bool.false_eq_true, ↓reduceIte, evalRvalue, evalOperand,
-              hptu, hval_cp, hbor, hcaller, hslot_s, readProjectedValue, hbeq_v,
-              hget_fv, hprot, invalidateConflictingBorrows]
+          · simp only [Bool.false_eq_true, ↓reduceIte, evalRvalue,
+              hbor, hcaller, hev_op_cp, hval_cp, hprot, invalidateConflictingBorrows]
             cases get? s.frame.locals dstIdx with
             | none => rfl
             | some sl =>
@@ -2963,9 +3037,8 @@ theorem evalProjection_downcast_field_simulation
                   apply congrArg MirStepNode.step
                   apply congrArg (fun mem' => advanceStmt s locals₂ mem')
                   cases hm : s.memory; simp_all
-          · simp only [↓reduceIte, evalRvalue, evalOperand,
-              hptu, hval_mv, hbor, hcaller, hslot_s, readProjectedValue, hbeq_v,
-              hget_fv, hprot, invalidateConflictingBorrows]
+          · simp only [↓reduceIte, evalRvalue,
+              hbor, hcaller, hev_op_mv, hval_mv, hprot, invalidateConflictingBorrows]
             cases get? s.frame.locals dstIdx with
             | none => rfl
             | some sl =>
@@ -3619,7 +3692,7 @@ theorem evalRvalue_discriminant_simulation
     rw [henv_src] at henv'; injection henv' with heq_p; rcases heq_p with ⟨rfl, rfl⟩
     have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
       unfold evalStmt; rw [hkind]
-      simp [evalRvalue, evalOperand, hslot_s]
+      simp [evalRvalue, hslot_s]
     have hop_ok :=
       annealEvalOperand_copy_live (m := m₀) (known := none) rfl hlt_s hsrc_decl hmls_s_eq hcache_s
     have hrd_err := readDiscriminant_uninitInd_ub body.localDecls (m := m₁) hmem_u
@@ -4828,6 +4901,147 @@ theorem step_setDiscriminant_any_simulation
 (where `dstIdx` has an enum type in `env`) automatically avoids `dstIdx` by
 disjointness of primitive scalar types and enum types, leaving
 `tf.locals[dstIdx]?` unchanged. -/
+private theorem ValidEnumLayout.readValid_root
+    {ty : Ty} {layouts : LayoutTable} {tagBytes : Nat}
+    {variants : List (List StructFieldDesc)}
+    (hvalid : ValidEnumLayout ty layouts tagBytes variants) (v : Value) :
+    materializeReadPtrValue layouts (some ty) v = some v ∧
+    validateValueForTy? layouts (some ty) v = true := by
+  obtain ⟨defPath, adtArgs, hk⟩ := hvalid.is_adt
+  refine ⟨?_, ?_⟩
+  · rcases ty with ⟨tk, tli⟩; dsimp only at hk; subst hk
+    cases v with
+    | aggregate varIdx rawVals =>
+      cases varIdx with
+      | zero =>
+        change materializeReadPtrValue layouts
+          (some { kind := .adt defPath adtArgs, layoutIdx := tli })
+          (.aggregate 0 rawVals) = some (.aggregate 0 rawVals)
+        simp only [materializeReadPtrValue]
+        cases Nat.blt 2 (length rawVals) <;> rfl
+      | succ _ => rfl
+    | _ => rfl
+  · obtain ⟨tl, _, rawTag, rawShapes, hlook, hmult, _, _, _, _⟩ := hvalid.table_entry
+    have huninh_ty := hvalid.uninhabited_false
+    rcases ty with ⟨tk, tli⟩
+    dsimp only at hk hlook huninh_ty
+    subst hk
+    unfold translateTy at huninh_ty
+    dsimp only at huninh_ty
+    change (match layouts.lookup tli with
+      | some tl => translateTypeLayout tl
+      | none => zstLayoutData).uninhabited = false at huninh_ty
+    rw [hlook] at huninh_ty
+    dsimp only [translateTypeLayout] at huninh_ty
+    unfold validateValueForTy? validateValueForTyAux
+    dsimp only
+    change (match LayoutTable.lookup layouts tli with
+      | .none => true
+      | .some l => _) = true
+    rw [show LayoutTable.lookup layouts tli = some tl from hlook]
+    dsimp only
+    rw [huninh_ty]
+    dsimp only
+    rw [hmult]
+
+private theorem ValidEnumLayout.evalOperand_unproj_of_nil_ok
+    {locals locals' : List LocalSlot} {isMove : Bool} {idx : Local} {decl : LocalDecl} {v : Value}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {layouts : LayoutTable} {callerLocals : List LocalSlot}
+    {localDecls : List LocalDecl} {cs : List SavedCallerFrame}
+    {tagBytes : Nat} {variants : List (List StructFieldDesc)}
+    (hvalid : ValidEnumLayout decl.ty layouts tagBytes variants)
+    (hdecl : get? localDecls idx = some decl)
+    (hok : evalOperand locals (if isMove then .move ⟨idx, .nil⟩ else .copy ⟨idx, .nil⟩)
+      borrows globals layouts callerLocals .nil cs = .ok v locals') :
+    evalOperand locals (if isMove then .move ⟨idx, .nil⟩ else .copy ⟨idx, .nil⟩)
+      borrows globals layouts callerLocals localDecls cs = .ok v locals' := by
+  cases hld : localDecls with
+  | nil => exact hok
+  | cons d ds =>
+    have hpty : placeTyResolved (d :: ds) layouts ⟨idx, .nil⟩ = some decl.ty := by
+      unfold placeTyResolved; dsimp only [resolveProjectedTyResolved]; rw [← hld, hdecl]
+    cases isMove with
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte] at hok ⊢
+      unfold evalOperand at hok ⊢; dsimp only at hok ⊢
+      cases hslot : get? locals idx with
+      | none => rw [hslot] at hok; cases hok
+      | some sl =>
+        rw [hslot] at hok
+        cases sl with
+        | dead | uninit => cases hok
+        | init rv =>
+          dsimp only at hok ⊢
+          cases hrv : readProjectedValue locals rv .nil with
+          | ub | unsupported => rw [hrv] at hok; cases hok
+          | ok fv =>
+            rw [hrv] at hok; injection hok with hfv hloc; subst hfv hloc
+            dsimp only; rw [hpty, (hvalid.readValid_root fv).1]; dsimp only
+            rw [(hvalid.readValid_root fv).2]
+    | true =>
+      simp only [↓reduceIte] at hok ⊢
+      unfold evalOperand at hok ⊢; dsimp only at hok ⊢
+      cases hslot : get? locals idx with
+      | none => rw [hslot] at hok; cases hok
+      | some sl =>
+        rw [hslot] at hok
+        cases sl with
+        | dead | uninit => cases hok
+        | init rv =>
+          dsimp only at hok ⊢
+          cases hrv : readProjectedValue locals rv .nil with
+          | ub | unsupported => rw [hrv] at hok; cases hok
+          | ok fv =>
+            rw [hrv] at hok; dsimp only at hok ⊢
+            cases hset : set? locals idx .uninit with
+            | none => rw [hset] at hok; cases hok
+            | some l_out =>
+              rw [hset] at hok; injection hok with hfv hloc; subst hfv hloc
+              rw [hpty, (hvalid.readValid_root fv).1]; dsimp only
+              rw [(hvalid.readValid_root fv).2]
+
+private theorem evalEnumScalarOp_nil_ub_of_localDecls_ub
+    {body : CapturedMir} {env : EnumTypeEnv} {dstIdx : Local} {dstDecl : LocalDecl}
+    {tagBytes : Nat} {variants : List (List StructFieldDesc)}
+    {af : StackFrame}
+    {topFrame : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {mach : AnnealMachine} {op : MirAst.Operand} {ty : Ty}
+    {globals : List CapturedAllocation}
+    (henv_valid : ∀ t tb vs, env t = some (tb, vs) → ValidEnumLayout t body.layouts tb vs)
+    (hdst_decl : get? body.localDecls dstIdx = some dstDecl)
+    (henv_dst : env dstDecl.ty = some (tagBytes, variants))
+    (hframe : FrameRelLM2_3Except body env dstIdx mach af topFrame)
+    (hop : WellTypedEnumScalarOp body topFrame op ty)
+    (hub : evalOperand af.locals op .nil globals body.layouts .nil body.localDecls = .ub) :
+    evalOperand af.locals op .nil globals body.layouts .nil .nil = .ub := by
+  cases hop with
+  | constScalar c sc hval _ _ _ _ _ _ =>
+    unfold evalOperand at hub; dsimp only at hub; rw [hval] at hub; cases hub
+  | copyLocal idx decl hdecl hprim himm =>
+    have hnone := env_none_of_isPrimScalarTy henv_valid hprim
+    have hne : idx ≠ dstIdx := by
+      intro rfl; rw [hdst_decl] at hdecl; injection hdecl with hd_eq; subst hd_eq
+      rw [hnone] at henv_dst; cases henv_dst
+    obtain ⟨slot, mls, hlt_mf, hslot, hmls_eq, hloc⟩ := hframe.lookup_local hne hdecl
+    have hloc_base := hloc.to_localRel_of_none hnone
+    have hmls_get : topFrame.locals[idx]? = some mls := by
+      rw [Array.getElem?_eq_getElem hlt_mf, hmls_eq]
+    cases hloc_base with
+    | dead _ _ => simp [evalOperand, hslot]
+    | indirect _ mp _ _ _ _ => exact False.elim (himm _ hmls_get mp rfl)
+    | immediate _ imm _ _ hval =>
+      rcases hval with ⟨rfl, _⟩ | ⟨v, rfl, himmRel⟩
+      · simp [evalOperand, hslot]
+      · obtain ⟨sc, _, rfl, rfl, _⟩ := himmRel.of_primitive_scalar hprim
+        have hkind_d : IsScalarOrPtrTyKind decl.ty.kind = true := by
+          rcases hprim with hk | hk | ⟨_, hk⟩ | ⟨_, hk⟩ <;> simp [IsScalarOrPtrTyKind, hk]
+        have hok := evalOperand_copy_root_of_readValid hslot rfl hdecl
+          (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hprim.size_ne_zero hkind_d hrk).1)
+          (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hprim.size_ne_zero hkind_d hrk).2)
+          (borrows := .nil) (globals := globals) (callerLocals := .nil) (cs := .nil)
+        rw [hok] at hub; cases hub
+
 private theorem evalEnumScalarOp_except_dst
     {body : CapturedMir} {env : EnumTypeEnv} {dstIdx : Local} {dstDecl : LocalDecl}
     {tagBytes : Nat} {variants : List (List StructFieldDesc)}
@@ -4954,7 +5168,11 @@ private theorem evalEnumScalarOp_except_dst
           (fun j hj => hj.cache_layout hlt_mf (translateTy decl.ty body.layouts)),
           (fun hd => MemoryAllocDisjoint_cacheFrameLocalLayout hd hlt_mf _),
           (fun _ _ hu => EnumLocalByteUninit.of_cache_layout hframes hu)⟩
-        · simp [evalOperand, hslot, readProjectedValue]
+        · have hkind_d : IsScalarOrPtrTyKind decl.ty.kind = true := by
+            rcases hprim with hk | hk | ⟨_, hk⟩ | ⟨_, hk⟩ <;> simp [IsScalarOrPtrTyKind, hk]
+          exact evalOperand_copy_root_of_readValid hslot rfl hdecl
+            (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hprim.size_ne_zero hkind_d hrk).1)
+            (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hprim.size_ne_zero hkind_d hrk).2)
         · rw [EStateM.bind_eq_ok
             (annealEvalOperand_copy_live hframes hlt_mf hdecl hmls_eq hcache)]
           rfl
@@ -4990,11 +5208,28 @@ private theorem evalOperands_enumScalarOps_shape
           unfold get?; exact List.getElem?_eq_getElem hlt_l
         cases hsl : locals[idx]'hlt_l with
         | dead | uninit =>
-          exact Or.inl (by simp [evalOperand, hget, hsl])
+          exact Or.inl (by cases body.localDecls <;> simp [evalOperand, hget, hsl])
         | init val =>
           cases hv_init : valueContainsUninit val with
-          | true => exact Or.inl (by simp [evalOperand, hget, hsl, readProjectedValue, hv_init])
-          | false => exact Or.inr ⟨val, by simp [evalOperand, hget, hsl, readProjectedValue, hv_init]⟩
+          | true =>
+            exact Or.inl (by cases body.localDecls <;> simp [evalOperand, hget, hsl, readProjectedValue, hv_init])
+          | false =>
+            cases hlds : body.localDecls with
+            | nil => nomatch (hlds ▸ hdecl : get? ([] : List LocalDecl) idx = some decl)
+            | cons d ds =>
+              unfold evalOperand readProjectedValue
+              dsimp only
+              rw [hget, hsl]
+              dsimp only
+              rw [hv_init]
+              dsimp only
+              cases materializeReadPtrValue body.layouts (placeTyResolved (d :: ds) body.layouts ⟨idx, .nil⟩) val with
+              | none => exact Or.inl rfl
+              | some matVal =>
+                dsimp only
+                cases validateValueForTy? body.layouts (placeTyResolved (d :: ds) body.layouts ⟨idx, .nil⟩) matVal with
+                | false => exact Or.inl rfl
+                | true => exact Or.inr ⟨matVal, rfl⟩
     have hrest := evalOperands_enumScalarOps_shape locals globals hlocals_len rest (fun k hk =>
       hops (k + 1) (Nat.succ_lt_succ hk))
     rcases hfirst with hub0 | ⟨v0, hok0⟩
@@ -7398,12 +7633,8 @@ theorem step_enum_copy_move_simulation
     have hkind_op : stmt.kind = .assign ⟨dstIdx, .nil⟩ (.use op) := hkind
     have hev_op_ld :
         evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil
-          body.localDecls = .ok rootVal locals₁ := by
-      have : evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil
-          body.localDecls =
-        evalOperand s.frame.locals op .nil s.memory.globals body.layouts .nil .nil := by
-        cases isMove <;> rfl
-      rw [this]; exact hev_op
+          body.localDecls = .ok rootVal locals₁ :=
+      hvalid.evalOperand_unproj_of_nil_ok (isMove := isMove) hsrc_decl hev_op
     have hval_root :
         validateLoadedValue body.layouts body.localDecls op rootVal = true := by
       apply hvalid.validateLoadedValue_unproj hsrc_decl
@@ -8759,7 +8990,7 @@ theorem step_downcast_field_write_inactive_divergence
         rw [htf₁_eta]; exact (hframe.cache_local_layout hdst_decl hlt_d0).location_eq
       exact ⟨ha_ub, _, miri_step_at_statement_ok _ hframes hframe.body_eq
         hframe.location_eq hbb hstmt hm_ok rfl hloc_tf₁⟩
-  · cases hop₀ <;> exact absurd ha_op_ub hop_ok
+  · exact absurd (evalEnumScalarOp_nil_ub_of_localDecls_ub henv_valid hdst_decl henv_dst hfr₀_excl hop₀ ha_op_ub) hop_ok
 
 /-- Uninitialized downcast-field write divergence
 (`((_dst as variantIdx).fieldIdx : fieldTy) = use op` when `_dst` holds
@@ -9020,7 +9251,7 @@ theorem step_downcast_field_write_uninit_divergence
         rw [hwrite_eq]; dsimp only [destPlace]; rw [hw_proj]
       exact ⟨ha_ub, _, miri_step_at_statement_ok _ hframes hframe.body_eq
         hframe.location_eq hbb hstmt hm_ok rfl hloc_tf₁⟩
-  · cases hop₀ <;> exact absurd ha_op_ub hop_ok
+  · exact absurd (evalEnumScalarOp_nil_ub_of_localDecls_ub henv_valid hdst_decl henv_dst hfr₀_excl hop₀ ha_op_ub) hop_ok
 
 /-- Whole-enum self-move simulation (`_idx = Rvalue.Use(move _idx)` on a
 multi-variant enum local `idx`):
@@ -9280,7 +9511,9 @@ theorem step_enum_self_move_simulation
       have hev_op :
           evalOperand s.frame.locals (.move ⟨idx, .nil⟩) .nil s.memory.globals
             body.layouts .nil body.localDecls = .ok rootVal locals₁ := by
-        unfold evalOperand; dsimp only; rw [hslot0]; dsimp only [readProjectedValue, valueContainsUninit]; rw [hno_uninit]; dsimp only
+        apply hvalid.evalOperand_unproj_of_nil_ok (isMove := true) hdecl
+        simp only [↓reduceIte]; unfold evalOperand; dsimp only
+        rw [hslot0]; dsimp only [readProjectedValue, valueContainsUninit]; rw [hno_uninit]; dsimp only
         rw [set?_eq_some_set hlt_af0 .uninit]
       rw [hev_op]; dsimp only
       rw [hvalid.validateLoadedValue_unproj hdecl (Or.inr rfl)]; dsimp only
@@ -10812,6 +11045,7 @@ theorem step_enum_self_copy_overlap_divergence
     have hev :
         evalOperand s.frame.locals (.copy ⟨idx, .nil⟩) .nil s.memory.globals
           body.layouts .nil body.localDecls = .ok rootVal s.frame.locals := by
+      apply hvalid.evalOperand_unproj_of_nil_ok (isMove := false) hdecl
       simp [evalOperand, readProjectedValue, hroot_init, hslot]
     rw [hev]; dsimp only
     rw [hvalid.validateLoadedValue_unproj hdecl (Or.inl rfl)]; dsimp only

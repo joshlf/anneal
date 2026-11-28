@@ -30,9 +30,88 @@ use crate::manifest::{
 };
 use crate::rustc_2026_06_01::mir_lower::{
     CrateContractIndex, ItemClassification, canonical_def_path, collect_referenced_callees,
-    def_id_sort_key, lower_mir_body, query_post_cleanup_mir, should_capture_mir_item,
-    should_capture_non_local_callee,
+    def_id_sort_key, is_capturable_local_closure, lower_mir_body, query_post_cleanup_mir,
+    should_capture_mir_item, should_capture_non_local_callee,
 };
+
+/// Enqueues the local closure `def_id` for capture as a
+/// `CapturedItemKind::Callee` unless it was already enqueued.
+///
+/// Closure bodies are never selected as top-level items
+/// (`should_capture_mir_item` rejects `DefKind::Closure`), so they are never
+/// emitted as `CapturedItemKind::Subject` and never receive `Verify/`
+/// obligations. They are captured only when a captured item (or a captured
+/// callee body) references them through a closure type or a closure aggregate
+/// (`collect_referenced_callees`), which keeps them reachable under
+/// `ANNEAL_CAPTURE_FILTER`. Each `DefId` is captured at most once, keyed by
+/// `def_id_sort_key`.
+fn enqueue_local_closure(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    seen: &mut BTreeSet<(u32, u32)>,
+    worklist: &mut VecDeque<LocalDefId>,
+) {
+    if let Some(local_def_id) = def_id.as_local()
+        && is_capturable_local_closure(tcx, def_id)
+        && seen.insert(def_id_sort_key(def_id))
+    {
+        worklist.push_back(local_def_id);
+    }
+}
+
+/// Writes the Lean module for a captured callee body `ir_captured` to
+/// `<unit_dir>/Mir/<crate_pascal>/<item_stem>.lean` and returns its
+/// `CapturedItemKind::Callee` manifest record.
+fn emit_callee_unit_target(
+    unit_dir: &Path,
+    crate_pascal: &str,
+    item_stem: &str,
+    def_path: String,
+    ir_captured: crate::lean_emit::IrCapturedMir,
+) -> Result<UnitTargetRecord, String> {
+    let lean_module_name = format!("Mir.{crate_pascal}.{item_stem}");
+    let mir_module_rel_path = format!("Mir/{crate_pascal}/{item_stem}.lean");
+    let lean_source = emit_mir_lean_module(&lean_module_name, &ir_captured);
+    let mir_digest = sha256_hex(lean_source.as_bytes());
+
+    let mir_full_path = unit_dir.join(&mir_module_rel_path);
+    if let Some(parent) = mir_full_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!("failed to create MIR directory `{}`: {e}", parent.display())
+        })?;
+    }
+    fs::write(&mir_full_path, lean_source.as_bytes()).map_err(|e| {
+        format!(
+            "failed to write MIR Lean module `{}`: {e}",
+            mir_full_path.display()
+        )
+    })?;
+
+    let mut manifest_trait_impls = Vec::new();
+    for ti in ir_captured.trait_impls {
+        let mut trait_args_lean = Vec::new();
+        for arg in ti.trait_ref.args {
+            trait_args_lean.push(crate::lean_emit::render_rigid_ty_pub(&arg));
+        }
+        manifest_trait_impls.push(crate::manifest::ManifestTraitImplEntry {
+            trait_method_def_path: ti.trait_ref.def_path,
+            trait_args_lean,
+            impl_path: ti.impl_path,
+        });
+    }
+
+    Ok(UnitTargetRecord {
+        target: CapturedTarget {
+            def_id: def_path,
+            mir_module_path: mir_module_rel_path,
+            mir_module_sha256: mir_digest,
+        },
+        lean_module_name,
+        item_kind: CapturedItemKind::Callee,
+        associated_subject_def_id: None,
+        trait_impls: manifest_trait_impls,
+    })
+}
 
 /// Default pass-through callbacks used when `anneal-rustc-capture` is invoked
 /// without `ANNEAL_CAPTURE_DIR` or for non-capture compiler queries (such as
@@ -345,6 +424,8 @@ fn capture_crate_unit<'tcx>(
     > = BTreeMap::new();
     let mut worklist: VecDeque<(DefId, Option<rustc_middle::ty::GenericArgsRef<'tcx>>)> =
         VecDeque::new();
+    let mut seen_local_closures: BTreeSet<(u32, u32)> = BTreeSet::new();
+    let mut local_closure_worklist: VecDeque<LocalDefId> = VecDeque::new();
 
     for candidate in candidates {
         let def_id = candidate.local_def_id.to_def_id();
@@ -363,7 +444,22 @@ fn capture_crate_unit<'tcx>(
                 | CapturedItemKind::InlineSpecRequires
                 | CapturedItemKind::InlineSpecEnsures
         ) {
+            // Inline `requires` / `ensures` companions inline their `anodized`
+            // closure wrappers during lowering, so only executable items seed
+            // local closure capture.
+            let seeds_local_closures = !matches!(
+                candidate.classification.item_kind,
+                CapturedItemKind::InlineSpecRequires | CapturedItemKind::InlineSpecEnsures
+            );
             for (callee_def_id, opt_substs) in collect_referenced_callees(tcx, def_id, body, None) {
+                if seeds_local_closures {
+                    enqueue_local_closure(
+                        tcx,
+                        callee_def_id,
+                        &mut seen_local_closures,
+                        &mut local_closure_worklist,
+                    );
+                }
                 if should_capture_non_local_callee(tcx, callee_def_id) {
                     let seen_substs = visited_worklist_substs
                         .entry(def_id_sort_key(callee_def_id))
@@ -442,7 +538,62 @@ fn capture_crate_unit<'tcx>(
         used_stems_by_crate.insert(crate_pascal.clone(), used_item_stems);
         next_stem_suffix_by_crate.insert(crate_pascal.clone(), next_stem_suffix);
 
-        while let Some((callee_def_id, opt_substs)) = worklist.pop_front() {
+        loop {
+            // Local closures referenced by captured items or captured callee
+            // bodies are captured as `CapturedItemKind::Callee` in the local
+            // crate's module namespace, before the next non-local callee.
+            while let Some(closure_local_id) = local_closure_worklist.pop_front() {
+                let closure_def_id = closure_local_id.to_def_id();
+                let body = query_post_cleanup_mir(tcx, closure_local_id);
+                for (next_def_id, next_substs) in
+                    collect_referenced_callees(tcx, closure_def_id, body, None)
+                {
+                    enqueue_local_closure(
+                        tcx,
+                        next_def_id,
+                        &mut seen_local_closures,
+                        &mut local_closure_worklist,
+                    );
+                    if should_capture_non_local_callee(tcx, next_def_id) {
+                        let seen_substs = visited_worklist_substs
+                            .entry(def_id_sort_key(next_def_id))
+                            .or_default();
+                        if seen_substs.len() < 16 && !seen_substs.contains(&next_substs) {
+                            seen_substs.push(next_substs);
+                            worklist.push_back((next_def_id, next_substs));
+                        }
+                    }
+                }
+                let raw_def_path = canonical_def_path(tcx, closure_def_id);
+                let def_path = disambiguate_identifier(
+                    &raw_def_path,
+                    &mut used_def_paths,
+                    &mut next_def_path_suffix,
+                );
+                let raw_stem = sanitize_item_module_stem(&crate_name, &def_path);
+                let crate_used_stems = used_stems_by_crate.entry(crate_pascal.clone()).or_default();
+                let crate_next_suffix = next_stem_suffix_by_crate
+                    .entry(crate_pascal.clone())
+                    .or_default();
+                let item_stem =
+                    disambiguate_identifier(&raw_stem, crate_used_stems, crate_next_suffix);
+                let mut ir_captured =
+                    lower_mir_body(tcx, closure_def_id, body, IrContractRole::Subject);
+                ir_captured.def_path = def_path.clone();
+                for ti in &mut ir_captured.trait_impls {
+                    ti.impl_path = def_path.clone();
+                }
+                unit_targets.push(emit_callee_unit_target(
+                    &unit_dir,
+                    &crate_pascal,
+                    &item_stem,
+                    def_path,
+                    ir_captured,
+                )?);
+            }
+            let Some((callee_def_id, opt_substs)) = worklist.pop_front() else {
+                break;
+            };
             if !should_capture_non_local_callee(tcx, callee_def_id) {
                 continue;
             }
@@ -450,6 +601,12 @@ fn capture_crate_unit<'tcx>(
             for (next_def_id, next_substs) in
                 collect_referenced_callees(tcx, callee_def_id, body, opt_substs)
             {
+                enqueue_local_closure(
+                    tcx,
+                    next_def_id,
+                    &mut seen_local_closures,
+                    &mut local_closure_worklist,
+                );
                 if should_capture_non_local_callee(tcx, next_def_id) {
                     let seen_substs = visited_worklist_substs
                         .entry(def_id_sort_key(next_def_id))
@@ -487,48 +644,13 @@ fn capture_crate_unit<'tcx>(
                 ti.impl_path = def_path.clone();
             }
 
-            let lean_module_name = format!("Mir.{callee_crate_pascal}.{item_stem}");
-            let mir_module_rel_path = format!("Mir/{callee_crate_pascal}/{item_stem}.lean");
-            let lean_source = emit_mir_lean_module(&lean_module_name, &ir_captured);
-            let mir_digest = sha256_hex(lean_source.as_bytes());
-
-            let mir_full_path = unit_dir.join(&mir_module_rel_path);
-            if let Some(parent) = mir_full_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    format!("failed to create MIR directory `{}`: {e}", parent.display())
-                })?;
-            }
-            fs::write(&mir_full_path, lean_source.as_bytes()).map_err(|e| {
-                format!(
-                    "failed to write MIR Lean module `{}`: {e}",
-                    mir_full_path.display()
-                )
-            })?;
-
-            let mut manifest_trait_impls = Vec::new();
-            for ti in ir_captured.trait_impls {
-                let mut trait_args_lean = Vec::new();
-                for arg in ti.trait_ref.args {
-                    trait_args_lean.push(crate::lean_emit::render_rigid_ty_pub(&arg));
-                }
-                manifest_trait_impls.push(crate::manifest::ManifestTraitImplEntry {
-                    trait_method_def_path: ti.trait_ref.def_path,
-                    trait_args_lean,
-                    impl_path: ti.impl_path,
-                });
-            }
-
-            unit_targets.push(UnitTargetRecord {
-                target: CapturedTarget {
-                    def_id: def_path,
-                    mir_module_path: mir_module_rel_path,
-                    mir_module_sha256: mir_digest,
-                },
-                lean_module_name,
-                item_kind: CapturedItemKind::Callee,
-                associated_subject_def_id: None,
-                trait_impls: manifest_trait_impls,
-            });
+            unit_targets.push(emit_callee_unit_target(
+                &unit_dir,
+                &callee_crate_pascal,
+                &item_stem,
+                def_path,
+                ir_captured,
+            )?);
         }
     }
 

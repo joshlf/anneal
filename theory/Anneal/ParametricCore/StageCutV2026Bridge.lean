@@ -57,7 +57,7 @@ open Trusted.Effect
 open Trusted.Sequence
 open Trusted.Rustc.V2026_06_01.Layout
 open Trusted.Rustc.V2026_06_01.MirAst
-open Trusted.Rustc.V2026_06_01.MirSemantics
+open Trusted.Rustc.V2026_06_01.MirSemantics hiding natListMem
 open Anneal.MirFuelFree
 open Anneal.PureMirExec
 open Anneal.SepLogicLenses
@@ -166,11 +166,11 @@ theorem mirStepsConverges_of_wpUntilOk_det {body : CapturedMir} {tag : MachineSt
 
 /-! ## Section 1: `ByteRun` ↔ `V2026_06_01` Operational Bridge -/
 
-/-- Exact bijection `ByteRunCodec (Nat × Nat) AbstractByte` mapping
-`ByteRunAtom (Nat × Nat)` onto unmodified `V2026_06_01.MirSemantics.AbstractByte`,
-preserving `.uninit`, plain `.init b none`, and provenance `.init b (some (aid, tag))`
+/-- Exact bijection `ByteRunCodec PtrByteFrag AbstractByte` mapping
+`ByteRunAtom PtrByteFrag` onto unmodified `V2026_06_01.MirSemantics.AbstractByte`,
+preserving `.uninit`, plain `.init b none`, and provenance `.init b (some frag)`
 verbatim. -/
-def abstractByteRunCodec : ByteRunCodec (Nat × Nat) AbstractByte where
+def abstractByteRunCodec : ByteRunCodec PtrByteFrag AbstractByte where
   encodeAtom
     | .uninitPad => .uninit
     | .initPlain b => .init b none
@@ -188,7 +188,7 @@ def abstractByteRunCodec : ByteRunCodec (Nat × Nat) AbstractByte where
 /-- Right inverse of `abstractByteRunCodec`: every `AbstractByte` round-trips
 through `decodeAtom?` and `encodeAtom`. -/
 theorem abstractByteRunCodec_encode_decode (b : AbstractByte) :
-    ∃ a : ByteRunAtom (Nat × Nat),
+    ∃ a : ByteRunAtom PtrByteFrag,
       abstractByteRunCodec.decodeAtom? b = some a ∧
       abstractByteRunCodec.encodeAtom a = b := by
   cases b with
@@ -280,10 +280,10 @@ theorem v2026ByteMem_get_eq_readV2026Bytes (m : V2026ByteMem)
     rw [hInB]
     rfl
 
-/-- Canonical 3-run `ByteRun (Nat × Nat)` layout for a padded
+/-- Canonical 3-run `ByteRun PtrByteFrag` layout for a padded
 `#[repr(C)] (u8, [pad; 3], u32)` struct:
 1 plain byte (`aByte`), 3 uninitialized padding bytes, and 4 plain LE bytes (`bVal`). -/
-def paddedU8U32ByteRuns (s : U8U32Struct) : List (ByteRun (Nat × Nat)) :=
+def paddedU8U32ByteRuns (s : U8U32Struct) : List (ByteRun PtrByteFrag) :=
   [ .initPlain [s.aByte]
   , .uninitPad 3
   , .initPlain (encodeU32LEBytes s.bVal.val) ]
@@ -323,21 +323,20 @@ theorem copyRangeComp_paddedU8U32_preserves_decode {Mem Addr : Type}
   subst hEq
   exact ((paddedU8U32MemCodec_lawful hLookup hSize hFields).encodeProps s).2.2.2.2.1
 
-/-- Canonical 3-run `ByteRun (Nat × Nat)` layout for a provenance-carrying
-`#[repr(C)] (u8, [pad; 7], *mut u8)` struct. -/
-def provPtrByteRuns (aid tag : Nat) (s : ProvPtrStruct) : List (ByteRun (Nat × Nat)) :=
+/-- Canonical `ByteRun PtrByteFrag` layout for a provenance-carrying
+`#[repr(C)] (u8, [pad; 7], *mut u8)` struct with per-byte coherent `PtrByteFrag` metadata. -/
+def provPtrByteRuns (aid tag : Nat) (s : ProvPtrStruct) : List (ByteRun PtrByteFrag) :=
+  let off := s.ptrOffset.val
   [ .initPlain [s.tagByte]
   , .uninitPad 7
-  , .initProv
-      [ UInt8.ofNat s.ptrOffset.val
-      , UInt8.ofNat (s.ptrOffset.val / 256)
-      , UInt8.ofNat (s.ptrOffset.val / 65536)
-      , UInt8.ofNat (s.ptrOffset.val / 16777216)
-      , UInt8.ofNat (s.ptrOffset.val / 4294967296)
-      , UInt8.ofNat (s.ptrOffset.val / 1099511627776)
-      , UInt8.ofNat (s.ptrOffset.val / 281474976710656)
-      , UInt8.ofNat (s.ptrOffset.val / 72057594037927936) ]
-      (aid, tag) ]
+  , .initProv [UInt8.ofNat off] ⟨aid, tag, 0, off, 8⟩
+  , .initProv [UInt8.ofNat (off / 256)] ⟨aid, tag, 1, off, 8⟩
+  , .initProv [UInt8.ofNat (off / 65536)] ⟨aid, tag, 2, off, 8⟩
+  , .initProv [UInt8.ofNat (off / 16777216)] ⟨aid, tag, 3, off, 8⟩
+  , .initProv [UInt8.ofNat (off / 4294967296)] ⟨aid, tag, 4, off, 8⟩
+  , .initProv [UInt8.ofNat (off / 1099511627776)] ⟨aid, tag, 5, off, 8⟩
+  , .initProv [UInt8.ofNat (off / 281474976710656)] ⟨aid, tag, 6, off, 8⟩
+  , .initProv [UInt8.ofNat (off / 72057594037927936)] ⟨aid, tag, 7, off, 8⟩ ]
 
 /-- Copying a provenance-carrying `#[repr(C)] (u8, [pad; 7], *mut u8)` struct via
 `copyRangeComp` preserves all 7 `.uninit` padding bytes and all 8 `(aid, aid)`
@@ -351,7 +350,8 @@ theorem copyRangeComp_provPtr_preserves_decode {Mem Addr : Type}
     (hFields : l.fields = .arbitrary [⟨0⟩, ⟨8⟩] mem)
     (aid : AllocId) (src dst : ByteSubLens Addr) (m₀ m₁ : Mem) (s : ProvPtrStruct)
     (hSrc : src.get m₀ = some (provPtrEncode aid aid s))
-    (hCopy : copyRangeComp src dst m₀ = some m₁) :
+    (hCopy : copyRangeComp src dst m₀ = some m₁)
+    (hPtr : layoutPointerBytes layouts = 8 := by rfl) :
     dst.get m₁ = some (provPtrEncode aid aid s) ∧
     (∀ bs, dst.get m₁ = some bs →
       decodeValueFromBytes defaultCodecFuel layouts (provPtrMirTy idx) bs =
@@ -364,7 +364,7 @@ theorem copyRangeComp_provPtr_preserves_decode {Mem Addr : Type}
   rw [hRaw.2.1] at hGet
   injection hGet with hEq
   subst hEq
-  exact ((provPtrPaddedMemCodec_lawful hLookup hSize hFields aid).encodeProps s).2.2.2.2.1
+  exact ((provPtrPaddedMemCodec_lawful hLookup hSize hFields aid hPtr).encodeProps s).2.2.2.2.1
 
 /-- Agreement between unmodified `MirSemantics.replicateValue n v` (produced by
 `Rvalue.repeat op n`) and `ByteRun.repeatSlice n [v]`. -/

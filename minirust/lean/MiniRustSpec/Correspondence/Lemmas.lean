@@ -3401,7 +3401,11 @@ theorem intTypeOf_of_specOfRigidTy_scalar {layouts : Layout.LayoutTable} {ty : M
     | some l =>
       simp only [hl, Option.bind_eq_bind, Option.bind_some] at h
       split at h
-      · split at h <;> simp [Option.bind_eq_some_iff] at h
+      · split at h
+        · simp only [Option.bind_eq_some_iff] at h
+          rcases h with ⟨_, _, h2⟩
+          split at h2 <;> simp at h2
+        · simp at h
       · simp at h
   · next _ _ fieldKinds _ =>
     cases hl : layouts.lookup ty.layoutIdx with
@@ -3409,7 +3413,11 @@ theorem intTypeOf_of_specOfRigidTy_scalar {layouts : Layout.LayoutTable} {ty : M
     | some l =>
       simp only [hl, Option.bind_eq_bind, Option.bind_some] at h
       split at h
-      · split at h <;> simp [Option.bind_eq_some_iff] at h
+      · split at h
+        · simp only [Option.bind_eq_some_iff] at h
+          rcases h with ⟨_, _, h2⟩
+          split at h2 <;> simp at h2
+        · simp at h
       · simp at h
   · simp at h
 

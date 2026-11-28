@@ -37,6 +37,9 @@ import MiniRustSpec.Correspondence.IntrinsicFallback
 import MiniRustSpec.Correspondence.WideSliceDst
 import MiniRustSpec.Correspondence.IntrinsicBoundary
 import MiniRustSpec.UnwindSetDiscrAndFnPtrMR
+import MiniRustSpec.FloatArithMR
+import MiniRustSpec.ClosureFnPtrMR
+import MiniRustSpec.PtrByteCoherenceMR
 import MiniRustSpec.Audit
 
 /-!
@@ -83,6 +86,55 @@ import MiniRustSpec.Audit
   `pointerCoercion` (`ReifyFnPointer`, `ClosureFnPointer`, `UnsafeFnPointer`,
   `MutToConstPointer`, `ArrayToPointer`), `unwrapUnsafeBinder`, and
   `AggregateKind.closure`.
+* `MiniRustSpec.FloatArithMR`: two-sided fail-closed translation boundary for
+  float unary negation and binary arithmetic/comparison ops (including
+  no-float-local float-constant comparison rejection, arbitrary projected
+  float places `*p` / `_s.0` / `_a[i]`, and the exact two-sided
+  `translateRvalue` truth `fa_translateRvalue_binaryOp_two_sided`), IEEE-754
+  bit-carrier bridges (`UnOp.neg` ↔ `u32`/`u64` sign-bit XOR lockstep across
+  `Mach` and `MachTB` with `MachTB.wfLive`, `Bool` comparison carriers, and
+  `EvalFloatBinOpRel` / `nanChoices` `.deterministic` & `.nondeterministic`
+  carriers, with universal `f64` 8-byte, zero-extended `f32`, and native
+  4-byte `f32` `Mach` + `MachTB.wfLive` carrier execution), mode-parametric
+  `Ptr2IntTransmutePolicy` (`ucg#630` vs.
+  `reference#1752`) scalar and composite `(*const u8, usize)` / `struct Mixed`
+  correspondence across `BasicMemory` and `TreeBorrowsMemory`, shared UB /
+  no-forgery (`usize → &u8`, `MaybeUninit` uninit → `u64`, size mismatch), and
+  shared concrete witnesses `W1–W6` (68 public theorems, all pinned by
+  `axiomAudit_choiceFree` and `axiomAudit_machine`).
+* `MiniRustSpec.ClosureFnPtrMR`: dual-authority correspondence for
+  non-capturing closure function pointers. Universal laws relate `Trusted`'s
+  callee-directed closure dispatch (`calleeOwnClosureShape?`, no closure flag
+  on `FnPtrEntry`, synthesized zero-sized environment prepended to `_1`) to
+  MiniRust functions of the closure's user-visible arity across `Mach` and
+  `MachTB` (`ClosureFnPtrEntryRel`, `ClosureFnSigRel`,
+  `ClosureFnPointer(Safe|Unsafe)` reification, `UnsafeFnPointer` widening,
+  `FnPtrToPtr` pointer identity, indirect `call` / `tailCall` for `Fn` /
+  `FnMut` / `FnOnce` receivers, the `const_eval_select` runtime target,
+  translation-derived fixed-width integer/`bool` ABI correspondence, and the
+  fail-closed capturing, forged `(N + 1)`-argument, ABI, `Safety`,
+  generic-closure, and direct-call laws), with non-vacuity instantiations and
+  kernel-checked three-way witnesses on verbatim `rustc-capture` bodies —
+  including the difftest reproducer that Miri evaluates to `9147` and
+  characterization of the pre-existing thin-pointer / `usize`-vs-`u64`
+  false-positive UB divergence (pinned by `#assert_closure_fn_ptr_mr_audit` and
+  `[CLOSURE-FNPTR-AUDIT]`).
+* `MiniRustSpec.PtrByteCoherenceMR`: dual-authority correspondence for
+  pointer-byte fragment coherence (`UCG#558` / `rust#148259`) and read-time
+  validity (`Kani#5205`), in lockstep for `V2026_06_01` and `V2026_08_01`. The
+  fragment projection `PtrByteFrag → ProvenanceFrag { provenance, position }`
+  relates `Trusted`'s `encodePtrBytes`, `abstractBytesCoherentPtrProv?`,
+  `decodePtrBytesNoForge`, `decodeScalarLayoutBytesNoForge`, and the union
+  raw-byte carrier to MiniRust `encode_ptr` / `decode_ptr` across `BasicMemory`
+  and `TreeBorrowsMemory`: exact encoding and intact round trips, exact
+  characterizations of both authorities, `Trusted → MiniRust` soundness, shared
+  stripping on reversals, swaps, duplicates, permutations, mixed / missing
+  provenance and uninitialized bytes, the kernel-proved offset-splice strict
+  refinement (`Trusted` strips where vendored MiniRust retains) with its exact
+  gap characterization, wide pointers, and `Kani#5205` typed-read rejection,
+  with non-vacuity instantiations, kernel-checked witnesses, and classified
+  scoped divergences (pinned by `#assert_ptr_byte_coherence_mr_audit` and
+  `[PTR-BYTE-COHERENCE-AUDIT]`).
 * `MiniRustSpec.Audit`: fails the build unless the main theorems use only the
   standard axioms.
 

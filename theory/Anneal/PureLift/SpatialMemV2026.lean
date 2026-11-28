@@ -95,67 +95,97 @@ private theorem dropAbstractBytes_eq_drop' : ∀ (n : Nat) (bs : List AbstractBy
 
 /-- Total computable little-endian encoder mirroring
 `Trusted.Rustc.V2026_06_01.MirSemantics.encodeLittleEndianBytes`. -/
-def execEncodeLittleEndianBytes (bits : Nat) :
-    Nat → Option (Nat × Nat) → List AbstractByte
-  | 0, _ => []
-  | rem + 1, prov =>
-    .init (UInt8.ofNat bits) prov ::
-      execEncodeLittleEndianBytes (bits / 256) rem prov
+def execEncodeLittleEndianBytes (bits : Nat) (numBytes : Nat)
+    (prov : Option (Nat × Nat) := none) : List AbstractByte :=
+  encodeLittleEndianBytes bits numBytes prov
 
 theorem execEncodeLittleEndianBytes_eq (bits numBytes : Nat)
     (prov : Option (Nat × Nat)) :
     execEncodeLittleEndianBytes bits numBytes prov =
-      encodeLittleEndianBytes bits numBytes prov := by
+      encodeLittleEndianBytes bits numBytes prov := rfl
+
+private theorem encodePlainLittleEndianBytes_length (bits numBytes : Nat) :
+    (encodePlainLittleEndianBytes bits numBytes).length = numBytes := by
   induction numBytes generalizing bits with
   | zero => rfl
   | succ rem ih =>
-    simp only [execEncodeLittleEndianBytes, encodeLittleEndianBytes]
-    exact congrArg (List.cons (.init (UInt8.ofNat bits) prov)) (ih (bits / 256))
+    simp only [encodePlainLittleEndianBytes, List.length_cons, ih]
+
+private theorem encodePtrBytesAux_length (a t origOff ptrBytes bits idx numBytes : Nat) :
+    (encodePtrBytesAux a t origOff ptrBytes bits idx numBytes).length = numBytes := by
+  induction numBytes generalizing bits idx with
+  | zero => rfl
+  | succ rem ih =>
+    simp only [encodePtrBytesAux, List.length_cons, ih]
 
 theorem encodeLittleEndianBytes_length (bits numBytes : Nat)
     (prov : Option (Nat × Nat)) :
     (encodeLittleEndianBytes bits numBytes prov).length = numBytes := by
-  induction numBytes generalizing bits with
-  | zero => rfl
-  | succ rem ih =>
-    simp only [encodeLittleEndianBytes, List.length_cons, ih]
+  cases prov with
+  | none => exact encodePlainLittleEndianBytes_length bits numBytes
+  | some p => exact encodePtrBytesAux_length p.1 p.2 (normPtrByteOffset numBytes bits) numBytes bits 0 numBytes
 
 /-- Total computable little-endian decoder mirroring
 `Trusted.Rustc.V2026_06_01.MirSemantics.decodeLittleEndianBytes`. -/
-def execDecodeLittleEndianBytes :
-    List AbstractByte → Option (Nat × Option (Nat × Nat))
-  | [] => some (0, none)
-  | .uninit :: _ => none
-  | .init b prov :: rest =>
-    match execDecodeLittleEndianBytes rest with
-    | some (highBits, restProv) =>
-      some (b.toBitVec.toNat + 256 * highBits, mergeByteProvenance prov restProv)
-    | none => none
+def execDecodeLittleEndianBytes (bs : List AbstractByte) :
+    Option (Nat × Option (Nat × Nat)) :=
+  decodeLittleEndianBytes bs
 
 theorem execDecodeLittleEndianBytes_eq (bs : List AbstractByte) :
-    execDecodeLittleEndianBytes bs = decodeLittleEndianBytes bs := by
-  induction bs with
-  | nil => rfl
-  | cons b rest ih =>
-    cases b with
-    | uninit => rfl
-    | init byte prov =>
-      unfold execDecodeLittleEndianBytes decodeLittleEndianBytes
-      rw [ih]
-      rfl
-
-private theorem mergeByteProvenance_same (p : Option (Nat × Nat)) :
-    mergeByteProvenance p p = p := by
-  cases p <;> rfl
-
-private theorem mergeByteProvenance_none_right (p : Option (Nat × Nat)) :
-    mergeByteProvenance p none = p := by
-  cases p <;> rfl
+    execDecodeLittleEndianBytes bs = decodeLittleEndianBytes bs := rfl
 
 private theorem uint8_ofNat_toBitVec_toNat (n : Nat) :
     (UInt8.ofNat n).toBitVec.toNat = n % 256 := by
   change (BitVec.ofNat 8 n).toNat = n % 256
   simp [BitVec.toNat_ofNat]
+
+private theorem decodeLittleEndianBits_encodePlain (bits numBytes : Nat) :
+    decodeLittleEndianBits (encodePlainLittleEndianBytes bits numBytes) =
+      some (bits % 256 ^ numBytes) := by
+  induction numBytes generalizing bits with
+  | zero =>
+    show some 0 = some (bits % 1)
+    rw [Nat.mod_one]
+  | succ rem ih =>
+    unfold encodePlainLittleEndianBytes decodeLittleEndianBits
+    rw [ih (Nat.div bits 256), uint8_ofNat_toBitVec_toNat]
+    have hMod : bits % 256 + 256 * (bits / 256 % 256 ^ rem) = bits % 256 ^ (rem + 1) := by
+      have hPow : 256 ^ (rem + 1) = 256 * 256 ^ rem := by
+        rw [Nat.pow_succ, Nat.mul_comm]
+      rw [hPow, Nat.mod_mul]
+    exact congrArg some hMod
+
+private theorem decodeLittleEndianBits_encodePtrAux
+    (a t origOff ptrBytes : Nat) : ∀ (numBytes idx bits : Nat),
+    decodeLittleEndianBits (encodePtrBytesAux a t origOff ptrBytes bits idx numBytes) =
+      some (bits % 256 ^ numBytes)
+  | 0, _, bits => by
+    show some 0 = some (bits % 1)
+    rw [Nat.mod_one]
+  | rem + 1, idx, bits => by
+    unfold encodePtrBytesAux decodeLittleEndianBits
+    rw [decodeLittleEndianBits_encodePtrAux a t origOff ptrBytes rem (idx + 1) (Nat.div bits 256),
+      uint8_ofNat_toBitVec_toNat]
+    have hMod : bits % 256 + 256 * (bits / 256 % 256 ^ rem) = bits % 256 ^ (rem + 1) := by
+      have hPow : 256 ^ (rem + 1) = 256 * 256 ^ rem := by
+        rw [Nat.pow_succ, Nat.mul_comm]
+      rw [hPow, Nat.mod_mul]
+    exact congrArg some hMod
+
+private theorem abstractBytesCoherentPtrProvAux_encodePtrAux
+    (a t origOff ptrBytes : Nat) : ∀ (numBytes idx bits : Nat),
+    abstractBytesCoherentPtrProvAux a t origOff ptrBytes idx
+      (encodePtrBytesAux a t origOff ptrBytes bits idx numBytes) =
+      Nat.beq (Nat.add idx numBytes) ptrBytes
+  | 0, idx, _ => rfl
+  | rem + 1, idx, bits => by
+    unfold encodePtrBytesAux abstractBytesCoherentPtrProvAux
+    simp only [Nat.beq_refl, Bool.and_self, Bool.true_and,
+      abstractBytesCoherentPtrProvAux_encodePtrAux a t origOff ptrBytes rem (idx + 1) (Nat.div bits 256)]
+    have hIdx : Nat.add (Nat.add idx 1) rem = Nat.add idx (Nat.succ rem) := by
+      change (idx + 1) + rem = idx + (rem + 1)
+      rw [Nat.add_assoc, Nat.add_comm 1 rem]
+    rw [hIdx]
 
 /-- Exact little-endian round-trip: decoding `encodeLittleEndianBytes bits n prov`
 recovers `(bits % 256^n, if n == 0 then none else prov)`. -/
@@ -163,27 +193,30 @@ theorem decodeLittleEndianBytes_encodeLittleEndianBytes
     (bits numBytes : Nat) (prov : Option (Nat × Nat)) :
     decodeLittleEndianBytes (encodeLittleEndianBytes bits numBytes prov) =
       some (bits % 256 ^ numBytes, if numBytes == 0 then none else prov) := by
-  induction numBytes generalizing bits with
-  | zero =>
-    simp only [decodeLittleEndianBytes, Nat.pow_zero,
-      Nat.mod_one, beq_self_eq_true, ↓reduceIte]
-  | succ rem ih =>
-    unfold encodeLittleEndianBytes decodeLittleEndianBytes
-    change (match decodeLittleEndianBytes (encodeLittleEndianBytes (bits / 256) rem prov) with
-      | some (highBits, restProv) =>
-        some ((UInt8.ofNat bits).toBitVec.toNat + 256 * highBits, mergeByteProvenance prov restProv)
-      | none => none) = _
-    rw [ih (bits / 256), uint8_ofNat_toBitVec_toNat]
-    have hMod : bits % 256 + 256 * (bits / 256 % 256 ^ rem) = bits % 256 ^ (rem + 1) := by
-      have hPow : 256 ^ (rem + 1) = 256 * 256 ^ rem := by
-        rw [Nat.pow_succ, Nat.mul_comm]
-      rw [hPow, Nat.mod_mul]
-    have hProv : mergeByteProvenance prov (if rem == 0 then none else prov) = prov := by
-      cases rem with
-      | zero => exact mergeByteProvenance_none_right prov
-      | succ _ => exact mergeByteProvenance_same prov
-    have hSucc : (rem + 1 == 0) = false := rfl
-    simp only [hMod, hProv, hSucc, Bool.false_eq_true, ↓reduceIte]
+  cases prov with
+  | none =>
+    cases numBytes with
+    | zero =>
+      exact congrArg (fun x => some (x, none)) (Nat.mod_one bits).symm
+    | succ rem =>
+      unfold encodeLittleEndianBytes decodeLittleEndianBytes
+      rw [decodeLittleEndianBits_encodePlain]
+      rfl
+  | some p =>
+    rcases p with ⟨a, t⟩
+    cases numBytes with
+    | zero =>
+      exact congrArg (fun x => some (x, none)) (Nat.mod_one bits).symm
+    | succ rem =>
+      unfold encodeLittleEndianBytes encodePtrBytes decodeLittleEndianBytes
+      rw [decodeLittleEndianBits_encodePtrAux]
+      unfold encodePtrBytesAux abstractBytesCoherentPtrProv?
+      dsimp only
+      rw [Nat.beq_refl,
+        abstractBytesCoherentPtrProvAux_encodePtrAux a t (normPtrByteOffset (rem + 1) bits) (rem + 1) rem 1 (Nat.div bits 256)]
+      have hLen : Nat.add 1 rem = rem + 1 := Nat.add_comm 1 rem
+      rw [hLen, Nat.beq_refl]
+      rfl
 
 /-- Bounded round-trip specialization when `bits < 256 ^ numBytes` and
 `numBytes > 0`. -/
@@ -303,41 +336,44 @@ theorem execGlobalAllocSliceToAbstractBytes_eq (alloc : CapturedAllocation)
   rw [hLen]
   cases Nat.ble offset alloc.bytes.length <;> rfl
 
-/-- Equality test on `Option (Nat × Nat)` provenance pairs. -/
-def optProvBeq : Option (Nat × Nat) → Option (Nat × Nat) → Bool
+/-- Equality test on `Option PtrByteFrag` provenance fragments. -/
+def optProvBeq : Option PtrByteFrag → Option PtrByteFrag → Bool
   | none, none => true
-  | some (a1, t1), some (a2, t2) => Nat.beq a1 a2 && Nat.beq t1 t2
+  | some f1, some f2 =>
+    Nat.beq f1.allocId f2.allocId &&
+    Nat.beq f1.tag f2.tag &&
+    Nat.beq f1.byteIdx f2.byteIdx &&
+    Nat.beq f1.origOffset f2.origOffset &&
+    Nat.beq f1.ptrBytes f2.ptrBytes
   | _, _ => false
 
-theorem optProvBeq_refl (p : Option (Nat × Nat)) : optProvBeq p p = true := by
+theorem optProvBeq_refl (p : Option PtrByteFrag) : optProvBeq p p = true := by
   cases p with
   | none => rfl
-  | some pair =>
-    cases pair with
-    | mk a t =>
-      simp only [optProvBeq, Nat.beq_refl, Bool.and_self]
+  | some f =>
+    rcases f with ⟨a, t, bi, oo, pb⟩
+    simp only [optProvBeq, Nat.beq_refl, Bool.and_self]
 
-theorem optProvBeq_eq_true_iff (p1 p2 : Option (Nat × Nat)) :
+theorem optProvBeq_eq_true_iff (p1 p2 : Option PtrByteFrag) :
     optProvBeq p1 p2 = true ↔ p1 = p2 := by
   cases p1 with
   | none =>
     cases p2 with
     | none => simp [optProvBeq]
     | some _ => simp [optProvBeq]
-  | some pair1 =>
-    cases pair1 with
-    | mk a1 t1 =>
-      cases p2 with
-      | none => simp [optProvBeq]
-      | some pair2 =>
-        cases pair2 with
-        | mk a2 t2 =>
-          simp only [optProvBeq, Bool.and_eq_true, Option.some.injEq, Prod.mk.injEq]
-          constructor
-          · rintro ⟨hA, hT⟩
-            exact ⟨Nat.eq_of_beq_eq_true hA, Nat.eq_of_beq_eq_true hT⟩
-          · rintro ⟨rfl, rfl⟩
-            exact ⟨Nat.beq_refl _, Nat.beq_refl _⟩
+  | some f1 =>
+    rcases f1 with ⟨a1, t1, bi1, oo1, pb1⟩
+    cases p2 with
+    | none => simp [optProvBeq]
+    | some f2 =>
+      rcases f2 with ⟨a2, t2, bi2, oo2, pb2⟩
+      simp only [optProvBeq, Bool.and_eq_true, Option.some.injEq, PtrByteFrag.mk.injEq]
+      constructor
+      · rintro ⟨⟨⟨⟨hA, hT⟩, hBi⟩, hOo⟩, hPb⟩
+        exact ⟨Nat.eq_of_beq_eq_true hA, Nat.eq_of_beq_eq_true hT,
+          Nat.eq_of_beq_eq_true hBi, Nat.eq_of_beq_eq_true hOo, Nat.eq_of_beq_eq_true hPb⟩
+      · rintro ⟨rfl, rfl, rfl, rfl, rfl⟩
+        exact ⟨⟨⟨⟨Nat.beq_refl _, Nat.beq_refl _⟩, Nat.beq_refl _⟩, Nat.beq_refl _⟩, Nat.beq_refl _⟩
 
 /-- Decidable equality test on `AbstractByte`. -/
 def abstractByteBeq : AbstractByte → AbstractByte → Bool
@@ -559,23 +595,11 @@ private theorem globalAllocBytesAux_length (bytes : List (Option UInt8))
     have hOpt : Trusted.Sequence.get? bytes offset = some (bytes[offset]'hLt) := by
       rw [seqGet?_eq_listGetElem?, List.getElem?_eq_getElem hLt]
     obtain ⟨rest, hRest, hLen⟩ := ih (offset + 1) (by omega)
-    let headByte : AbstractByte :=
-      match bytes[offset]'hLt with
-      | .none => AbstractByte.uninit
-      | .some b =>
-        let prov :=
-          match lookupRelocAllocId relocs offset with
-          | .some targetPtr => .some (targetPtr.allocId, targetPtr.tag)
-          | .none => .none
-        AbstractByte.init b prov
-    refine ⟨headByte :: rest, ?_, ?_⟩
-    · unfold globalAllocBytesAux
-      rw [hOpt]
-      change (match globalAllocBytesAux bytes relocs (offset + 1) rem with
-        | none => none
-        | some restBytes => some (headByte :: restBytes)) = some (headByte :: rest)
-      rw [hRest]
-    · simp only [List.length_cons, hLen]
+    unfold globalAllocBytesAux
+    rw [hOpt]
+    dsimp only
+    rw [hRest]
+    exact ⟨_, rfl, by simp only [List.length_cons, hLen]⟩
 
 private theorem globalAllocBytesAux_drop_take (bytes : List (Option UInt8))
     (relocs : List (Nat × ProvenancePtr)) :
@@ -1408,15 +1432,12 @@ def sliceAllInitNoProv : List AbstractByte → Bool
   | .init _ none :: rest => sliceAllInitNoProv rest
   | _ => false
 
-/-- True iff every byte in `bs` is initialized with the EXACT provenance pair
-`some (allocId, tag)`. -/
+/-- True iff `bs` is a coherent encoded pointer byte image carrying exact provenance
+`(allocId, tag)` (`UCG#558`: matching fragment indices, original offset, and width). -/
 def allHaveExactProv (bs : List AbstractByte) (allocId tag : Nat) : Bool :=
-  bs.foldr
-    (fun b acc =>
-      match b with
-      | .init _ (some (a, t)) => Nat.beq a allocId && Nat.beq t tag && acc
-      | _ => false)
-    true
+  match decodeLittleEndianBits bs with
+  | some bits => abstractByteListBeq bs (encodeLittleEndianBytes bits bs.length (some (allocId, tag)))
+  | none => false
 
 /-- True iff no padding byte in `bs` carries provenance (every padding byte is
 either `.uninit` or `.init _ none`). -/
@@ -1435,12 +1456,12 @@ def nonPadBytesOfMask : List Bool → List AbstractByte → List AbstractByte
   | true :: pm, _ :: bs => nonPadBytesOfMask pm bs
   | false :: pm, b :: bs => b :: nonPadBytesOfMask pm bs
 
-/-- Check whether `prov` occurs among the bytes of `allowed`. -/
-def provInBytes (p : Nat × Nat) (allowed : List AbstractByte) : Bool :=
+/-- Check whether pointer-byte fragment `p` occurs among the bytes of `allowed`. -/
+def provInBytes (p : PtrByteFrag) (allowed : List AbstractByte) : Bool :=
   allowed.foldr
     (fun b acc =>
       match b with
-      | .init _ (some q) => (Nat.beq p.1 q.1 && Nat.beq p.2 q.2) || acc
+      | .init _ (some q) => optProvBeq (some p) (some q) || acc
       | _ => acc)
     false
 
@@ -1898,7 +1919,7 @@ def anyAllocBytesRefAlloc (aid : AllocId) (allocs : List V2026ByteAlloc) : Bool 
        a.bytes.foldr
          (fun b bacc =>
            match b with
-           | .init _ (some (pAid, _)) => Nat.beq pAid aid || bacc
+           | .init _ (some frag) => Nat.beq frag.allocId aid || bacc
            | _ => bacc)
          false) || acc)
     false
@@ -1910,7 +1931,7 @@ def otherLiveAllocRefsAlloc (aid : AllocId) (allocs : List V2026ByteAlloc) : Boo
        a.bytes.foldr
          (fun b bacc =>
            match b with
-           | .init _ (some (pAid, _)) => Nat.beq pAid aid || bacc
+           | .init _ (some frag) => Nat.beq frag.allocId aid || bacc
            | _ => bacc)
          false) || acc)
     false
@@ -2345,7 +2366,7 @@ def u32MemCodec : TypedSpatialMemCodec U32Val where
     | _ => none
 
 theorem decodeValueFromBytes_u32_4bytes (layouts : LayoutTable)
-    (b0 b1 b2 b3 : UInt8) (p0 p1 p2 p3 : Option (Nat × Nat)) :
+    (b0 b1 b2 b3 : UInt8) (p0 p1 p2 p3 : Option PtrByteFrag) :
     decodeValueFromBytes defaultCodecFuel layouts u32MirTy
       [.init b0 p0, .init b1 p1, .init b2 p2, .init b3 p3] =
       some (.scalar ⟨decodeU32LEBytes b0 b1 b2 b3, 4⟩) := by
@@ -2927,101 +2948,150 @@ def provPtrPaddedMemCodec (expectedAllocId : AllocId) (idx : Nat := 0) :
   encodeToSymVal := provPtrToSymVal expectedAllocId
   decodeFromSymVal := provPtrFromSymVal expectedAllocId
 
-private theorem allHaveExactProv_encodeLittleEndianBytes (bits n a t : Nat) :
+private theorem allHaveExactProv_encodeLittleEndianBytes (bits n a t : Nat)
+    (hLt : bits < 256 ^ n) :
     allHaveExactProv (encodeLittleEndianBytes bits n (some (a, t))) a t = true := by
+  unfold allHaveExactProv
+  have hDec : decodeLittleEndianBits (encodeLittleEndianBytes bits n (some (a, t))) = some bits := by
+    unfold encodeLittleEndianBytes encodePtrBytes
+    rw [decodeLittleEndianBits_encodePtrAux, Nat.mod_eq_of_lt hLt]
+  rw [hDec]
+  dsimp only
+  rw [encodeLittleEndianBytes_length, abstractByteListBeq_refl]
+
+private theorem nonPadBytesInitialized_allFalse_encodePlain (bits n : Nat) :
+    nonPadBytesInitialized (List.replicate n false)
+      (encodePlainLittleEndianBytes bits n) = true := by
   induction n generalizing bits with
   | zero => rfl
   | succ rem ih =>
-    simp only [allHaveExactProv, List.foldr,
-      Nat.beq_refl, Bool.and_self, Bool.true_and]
-    exact ih (bits / 256)
+    simp only [List.replicate_succ, encodePlainLittleEndianBytes, nonPadBytesInitialized]
+    exact ih (Nat.div bits 256)
+
+private theorem nonPadBytesInitialized_allFalse_encodePtrAux
+    (a t origOff ptrBytes : Nat) : ∀ (n idx bits : Nat),
+    nonPadBytesInitialized (List.replicate n false)
+      (encodePtrBytesAux a t origOff ptrBytes bits idx n) = true
+  | 0, _, _ => rfl
+  | rem + 1, idx, bits => by
+    simp only [List.replicate_succ, encodePtrBytesAux, nonPadBytesInitialized]
+    exact nonPadBytesInitialized_allFalse_encodePtrAux a t origOff ptrBytes rem (idx + 1) (Nat.div bits 256)
 
 private theorem nonPadBytesInitialized_allFalse_encodeLittleEndianBytes (bits n : Nat)
     (p : Option (Nat × Nat)) :
     nonPadBytesInitialized (List.replicate n false)
       (encodeLittleEndianBytes bits n p) = true := by
-  induction n generalizing bits with
-  | zero => rfl
-  | succ rem ih =>
-    simp only [List.replicate_succ, encodeLittleEndianBytes, nonPadBytesInitialized]
-    exact ih (bits / 256)
+  cases p with
+  | none => exact nonPadBytesInitialized_allFalse_encodePlain bits n
+  | some q => exact nonPadBytesInitialized_allFalse_encodePtrAux q.1 q.2 (normPtrByteOffset n bits) n n 0 bits
 
 private theorem encodeLittleEndianBytes_decode_uniform_prov (a t : Nat) :
     ∀ (bs : List AbstractByte) (bits : Nat) (p : Option (Nat × Nat)),
       allHaveExactProv bs a t = true →
       decodeLittleEndianBytes bs = some (bits, p) →
       encodeLittleEndianBytes bits bs.length (some (a, t)) = bs := by
-  intro bs
-  induction bs with
-  | nil =>
-    intro bits p _ hDec
-    rfl
-  | cons b rest ih =>
-    intro bits p hAll hDec
-    cases b with
-    | uninit => nomatch hAll
-    | init byte pb =>
-      cases pb with
-      | none => nomatch hAll
-      | some pair =>
-        cases pair with
-        | mk a1 t1 =>
-          simp only [allHaveExactProv, List.foldr, Bool.and_eq_true, Nat.beq_eq] at hAll
-          obtain ⟨⟨rfl, rfl⟩, hRest⟩ := hAll
-          simp only [decodeLittleEndianBytes] at hDec
-          cases hDR : decodeLittleEndianBytes rest with
-          | none => rw [hDR] at hDec; nomatch hDec
-          | some pairR =>
-            cases pairR with
-            | mk hi pR =>
-              rw [hDR] at hDec
-              injection hDec with hPair
-              injection hPair with hBits _
-              subst hBits
-              have hByteLt : byte.toBitVec.toNat < 256 := byte.toBitVec.isLt
-              have hMod : UInt8.ofNat (byte.toBitVec.toNat.add (Nat.mul 256 hi)) = byte := by
-                apply uint8_eq_of_toNat
-                rw [uint8_ofNat_toBitVec_toNat]
-                change (byte.toBitVec.toNat + 256 * hi) % 256 = byte.toBitVec.toNat
-                omega
-              have hDiv : Nat.div (byte.toBitVec.toNat.add (Nat.mul 256 hi)) 256 = hi := by
-                change (byte.toBitVec.toNat + 256 * hi) / 256 = hi
-                omega
-              simp only [List.length_cons, encodeLittleEndianBytes, hMod, hDiv]
-              exact congrArg (List.cons (.init byte (some (a1, t1)))) (ih hi pR hRest hDR)
+  intro bs bits p hAll hDec
+  unfold decodeLittleEndianBytes at hDec
+  cases hBits : decodeLittleEndianBits bs with
+  | none => rw [hBits] at hDec; nomatch hDec
+  | some b =>
+    rw [hBits] at hDec
+    injection hDec with hPair
+    injection hPair with hEq _
+    subst hEq
+    unfold allHaveExactProv at hAll
+    rw [hBits] at hAll
+    exact ((abstractByteListBeq_eq_true_iff _ _).mp hAll).symm
 
-private theorem decodeLittleEndianBytes_lt_pow :
-    ∀ (bs : List AbstractByte) (bits : Nat) (p : Option (Nat × Nat)),
-      decodeLittleEndianBytes bs = some (bits, p) → bits < 256 ^ bs.length
-  | [], bits, _, hDec => by
-    injection hDec with hP; injection hP with hB _
+private theorem decodeLittleEndianBits_lt_pow :
+    ∀ (bs : List AbstractByte) (bits : Nat),
+      decodeLittleEndianBits bs = some bits → bits < 256 ^ bs.length
+  | [], bits, hDec => by
+    injection hDec with hB
     subst hB; decide
-  | .uninit :: _, _, _, hDec => nomatch hDec
-  | .init b _ :: rest, bits, _, hDec => by
-    simp only [decodeLittleEndianBytes] at hDec
-    cases hR : decodeLittleEndianBytes rest with
+  | .uninit :: _, _, hDec => nomatch hDec
+  | .init b _ :: rest, bits, hDec => by
+    unfold decodeLittleEndianBits at hDec
+    cases hR : decodeLittleEndianBits rest with
     | none => rw [hR] at hDec; nomatch hDec
-    | some pairR =>
-      cases pairR with
-      | mk hi pR =>
-        rw [hR] at hDec
-        injection hDec with hP; injection hP with hB _
-        subst hB
-        have hIH := decodeLittleEndianBytes_lt_pow rest hi pR hR
-        have hByteLt : b.toBitVec.toNat < 256 := b.toBitVec.isLt
-        have hPow : 256 ^ (rest.length + 1) = 256 * 256 ^ rest.length := by
-          rw [Nat.pow_succ, Nat.mul_comm]
-        simp only [List.length_cons, hPow]
-        change b.toBitVec.toNat + 256 * hi < 256 * 256 ^ rest.length
-        omega
+    | some hi =>
+      rw [hR] at hDec
+      injection hDec with hB
+      subst hB
+      have hIH := decodeLittleEndianBits_lt_pow rest hi hR
+      have hByteLt : b.toBitVec.toNat < 256 := b.toBitVec.isLt
+      have hPow : 256 ^ (rest.length + 1) = 256 * 256 ^ rest.length := by
+        rw [Nat.pow_succ, Nat.mul_comm]
+      simp only [List.length_cons, hPow]
+      change b.toBitVec.toNat + 256 * hi < 256 * 256 ^ rest.length
+      have h1 : b.toBitVec.toNat + 256 * hi < 256 * (hi + 1) := by
+        rw [Nat.mul_succ, Nat.add_comm]
+        exact Nat.add_lt_add_left hByteLt _
+      exact Nat.lt_of_lt_of_le h1 (Nat.mul_le_mul_left 256 (Nat.succ_le_of_lt hIH))
+
+private theorem decodeLittleEndianBytes_lt_pow
+    (bs : List AbstractByte) (bits : Nat) (p : Option (Nat × Nat))
+    (hDec : decodeLittleEndianBytes bs = some (bits, p)) :
+    bits < 256 ^ bs.length := by
+  unfold decodeLittleEndianBytes at hDec
+  cases hBits : decodeLittleEndianBits bs with
+  | none => rw [hBits] at hDec; nomatch hDec
+  | some b =>
+    rw [hBits] at hDec
+    injection hDec with hPair
+    injection hPair with hEq _
+    subst hEq
+    exact decodeLittleEndianBits_lt_pow bs b hBits
 
 private theorem encodeValueToBytes_rawPtr_mut_u8 (layouts : LayoutTable)
-    (aid off : Nat) :
+    (aid off : Nat) (hPtr : layoutPointerBytes layouts = 8 := by rfl) :
     encodeValueToBytes defaultCodecFuel layouts
       { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 }
       (.ptr ⟨aid, off⟩ 8) =
       some (encodeLittleEndianBytes off 8 (some (aid, aid))) := by
+  unfold encodeValueToBytes
+  rw [hPtr]
   rfl
+
+private theorem abstractBytesCoherentPtrProvAux_ptrBytes_eq :
+    ∀ (a t o pb idx : Nat) (bs : List AbstractByte),
+      abstractBytesCoherentPtrProvAux a t o pb idx bs = true → pb = idx + bs.length
+  | _, _, _, _, _, [], h => (Nat.beq_eq.mp h).symm
+  | _, _, _, _, _, .uninit :: _, h => nomatch h
+  | _, _, _, _, _, .init _ none :: _, h => nomatch h
+  | a, t, o, pb, idx, .init _ (some _) :: rest, h => by
+    unfold abstractBytesCoherentPtrProvAux at h
+    simp only [Bool.and_eq_true] at h
+    have ih := abstractBytesCoherentPtrProvAux_ptrBytes_eq a t o pb (idx + 1) rest h.2
+    simp only [List.length_cons]
+    rw [ih, Nat.add_assoc, Nat.add_comm 1]
+
+private theorem abstractBytesCoherentPtrProv?_ptrBytes_eq (bs : List AbstractByte)
+    (frag : PtrByteFrag) (h : abstractBytesCoherentPtrProv? bs = some frag) :
+    frag.ptrBytes = bs.length := by
+  cases bs with
+  | nil => nomatch h
+  | cons b rest =>
+    cases b with
+    | uninit => nomatch h
+    | init _ prov =>
+      cases prov with
+      | none => nomatch h
+      | some f =>
+        unfold abstractBytesCoherentPtrProv? at h
+        dsimp only at h
+        cases hC : Bool.and (Nat.blt 0 f.ptrBytes)
+            (Bool.and (Nat.beq f.byteIdx 0)
+              (abstractBytesCoherentPtrProvAux f.allocId f.tag f.origOffset f.ptrBytes 1 rest))
+        · rw [hC] at h; nomatch h
+        · rw [hC] at h
+          injection h with hEq
+          subst hEq
+          simp only [Bool.and_eq_true] at hC
+          have hAux := abstractBytesCoherentPtrProvAux_ptrBytes_eq
+            f.allocId f.tag f.origOffset f.ptrBytes 1 rest hC.2.2
+          simp only [List.length_cons]
+          rw [hAux, Nat.add_comm]
 
 private theorem decodeValueFromBytes_provPtr_16bytes {layouts : LayoutTable} {idx : Nat}
     {l : TypeLayout} {mem : List Nat}
@@ -3030,7 +3100,8 @@ private theorem decodeValueFromBytes_provPtr_16bytes {layouts : LayoutTable} {id
     (hFields : l.fields = .arbitrary [⟨0⟩, ⟨8⟩] mem)
     (tagB : UInt8) (p1 p2 p3 p4 p5 p6 p7 : AbstractByte)
     (ptrBytes : List AbstractByte) (hPtrLen : ptrBytes.length = 8)
-    (aid off : Nat) (hPtrDec : decodeLittleEndianBytes ptrBytes = some (off, some (aid, aid))) :
+    (aid off : Nat) (hPtrDec : decodeLittleEndianBytes ptrBytes = some (off, some (aid, aid)))
+    (hPtr : layoutPointerBytes layouts = 8 := by rfl) :
     decodeValueFromBytes defaultCodecFuel layouts (provPtrMirTy idx)
       ([.init tagB none, p1, p2, p3, p4, p5, p6, p7] ++ ptrBytes) =
       some (.aggregate 0 [.scalar ⟨tagB.toNat, 1⟩, .ptr ⟨aid, off⟩ 8]) := by
@@ -3047,7 +3118,7 @@ private theorem decodeValueFromBytes_provPtr_16bytes {layouts : LayoutTable} {id
     hTotalLen
   have hTake8Ptr : takeAbstractBytes 8 ptrBytes = ptrBytes := by
     rw [takeAbstractBytes_eq_take']
-    exact List.take_of_length_le (by omega)
+    exact List.take_of_length_le (Nat.le_of_eq hPtrLen)
   have hDrop8 :
       dropAbstractBytes 8 ([AbstractByte.init tagB none, p1, p2, p3, p4, p5, p6, p7] ++ ptrBytes) =
         ptrBytes := by
@@ -3068,10 +3139,30 @@ private theorem decodeValueFromBytes_provPtr_16bytes {layouts : LayoutTable} {id
   have hF1 :
       decodeValueFromBytes 15 layouts { kind := .rawPtr .mut (.uint .u8), layoutIdx := 0 } ptrBytes =
         some (.ptr ⟨aid, off⟩ 8) := by
-    unfold decodeValueFromBytes decodeScalarBytes
-    simp [hLenPtr, hPtrDec]
-  simp only [decodeFieldsAtOffsetsWith, sliceAbstractBytes, rigidTyByteSize, rigidTyKindByteSize,
-    intCastTargetBytes, hLen16, hB0, hB8, hTake1, hDrop8, hTake8Ptr, hF0, hF1]
+    unfold decodeLittleEndianBytes at hPtrDec
+    cases hBits : decodeLittleEndianBits ptrBytes with
+    | none => rw [hBits] at hPtrDec; nomatch hPtrDec
+    | some bits =>
+      rw [hBits] at hPtrDec
+      cases hCoh : abstractBytesCoherentPtrProv? ptrBytes with
+      | none => rw [hCoh] at hPtrDec; nomatch hPtrDec
+      | some frag =>
+        rw [hCoh] at hPtrDec
+        injection hPtrDec with hPair
+        injection hPair with hOff hSome
+        injection hSome with hAT
+        injection hAT with hA hT
+        have hPb : frag.ptrBytes = 8 := (abstractBytesCoherentPtrProv?_ptrBytes_eq ptrBytes frag hCoh).trans hPtrLen
+        unfold decodeValueFromBytes decodeScalarBytes decodeLittleEndianBytes
+        dsimp only
+        rw [hPtr, hLenPtr, hBits, hCoh]
+        dsimp only
+        rw [hPb, hOff, hA]
+        rfl
+  simp only [anyTupleKindNeedsLayoutIdx, tupleKindNeedsLayoutIdx, decodeFieldsAtOffsetsWith,
+    sliceAbstractBytes, rigidTyByteSize, rigidTyKindByteSize,
+    intCastTargetBytes, hLen16, hB0, hB8, hTake1, hDrop8, hTake8Ptr, hF0, hF1, Nat.beq_refl]
+  rfl
 
 /-- Constructive `LawfulTypedSpatialMemCodec` proof for `provPtrPaddedMemCodec`
 enforcing bidirectional `(allocId, tag)` provenance on all 8 pointer bytes. -/
@@ -3080,7 +3171,8 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
     (hLookup : LayoutTable.lookup layouts idx = some l)
     (hSize : l.size.bytes = 16)
     (hFields : l.fields = .arbitrary [⟨0⟩, ⟨8⟩] mem)
-    (expectedAllocId : AllocId) :
+    (expectedAllocId : AllocId)
+    (hPtr : layoutPointerBytes layouts = 8 := by rfl) :
     LawfulTypedSpatialMemCodec layouts (provPtrPaddedMemCodec expectedAllocId idx) := by
   refine ⟨rfl, by simp [provPtrPaddedMemCodec], by simp [provPtrPaddedMemCodec], rfl, ?_, ?_, ?_⟩
   · intro s
@@ -3094,6 +3186,7 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
     have hAllProv : allHaveExactProv (encodeLittleEndianBytes s.ptrOffset.val 8
         (some (expectedAllocId, expectedAllocId))) expectedAllocId expectedAllocId = true :=
       allHaveExactProv_encodeLittleEndianBytes s.ptrOffset.val 8 expectedAllocId expectedAllocId
+        s.ptrOffset.property
     have hPtrDec : decodeLittleEndianBytes
         (encodeLittleEndianBytes s.ptrOffset.val 8 (some (expectedAllocId, expectedAllocId))) =
         some (s.ptrOffset.val, some (expectedAllocId, expectedAllocId)) :=
@@ -3114,7 +3207,7 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
           some (provPtrToMirVal expectedAllocId s) :=
       decodeValueFromBytes_provPtr_16bytes hLookup hSize hFields s.tagByte
         .uninit .uninit .uninit .uninit .uninit .uninit .uninit
-        _ hPtrLen expectedAllocId s.ptrOffset.val hPtrDec
+        _ hPtrLen expectedAllocId s.ptrOffset.val hPtrDec hPtr
     have hDecMem : provPtrDecode expectedAllocId expectedAllocId
         (provPtrEncode expectedAllocId expectedAllocId s) = some s := by
       unfold provPtrDecode
@@ -3123,7 +3216,7 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
         provPtrEncode, List.cons_append, List.drop_succ_cons, List.drop_zero,
         List.nil_append, hAllProv, hPtrDec, Bool.and_self, s.ptrOffset.property, ↓reduceDIte]
     have hEncU8 := encodeValueToBytes_u8_byte layouts s.tagByte
-    have hEncPtr := encodeValueToBytes_rawPtr_mut_u8 layouts expectedAllocId s.ptrOffset.val
+    have hEncPtr := encodeValueToBytes_rawPtr_mut_u8 layouts expectedAllocId s.ptrOffset.val hPtr
     have hU8Nat : UInt8.ofNat s.tagByte.toNat = s.tagByte := by
       apply uint8_eq_of_toNat
       rw [uint8_ofNat_toBitVec_toNat]
@@ -3281,7 +3374,7 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
                   exact encodeLittleEndianBytes_decode_uniform_prov expectedAllocId expectedAllocId
                     ptrBytes bits _ hAll hDL
                 have hEncU8 := encodeValueToBytes_u8_byte layouts tagB
-                have hEncPtr := encodeValueToBytes_rawPtr_mut_u8 layouts expectedAllocId bits
+                have hEncPtr := encodeValueToBytes_rawPtr_mut_u8 layouts expectedAllocId bits hPtr
                 have hTakePtr : ptrBytes.take 8 = ptrBytes :=
                   List.take_of_length_le (by omega)
                 unfold provPtrPaddedMemCodec provPtrCheck at hProv
@@ -3392,7 +3485,7 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
                                   (hTail8 8 ptrBytes (by omega) (by omega))))))))
                   exact hPadClean p1 p2 p3 p4 p5 p6 p7 hProv
                 · exact decodeValueFromBytes_provPtr_16bytes hLookup hSize hFields
-                    tagB p1 p2 p3 p4 p5 p6 p7 ptrBytes hPtrLen expectedAllocId bits hDL
+                    tagB p1 p2 p3 p4 p5 p6 p7 ptrBytes hPtrLen expectedAllocId bits hDL hPtr
 
 /-! ### 4.4 Canonical Authenticated `CapturedMir` Contexts & End-to-End Soundness -/
 
@@ -4564,7 +4657,15 @@ theorem provPtr_provenance_stripping_rejected :
   let mStripped : V2026ByteMem :=
     (writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 none]).getD stPinned.mem
   let bsStripped : List AbstractByte :=
-    (readV2026Bytes mStripped ⟨1, 0⟩ 16 8).getD []
+    [ .init 0x10 none, .uninit, .uninit, .uninit, .uninit, .uninit, .uninit, .uninit
+    , .init 0x00 none
+    , .init 0x10 (some ⟨7, 7, 1, 0x1000, 8⟩)
+    , .init 0x00 (some ⟨7, 7, 2, 0x1000, 8⟩)
+    , .init 0x00 (some ⟨7, 7, 3, 0x1000, 8⟩)
+    , .init 0x00 (some ⟨7, 7, 4, 0x1000, 8⟩)
+    , .init 0x00 (some ⟨7, 7, 5, 0x1000, 8⟩)
+    , .init 0x00 (some ⟨7, 7, 6, 0x1000, 8⟩)
+    , .init 0x00 (some ⟨7, 7, 7, 0x1000, 8⟩) ]
   exact ⟨stPinned, mStripped, bsStripped, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- **Negative 3 — Surplus provenance forgery & `(allocId, tag)` tampering rejection**:
@@ -4579,30 +4680,30 @@ theorem provPtr_and_scalar_provenance_forgery_rejected :
     ∃ stPinned mForgeAlloc mForgeTag mSurplusField mSurplusPad,
       freezePaddedToMem provPtrBodyCtx 0 codec
         (provPtrPaddedMemCodec_lawful_sample 7) st0 = .ok stPinned ∧
-      writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 (some (99, 7))] = some mForgeAlloc ∧
+      writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 (some ⟨99, 7, 0, 0x1000, 8⟩)] = some mForgeAlloc ∧
       reabsorbPaddedFromMem provPtrBodyCtx 0 { stPinned with mem := mForgeAlloc } = .fail ∧
-      writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 (some (7, 99))] = some mForgeTag ∧
+      writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 (some ⟨7, 99, 0, 0x1000, 8⟩)] = some mForgeTag ∧
       reabsorbPaddedFromMem provPtrBodyCtx 0 { stPinned with mem := mForgeTag } = .fail ∧
-      writeV2026Bytes stPinned.mem ⟨1, 0⟩ 1 [.init 0x10 (some (7, 7))] = some mSurplusField ∧
+      writeV2026Bytes stPinned.mem ⟨1, 0⟩ 1 [.init 0x10 (some ⟨7, 7, 0, 0x1000, 8⟩)] = some mSurplusField ∧
       reabsorbPaddedFromMem provPtrBodyCtx 0 { stPinned with mem := mSurplusField } = .fail ∧
-      writeV2026Bytes stPinned.mem ⟨1, 1⟩ 1 [.init 0x00 (some (7, 7))] = some mSurplusPad ∧
+      writeV2026Bytes stPinned.mem ⟨1, 1⟩ 1 [.init 0x00 (some ⟨7, 7, 0, 0x1000, 8⟩)] = some mSurplusPad ∧
       reabsorbPaddedFromMem provPtrBodyCtx 0 { stPinned with mem := mSurplusPad } = .fail ∧
       valAndBytesMatchTargetSpec false u8U32BodyCtx.body.layouts u32TargetSpec
         (.scalar ⟨42, 4⟩)
-        [.init 42 (some (7, 7)), .init 0 none, .init 0 none, .init 0 none] = false := by
+        [.init 42 (some ⟨7, 7, 0, 42, 8⟩), .init 0 none, .init 0 none, .init 0 none] = false := by
   intro codec st0
   let stPinned : PaddedSymMemState :=
     match freezePaddedToMem provPtrBodyCtx 0 codec (provPtrPaddedMemCodec_lawful_sample 7) st0 with
     | .ok s => s
     | .fail => st0
   let mForgeAlloc : V2026ByteMem :=
-    (writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 (some (99, 7))]).getD stPinned.mem
+    (writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 (some ⟨99, 7, 0, 0x1000, 8⟩)]).getD stPinned.mem
   let mForgeTag : V2026ByteMem :=
-    (writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 (some (7, 99))]).getD stPinned.mem
+    (writeV2026Bytes stPinned.mem ⟨1, 8⟩ 1 [.init 0x00 (some ⟨7, 99, 0, 0x1000, 8⟩)]).getD stPinned.mem
   let mSurplusField : V2026ByteMem :=
-    (writeV2026Bytes stPinned.mem ⟨1, 0⟩ 1 [.init 0x10 (some (7, 7))]).getD stPinned.mem
+    (writeV2026Bytes stPinned.mem ⟨1, 0⟩ 1 [.init 0x10 (some ⟨7, 7, 0, 0x1000, 8⟩)]).getD stPinned.mem
   let mSurplusPad : V2026ByteMem :=
-    (writeV2026Bytes stPinned.mem ⟨1, 1⟩ 1 [.init 0x00 (some (7, 7))]).getD stPinned.mem
+    (writeV2026Bytes stPinned.mem ⟨1, 1⟩ 1 [.init 0x00 (some ⟨7, 7, 0, 0x1000, 8⟩)]).getD stPinned.mem
   exact ⟨stPinned, mForgeAlloc, mForgeTag, mSurplusField, mSurplusPad,
     rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 

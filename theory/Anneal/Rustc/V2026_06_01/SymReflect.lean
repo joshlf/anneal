@@ -310,6 +310,462 @@ theorem evalSymConstVal_sound
   | indirect _ _ => nomatch h
   | unevaluated _ => nomatch h
 
+/-- Apply `evalOperand`'s read-time pointer materialization and type-validity
+checks (`Kani#5205` / `#5196`) to a `PlaceReadResult` for place `p`. -/
+def applyPlaceReadValid
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl)
+    (p : Place) :
+    PlaceReadResult → PlaceReadResult
+  | .ok v locals' =>
+    match localDecls with
+    | .nil => .ok v locals'
+    | _ :: _ =>
+      let accTy := placeTyResolved localDecls layouts p
+      match materializeReadPtrValue layouts accTy v with
+      | .none => .ub
+      | .some matVal =>
+        match validateValueForTy? layouts accTy matVal with
+        | true => .ok matVal locals'
+        | false => .ub
+  | .ub => .ub
+  | .unsupported => .unsupported
+
+/-- Apply `evalOperand`'s read-time validity checks to an `Operand` read result. -/
+def applyOperandReadValid
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl) :
+    Operand → PlaceReadResult → PlaceReadResult
+  | .copy p, r => applyPlaceReadValid layouts localDecls p r
+  | .move p, r => applyPlaceReadValid layouts localDecls p r
+  | .constant _, r => r
+
+/-- Return `true` when `materializeReadPtrValue` is guaranteed to be identity
+for `tyOpt` (i.e. `tyOpt` is not a pointer/reference/fnPtr type). -/
+def isNonMatPtrTyOpt (tyOpt : Option Ty) : Bool :=
+  match tyOpt with
+  | .some ty =>
+    match (normalizeCodecTy ty).kind with
+    | .rawPtr _ _ | .ref _ _ | .fnPtr _ _ _ _ => false
+    | _ => true
+  | .none => true
+
+/-- Return `true` when `materializeReadPtrValue` is guaranteed to be identity
+at place `p` under `localDecls` / `layouts`. -/
+def isNonMatPtrPlace
+    (layouts : LayoutTable) (localDecls : List LocalDecl) (p : Place) : Bool :=
+  match localDecls with
+  | .nil => true
+  | _ :: _ => isNonMatPtrTyOpt (placeTyResolved localDecls layouts p)
+
+/-- Return `true` when `materializeReadPtrValue` is identity on `v` regardless of type. -/
+def isNonRawAggShape : Value → Bool
+  | .aggregate 0 (_ :: _ :: _ :: _) => false
+  | _ => true
+
+/-- Return `true` when reading concrete value `v` from place `p` passes
+`evalOperand`'s `materializeReadPtrValue` (as identity) and `validateValueForTy?`. -/
+def symConcreteReadValid
+    (layouts : LayoutTable)
+    (localDecls : List LocalDecl)
+    (p : Place)
+    (v : Value) :
+    Bool :=
+  match localDecls with
+  | .nil => true
+  | _ :: _ =>
+    let accTy := placeTyResolved localDecls layouts p
+    Bool.and
+      (Bool.or (isNonRawAggShape v) (isNonMatPtrTyOpt accTy))
+      (validateValueForTy? layouts accTy v)
+
+theorem materializeReadPtrValue_eq_some_of_nonMat
+    (layouts : LayoutTable) (tyOpt : Option Ty) (v : Value)
+    (h : Bool.or (isNonRawAggShape v) (isNonMatPtrTyOpt tyOpt) = true) :
+    materializeReadPtrValue layouts tyOpt v = .some v := by
+  cases tyOpt with
+  | none => rfl
+  | some ty =>
+    cases v with
+    | uninit | unit | scalar _ | ptr _ _ => rfl
+    | aggregate varIdx fields =>
+      cases varIdx with
+      | succ _ => rfl
+      | zero =>
+        cases fields with
+        | nil => rfl
+        | cons a rest1 =>
+          cases rest1 with
+          | nil => rfl
+          | cons b rest2 =>
+            cases rest2 with
+            | nil => rfl
+            | cons c rest3 =>
+              dsimp only [isNonRawAggShape, Bool.false_or, isNonMatPtrTyOpt] at h
+              change
+                (match (normalizeCodecTy ty).kind with
+                | .rawPtr _ pointee =>
+                  match decodeRawAbstractByteVals? (a :: b :: c :: rest3) with
+                  | .some bs => decodePtrBytesNoForge false pointee (layoutPointerBytes layouts) bs
+                  | .none => .some (.aggregate 0 (a :: b :: c :: rest3))
+                | .ref _ pointee =>
+                  match decodeRawAbstractByteVals? (a :: b :: c :: rest3) with
+                  | .some bs => decodePtrBytesNoForge true pointee (layoutPointerBytes layouts) bs
+                  | .none => .some (.aggregate 0 (a :: b :: c :: rest3))
+                | .fnPtr _ _ _ _ =>
+                  match decodeRawAbstractByteVals? (a :: b :: c :: rest3) with
+                  | .some bs => decodePtrBytesNoForge true (.tuple .nil) (layoutPointerBytes layouts) bs
+                  | .none => .some (.aggregate 0 (a :: b :: c :: rest3))
+                | _ => .some (.aggregate 0 (a :: b :: c :: rest3))) =
+                .some (.aggregate 0 (a :: b :: c :: rest3))
+              generalize (normalizeCodecTy ty).kind = k at h ⊢
+              cases k with
+              | rawPtr _ _ | ref _ _ | fnPtr _ _ _ _ => nomatch h
+              | _ => rfl
+
+theorem applyPlaceReadValid_of_symConcreteReadValid
+    (layouts : LayoutTable) (localDecls : List LocalDecl) (p : Place)
+    (v : Value) (locals' : List LocalSlot)
+    (h : symConcreteReadValid layouts localDecls p v = true) :
+    applyPlaceReadValid layouts localDecls p (.ok v locals') = .ok v locals' := by
+  cases localDecls with
+  | nil => rfl
+  | cons d ds =>
+    dsimp only [symConcreteReadValid] at h
+    rcases Bool.and_eq_true_iff.1 h with ⟨hMat, hVal⟩
+    dsimp only [applyPlaceReadValid]
+    rw [materializeReadPtrValue_eq_some_of_nonMat layouts _ v hMat]
+    dsimp only
+    rw [hVal]
+
+theorem applyPlaceReadValid_eq_ok_or_ub_of_nonMat
+    (layouts : LayoutTable) (localDecls : List LocalDecl) (p : Place)
+    (v : Value) (locals' : List LocalSlot)
+    (h : localDecls = .nil ∨ Bool.or (isNonRawAggShape v) (isNonMatPtrTyOpt (placeTyResolved localDecls layouts p)) = true) :
+    applyPlaceReadValid layouts localDecls p (.ok v locals') = .ok v locals' ∨
+      applyPlaceReadValid layouts localDecls p (.ok v locals') = .ub := by
+  cases localDecls with
+  | nil => exact Or.inl rfl
+  | cons d ds =>
+    rcases h with hNil | hMat
+    · nomatch hNil
+    · dsimp only [applyPlaceReadValid]
+      rw [materializeReadPtrValue_eq_some_of_nonMat layouts _ v hMat]
+      dsimp only
+      cases validateValueForTy? layouts (placeTyResolved (d :: ds) layouts p) v with
+      | true => exact Or.inl rfl
+      | false => exact Or.inr rfl
+
+/-- Return `true` when `v` is neither uninit, pointer, nor a raw-byte carrier
+(so `validateValueForTy?` accepts `v` at every numeric primitive type). -/
+def isNonPtrNonRawVal : Value → Bool
+  | .uninit => false
+  | .ptr _ _ => false
+  | .aggregate varIdx fields =>
+    match isRawFragByteVal (.aggregate varIdx fields) with
+    | true => false
+    | false => true
+  | _ => true
+
+/-- Return `true` when `tyOpt` is `.none` or a numeric primitive type
+(`.uint _`, `.int _`, `.float _`) whose read validity matches `isNonPtrNonRawVal`. -/
+def symArgReadSafeTyOpt (tyOpt : Option Ty) : Bool :=
+  match tyOpt with
+  | .none => true
+  | .some ty =>
+    match ty.kind with
+    | .uint _ | .int _ | .float _ => true
+    | _ => false
+
+/-- Return `true` when reading a symbolic argument from place `p` is guaranteed
+to pass `applyPlaceReadValid` for any value satisfying `isNonPtrNonRawVal`. -/
+def symArgSafePlace
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place) : Bool :=
+  match localDecls with
+  | .nil => true
+  | _ :: _ => symArgReadSafeTyOpt (placeTyResolved localDecls layouts p)
+
+/-- Return `true` when reading operand `op` is guaranteed to pass
+`applyOperandReadValid` for any symbolic argument satisfying `isNonPtrNonRawVal`. -/
+def symArgSafeOp
+    (localDecls : List LocalDecl) (layouts : LayoutTable) : Operand → Bool
+  | .copy p => symArgSafePlace localDecls layouts p
+  | .move p => symArgSafePlace localDecls layouts p
+  | .constant _ => true
+
+theorem validateValueForTyAux_of_symArgReadSafe
+    (layouts : LayoutTable) (fuel' : Nat) (ty : Ty) (v : Value)
+    (hSafe : symArgReadSafeTyOpt (.some ty) = true)
+    (hNonPtr : isNonPtrNonRawVal v = true) :
+    validateValueForTyAux layouts (.succ fuel') ty v = true := by
+  dsimp only [symArgReadSafeTyOpt] at hSafe
+  rcases ty with ⟨kind, lIdx⟩
+  dsimp only at hSafe
+  cases kind with
+  | param _ | alias _ _ | bool | char | never | str | tuple _ | array _ _
+  | slice _ | ref _ _ | rawPtr _ _ | adt _ _ | fnDef _ _ | fnPtr _ _ _ _
+  | closure _ _ | dynamic _ | foreign _ | other _ => nomatch hSafe
+  | uint _ | int _ | float _ =>
+    dsimp only [validateValueForTyAux]
+    cases v with
+    | uninit => nomatch hNonPtr
+    | ptr _ _ => nomatch hNonPtr
+    | unit => rfl
+    | scalar _ => rfl
+    | aggregate varIdx fields =>
+      dsimp only [isNonPtrNonRawVal] at hNonPtr
+      cases hRaw : isRawFragByteVal (.aggregate varIdx fields) with
+      | true => rw [hRaw] at hNonPtr; nomatch hNonPtr
+      | false => dsimp only; rw [hRaw]
+
+def symPair0SafePlace
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (p : Place) (v0 : Value) : Bool :=
+  match localDecls with
+  | .nil => true
+  | _ :: _ =>
+    match placeTyResolved localDecls layouts p with
+    | .none => true
+    | .some { kind := .tuple (k0 :: k1 :: .nil), layoutIdx := tIdx } =>
+      let (fl0, fl1) :=
+        match LayoutTable.lookup layouts tIdx with
+        | .some l =>
+          match l.fieldLayouts with
+          | f0 :: f1 :: .nil => (f0, f1)
+          | _ => (unresolvedLayoutIdx layouts, unresolvedLayoutIdx layouts)
+        | .none => (unresolvedLayoutIdx layouts, unresolvedLayoutIdx layouts)
+      Bool.and
+        (validateValueForTyAux layouts 15 { kind := k0, layoutIdx := fl0 } v0)
+        (symArgReadSafeTyOpt (.some { kind := k1, layoutIdx := fl1 }))
+    | _ => false
+
+def symPair0SafeOp
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (v0 : Value) : Operand → Bool
+  | .copy p => symPair0SafePlace localDecls layouts p v0
+  | .move p => symPair0SafePlace localDecls layouts p v0
+  | .constant _ => true
+
+theorem applyPlaceReadValid_of_symPair0Safe
+    (layouts : LayoutTable) (localDecls : List LocalDecl) (p : Place)
+    (v0 v1 : Value) (locals' : List LocalSlot)
+    (hSafe : symPair0SafePlace localDecls layouts p v0 = true)
+    (hNonPtr : isNonPtrNonRawVal v1 = true) :
+    applyPlaceReadValid layouts localDecls p (.ok (.aggregate 0 [v0, v1]) locals') =
+      .ok (.aggregate 0 [v0, v1]) locals' := by
+  cases localDecls with
+  | nil => rfl
+  | cons d ds =>
+    dsimp only [symPair0SafePlace] at hSafe
+    dsimp only [applyPlaceReadValid]
+    cases hTy : placeTyResolved (d :: ds) layouts p with
+    | none => rfl
+    | some ty =>
+      rw [hTy] at hSafe
+      rcases ty with ⟨kind, tIdx⟩
+      cases kind with
+      | param _ | alias _ _ | bool | char | int _ | uint _ | float _ | never | str
+      | array _ _ | slice _ | ref _ _ | rawPtr _ _ | adt _ _ | fnDef _ _ | fnPtr _ _ _ _
+      | closure _ _ | dynamic _ | foreign _ | other _ =>
+        nomatch hSafe
+      | tuple ks =>
+        cases ks with
+        | nil => nomatch hSafe
+        | cons k0 ks1 =>
+          cases ks1 with
+          | nil => nomatch hSafe
+          | cons k1 ks2 =>
+            cases ks2 with
+            | cons _ _ => nomatch hSafe
+            | nil =>
+              dsimp only at hSafe
+              change
+                (match
+                  validateValueForTy? layouts
+                    (.some { kind := .tuple [k0, k1], layoutIdx := tIdx })
+                    (.aggregate 0 [v0, v1])
+                with
+                | true => PlaceReadResult.ok (.aggregate 0 [v0, v1]) locals'
+                | false => PlaceReadResult.ub) = PlaceReadResult.ok (.aggregate 0 [v0, v1]) locals'
+              cases hLook : LayoutTable.lookup layouts tIdx with
+              | none =>
+                rw [hLook] at hSafe
+                dsimp only at hSafe
+                rcases Bool.and_eq_true_iff.1 hSafe with ⟨hV0, hS1⟩
+                have hV1 := validateValueForTyAux_of_symArgReadSafe layouts 14 _ v1 hS1 hNonPtr
+                change
+                  (match
+                    validateTyTupleFieldsWith
+                      (fun k lIdx fv => validateValueForTyAux layouts 15 { kind := k, layoutIdx := lIdx } fv)
+                      (unresolvedLayoutIdx layouts)
+                      [k0, k1]
+                      (match LayoutTable.lookup layouts tIdx with
+                       | .some l =>
+                         match Nat.beq (length l.fieldLayouts) 2 with
+                         | true => l.fieldLayouts
+                         | false => .nil
+                       | .none => .nil)
+                      [v0, v1]
+                  with
+                  | true => PlaceReadResult.ok (.aggregate 0 [v0, v1]) locals'
+                  | false => PlaceReadResult.ub) = PlaceReadResult.ok (.aggregate 0 [v0, v1]) locals'
+                rw [hLook]
+                dsimp only [validateTyTupleFieldsWith]
+                rw [hV0, hV1]
+              | some l =>
+                rw [hLook] at hSafe
+                change
+                  (match
+                    validateTyTupleFieldsWith
+                      (fun k lIdx fv => validateValueForTyAux layouts 15 { kind := k, layoutIdx := lIdx } fv)
+                      (unresolvedLayoutIdx layouts)
+                      [k0, k1]
+                      (match LayoutTable.lookup layouts tIdx with
+                       | .some l =>
+                         match Nat.beq (length l.fieldLayouts) 2 with
+                         | true => l.fieldLayouts
+                         | false => .nil
+                       | .none => .nil)
+                      [v0, v1]
+                  with
+                  | true => PlaceReadResult.ok (.aggregate 0 [v0, v1]) locals'
+                  | false => PlaceReadResult.ub) = PlaceReadResult.ok (.aggregate 0 [v0, v1]) locals'
+                rw [hLook]
+                dsimp only
+                cases hFls : l.fieldLayouts with
+                | nil =>
+                  have hSafe' : Bool.and
+                      (validateValueForTyAux layouts 15 { kind := k0, layoutIdx := unresolvedLayoutIdx layouts } v0)
+                      (symArgReadSafeTyOpt (.some { kind := k1, layoutIdx := unresolvedLayoutIdx layouts })) = true := by
+                    simpa only [hFls] using hSafe
+                  rcases Bool.and_eq_true_iff.1 hSafe' with ⟨hV0, hS1⟩
+                  have hV1 := validateValueForTyAux_of_symArgReadSafe layouts 14 _ v1 hS1 hNonPtr
+                  dsimp only [validateTyTupleFieldsWith, List.length, length, HAdd.hAdd, Add.add, Nat.add, Nat.beq]
+                  rw [hV0, hV1]
+                | cons f0 fls1 =>
+                  cases fls1 with
+                  | nil =>
+                    have hSafe' : Bool.and
+                        (validateValueForTyAux layouts 15 { kind := k0, layoutIdx := unresolvedLayoutIdx layouts } v0)
+                        (symArgReadSafeTyOpt (.some { kind := k1, layoutIdx := unresolvedLayoutIdx layouts })) = true := by
+                      simpa only [hFls] using hSafe
+                    rcases Bool.and_eq_true_iff.1 hSafe' with ⟨hV0, hS1⟩
+                    have hV1 := validateValueForTyAux_of_symArgReadSafe layouts 14 _ v1 hS1 hNonPtr
+                    dsimp only [validateTyTupleFieldsWith, List.length, length, HAdd.hAdd, Add.add, Nat.add, Nat.beq]
+                    rw [hV0, hV1]
+                  | cons f1 fls2 =>
+                    cases fls2 with
+                    | nil =>
+                      have hSafe' : Bool.and
+                          (validateValueForTyAux layouts 15 { kind := k0, layoutIdx := f0 } v0)
+                          (symArgReadSafeTyOpt (.some { kind := k1, layoutIdx := f1 })) = true := by
+                        simpa only [hFls] using hSafe
+                      rcases Bool.and_eq_true_iff.1 hSafe' with ⟨hV0, hS1⟩
+                      have hV1 := validateValueForTyAux_of_symArgReadSafe layouts 14 _ v1 hS1 hNonPtr
+                      dsimp only [validateTyTupleFieldsWith, List.length, length, HAdd.hAdd, Add.add, Nat.add, Nat.beq]
+                      rw [hV0, hV1]
+                    | cons f2 fls3 =>
+                      have hSafe' : Bool.and
+                          (validateValueForTyAux layouts 15 { kind := k0, layoutIdx := unresolvedLayoutIdx layouts } v0)
+                          (symArgReadSafeTyOpt (.some { kind := k1, layoutIdx := unresolvedLayoutIdx layouts })) = true := by
+                        simpa only [hFls] using hSafe
+                      rcases Bool.and_eq_true_iff.1 hSafe' with ⟨hV0, hS1⟩
+                      have hV1 := validateValueForTyAux_of_symArgReadSafe layouts 14 _ v1 hS1 hNonPtr
+                      dsimp only [validateTyTupleFieldsWith, List.length, length, HAdd.hAdd, Add.add, Nat.add, Nat.beq]
+                      rw [hV0, hV1]
+
+theorem applyOperandReadValid_of_symPair0Safe
+    (layouts : LayoutTable) (localDecls : List LocalDecl) (op : Operand)
+    (v0 v1 : Value) (locals' : List LocalSlot)
+    (hSafe : symPair0SafeOp localDecls layouts v0 op = true)
+    (hNonPtr : isNonPtrNonRawVal v1 = true) :
+    applyOperandReadValid layouts localDecls op (.ok (.aggregate 0 [v0, v1]) locals') =
+      .ok (.aggregate 0 [v0, v1]) locals' := by
+  cases op with
+  | constant _ => rfl
+  | copy p => exact applyPlaceReadValid_of_symPair0Safe layouts localDecls p v0 v1 locals' hSafe hNonPtr
+  | move p => exact applyPlaceReadValid_of_symPair0Safe layouts localDecls p v0 v1 locals' hSafe hNonPtr
+
+theorem applyPlaceReadValid_of_symArgSafe
+    (layouts : LayoutTable) (localDecls : List LocalDecl) (p : Place)
+    (v : Value) (locals' : List LocalSlot)
+    (hSafe : symArgSafePlace localDecls layouts p = true)
+    (hNonPtr : isNonPtrNonRawVal v = true) :
+    applyPlaceReadValid layouts localDecls p (.ok v locals') = .ok v locals' := by
+  cases localDecls with
+  | nil => rfl
+  | cons d ds =>
+    dsimp only [symArgSafePlace] at hSafe
+    dsimp only [applyPlaceReadValid]
+    cases hTy : placeTyResolved (d :: ds) layouts p with
+    | none => rfl
+    | some ty =>
+      rw [hTy] at hSafe
+      dsimp only [symArgReadSafeTyOpt] at hSafe
+      rcases ty with ⟨kind, lIdx⟩
+      dsimp only at hSafe
+      cases kind with
+      | uint uk =>
+        have hMat : materializeReadPtrValue layouts (.some { kind := .uint uk, layoutIdx := lIdx }) v = .some v :=
+          materializeReadPtrValue_eq_some_of_nonMat layouts _ v (by
+            dsimp only [isNonMatPtrTyOpt, normalizeCodecTy]
+            rw [Bool.or_true])
+        rw [hMat]
+        dsimp only [validateValueForTy?, defaultCodecFuel, validateValueForTyAux]
+        cases v with
+        | uninit => nomatch hNonPtr
+        | ptr _ _ => nomatch hNonPtr
+        | unit => rfl
+        | scalar _ => rfl
+        | aggregate varIdx fields =>
+          dsimp only [isNonPtrNonRawVal] at hNonPtr
+          cases hRaw : isRawFragByteVal (.aggregate varIdx fields) with
+          | true => rw [hRaw] at hNonPtr; nomatch hNonPtr
+          | false => dsimp only; rw [hRaw]
+      | int ik =>
+        have hMat : materializeReadPtrValue layouts (.some { kind := .int ik, layoutIdx := lIdx }) v = .some v :=
+          materializeReadPtrValue_eq_some_of_nonMat layouts _ v (by
+            dsimp only [isNonMatPtrTyOpt, normalizeCodecTy]
+            rw [Bool.or_true])
+        rw [hMat]
+        dsimp only [validateValueForTy?, defaultCodecFuel, validateValueForTyAux]
+        cases v with
+        | uninit => nomatch hNonPtr
+        | ptr _ _ => nomatch hNonPtr
+        | unit => rfl
+        | scalar _ => rfl
+        | aggregate varIdx fields =>
+          dsimp only [isNonPtrNonRawVal] at hNonPtr
+          cases hRaw : isRawFragByteVal (.aggregate varIdx fields) with
+          | true => rw [hRaw] at hNonPtr; nomatch hNonPtr
+          | false => dsimp only; rw [hRaw]
+      | float fk =>
+        have hMat : materializeReadPtrValue layouts (.some { kind := .float fk, layoutIdx := lIdx }) v = .some v :=
+          materializeReadPtrValue_eq_some_of_nonMat layouts _ v (by
+            cases fk <;> dsimp only [isNonMatPtrTyOpt, normalizeCodecTy, byteCodecScalarKind] <;> rw [Bool.or_true])
+        rw [hMat]
+        dsimp only [validateValueForTy?, defaultCodecFuel, validateValueForTyAux]
+        cases v with
+        | uninit => nomatch hNonPtr
+        | ptr _ _ => nomatch hNonPtr
+        | unit => rfl
+        | scalar _ => rfl
+        | aggregate varIdx fields =>
+          dsimp only [isNonPtrNonRawVal] at hNonPtr
+          cases hRaw : isRawFragByteVal (.aggregate varIdx fields) with
+          | true => rw [hRaw] at hNonPtr; nomatch hNonPtr
+          | false => dsimp only; rw [hRaw]
+      | _ => nomatch hSafe
+
+theorem applyOperandReadValid_of_symArgSafe
+    (layouts : LayoutTable) (localDecls : List LocalDecl) (op : Operand)
+    (v : Value) (locals' : List LocalSlot)
+    (hSafe : symArgSafeOp localDecls layouts op = true)
+    (hNonPtr : isNonPtrNonRawVal v = true) :
+    applyOperandReadValid layouts localDecls op (.ok v locals') = .ok v locals' := by
+  cases op with
+  | copy p => exact applyPlaceReadValid_of_symArgSafe layouts localDecls p v locals' hSafe hNonPtr
+  | move p => exact applyPlaceReadValid_of_symArgSafe layouts localDecls p v locals' hSafe hNonPtr
+  | constant _ => rfl
+
 /-- Evaluate a `Place` read (as in `Operand.copy` or projected `Operand.move`)
 over symbolic slots `slots`. -/
 def evalSymPlaceCopy
@@ -325,9 +781,15 @@ def evalSymPlaceCopy
     match get? slots p.local_ with
     | .some (.concrete (.init rootVal)) =>
       match valueContainsUninit rootVal with
-      | false => .some (.concrete rootVal)
+      | false =>
+        match symConcreteReadValid layouts localDecls p rootVal with
+        | true => .some (.concrete rootVal)
+        | false => .none
       | true => .none
-    | .some (.symArg idx) => .some (.symArg idx)
+    | .some (.symArg idx) =>
+      match isNonMatPtrPlace layouts localDecls p with
+      | true => .some (.symArg idx)
+      | false => .none
     | .some (.symPair0 v0 idx) =>
       match valueContainsUninit v0 with
       | false => .some (.symPair0 v0 idx)
@@ -340,15 +802,24 @@ def evalSymPlaceCopy
       match get? slots p.local_ with
       | .some (.concrete (.init rootVal)) =>
         match readProjectedPure rootVal (proj :: rest) with
-        | .some fieldVal => .some (.concrete fieldVal)
+        | .some fieldVal =>
+          match symConcreteReadValid layouts localDecls p fieldVal with
+          | true => .some (.concrete fieldVal)
+          | false => .none
         | .none => .none
       | .some (.symPair0 v0 idx) =>
         match proj, rest with
         | .field .zero _, .nil =>
           match valueContainsUninit v0 with
-          | false => .some (.symGuarded v0 idx)
+          | false =>
+            match symConcreteReadValid layouts localDecls p v0 with
+            | true => .some (.symGuarded v0 idx)
+            | false => .none
           | true => .none
-        | .field (.succ .zero) _, .nil => .some (.symArg idx)
+        | .field (.succ .zero) _, .nil =>
+          match isNonMatPtrPlace layouts localDecls p with
+          | true => .some (.symArg idx)
+          | false => .none
         | _, _ => .none
       | _ => .none
 
@@ -393,7 +864,7 @@ theorem evalSymPlaceCopy_sound_copy
     (h : evalSymPlaceCopy slots p borrows localDecls layouts = .some sv) :
     evalOperand (concretizeSymSlots args slots) (.copy p) borrows globals layouts callerLocals localDecls
         callStack =
-      concretizeSymReadResult args sv slots := by
+      applyPlaceReadValid layouts localDecls p (concretizeSymReadResult args sv slots) := by
   cases p with
   | mk loc proj =>
     cases proj with
@@ -409,12 +880,16 @@ theorem evalSymPlaceCopy_sound_copy
         rw [hGet] at h
         cases slot with
         | symArg idx =>
-          injection h with hEq
-          subst hEq
-          dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
-          cases get? args idx with
-          | none => rfl
-          | some v => dsimp only; cases valueContainsUninit v <;> rfl
+          cases hNM : isNonMatPtrPlace layouts localDecls { local_ := loc, projection := [] } with
+          | false => rw [hNM] at h; nomatch h
+          | true =>
+            rw [hNM] at h
+            injection h with hEq
+            subst hEq
+            dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue, applyPlaceReadValid]
+            cases get? args idx with
+            | none => rfl
+            | some v => dsimp only; cases valueContainsUninit v <;> rfl
         | symPair0 v0 idx =>
           dsimp only at h
           cases hU0 : valueContainsUninit v0 with
@@ -423,7 +898,7 @@ theorem evalSymPlaceCopy_sound_copy
             rw [hU0] at h
             injection h with hEq
             subst hEq
-            dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
+            dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue, applyPlaceReadValid]
             cases get? args idx with
             | none => rfl
             | some v =>
@@ -441,10 +916,15 @@ theorem evalSymPlaceCopy_sound_copy
             | true => rw [hU] at h; nomatch h
             | false =>
               rw [hU] at h
-              injection h with hEq
-              subst hEq
-              dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
-              rw [hU]
+              cases hVal : symConcreteReadValid layouts localDecls { local_ := loc, projection := [] } rootVal with
+              | false => rw [hVal] at h; nomatch h
+              | true =>
+                rw [hVal] at h
+                injection h with hEq
+                subst hEq
+                dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue, applyPlaceReadValid]
+                rw [hU]
+                rfl
     | cons pHead pTail =>
       cases hHead : pHead with
       | deref =>
@@ -482,32 +962,41 @@ theorem evalSymPlaceCopy_sound_copy
                   | true => rw [hU0] at h; nomatch h
                   | false =>
                     rw [hU0] at h
-                    injection h with hEq
-                    subst hEq
-                    dsimp only [concretizeSymSlot, concretizeSymReadResult]
-                    cases get? args idx with
-                    | none => rfl
-                    | some _ =>
-                      dsimp only [readProjectedValue, get?, List.getElem?_cons_zero]
-                      rw [hUnion]
-                      dsimp only [readProjectedValue, get?, List.getElem?_cons_zero]
-                      rw [hU0]
+                    cases hVal : symConcreteReadValid layouts localDecls ⟨loc, [.field 0 fTy]⟩ v0 with
+                    | false => rw [hVal] at h; nomatch h
+                    | true =>
+                      rw [hVal] at h
+                      injection h with hEq
+                      subst hEq
+                      dsimp only [concretizeSymSlot, concretizeSymReadResult, applyPlaceReadValid]
+                      cases get? args idx with
+                      | none => rfl
+                      | some _ =>
+                        dsimp only [readProjectedValue, get?, List.getElem?_cons_zero]
+                        rw [hUnion]
+                        dsimp only [readProjectedValue, get?, List.getElem?_cons_zero]
+                        rw [hU0]
+                        rfl
               | succ fIdx' =>
                 cases fIdx' with
                 | zero =>
                   cases pTail with
                   | cons _ _ => nomatch h
                   | nil =>
-                    injection h with hEq
-                    subst hEq
-                    dsimp only [concretizeSymSlot, concretizeSymReadResult]
-                    cases get? args idx with
-                    | none => rfl
-                    | some v =>
-                      dsimp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero]
-                      rw [hUnion]
-                      dsimp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero]
-                      cases valueContainsUninit v <;> rfl
+                    cases hNM : isNonMatPtrPlace layouts localDecls ⟨loc, [.field 1 fTy]⟩ with
+                    | false => rw [hNM] at h; nomatch h
+                    | true =>
+                      rw [hNM] at h
+                      injection h with hEq
+                      subst hEq
+                      dsimp only [concretizeSymSlot, concretizeSymReadResult, applyPlaceReadValid]
+                      cases get? args idx with
+                      | none => rfl
+                      | some v =>
+                        dsimp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero]
+                        rw [hUnion]
+                        dsimp only [readProjectedValue, get?, List.getElem?_cons_succ, List.getElem?_cons_zero]
+                        cases valueContainsUninit v <;> rfl
                 | succ _ => nomatch h
             | concrete cSlot =>
               cases cSlot with
@@ -524,15 +1013,21 @@ theorem evalSymPlaceCopy_sound_copy
                   nomatch h
                 | some fieldVal =>
                   rw [hRead] at h
-                  injection h with hEq
-                  subst hEq
-                  dsimp only [concretizeSymReadResult]
-                  rw [readProjectedPure_sound
-                    (concretizeSymSlots args slots)
-                    rootVal
-                    (.field fIdx fTy :: pTail)
-                    fieldVal
-                    hRead]
+                  dsimp only at h
+                  cases hVal : symConcreteReadValid layouts localDecls ⟨loc, .field fIdx fTy :: pTail⟩ fieldVal with
+                  | false => rw [hVal] at h; nomatch h
+                  | true =>
+                    rw [hVal] at h
+                    injection h with hEq
+                    subst hEq
+                    dsimp only [concretizeSymReadResult, applyPlaceReadValid]
+                    rw [readProjectedPure_sound
+                      (concretizeSymSlots args slots)
+                      rootVal
+                      (.field fIdx fTy :: pTail)
+                      fieldVal
+                      hRead]
+                    rfl
       | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
         subst hHead
         dsimp only [evalSymPlaceCopy] at h
@@ -558,6 +1053,352 @@ theorem evalSymPlaceCopy_sound_copy
               | init rootVal =>
                 dsimp only at h
                 nomatch h
+
+theorem evalSymPlaceCopy_concrete_readValid
+    {slots : List SymSlot} {p : Place} {borrows : List BorrowEntry}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {v : Value}
+    (h : evalSymPlaceCopy slots p borrows localDecls layouts = .some (.concrete v)) :
+    symConcreteReadValid layouts localDecls p v = true := by
+  cases p with
+  | mk loc proj =>
+    cases proj with
+    | nil =>
+      dsimp only [evalSymPlaceCopy] at h
+      cases hGet : get? slots loc with
+      | none => rw [hGet] at h; nomatch h
+      | some slot =>
+        rw [hGet] at h
+        cases slot with
+        | symArg _ =>
+          dsimp only at h
+          cases hNM : isNonMatPtrPlace layouts localDecls { local_ := loc, projection := [] } <;> (rw [hNM] at h; nomatch h)
+        | symPair0 v0 _ =>
+          dsimp only at h
+          cases hU0 : valueContainsUninit v0 <;> (rw [hU0] at h; nomatch h)
+        | concrete cSlot =>
+          cases cSlot with
+          | dead | uninit => nomatch h
+          | init rootVal =>
+            dsimp only at h
+            cases hU : valueContainsUninit rootVal with
+            | true => rw [hU] at h; nomatch h
+            | false =>
+              rw [hU] at h
+              cases hV : symConcreteReadValid layouts localDecls { local_ := loc, projection := [] } rootVal with
+              | false => rw [hV] at h; nomatch h
+              | true =>
+                rw [hV] at h; injection h with hEq; injection hEq with hEq'; subst hEq'; exact hV
+    | cons pHead pTail =>
+      cases pHead with
+      | deref => nomatch h
+      | field fIdx fTy =>
+        dsimp only [evalSymPlaceCopy] at h
+        cases hU : placeTouchesUnion localDecls layouts ⟨loc, .field fIdx fTy :: pTail⟩ with
+        | true => rw [hU] at h; nomatch h
+        | false =>
+          rw [hU] at h; dsimp only at h
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some slot =>
+            rw [hGet] at h
+            cases slot with
+            | symArg _ => nomatch h
+            | symPair0 v0 _ =>
+              dsimp only at h
+              cases fIdx with
+              | zero =>
+                cases pTail with
+                | cons _ _ => nomatch h
+                | nil =>
+                  dsimp only at h
+                  cases hU0 : valueContainsUninit v0 with
+                  | true => rw [hU0] at h; nomatch h
+                  | false =>
+                    rw [hU0] at h
+                    cases hV : symConcreteReadValid layouts localDecls ⟨loc, [.field 0 fTy]⟩ v0 <;>
+                      (rw [hV] at h; nomatch h)
+              | succ fIdx' =>
+                cases fIdx' with
+                | zero =>
+                  cases pTail with
+                  | cons _ _ => nomatch h
+                  | nil =>
+                    cases hNM : isNonMatPtrPlace layouts localDecls ⟨loc, [.field 1 fTy]⟩ <;> (rw [hNM] at h; nomatch h)
+                | succ _ => nomatch h
+            | concrete cSlot =>
+              cases cSlot with
+              | dead | uninit => nomatch h
+              | init rootVal =>
+                dsimp only at h
+                cases hR : readProjectedPure rootVal (.field fIdx fTy :: pTail) with
+                | none => rw [hR] at h; nomatch h
+                | some fv =>
+                  rw [hR] at h
+                  dsimp only at h
+                  cases hV : symConcreteReadValid layouts localDecls ⟨loc, .field fIdx fTy :: pTail⟩ fv with
+                  | false => rw [hV] at h; nomatch h
+                  | true =>
+                    rw [hV] at h; injection h with hEq; injection hEq with hEq'; subst hEq'; exact hV
+      | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+        dsimp only [evalSymPlaceCopy] at h
+        cases hU : placeTouchesUnion localDecls layouts ⟨loc, _ :: pTail⟩ with
+        | true => rw [hU] at h; nomatch h
+        | false =>
+          rw [hU] at h; dsimp only at h
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some slot =>
+            rw [hGet] at h
+            cases slot with
+            | symArg _ | symPair0 _ _ => nomatch h
+            | concrete cSlot => cases cSlot <;> nomatch h
+
+theorem evalSymPlaceCopy_guarded_readValid
+    {slots : List SymSlot} {p : Place} {borrows : List BorrowEntry}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {v0 : Value} {idx : Nat}
+    (h : evalSymPlaceCopy slots p borrows localDecls layouts = .some (.symGuarded v0 idx)) :
+    symConcreteReadValid layouts localDecls p v0 = true := by
+  cases p with
+  | mk loc proj =>
+    cases proj with
+    | nil =>
+      dsimp only [evalSymPlaceCopy] at h
+      cases hGet : get? slots loc with
+      | none => rw [hGet] at h; nomatch h
+      | some slot =>
+        rw [hGet] at h
+        cases slot with
+        | symArg _ =>
+          dsimp only at h
+          cases hNM : isNonMatPtrPlace layouts localDecls { local_ := loc, projection := [] } <;> (rw [hNM] at h; nomatch h)
+        | symPair0 w _ =>
+          dsimp only at h
+          cases hU0 : valueContainsUninit w <;> (rw [hU0] at h; nomatch h)
+        | concrete cSlot =>
+          cases cSlot with
+          | dead | uninit => nomatch h
+          | init rv =>
+            dsimp only at h
+            cases hU : valueContainsUninit rv with
+            | true => rw [hU] at h; nomatch h
+            | false =>
+              rw [hU] at h; dsimp only at h
+              cases hV : symConcreteReadValid layouts localDecls { local_ := loc, projection := [] } rv <;> (rw [hV] at h; nomatch h)
+    | cons pHead pTail =>
+      cases pHead with
+      | deref => nomatch h
+      | field fIdx fTy =>
+        dsimp only [evalSymPlaceCopy] at h
+        cases hU : placeTouchesUnion localDecls layouts ⟨loc, .field fIdx fTy :: pTail⟩ with
+        | true => rw [hU] at h; nomatch h
+        | false =>
+          rw [hU] at h; dsimp only at h
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some slot =>
+            rw [hGet] at h
+            cases slot with
+            | symArg _ => nomatch h
+            | symPair0 w j =>
+              dsimp only at h
+              cases fIdx with
+              | zero =>
+                cases pTail with
+                | cons _ _ => nomatch h
+                | nil =>
+                  dsimp only at h
+                  cases hU0 : valueContainsUninit w with
+                  | true => rw [hU0] at h; nomatch h
+                  | false =>
+                    rw [hU0] at h
+                    cases hV : symConcreteReadValid layouts localDecls ⟨loc, [.field 0 fTy]⟩ w with
+                    | false => rw [hV] at h; nomatch h
+                    | true =>
+                      rw [hV] at h; injection h with hEq; injection hEq with hW _; subst hW; exact hV
+              | succ fIdx' =>
+                cases fIdx' with
+                | zero =>
+                  cases pTail with
+                  | cons _ _ => nomatch h
+                  | nil =>
+                    cases hNM : isNonMatPtrPlace layouts localDecls ⟨loc, [.field 1 fTy]⟩ <;> (rw [hNM] at h; nomatch h)
+                | succ _ => nomatch h
+            | concrete cSlot =>
+              cases cSlot with
+              | dead | uninit => nomatch h
+              | init rv =>
+                dsimp only at h
+                cases hR : readProjectedPure rv (.field fIdx fTy :: pTail) with
+                | none => rw [hR] at h; nomatch h
+                | some fv =>
+                  rw [hR] at h
+                  dsimp only at h
+                  cases hV : symConcreteReadValid layouts localDecls ⟨loc, .field fIdx fTy :: pTail⟩ fv <;> (rw [hV] at h; nomatch h)
+      | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+        dsimp only [evalSymPlaceCopy] at h
+        cases hU : placeTouchesUnion localDecls layouts ⟨loc, _ :: pTail⟩ with
+        | true => rw [hU] at h; nomatch h
+        | false =>
+          rw [hU] at h; dsimp only at h
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some slot =>
+            rw [hGet] at h
+            cases slot with
+            | symArg _ | symPair0 _ _ => nomatch h
+            | concrete cSlot => cases cSlot <;> nomatch h
+
+theorem evalSymPlaceCopy_symArg_nonMat
+    {slots : List SymSlot} {p : Place} {borrows : List BorrowEntry}
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {idx : Nat}
+    (h : evalSymPlaceCopy slots p borrows localDecls layouts = .some (.symArg idx)) :
+    isNonMatPtrPlace layouts localDecls p = true := by
+  cases p with
+  | mk loc proj =>
+    cases proj with
+    | nil =>
+      dsimp only [evalSymPlaceCopy] at h
+      cases hGet : get? slots loc with
+      | none => rw [hGet] at h; nomatch h
+      | some slot =>
+        rw [hGet] at h
+        cases slot with
+        | symArg j =>
+          cases hNM : isNonMatPtrPlace layouts localDecls { local_ := loc, projection := [] } with
+          | false => rw [hNM] at h; nomatch h
+          | true => rfl
+        | symPair0 w _ =>
+          dsimp only at h
+          cases hU0 : valueContainsUninit w <;> (rw [hU0] at h; nomatch h)
+        | concrete cSlot =>
+          cases cSlot with
+          | dead | uninit => nomatch h
+          | init rv =>
+            dsimp only at h
+            cases hU : valueContainsUninit rv with
+            | true => rw [hU] at h; nomatch h
+            | false =>
+              rw [hU] at h; dsimp only at h
+              cases hV : symConcreteReadValid layouts localDecls { local_ := loc, projection := [] } rv <;> (rw [hV] at h; nomatch h)
+    | cons pHead pTail =>
+      cases pHead with
+      | deref => nomatch h
+      | field fIdx fTy =>
+        dsimp only [evalSymPlaceCopy] at h
+        cases hU : placeTouchesUnion localDecls layouts ⟨loc, .field fIdx fTy :: pTail⟩ with
+        | true => rw [hU] at h; nomatch h
+        | false =>
+          rw [hU] at h; dsimp only at h
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some slot =>
+            rw [hGet] at h
+            cases slot with
+            | symArg _ => nomatch h
+            | symPair0 w j =>
+              dsimp only at h
+              cases fIdx with
+              | zero =>
+                cases pTail with
+                | cons _ _ => nomatch h
+                | nil =>
+                  dsimp only at h
+                  cases hU0 : valueContainsUninit w with
+                  | true => rw [hU0] at h; nomatch h
+                  | false =>
+                    rw [hU0] at h; dsimp only at h
+                    cases hV : symConcreteReadValid layouts localDecls ⟨loc, [.field 0 fTy]⟩ w <;> (rw [hV] at h; nomatch h)
+              | succ fIdx' =>
+                cases fIdx' with
+                | zero =>
+                  cases pTail with
+                  | cons _ _ => nomatch h
+                  | nil =>
+                    cases hNM : isNonMatPtrPlace layouts localDecls ⟨loc, [.field 1 fTy]⟩ with
+                    | false => rw [hNM] at h; nomatch h
+                    | true => rfl
+                | succ _ => nomatch h
+            | concrete cSlot =>
+              cases cSlot with
+              | dead | uninit => nomatch h
+              | init rv =>
+                dsimp only at h
+                cases hR : readProjectedPure rv (.field fIdx fTy :: pTail) with
+                | none => rw [hR] at h; nomatch h
+                | some fv =>
+                  rw [hR] at h
+                  dsimp only at h
+                  cases hV : symConcreteReadValid layouts localDecls ⟨loc, .field fIdx fTy :: pTail⟩ fv <;> (rw [hV] at h; nomatch h)
+      | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+        dsimp only [evalSymPlaceCopy] at h
+        cases hU : placeTouchesUnion localDecls layouts ⟨loc, _ :: pTail⟩ with
+        | true => rw [hU] at h; nomatch h
+        | false =>
+          rw [hU] at h; dsimp only at h
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some slot =>
+            rw [hGet] at h
+            cases slot with
+            | symArg _ | symPair0 _ _ => nomatch h
+            | concrete cSlot => cases cSlot <;> nomatch h
+
+theorem evalSymPlaceCopy_sound_copy_or_ub
+    (args : List Value)
+    (slots : List SymSlot)
+    (p : Place)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    {callerLocals : List LocalSlot}
+    {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame}
+    (sv : SymVal)
+    (h : evalSymPlaceCopy slots p borrows localDecls layouts = .some sv) :
+    evalOperand (concretizeSymSlots args slots) (.copy p) borrows globals layouts callerLocals localDecls
+        callStack =
+      concretizeSymReadResult args sv slots ∨
+    evalOperand (concretizeSymSlots args slots) (.copy p) borrows globals layouts callerLocals localDecls
+        callStack = .ub := by
+  rw [evalSymPlaceCopy_sound_copy args slots p borrows globals layouts sv h]
+  cases sv with
+  | concrete v =>
+    exact Or.inl (applyPlaceReadValid_of_symConcreteReadValid layouts localDecls p v _
+      (evalSymPlaceCopy_concrete_readValid h))
+  | symGuarded v0 idx =>
+    dsimp only [concretizeSymReadResult]
+    cases get? args idx with
+    | none => exact Or.inl rfl
+    | some _ =>
+      exact Or.inl (applyPlaceReadValid_of_symConcreteReadValid layouts localDecls p v0 _
+        (evalSymPlaceCopy_guarded_readValid h))
+  | symArg idx =>
+    have hNM := evalSymPlaceCopy_symArg_nonMat h
+    dsimp only [concretizeSymReadResult]
+    cases get? args idx with
+    | none => exact Or.inl rfl
+    | some v =>
+      dsimp only
+      cases valueContainsUninit v with
+      | true => exact Or.inl rfl
+      | false =>
+        apply applyPlaceReadValid_eq_ok_or_ub_of_nonMat
+        cases localDecls with
+        | nil => exact Or.inl rfl
+        | cons d ds =>
+          dsimp only [isNonMatPtrPlace] at hNM
+          exact Or.inr (by rw [hNM, Bool.or_true])
+  | symPair0 v0 idx =>
+    dsimp only [concretizeSymReadResult]
+    cases get? args idx with
+    | none => exact Or.inl rfl
+    | some v1 =>
+      dsimp only
+      cases valueContainsUninit v1 with
+      | true => exact Or.inl rfl
+      | false =>
+        exact applyPlaceReadValid_eq_ok_or_ub_of_nonMat layouts localDecls p
+          (.aggregate 0 [v0, v1]) _ (Or.inr rfl)
 
 
 private theorem evalSymPlaceCopy_not_opaqueCast
@@ -621,14 +1462,20 @@ def evalSymOperand
       | .some (.concrete (.init rootVal)) =>
         match valueContainsUninit rootVal with
         | false =>
-          match set? slots p.local_ (.concrete .uninit) with
-          | .some slots' => .some (.concrete rootVal, slots')
-          | .none => .none
+          match symConcreteReadValid layouts localDecls p rootVal with
+          | false => .none
+          | true =>
+            match set? slots p.local_ (.concrete .uninit) with
+            | .some slots' => .some (.concrete rootVal, slots')
+            | .none => .none
         | true => .none
       | .some (.symArg idx) =>
-        match set? slots p.local_ (.concrete .uninit) with
-        | .some slots' => .some (.symArg idx, slots')
-        | .none => .none
+        match isNonMatPtrPlace layouts localDecls p with
+        | false => .none
+        | true =>
+          match set? slots p.local_ (.concrete .uninit) with
+          | .some slots' => .some (.symArg idx, slots')
+          | .none => .none
       | .some (.symPair0 v0 idx) =>
         match valueContainsUninit v0 with
         | false =>
@@ -661,7 +1508,7 @@ theorem evalSymOperand_sound
     (h : evalSymOperand slots op borrows localDecls layouts = .some (sv, slots')) :
     evalOperand (concretizeSymSlots args slots) op borrows globals layouts callerLocals localDecls
         callStack =
-      concretizeSymReadResult args sv slots' := by
+      applyOperandReadValid layouts localDecls op (concretizeSymReadResult args sv slots') := by
   cases op with
   | copy p =>
     dsimp only [evalSymOperand] at h
@@ -692,24 +1539,40 @@ theorem evalSymOperand_sound
           rw [hGet] at h
           cases sSlot with
           | symArg idx =>
-            dsimp only at h
-            cases hSet : set? slots loc (.concrete .uninit) with
-            | none =>
-              rw [hSet] at h
-              nomatch h
-            | some slots1 =>
-              rw [hSet] at h
-              injection h with hPair
-              injection hPair with hSv hSlots
-              subst hSv
-              subst hSlots
-              dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
-              cases get? args idx with
-              | none => rfl
-              | some v =>
-                dsimp only
-                rw [set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
-                cases valueContainsUninit v <;> rfl
+            cases hNM : isNonMatPtrPlace layouts localDecls { local_ := loc, projection := [] } with
+            | false => rw [hNM] at h; nomatch h
+            | true =>
+              rw [hNM] at h
+              dsimp only at h
+              cases hSet : set? slots loc (.concrete .uninit) with
+              | none =>
+                rw [hSet] at h
+                nomatch h
+              | some slots1 =>
+                rw [hSet] at h
+                injection h with hPair
+                injection hPair with hSv hSlots
+                subst hSv
+                subst hSlots
+                dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue,
+                  applyOperandReadValid, applyPlaceReadValid]
+                cases get? args idx with
+                | none => rfl
+                | some v =>
+                  dsimp only
+                  rw [set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
+                  cases valueContainsUninit v with
+                  | true => cases localDecls <;> rfl
+                  | false =>
+                    cases localDecls with
+                    | nil => rfl
+                    | cons d ds =>
+                      dsimp only
+                      cases materializeReadPtrValue layouts (placeTyResolved (d :: ds) layouts { local_ := loc, projection := [] }) v with
+                      | none => rfl
+                      | some matVal =>
+                        dsimp only
+                        cases validateValueForTy? layouts (placeTyResolved (d :: ds) layouts { local_ := loc, projection := [] }) matVal <;> rfl
           | symPair0 v0 idx =>
             dsimp only at h
             cases hU0 : valueContainsUninit v0 with
@@ -727,14 +1590,26 @@ theorem evalSymOperand_sound
                 injection hPair with hSv hSlots
                 subst hSv
                 subst hSlots
-                dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
+                dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue,
+                  applyOperandReadValid, applyPlaceReadValid]
                 cases get? args idx with
                 | none => rfl
                 | some v =>
                   dsimp only [valueContainsUninit, valueListContainsUninit]
                   rw [hU0, set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
                   dsimp only
-                  cases valueContainsUninit v <;> rfl
+                  cases valueContainsUninit v with
+                  | true => cases localDecls <;> rfl
+                  | false =>
+                    cases localDecls with
+                    | nil => rfl
+                    | cons d ds =>
+                      dsimp only
+                      cases materializeReadPtrValue layouts (placeTyResolved (d :: ds) layouts { local_ := loc, projection := [] }) (.aggregate 0 [v0, v]) with
+                      | none => rfl
+                      | some matVal =>
+                        dsimp only
+                        cases validateValueForTy? layouts (placeTyResolved (d :: ds) layouts { local_ := loc, projection := [] }) matVal <;> rfl
           | concrete cSlot =>
             cases cSlot with
             | dead => nomatch h
@@ -745,19 +1620,33 @@ theorem evalSymOperand_sound
               | true => rw [hU] at h; nomatch h
               | false =>
                 rw [hU] at h
-                dsimp only at h
-                cases hSet : set? slots loc (.concrete .uninit) with
-                | none =>
-                  rw [hSet] at h
-                  nomatch h
-                | some slots1 =>
-                  rw [hSet] at h
-                  injection h with hPair
-                  injection hPair with hSv hSlots
-                  subst hSv
-                  subst hSlots
-                  dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue]
-                  rw [hU, set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
+                cases hVal : symConcreteReadValid layouts localDecls { local_ := loc, projection := [] } rootVal with
+                | false => rw [hVal] at h; nomatch h
+                | true =>
+                  rw [hVal] at h
+                  dsimp only at h
+                  cases hSet : set? slots loc (.concrete .uninit) with
+                  | none =>
+                    rw [hSet] at h
+                    nomatch h
+                  | some slots1 =>
+                    rw [hSet] at h
+                    injection h with hPair
+                    injection hPair with hSv hSlots
+                    subst hSv
+                    subst hSlots
+                    dsimp only [concretizeSymSlot, concretizeSymReadResult, readProjectedValue,
+                      applyOperandReadValid, applyPlaceReadValid]
+                    rw [hU, set?_concretizeSymSlots_concrete args .uninit slots loc, hSet]
+                    cases localDecls with
+                    | nil => rfl
+                    | cons d ds =>
+                      dsimp only
+                      cases materializeReadPtrValue layouts (placeTyResolved (d :: ds) layouts { local_ := loc, projection := [] }) rootVal with
+                      | none => rfl
+                      | some matVal =>
+                        dsimp only
+                        cases validateValueForTy? layouts (placeTyResolved (d :: ds) layouts { local_ := loc, projection := [] }) matVal <;> rfl
       | cons pHead pTail =>
         dsimp only [evalSymOperand] at h
         cases hCopy : evalSymPlaceCopy slots ⟨loc, pHead :: pTail⟩ borrows localDecls layouts with
@@ -789,6 +1678,197 @@ theorem evalSymOperand_sound
         subst hSv
         subst hSlots
         exact evalSymConstVal_sound (concretizeSymSlots args slots) ty cv borrows globals layouts v hCv
+
+theorem evalSymOperand_sound_or_ub
+    (args : List Value)
+    (slots : List SymSlot)
+    (op : Operand)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    {callerLocals : List LocalSlot}
+    {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame}
+    (sv : SymVal)
+    (slots' : List SymSlot)
+    (h : evalSymOperand slots op borrows localDecls layouts = .some (sv, slots')) :
+    evalOperand (concretizeSymSlots args slots) op borrows globals layouts callerLocals localDecls
+        callStack =
+      concretizeSymReadResult args sv slots' ∨
+    evalOperand (concretizeSymSlots args slots) op borrows globals layouts callerLocals localDecls
+        callStack = .ub := by
+  cases op with
+  | constant c =>
+    exact Or.inl (evalSymOperand_sound args slots (.constant c) borrows globals layouts sv slots' h)
+  | copy p =>
+    dsimp only [evalSymOperand] at h
+    cases hCopy : evalSymPlaceCopy slots p borrows localDecls layouts with
+    | none => rw [hCopy] at h; nomatch h
+    | some sv0 =>
+      rw [hCopy] at h; injection h with hP; injection hP with hS hSl; subst hS; subst hSl
+      exact evalSymPlaceCopy_sound_copy_or_ub args slots p borrows globals layouts sv0 hCopy
+  | move p =>
+    cases p with
+    | mk loc proj =>
+      cases proj with
+      | cons pHead pTail =>
+        dsimp only [evalSymOperand] at h
+        cases hCopy : evalSymPlaceCopy slots ⟨loc, pHead :: pTail⟩ borrows localDecls layouts with
+        | none => rw [hCopy] at h; nomatch h
+        | some sv0 =>
+          rw [hCopy] at h; injection h with hP; injection hP with hS hSl; subst hS; subst hSl
+          rw [evalOperand_move_cons_eq_copy _ _ _ _ _ _ _ (evalSymPlaceCopy_not_opaqueCast hCopy)]
+          exact evalSymPlaceCopy_sound_copy_or_ub args slots ⟨loc, pHead :: pTail⟩ borrows globals layouts sv0 hCopy
+      | nil =>
+        rw [evalSymOperand_sound args slots (.move ⟨loc, .nil⟩) borrows globals layouts sv slots' h]
+        dsimp only [evalSymOperand] at h
+        cases hGet : get? slots loc with
+        | none => rw [hGet] at h; nomatch h
+        | some sSlot =>
+          rw [hGet] at h
+          cases sSlot with
+          | symArg idx =>
+            dsimp only at h
+            cases hNM : isNonMatPtrPlace layouts localDecls { local_ := loc, projection := [] } with
+            | false => rw [hNM] at h; nomatch h
+            | true =>
+              rw [hNM] at h; dsimp only at h
+              cases hSet : set? slots loc (.concrete .uninit) with
+              | none => rw [hSet] at h; nomatch h
+              | some sl1 =>
+                rw [hSet] at h; injection h with hP; injection hP with hS hSl; subst hS; subst hSl
+                dsimp only [concretizeSymReadResult, applyOperandReadValid]
+                cases get? args idx with
+                | none => exact Or.inl rfl
+                | some v =>
+                  dsimp only
+                  cases valueContainsUninit v with
+                  | true => exact Or.inl rfl
+                  | false =>
+                    apply applyPlaceReadValid_eq_ok_or_ub_of_nonMat
+                    cases localDecls with
+                    | nil => exact Or.inl rfl
+                    | cons d ds =>
+                      dsimp only [isNonMatPtrPlace] at hNM
+                      exact Or.inr (by rw [hNM, Bool.or_true])
+          | symPair0 v0 idx =>
+            dsimp only at h
+            cases hU0 : valueContainsUninit v0 with
+            | true => rw [hU0] at h; nomatch h
+            | false =>
+              rw [hU0] at h; dsimp only at h
+              cases hSet : set? slots loc (.concrete .uninit) with
+              | none => rw [hSet] at h; nomatch h
+              | some sl1 =>
+                rw [hSet] at h; injection h with hP; injection hP with hS hSl; subst hS; subst hSl
+                dsimp only [concretizeSymReadResult, applyOperandReadValid]
+                cases get? args idx with
+                | none => exact Or.inl rfl
+                | some v1 =>
+                  dsimp only
+                  cases valueContainsUninit v1 with
+                  | true => exact Or.inl rfl
+                  | false =>
+                    exact applyPlaceReadValid_eq_ok_or_ub_of_nonMat layouts localDecls _
+                      (.aggregate 0 [v0, v1]) _ (Or.inr rfl)
+          | concrete cSlot =>
+            cases cSlot with
+            | dead | uninit => nomatch h
+            | init rv =>
+              dsimp only at h
+              cases hU : valueContainsUninit rv with
+              | true => rw [hU] at h; nomatch h
+              | false =>
+                rw [hU] at h; dsimp only at h
+                cases hVal : symConcreteReadValid layouts localDecls { local_ := loc, projection := [] } rv with
+                | false => rw [hVal] at h; nomatch h
+                | true =>
+                  rw [hVal] at h; dsimp only at h
+                  cases hSet : set? slots loc (.concrete .uninit) with
+                  | none => rw [hSet] at h; nomatch h
+                  | some sl1 =>
+                    rw [hSet] at h; injection h with hP; injection hP with hS hSl; subst hS; subst hSl
+                    exact Or.inl (applyPlaceReadValid_of_symConcreteReadValid layouts localDecls _ rv _ hVal)
+
+theorem evalSymOperand_sound_concrete
+    (args : List Value)
+    (slots : List SymSlot)
+    (op : Operand)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    {callerLocals : List LocalSlot}
+    {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame}
+    (v : Value)
+    (slots' : List SymSlot)
+    (h : evalSymOperand slots op borrows localDecls layouts = .some (.concrete v, slots')) :
+    evalOperand (concretizeSymSlots args slots) op borrows globals layouts callerLocals localDecls
+        callStack =
+      .ok v (concretizeSymSlots args slots') := by
+  rw [evalSymOperand_sound args slots op borrows globals layouts (.concrete v) slots' h]
+  cases op with
+  | constant _ => rfl
+  | copy p =>
+    dsimp only [evalSymOperand] at h
+    cases hCopy : evalSymPlaceCopy slots p borrows localDecls layouts with
+    | none => rw [hCopy] at h; nomatch h
+    | some sv0 =>
+      rw [hCopy] at h; injection h with hP; injection hP with hS _; subst hS
+      exact applyPlaceReadValid_of_symConcreteReadValid layouts localDecls p v _
+        (evalSymPlaceCopy_concrete_readValid hCopy)
+  | move p =>
+    cases p with
+    | mk loc proj =>
+      cases proj with
+      | nil =>
+        dsimp only [evalSymOperand] at h
+        cases hGet : get? slots loc with
+        | none => rw [hGet] at h; nomatch h
+        | some sSlot =>
+          rw [hGet] at h
+          cases sSlot with
+          | symArg _ =>
+            dsimp only at h
+            cases hNM : isNonMatPtrPlace layouts localDecls { local_ := loc, projection := [] } with
+            | false => rw [hNM] at h; nomatch h
+            | true =>
+              rw [hNM] at h; dsimp only at h
+              cases hSet : set? slots loc (.concrete .uninit) <;> (rw [hSet] at h; nomatch h)
+          | symPair0 w _ =>
+            dsimp only at h
+            cases hU0 : valueContainsUninit w with
+            | true => rw [hU0] at h; nomatch h
+            | false =>
+              rw [hU0] at h; dsimp only at h
+              cases hSet : set? slots loc (.concrete .uninit) <;> (rw [hSet] at h; nomatch h)
+          | concrete cSlot =>
+            cases cSlot with
+            | dead | uninit => nomatch h
+            | init rootVal =>
+              dsimp only at h
+              cases hU : valueContainsUninit rootVal with
+              | true => rw [hU] at h; nomatch h
+              | false =>
+                rw [hU] at h; dsimp only at h
+                cases hVal : symConcreteReadValid layouts localDecls { local_ := loc, projection := [] } rootVal with
+                | false => rw [hVal] at h; nomatch h
+                | true =>
+                  rw [hVal] at h; dsimp only at h
+                  cases hSet : set? slots loc (.concrete .uninit) with
+                  | none => rw [hSet] at h; nomatch h
+                  | some slots1 =>
+                    rw [hSet] at h
+                    injection h with hP; injection hP with hS _; injection hS with hEq; subst hEq
+                    exact applyPlaceReadValid_of_symConcreteReadValid layouts localDecls _ rootVal _ hVal
+      | cons pHead pTail =>
+        dsimp only [evalSymOperand] at h
+        cases hCopy : evalSymPlaceCopy slots ⟨loc, pHead :: pTail⟩ borrows localDecls layouts with
+        | none => rw [hCopy] at h; nomatch h
+        | some sv0 =>
+          rw [hCopy] at h; injection h with hP; injection hP with hS _; subst hS
+          exact applyPlaceReadValid_of_symConcreteReadValid layouts localDecls _ v _
+            (evalSymPlaceCopy_concrete_readValid hCopy)
 
 /-- Evaluate a list of operands to concrete `Value`s left-to-right. -/
 def evalSymOperandsConcrete
@@ -845,8 +1925,8 @@ theorem evalSymOperandsConcrete_sound
         | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch h
         | concrete v1 =>
           dsimp only at h
-          rw [evalSymOperand_sound args slots op borrows globals layouts (.concrete v1) slots1 hOp]
-          dsimp only [concretizeSymReadResult]
+          rw [evalSymOperand_sound_concrete args slots op borrows globals layouts v1 slots1 hOp]
+          dsimp only
           cases hRest : evalSymOperandsConcrete slots1 rest borrows localDecls layouts with
           | none =>
             rw [hRest] at h
@@ -1414,9 +2494,16 @@ def evalSymRvalueConcrete
     | .some (.concrete (.scalar lhs), slots₁) =>
       match evalSymOperand slots₁ rhsOp borrows localDecls layouts with
       | .some (.concrete (.scalar rhs), slots₂) =>
-        match evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
-        | .some v => .some (.concrete v, slots₂, borrows, nextTag)
-        | .none => .none
+        match
+          Bool.or
+            (isFloatOptTy (operandTy localDecls layouts lhsOp))
+            (isFloatOptTy (operandTy localDecls layouts rhsOp))
+        with
+        | true => .none
+        | false =>
+          match evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
+          | .some v => .some (.concrete v, slots₂, borrows, nextTag)
+          | .none => .none
       | _ => .none
     | _ => .none
   | .aggregate .tuple ops =>
@@ -1734,7 +2821,8 @@ theorem evalSymRvalueConcrete_sound
         args
         sv
         slots'
-        { mem with borrows := borrows', nextTag := nextTag' } := by
+        { mem with borrows := borrows', nextTag := nextTag' } ∨
+    evalRvalue (concretizeSymSlots args slots) rv mem localDecls layouts = .ub := by
   cases rv with
   | use op =>
     dsimp only [evalSymRvalueConcrete] at h
@@ -1766,52 +2854,55 @@ theorem evalSymRvalueConcrete_sound
             injection hRest1 with hS hRest2
             injection hRest2 with hB hT
             subst hV; subst hS; subst hB; subst hT
-            rw [evalSymOperand_sound args slots op mem.borrows mem.globals layouts sv0 s1 hOp]
-            rw [memory_borrows_eta mem]
-            cases op with
-            | constant _ =>
-              dsimp only [freezeSymOperandReadBorrows]
-              exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.constant _) hValid
-            | copy p =>
-              cases p with
-              | mk loc proj =>
-                cases proj with
-                | nil =>
-                  dsimp only [freezeSymOperandReadBorrows]
-                  exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.copy { local_ := loc, projection := .nil }) hValid
-                | cons pHead pTail =>
-                  cases pHead with
-                  | deref =>
-                    dsimp only [evalSymOperand] at hOp
-                    cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows localDecls layouts with
-                    | none =>
-                      rw [hCopy] at hOp
-                      nomatch hOp
-                    | some sv1 =>
-                      nomatch hCopy
-                  | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+            rcases evalSymOperand_sound_or_ub args slots op mem.borrows mem.globals layouts sv0 s1 hOp with hOpEq | hOpUb
+            · rw [hOpEq]
+              rw [memory_borrows_eta mem]
+              refine Or.inl ?_
+              cases op with
+              | constant _ =>
+                dsimp only [freezeSymOperandReadBorrows]
+                exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.constant _) hValid
+              | copy p =>
+                cases p with
+                | mk loc proj =>
+                  cases proj with
+                  | nil =>
                     dsimp only [freezeSymOperandReadBorrows]
-                    exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls _ hValid
-            | move p =>
-              cases p with
-              | mk loc proj =>
-                cases proj with
-                | nil =>
-                  dsimp only [freezeSymOperandReadBorrows]
-                  exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.move { local_ := loc, projection := .nil }) hValid
-                | cons pHead pTail =>
-                  cases pHead with
-                  | deref =>
-                    dsimp only [evalSymOperand] at hOp
-                    cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows localDecls layouts with
-                    | none =>
-                      rw [hCopy] at hOp
-                      nomatch hOp
-                    | some sv1 =>
-                      nomatch hCopy
-                  | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                    exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.copy { local_ := loc, projection := .nil }) hValid
+                  | cons pHead pTail =>
+                    cases pHead with
+                    | deref =>
+                      dsimp only [evalSymOperand] at hOp
+                      cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows localDecls layouts with
+                      | none =>
+                        rw [hCopy] at hOp
+                        nomatch hOp
+                      | some sv1 =>
+                        nomatch hCopy
+                    | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                      dsimp only [freezeSymOperandReadBorrows]
+                      exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls _ hValid
+              | move p =>
+                cases p with
+                | mk loc proj =>
+                  cases proj with
+                  | nil =>
                     dsimp only [freezeSymOperandReadBorrows]
-                    exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls _ hValid
+                    exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.move { local_ := loc, projection := .nil }) hValid
+                  | cons pHead pTail =>
+                    cases pHead with
+                    | deref =>
+                      dsimp only [evalSymOperand] at hOp
+                      cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows localDecls layouts with
+                      | none =>
+                        rw [hCopy] at hOp
+                        nomatch hOp
+                      | some sv1 =>
+                        nomatch hCopy
+                    | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                      dsimp only [freezeSymOperandReadBorrows]
+                      exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls _ hValid
+            · rw [hOpUb]; exact Or.inr rfl
   | copyForDeref place =>
     dsimp only [evalSymRvalueConcrete] at h
     dsimp only [evalRvalue]
@@ -1832,45 +2923,49 @@ theorem evalSymRvalueConcrete_sound
         injection hRest1 with hS hRest2
         injection hRest2 with hB hT
         subst hV; subst hS; subst hB; subst hT
-        rw [evalSymPlaceCopy_sound_copy args slots place mem.borrows mem.globals layouts sv0 hCopy]
-        rw [memory_borrows_eta mem]
-        cases place with
-        | mk loc proj =>
-          cases proj with
-          | nil =>
-            dsimp only [freezeSymPlaceReadBorrows]
-            exact concretizeSymReadResult_to_rvalue args sv0 slots mem
-          | cons pHead pTail =>
-            cases pHead with
-            | deref =>
-              cases hBs : mem.borrows with
-              | nil =>
-                dsimp only [freezeSymPlaceReadBorrows]
-                rw [← hBs]
-                exact concretizeSymReadResult_to_rvalue args sv0 slots mem
-              | cons b1 rest1 =>
-                cases rest1 with
+        rcases evalSymPlaceCopy_sound_copy_or_ub args slots place mem.borrows mem.globals layouts sv0 hCopy with hCopyEq | hCopyUb
+        · rw [hCopyEq]
+          rw [memory_borrows_eta mem]
+          refine Or.inl ?_
+          cases place with
+          | mk loc proj =>
+            cases proj with
+            | nil =>
+              dsimp only [freezeSymPlaceReadBorrows]
+              exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+            | cons pHead pTail =>
+              cases pHead with
+              | deref =>
+                cases hBs : mem.borrows with
                 | nil =>
                   dsimp only [freezeSymPlaceReadBorrows]
                   rw [← hBs]
                   exact concretizeSymReadResult_to_rvalue args sv0 slots mem
-                | cons b2 restBorrows =>
-                  rw [hBs] at hCopy hUB
-                  dsimp only [symPlaceReadTreeUB] at hUB
-                  dsimp only [freezeSymPlaceReadBorrows]
-                  rw [derefSymReadTreeUB_sound args slots loc pTail
-                    (b1 :: b2 :: restBorrows) mem.activeProtectors sv0 hCopy, hUB]
-                  rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail
-                    (b1 :: b2 :: restBorrows) mem.activeProtectors sv0 hCopy]
-                  exact concretizeSymReadResult_to_rvalue args sv0 slots
-                    { mem with
-                      borrows :=
-                        freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail
-                          (b1 :: b2 :: restBorrows) mem.activeProtectors }
-            | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
-              dsimp only [freezeSymPlaceReadBorrows]
-              exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+                | cons b1 rest1 =>
+                  cases rest1 with
+                  | nil =>
+                    dsimp only [freezeSymPlaceReadBorrows]
+                    rw [← hBs]
+                    exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+                  | cons b2 restBorrows =>
+                    rw [hBs] at hCopy hUB
+                    dsimp only [symPlaceReadTreeUB] at hUB
+                    dsimp only [freezeSymPlaceReadBorrows]
+                    rw [derefSymReadTreeUB_sound args slots loc pTail
+                      (b1 :: b2 :: restBorrows) mem.activeProtectors sv0 hCopy, hUB]
+                    rw [← freezeSymDerefReadBorrowsAt_sound args slots loc pTail
+                      (b1 :: b2 :: restBorrows) mem.activeProtectors sv0 hCopy]
+                    exact concretizeSymReadResult_to_rvalue args sv0 slots
+                      { mem with
+                        borrows :=
+                          freezeDerefReadBorrowsAt (concretizeSymSlots args slots) loc pTail
+                            (b1 :: b2 :: restBorrows) mem.activeProtectors }
+              | field _ _ | index _ | constantIndex _ _ _ | subslice _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+                dsimp only [freezeSymPlaceReadBorrows]
+                exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+        · rw [hCopyUb]; exact Or.inr rfl
   | ref borrowKind place =>
+    refine Or.inl ?_
     cases place with
     | mk loc proj =>
       cases proj with
@@ -1935,6 +3030,7 @@ theorem evalSymRvalueConcrete_sound
               rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
                 (rw [hSlot]; rfl)
   | binaryOp op lhsOp rhsOp =>
+    refine Or.inl ?_
     dsimp only [evalSymRvalueConcrete] at h
     dsimp only [evalRvalue]
     cases hLhs : evalSymOperand slots lhsOp mem.borrows localDecls layouts with
@@ -1952,8 +3048,7 @@ theorem evalSymRvalueConcrete_sound
           | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
           | scalar lhs =>
             dsimp only at h
-            rw [evalSymOperand_sound args slots lhsOp mem.borrows mem.globals layouts (.concrete (.scalar lhs)) slots1 hLhs]
-            dsimp only [concretizeSymReadResult]
+            rw [evalSymOperand_sound_concrete args slots lhsOp mem.borrows mem.globals layouts (.scalar lhs) slots1 hLhs]
             cases hRhs : evalSymOperand slots1 rhsOp mem.borrows localDecls layouts with
             | none =>
               rw [hRhs] at h
@@ -1969,26 +3064,35 @@ theorem evalSymRvalueConcrete_sound
                   | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
                   | scalar rhs =>
                     dsimp only at h
-                    rw [evalSymOperand_sound args slots1 rhsOp mem.borrows mem.globals layouts (.concrete (.scalar rhs)) slots2 hRhs]
-                    dsimp only [concretizeSymReadResult]
-                    cases hBin : evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
-                    | none =>
-                      rw [hBin] at h
+                    dsimp only
+                    rw [evalSymOperand_sound_concrete args slots1 rhsOp mem.borrows mem.globals layouts (.scalar rhs) slots2 hRhs]
+                    cases hFl : Bool.or
+                        (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                        (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+                    | true =>
+                      rw [hFl] at h
                       nomatch h
-                    | some resVal =>
-                      rw [hBin] at h
-                      injection h with hTup
-                      injection hTup with hV hRest1
-                      injection hRest1 with hS hRest2
-                      injection hRest2 with hB hT
-                      subst hV; subst hS; subst hB; subst hT
-                      cases op with
-                      | offset =>
-                        unfold evalSymScalarBinOp at hBin
-                        repeat' split at hBin
-                        all_goals contradiction
-                      | _ =>
-                        exact evalSymScalarBinOp_sound _ lhs rhs (concretizeSymSlots args slots2) mem (operandIsSigned localDecls lhsOp layouts) resVal hBin
+                    | false =>
+                      rw [hFl] at h
+                      cases hBin : evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
+                      | none =>
+                        rw [hBin] at h
+                        nomatch h
+                      | some resVal =>
+                        rw [hBin] at h
+                        injection h with hTup
+                        injection hTup with hV hRest1
+                        injection hRest1 with hS hRest2
+                        injection hRest2 with hB hT
+                        subst hV; subst hS; subst hB; subst hT
+                        cases op with
+                        | offset =>
+                          unfold evalSymScalarBinOp at hBin
+                          repeat' split at hBin
+                          all_goals contradiction
+                        | _ =>
+                          dsimp only
+                          exact evalSymScalarBinOp_sound _ lhs rhs (concretizeSymSlots args slots2) mem (operandIsSigned localDecls lhsOp layouts) resVal hBin
   | aggregate aggKind ops =>
     cases aggKind with
     | tuple =>
@@ -2004,6 +3108,7 @@ theorem evalSymRvalueConcrete_sound
           injection hRest1 with hS hRest2
           injection hRest2 with hB hT
           subst hV; subst hS; subst hB; subst hT
+          refine Or.inl ?_
           rw [evalSymOperandsConcrete_sound args ops slots mem.borrows mem.globals layouts vals s1 hOps]
           rfl
       | none =>
@@ -2048,18 +3153,22 @@ theorem evalSymRvalueConcrete_sound
                           injection hRest2 with hB hT
                           subst hV; subst hS; subst hB; subst hT
                           dsimp only [evalOperands]
-                          rw [evalSymOperand_sound args slots op0 mem.borrows mem.globals layouts (.concrete v0) slots1 hOp0]
-                          dsimp only [concretizeSymReadResult]
-                          rw [evalSymOperand_sound args slots1 op1 mem.borrows mem.globals layouts (.symArg idx) slots2 hOp1]
-                          dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
-                          rw [memory_eta mem]
-                          cases get? args idx with
-                          | none => rfl
-                          | some v1 => dsimp only; cases valueContainsUninit v1 <;> rfl
+                          rw [evalSymOperand_sound_concrete args slots op0 mem.borrows mem.globals layouts v0 slots1 hOp0]
+                          dsimp only
+                          rcases evalSymOperand_sound_or_ub args slots1 op1 mem.borrows mem.globals layouts (.symArg idx) slots2 hOp1 with hOp1Eq | hOp1Ub
+                          · rw [hOp1Eq]
+                            dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
+                            rw [memory_eta mem]
+                            refine Or.inl ?_
+                            cases get? args idx with
+                            | none => rfl
+                            | some v1 => dsimp only; cases valueContainsUninit v1 <;> rfl
+                          · rw [hOp1Ub]; exact Or.inr rfl
     | adt _ variantIdx activeField =>
       cases activeField with
       | some _ => nomatch h
       | none =>
+        refine Or.inl ?_
         dsimp only [evalSymRvalueConcrete] at h
         dsimp only [evalRvalue, evalAggregateAdt]
         cases hOps : evalSymOperandsConcrete slots ops mem.borrows localDecls layouts with
@@ -2521,107 +3630,109 @@ theorem symStepStmtConcrete_sound
                 cases rest2 with
                 | mk borrows1 nextTag1 =>
                   dsimp only at h
-                  rw [evalSymRvalueConcrete_sound
-                    args st.slots (concretizeSymMemory body st) body.localDecls body.layouts
-                    rv sv slots1 borrows1 nextTag1 hRv]
-                  dsimp only [concretizeSymMemory]
-                  cases hGet : get? slots1 dstLoc with
-                  | none =>
-                    rw [hGet] at h
-                    nomatch h
-                  | some sSlot =>
-                    rw [hGet] at h
-                    have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
-                    cases sv with
-                    | concrete val =>
-                      dsimp only [concretizeSymRvalueResult] at hOk ⊢
-                      rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
-                      cases hSet : set? slots1 dstLoc (.concrete (.init val)) with
-                      | none =>
-                        rw [hSet] at hOk
-                        nomatch hOk
-                      | some slots2 =>
-                        rw [hSet] at hOk
-                        injection hOk with hEq
-                        subst hEq
-                        rw [set?_concretizeSymSlots_concrete args (.init val) slots1 dstLoc, hSet]
-                        dsimp only
-                        rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
-                          (rw [hSlot]; exact Or.inl rfl)
-                    | symArg valIdx =>
-                      dsimp only at hOk
-                      cases hSet : set? slots1 dstLoc (.symArg valIdx) with
-                      | none =>
-                        rw [hSet] at hOk
-                        nomatch hOk
-                      | some slots2 =>
-                        rw [hSet] at hOk
-                        injection hOk with hEq
-                        subst hEq
-                        dsimp only [concretizeSymRvalueResult]
-                        cases hArgVal : get? args valIdx with
-                        | none => exact Or.inr rfl
-                        | some val =>
-                          dsimp only
-                          cases hU : valueContainsUninit val with
-                          | true => exact Or.inr rfl
-                          | false =>
-                            dsimp only
-                            rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
-                            have hSetSym := set?_concretizeSymSlots args (.symArg valIdx) slots1 dstLoc
-                            dsimp only [concretizeSymSlot] at hSetSym
-                            rw [hArgVal, hSet] at hSetSym
-                            rw [hSetSym]
-                            dsimp only
-                            rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
-                              (rw [hSlot]; exact Or.inl rfl)
-                    | symPair0 v0 valIdx =>
-                      dsimp only at hOk
-                      cases hSet : set? slots1 dstLoc (.symPair0 v0 valIdx) with
-                      | none =>
-                        rw [hSet] at hOk
-                        nomatch hOk
-                      | some slots2 =>
-                        rw [hSet] at hOk
-                        injection hOk with hEq
-                        subst hEq
-                        dsimp only [concretizeSymRvalueResult]
-                        cases hArgVal : get? args valIdx with
-                        | none => exact Or.inr rfl
-                        | some val =>
-                          dsimp only
-                          cases hU : valueContainsUninit val with
-                          | true => exact Or.inr rfl
-                          | false =>
-                            dsimp only
-                            rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
-                            have hSetSym := set?_concretizeSymSlots args (.symPair0 v0 valIdx) slots1 dstLoc
-                            dsimp only [concretizeSymSlot] at hSetSym
-                            rw [hArgVal, hSet] at hSetSym
-                            rw [hSetSym]
-                            dsimp only
-                            rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
-                              (rw [hSlot]; exact Or.inl rfl)
-                    | symGuarded v0 valIdx =>
-                      dsimp only at hOk
-                      cases hSet : set? slots1 dstLoc (.concrete (.init v0)) with
-                      | none =>
-                        rw [hSet] at hOk
-                        nomatch hOk
-                      | some slots2 =>
-                        rw [hSet] at hOk
-                        injection hOk with hEq
-                        subst hEq
-                        dsimp only [concretizeSymRvalueResult]
-                        cases hArgVal : get? args valIdx with
-                        | none => exact Or.inr rfl
-                        | some _ =>
-                          dsimp only
-                          rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
-                          rw [set?_concretizeSymSlots_concrete args (.init v0) slots1 dstLoc, hSet]
+                  rcases evalSymRvalueConcrete_sound
+                      args st.slots (concretizeSymMemory body st) body.localDecls body.layouts
+                      rv sv slots1 borrows1 nextTag1 hRv with hRvEq | hRvUb
+                  · rw [hRvEq]
+                    dsimp only [concretizeSymMemory]
+                    cases hGet : get? slots1 dstLoc with
+                    | none =>
+                      rw [hGet] at h
+                      nomatch h
+                    | some sSlot =>
+                      rw [hGet] at h
+                      have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
+                      cases sv with
+                      | concrete val =>
+                        dsimp only [concretizeSymRvalueResult] at hOk ⊢
+                        rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                        cases hSet : set? slots1 dstLoc (.concrete (.init val)) with
+                        | none =>
+                          rw [hSet] at hOk
+                          nomatch hOk
+                        | some slots2 =>
+                          rw [hSet] at hOk
+                          injection hOk with hEq
+                          subst hEq
+                          rw [set?_concretizeSymSlots_concrete args (.init val) slots1 dstLoc, hSet]
                           dsimp only
                           rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
                             (rw [hSlot]; exact Or.inl rfl)
+                      | symArg valIdx =>
+                        dsimp only at hOk
+                        cases hSet : set? slots1 dstLoc (.symArg valIdx) with
+                        | none =>
+                          rw [hSet] at hOk
+                          nomatch hOk
+                        | some slots2 =>
+                          rw [hSet] at hOk
+                          injection hOk with hEq
+                          subst hEq
+                          dsimp only [concretizeSymRvalueResult]
+                          cases hArgVal : get? args valIdx with
+                          | none => exact Or.inr rfl
+                          | some val =>
+                            dsimp only
+                            cases hU : valueContainsUninit val with
+                            | true => exact Or.inr rfl
+                            | false =>
+                              dsimp only
+                              rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                              have hSetSym := set?_concretizeSymSlots args (.symArg valIdx) slots1 dstLoc
+                              dsimp only [concretizeSymSlot] at hSetSym
+                              rw [hArgVal, hSet] at hSetSym
+                              rw [hSetSym]
+                              dsimp only
+                              rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                                (rw [hSlot]; exact Or.inl rfl)
+                      | symPair0 v0 valIdx =>
+                        dsimp only at hOk
+                        cases hSet : set? slots1 dstLoc (.symPair0 v0 valIdx) with
+                        | none =>
+                          rw [hSet] at hOk
+                          nomatch hOk
+                        | some slots2 =>
+                          rw [hSet] at hOk
+                          injection hOk with hEq
+                          subst hEq
+                          dsimp only [concretizeSymRvalueResult]
+                          cases hArgVal : get? args valIdx with
+                          | none => exact Or.inr rfl
+                          | some val =>
+                            dsimp only
+                            cases hU : valueContainsUninit val with
+                            | true => exact Or.inr rfl
+                            | false =>
+                              dsimp only
+                              rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                              have hSetSym := set?_concretizeSymSlots args (.symPair0 v0 valIdx) slots1 dstLoc
+                              dsimp only [concretizeSymSlot] at hSetSym
+                              rw [hArgVal, hSet] at hSetSym
+                              rw [hSetSym]
+                              dsimp only
+                              rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                                (rw [hSlot]; exact Or.inl rfl)
+                      | symGuarded v0 valIdx =>
+                        dsimp only at hOk
+                        cases hSet : set? slots1 dstLoc (.concrete (.init v0)) with
+                        | none =>
+                          rw [hSet] at hOk
+                          nomatch hOk
+                        | some slots2 =>
+                          rw [hSet] at hOk
+                          injection hOk with hEq
+                          subst hEq
+                          dsimp only [concretizeSymRvalueResult]
+                          cases hArgVal : get? args valIdx with
+                          | none => exact Or.inr rfl
+                          | some _ =>
+                            dsimp only
+                            rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
+                            rw [set?_concretizeSymSlots_concrete args (.init v0) slots1 dstLoc, hSet]
+                            dsimp only
+                            rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                              (rw [hSlot]; exact Or.inl rfl)
+                  · rw [hRvUb]; exact Or.inr rfl
     | _ => nomatch h
 
 theorem symStepTermConcrete_sound
@@ -2705,10 +3816,11 @@ theorem symStepTermConcrete_sound
                       | some _ => exact False.elim (evalSymPlaceCopy_not_opaqueCast hC castTy rfl)
                     | _ => rfl
               unfold evalOperandWithBodyCast
-              rw [hNoCast, evalSymOperand_sound
+              rw [hNoCast]
+              dsimp only
+              rw [evalSymOperand_sound_concrete
                 args st.slots discr st.borrows body.allocations body.layouts
-                (.concrete (.scalar sc)) slots' hOp]
-              rfl
+                (.scalar sc) slots' hOp]
     | assert cond expected target unwind =>
       dsimp only [symStepTermConcrete] at h
       dsimp only [evalTerminator, concretizeSymState, concretizeSymMemory]
@@ -2752,10 +3864,12 @@ theorem symStepTermConcrete_sound
                   subst hEq
                   refine Or.inl ?_
                   unfold evalOperandWithBodyCast
-                  rw [hNoCast, evalSymOperand_sound
+                  rw [hNoCast]
+                  dsimp only
+                  rw [evalSymOperand_sound_concrete
                     args st.slots cond st.borrows body.allocations body.layouts
-                    (.concrete (.scalar sc)) slots' hOp]
-                  dsimp only [concretizeSymReadResult]
+                    (.scalar sc) slots' hOp]
+                  dsimp only
                   rw [hEqBit]
               | true =>
                 dsimp only at h
@@ -2769,10 +3883,12 @@ theorem symStepTermConcrete_sound
                   subst hEq
                   refine Or.inl ?_
                   unfold evalOperandWithBodyCast
-                  rw [hNoCast, evalSymOperand_sound
+                  rw [hNoCast]
+                  dsimp only
+                  rw [evalSymOperand_sound_concrete
                     args st.slots cond st.borrows body.allocations body.layouts
-                    (.concrete (.scalar sc)) slots' hOp]
-                  dsimp only [concretizeSymReadResult]
+                    (.scalar sc) slots' hOp]
+                  dsimp only
                   rw [hEqBit]
     | _ => nomatch h
 
@@ -3170,18 +4286,25 @@ def symExtractPinEqStmt
     match isPtrOrUntypedOperand localDecls layouts lhsOp with
     | true => .none
     | false =>
-      match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
-      | .some (sv₁, slots₁) =>
-        match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
-        | .some (sv₂, slots₂) =>
-          match sv₁, sv₂ with
-          | .symArg idx, .concrete (.scalar sc) =>
-            symFinishPinEq st dstLoc slots₂ idx sc
-          | .concrete (.scalar sc), .symArg idx =>
-            symFinishPinEq st dstLoc slots₂ idx sc
-          | _, _ => .none
+      match
+        Bool.or
+          (isFloatOptTy (operandTy localDecls layouts lhsOp))
+          (isFloatOptTy (operandTy localDecls layouts rhsOp))
+      with
+      | true => .none
+      | false =>
+        match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
+        | .some (sv₁, slots₁) =>
+          match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
+          | .some (sv₂, slots₂) =>
+            match sv₁, sv₂ with
+            | .symArg idx, .concrete (.scalar sc) =>
+              symFinishPinEq st dstLoc slots₂ idx sc
+            | .concrete (.scalar sc), .symArg idx =>
+              symFinishPinEq st dstLoc slots₂ idx sc
+            | _, _ => .none
+          | .none => .none
         | .none => .none
-      | .none => .none
   | _ => .none
 
 /-- Extract a symbolic equality pin from the current statement of `body` at `st`. -/
@@ -3464,6 +4587,17 @@ theorem symExtractPinEq_branch_sound
                       | true => rw [h] at hExt; nomatch hExt
                     rw [hPtrTy] at hExt
                     dsimp only at hExt
+                    have hFl :
+                        Bool.or
+                          (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                          (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) = false := by
+                      cases h : Bool.or
+                          (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                          (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+                      | false => rfl
+                      | true => rw [h] at hExt; nomatch hExt
+                    rw [hFl] at hExt
+                    dsimp only at hExt
                     rw [evalStmt_assign_nil_eq] at hHold
                     dsimp only [evalRvalue] at hHold
                     cases hLhs : evalSymOperand st.slots lhsOp st.borrows body.localDecls body.layouts with
@@ -3484,137 +4618,144 @@ theorem symExtractPinEq_branch_sound
                           cases pair2 with
                           | mk sv2 slots2 =>
                             dsimp only at hExt
-                            rw [evalSymOperand_sound
-                              args st.slots lhsOp st.borrows body.allocations body.layouts
-                              sv1 slots1 hLhs] at hHold
-                            cases sv1 with
-                            | symPair0 _ _ | symGuarded _ _ => nomatch hExt
-                            | symArg idx0 =>
-                              cases sv2 with
-                              | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
-                              | concrete v2 =>
-                                cases v2 with
+                            rcases evalSymOperand_sound_or_ub
+                                args st.slots lhsOp st.borrows body.allocations body.layouts
+                                sv1 slots1 hLhs with hLhsEq | hLhsUb
+                            · rw [hLhsEq] at hHold
+                              cases sv1 with
+                              | symPair0 _ _ | symGuarded _ _ => nomatch hExt
+                              | symArg idx0 =>
+                                cases sv2 with
+                                | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
+                                | concrete v2 =>
+                                  cases v2 with
+                                  | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
+                                  | scalar sc0 =>
+                                    dsimp only at hExt
+                                    dsimp only [concretizeSymReadResult] at hHold
+                                    cases hArg0 : get? args idx0 with
+                                    | none =>
+                                      rw [hArg0] at hHold
+                                      exact False.elim hHold
+                                    | some vArg0 =>
+                                      rw [hArg0] at hHold
+                                      dsimp only at hHold
+                                      cases hU0 : valueContainsUninit vArg0 with
+                                      | true =>
+                                        rw [hU0] at hHold
+                                        exact False.elim hHold
+                                      | false =>
+                                        rw [hU0] at hHold
+                                        dsimp only at hHold
+                                        rw [evalSymOperand_sound_concrete
+                                          args slots1 rhsOp st.borrows body.allocations body.layouts
+                                          (.scalar sc0) slots2 hRhs] at hHold
+                                        cases vArg0 with
+                                        | uninit | unit | aggregate _ _ =>
+                                          exact False.elim hHold
+                                        | ptr _ _ =>
+                                          dsimp only [isPtrRelationalBinOp] at hHold
+                                          rw [hPtrTy] at hHold
+                                          exact False.elim hHold
+                                        | scalar actualSc =>
+                                          rw [hFl] at hHold
+                                          dsimp only [evalScalarBinOp] at hHold
+                                          cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
+                                          | true =>
+                                            rw [hActSz0] at hHold
+                                            exact False.elim hHold
+                                          | false =>
+                                            rw [hActSz0] at hHold
+                                            dsimp only at hHold
+                                            cases hSzEq : Nat.beq actualSc.sizeBytes sc0.sizeBytes with
+                                            | false =>
+                                              rw [hSzEq] at hHold
+                                              exact False.elim hHold
+                                            | true =>
+                                              rw [hSzEq] at hHold
+                                              dsimp only at hHold
+                                              have ⟨hIdxEq, hScOutEq, hBranch⟩ :=
+                                                symFinishPinEq_branch_ok_sound
+                                                  fuel body args st dstLoc slots2 idx0 sc0
+                                                  idx expectedSc stTrue stFalse
+                                                  (Nat.beq actualSc.bits sc0.bits)
+                                                  hExt hHold
+                                              cases hBranch with
+                                              | inr hFalseHold => exact Or.inr hFalseHold
+                                              | inl hTruePair =>
+                                                have hScEq : actualSc = sc0 :=
+                                                  scalarInt_eq_of_parts
+                                                    (Nat.eq_of_beq_eq_true hTruePair.1)
+                                                    (Nat.eq_of_beq_eq_true hSzEq)
+                                                rw [hIdxEq, hScOutEq]
+                                                rw [← hScEq]
+                                                exact Or.inl ⟨hArg0, hTruePair.2 (by rw [← hScEq]; exact hArg0)⟩
+                              | concrete v1 =>
+                                cases v1 with
                                 | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
                                 | scalar sc0 =>
-                                  dsimp only at hExt
-                                  dsimp only [concretizeSymReadResult] at hHold
-                                  cases hArg0 : get? args idx0 with
-                                  | none =>
-                                    rw [hArg0] at hHold
-                                    exact False.elim hHold
-                                  | some vArg0 =>
-                                    rw [hArg0] at hHold
-                                    dsimp only at hHold
-                                    cases hU0 : valueContainsUninit vArg0 with
-                                    | true =>
-                                      rw [hU0] at hHold
-                                      exact False.elim hHold
-                                    | false =>
-                                      rw [hU0] at hHold
-                                      dsimp only at hHold
-                                      rw [evalSymOperand_sound
+                                  cases sv2 with
+                                  | concrete _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
+                                  | symArg idx0 =>
+                                    dsimp only at hExt
+                                    dsimp only [concretizeSymReadResult] at hHold
+                                    rcases evalSymOperand_sound_or_ub
                                         args slots1 rhsOp st.borrows body.allocations body.layouts
-                                        (.concrete (.scalar sc0)) slots2 hRhs] at hHold
+                                        (.symArg idx0) slots2 hRhs with hRhsEq | hRhsUb
+                                    · rw [hRhsEq] at hHold
                                       dsimp only [concretizeSymReadResult] at hHold
-                                      cases vArg0 with
-                                      | uninit | unit | aggregate _ _ =>
+                                      cases hArg0 : get? args idx0 with
+                                      | none =>
+                                        rw [hArg0] at hHold
                                         exact False.elim hHold
-                                      | ptr _ _ =>
-                                        dsimp only [isPtrRelationalBinOp] at hHold
-                                        rw [hPtrTy] at hHold
-                                        exact False.elim hHold
-                                      | scalar actualSc =>
-                                        dsimp only [evalScalarBinOp] at hHold
-                                        cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
+                                      | some vArg0 =>
+                                        rw [hArg0] at hHold
+                                        dsimp only at hHold
+                                        cases hU0 : valueContainsUninit vArg0 with
                                         | true =>
-                                          rw [hActSz0] at hHold
+                                          rw [hU0] at hHold
                                           exact False.elim hHold
                                         | false =>
-                                          rw [hActSz0] at hHold
+                                          rw [hU0] at hHold
                                           dsimp only at hHold
-                                          cases hSzEq : Nat.beq actualSc.sizeBytes sc0.sizeBytes with
-                                          | false =>
-                                            rw [hSzEq] at hHold
+                                          cases vArg0 with
+                                          | uninit | unit | aggregate _ _ =>
                                             exact False.elim hHold
-                                          | true =>
-                                            rw [hSzEq] at hHold
+                                          | ptr _ _ =>
+                                            dsimp only [isPtrRelationalBinOp] at hHold
+                                            rw [hPtrTy] at hHold
+                                            exact False.elim hHold
+                                          | scalar actualSc =>
+                                            rw [hFl] at hHold
+                                            dsimp only [evalScalarBinOp] at hHold
+                                            rw [symFinishPinEq_expSz0_false hExt] at hHold
                                             dsimp only at hHold
-                                            have ⟨hIdxEq, hScOutEq, hBranch⟩ :=
-                                              symFinishPinEq_branch_ok_sound
-                                                fuel body args st dstLoc slots2 idx0 sc0
-                                                idx expectedSc stTrue stFalse
-                                                (Nat.beq actualSc.bits sc0.bits)
-                                                hExt hHold
-                                            cases hBranch with
-                                            | inr hFalseHold => exact Or.inr hFalseHold
-                                            | inl hTruePair =>
-                                              have hScEq : actualSc = sc0 :=
-                                                scalarInt_eq_of_parts
-                                                  (Nat.eq_of_beq_eq_true hTruePair.1)
-                                                  (Nat.eq_of_beq_eq_true hSzEq)
-                                              rw [hIdxEq, hScOutEq]
-                                              rw [← hScEq]
-                                              exact Or.inl ⟨hArg0, hTruePair.2 (by rw [← hScEq]; exact hArg0)⟩
-                            | concrete v1 =>
-                              cases v1 with
-                              | uninit | unit | ptr _ _ | aggregate _ _ => nomatch hExt
-                              | scalar sc0 =>
-                                cases sv2 with
-                                | concrete _ | symPair0 _ _ | symGuarded _ _ => nomatch hExt
-                                | symArg idx0 =>
-                                  dsimp only at hExt
-                                  dsimp only [concretizeSymReadResult] at hHold
-                                  rw [evalSymOperand_sound
-                                    args slots1 rhsOp st.borrows body.allocations body.layouts
-                                    (.symArg idx0) slots2 hRhs] at hHold
-                                  dsimp only [concretizeSymReadResult] at hHold
-                                  cases hArg0 : get? args idx0 with
-                                  | none =>
-                                    rw [hArg0] at hHold
-                                    exact False.elim hHold
-                                  | some vArg0 =>
-                                    rw [hArg0] at hHold
-                                    dsimp only at hHold
-                                    cases hU0 : valueContainsUninit vArg0 with
-                                    | true =>
-                                      rw [hU0] at hHold
+                                            cases hSzEq : Nat.beq sc0.sizeBytes actualSc.sizeBytes with
+                                            | false =>
+                                              rw [hSzEq] at hHold
+                                              exact False.elim hHold
+                                            | true =>
+                                              rw [hSzEq] at hHold
+                                              dsimp only at hHold
+                                              have ⟨hIdxEq, hScOutEq, hBranch⟩ :=
+                                                symFinishPinEq_branch_ok_sound
+                                                  fuel body args st dstLoc slots2 idx0 sc0
+                                                  idx expectedSc stTrue stFalse
+                                                  (Nat.beq sc0.bits actualSc.bits)
+                                                  hExt hHold
+                                              cases hBranch with
+                                              | inr hFalseHold => exact Or.inr hFalseHold
+                                              | inl hTruePair =>
+                                                have hScEq : sc0 = actualSc :=
+                                                  scalarInt_eq_of_parts
+                                                    (Nat.eq_of_beq_eq_true hTruePair.1)
+                                                    (Nat.eq_of_beq_eq_true hSzEq)
+                                                rw [hIdxEq, hScOutEq, hScEq]
+                                                exact Or.inl ⟨hArg0, hTruePair.2 (by rw [hScEq]; exact hArg0)⟩
+                                    · rw [hRhsUb] at hHold
                                       exact False.elim hHold
-                                    | false =>
-                                      rw [hU0] at hHold
-                                      dsimp only at hHold
-                                      cases vArg0 with
-                                      | uninit | unit | aggregate _ _ =>
-                                        exact False.elim hHold
-                                      | ptr _ _ =>
-                                        dsimp only [isPtrRelationalBinOp] at hHold
-                                        rw [hPtrTy] at hHold
-                                        exact False.elim hHold
-                                      | scalar actualSc =>
-                                        dsimp only [evalScalarBinOp] at hHold
-                                        rw [symFinishPinEq_expSz0_false hExt] at hHold
-                                        dsimp only at hHold
-                                        cases hSzEq : Nat.beq sc0.sizeBytes actualSc.sizeBytes with
-                                      | false =>
-                                        rw [hSzEq] at hHold
-                                        exact False.elim hHold
-                                      | true =>
-                                        rw [hSzEq] at hHold
-                                        dsimp only at hHold
-                                        have ⟨hIdxEq, hScOutEq, hBranch⟩ :=
-                                          symFinishPinEq_branch_ok_sound
-                                            fuel body args st dstLoc slots2 idx0 sc0
-                                            idx expectedSc stTrue stFalse
-                                            (Nat.beq sc0.bits actualSc.bits)
-                                            hExt hHold
-                                        cases hBranch with
-                                        | inr hFalseHold => exact Or.inr hFalseHold
-                                        | inl hTruePair =>
-                                          have hScEq : sc0 = actualSc :=
-                                            scalarInt_eq_of_parts
-                                              (Nat.eq_of_beq_eq_true hTruePair.1)
-                                              (Nat.eq_of_beq_eq_true hSzEq)
-                                          rw [hIdxEq, hScOutEq, hScEq]
-                                          exact Or.inl ⟨hArg0, hTruePair.2 (by rw [hScEq]; exact hArg0)⟩
+                            · rw [hLhsUb] at hHold
+                              exact False.elim hHold
                   | _ => nomatch hExt
                 | _ => nomatch hExt
           | _ => nomatch hExt
@@ -3967,12 +5108,28 @@ theorem evalStackThinPtrTypedDerefRead_concreteFieldPtr_eq
                       rw [hPtrSz])
                   | _ => nomatch hAcc)
 
-theorem length_encodeLittleEndianBytes :
-    ∀ (n bits : Nat) (prov : Option (Nat × Nat)),
-      length (encodeLittleEndianBytes bits n prov) = n
+theorem length_encodePlainLittleEndianBytes :
+    ∀ (n bits : Nat),
+      length (encodePlainLittleEndianBytes bits n) = n
+  | .zero, _ => rfl
+  | .succ rem, bits =>
+    congrArg Nat.succ (length_encodePlainLittleEndianBytes rem (Nat.div bits 256))
+
+theorem length_encodePtrBytesAux (a t origOff ptrBytes : Nat) :
+    ∀ (n bits idx : Nat),
+      length (encodePtrBytesAux a t origOff ptrBytes bits idx n) = n
   | .zero, _, _ => rfl
-  | .succ rem, bits, prov =>
-    congrArg Nat.succ (length_encodeLittleEndianBytes rem (Nat.div bits 256) prov)
+  | .succ rem, bits, idx =>
+    congrArg Nat.succ (length_encodePtrBytesAux a t origOff ptrBytes rem (Nat.div bits 256) (Nat.add idx 1))
+
+theorem length_encodeLittleEndianBytes
+    (n bits : Nat) (prov : Option (Nat × Nat)) :
+    length (encodeLittleEndianBytes bits n prov) = n := by
+  cases prov with
+  | none => exact length_encodePlainLittleEndianBytes n bits
+  | some p =>
+    rcases p with ⟨a, t⟩
+    exact length_encodePtrBytesAux a t (normPtrByteOffset n bits) n n bits 0
 
 theorem rigidTyKindByteSize_uint
     (uKind : UintTy) :
@@ -3990,13 +5147,14 @@ theorem tyByteSize_uint_of_resolved
     (layouts : LayoutTable)
     (uKind : UintTy)
     (rpIdx : Nat)
+    (hPtrNot4 : Nat.beq (layoutPointerBytes layouts) 4 = false)
     (hRes :
       resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := rpIdx } =
         { kind := .uint uKind, layoutIdx := rpIdx }) :
     tyByteSize localDecls layouts { kind := .uint uKind, layoutIdx := rpIdx } =
       .some (uintBytesOfKind uKind) := by
   unfold tyByteSize tyByteSizeAndAlignAux
-  rw [hRes]
+  rw [hRes, hPtrNot4]
   dsimp only [rigidTyByteSize]
   rw [rigidTyKindByteSize_uint uKind]
 
@@ -4055,6 +5213,7 @@ theorem decodeSubValueAtByteOffset?_nonagg_uint_eq_none
     (uKind : UintTy)
     (rpIdx : Nat)
     (v : Value)
+    (hPtrNot4 : Nat.beq (layoutPointerBytes layouts) 4 = false)
     (hRes :
       resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := rpIdx } =
         { kind := .uint uKind, layoutIdx := rpIdx })
@@ -4076,7 +5235,7 @@ theorem decodeSubValueAtByteOffset?_nonagg_uint_eq_none
   unfold decodeSubValueAtByteOffset?
   rw [hRes]
   dsimp only
-  rw [tyByteSize_uint_of_resolved localDecls layouts uKind rpIdx hRes]
+  rw [tyByteSize_uint_of_resolved localDecls layouts uKind rpIdx hPtrNot4 hRes]
   dsimp only
   cases v with
   | uninit =>
@@ -4111,10 +5270,12 @@ theorem decodeSubValueAtByteOffset?_nonagg_uint_eq_none
     | succ m =>
       have hSz0 : Nat.beq (.succ m) 0 = false := rfl
       rw [hSz0]
-      dsimp only [encodeLittleEndianBytes, sliceAbstractBytes]
+      dsimp only [encodeLittleEndianBytes, encodePtrBytes, encodePtrBytesAux, sliceAbstractBytes]
+      generalize encodePtrBytesAux p.allocId p.tag (normPtrByteOffset (.succ m) p.offsetBytes) (.succ m) (Nat.div p.offsetBytes 256) (Nat.add 0 1) m = tailBytes
       cases Nat.ble (Nat.add 0 (uintBytesOfKind uKind))
-        (length (.init (UInt8.ofNat p.offsetBytes) (.some (p.allocId, p.tag)) ::
-          encodeLittleEndianBytes (Nat.div p.offsetBytes 256) m (.some (p.allocId, p.tag)))) with
+        (length (.init (UInt8.ofNat p.offsetBytes)
+            (.some { allocId := p.allocId, tag := p.tag, byteIdx := 0, origOffset := normPtrByteOffset (.succ m) p.offsetBytes, ptrBytes := .succ m }) ::
+          tailBytes)) with
       | false => rfl
       | true =>
         cases uKind <;> rfl
@@ -4126,6 +5287,7 @@ theorem decodeSubValueAtByteOffset?_agg_uint_eq_none
     (uKind : UintTy)
     (tIdx rpIdx varIdx : Nat)
     (fields : List Value)
+    (hPtrNot4 : Nat.beq (layoutPointerBytes layouts) 4 = false)
     (hRes :
       resolveTyWithLocalDecls localDecls layouts { kind := .uint uKind, layoutIdx := rpIdx } =
         { kind := .uint uKind, layoutIdx := rpIdx })
@@ -4145,7 +5307,7 @@ theorem decodeSubValueAtByteOffset?_agg_uint_eq_none
   unfold decodeSubValueAtByteOffset?
   rw [hRes]
   dsimp only
-  rw [tyByteSize_uint_of_resolved localDecls layouts uKind rpIdx hRes]
+  rw [tyByteSize_uint_of_resolved localDecls layouts uKind rpIdx hPtrNot4 hRes]
   dsimp only
   rw [resolveFaithfulAggregateTy?_uint_eq_none localDecls layouts uKind tIdx varIdx fields hLayout]
 
@@ -4298,6 +5460,7 @@ theorem resolveStackThinPtrFieldOffsetProj?_nil_agg_of_uint
     (offsetBytes : Nat)
     (targetDecls : List LocalDecl)
     (layouts : LayoutTable)
+    (hPtrNot4 : Nat.beq (layoutPointerBytes layouts) 4 = false)
     (hTarget :
       placeTyResolved targetDecls layouts { local_ := targetLocal, projection := .nil } =
         .some { kind := .uint uKind, layoutIdx := tIdx })
@@ -4330,7 +5493,7 @@ theorem resolveStackThinPtrFieldOffsetProj?_nil_agg_of_uint
   rw [hTarget]
   dsimp (config := { zetaHave := true }) only
   rw [hRTargetEq, hB0,
-    tyByteSize_uint_of_resolved targetDecls layouts uKind rtIdx hRRTargetEq,
+    tyByteSize_uint_of_resolved targetDecls layouts uKind rtIdx hPtrNot4 hRRTargetEq,
     resolveAggregateAtByteOffset?_uint_eq_none
       layouts varIdx fields uKind rtIdx (Nat.add 0 offsetBytes) (uintBytesOfKind uKind) _ _ _ targetDecls hRRTargetEq hLayout]
   dsimp (config := { zetaHave := true }) only
@@ -4352,6 +5515,7 @@ theorem resolveStackThinPtrTargetProjWithResidual?_nil_agg_of_uint
     (layouts : LayoutTable)
     (uKind : UintTy)
     (rpIdx tIdx rtIdx : Nat)
+    (hPtrNot4 : Nat.beq (layoutPointerBytes layouts) 4 = false)
     (hTProj : entry.targetProjection = .nil)
     (hOff : Nat.beq ptrVal.offsetBytes 0 = true)
     (hTarget :
@@ -4399,7 +5563,7 @@ theorem resolveStackThinPtrTargetProjWithResidual?_nil_agg_of_uint
   dsimp (config := { zetaHave := true }) only
   rw [resolveStackThinPtrFieldOffsetProj?_nil_agg_of_uint
     locals varIdx fields entry.targetLocal uKind rpIdx tIdx rtIdx ptrVal.offsetBytes
-    targetDecls layouts hTarget hRTargetEq hRRTargetEq hLayout']
+    targetDecls layouts hPtrNot4 hTarget hRTargetEq hRRTargetEq hLayout']
   cases varIdx with
   | succ _ => rfl
   | zero =>
@@ -4445,26 +5609,28 @@ def checkCanonicalUintDerefReadCtx
       let rTargetTy := resolveTyWithLocalDecls (d :: ds) layouts targetTy
       let rrTargetTy := resolveTyWithLocalDecls (d :: ds) layouts rTargetTy
       Bool.and
-        (Bool.not (placeTouchesUnion (d :: ds) layouts { local_ := entry.targetLocal, projection := .constantIndex 0 0 false :: .nil }))
+        (Bool.not (Nat.beq (layoutPointerBytes layouts) 4))
         (Bool.and
-          (isUintRigidKind uKind effPt.kind)
+          (Bool.not (placeTouchesUnion (d :: ds) layouts { local_ := entry.targetLocal, projection := .constantIndex 0 0 false :: .nil }))
           (Bool.and
-            (isUintRigidKind uKind rEffPt.kind)
+            (isUintRigidKind uKind effPt.kind)
             (Bool.and
-              (Nat.beq rEffPt.layoutIdx effPt.layoutIdx)
+              (isUintRigidKind uKind rEffPt.kind)
               (Bool.and
-                (isUintRigidKind uKind targetTy.kind)
+                (Nat.beq rEffPt.layoutIdx effPt.layoutIdx)
                 (Bool.and
-                  (isUintRigidKind uKind rTargetTy.kind)
+                  (isUintRigidKind uKind targetTy.kind)
                   (Bool.and
-                    (isUintRigidKind uKind rrTargetTy.kind)
+                    (isUintRigidKind uKind rTargetTy.kind)
                     (Bool.and
-                      (Nat.beq rrTargetTy.layoutIdx rTargetTy.layoutIdx)
+                      (isUintRigidKind uKind rrTargetTy.kind)
                       (Bool.and
-                        (isPrimSingleOrNoneLayoutOpt (LayoutTable.lookup layouts rTargetTy.layoutIdx))
+                        (Nat.beq rrTargetTy.layoutIdx rTargetTy.layoutIdx)
                         (Bool.and
-                          (checkDerefAlign (d :: ds) layouts (.some effPt) 0)
-                          (checkTargetPlaceAlign (d :: ds) layouts (.some effPt) entry ptrVal .none))))))))))
+                          (isPrimSingleOrNoneLayoutOpt (LayoutTable.lookup layouts rTargetTy.layoutIdx))
+                          (Bool.and
+                            (checkDerefAlign (d :: ds) layouts (.some effPt) 0)
+                            (checkTargetPlaceAlign (d :: ds) layouts (.some effPt) entry ptrVal .none)))))))))))
     | _, _, _ => false
   | _, _, _ => false
 
@@ -4530,7 +5696,12 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
             | some _ => nomatch hCtx
             | none =>
               dsimp only at hCtx
-              rcases Bool.and_eq_true_iff.1 hCtx with ⟨hNoUnion0, hRestA⟩
+              rcases Bool.and_eq_true_iff.1 hCtx with ⟨hPtrNot4B, hRestPtr⟩
+              have hPtrNot4 : Nat.beq (layoutPointerBytes layouts) 4 = false := by
+                cases hP4 : Nat.beq (layoutPointerBytes layouts) 4 with
+                | false => rfl
+                | true => rw [hP4] at hPtrNot4B; nomatch hPtrNot4B
+              rcases Bool.and_eq_true_iff.1 hRestPtr with ⟨hNoUnion0, hRestA⟩
               rcases Bool.and_eq_true_iff.1 hRestA with ⟨hEffKind, hRest0⟩
               rcases Bool.and_eq_true_iff.1 hRest0 with ⟨hREffKind, hRest1⟩
               rcases Bool.and_eq_true_iff.1 hRest1 with ⟨hREffIdx, hRest2⟩
@@ -4596,7 +5767,7 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                   rw [hOffEq, hAlign1, hAlign2]
                   dsimp only [Bool.and]
                   rw [tyScalarBytes_uint uKind rpIdx,
-                    tyByteSize_uint_of_resolved (d :: ds) layouts uKind rpIdx hREffEq]
+                    tyByteSize_uint_of_resolved (d :: ds) layouts uKind rpIdx hPtrNot4 hREffEq]
                   dsimp only [readProjectedForLocal, placeTouchesUnion, readProjectedValue,
                     decodeAtBorrowTargetOffset?]
                   rw [hTProj]
@@ -4618,7 +5789,7 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                     rw [hOffEq, hT,
                       decodeSubValueAtByteOffset?_nonagg_uint_eq_none
                         (d :: ds) layouts (.some { kind := .uint uKind, layoutIdx := tIdx })
-                        uKind rpIdx .unit hREffEq rfl rfl]
+                        uKind rpIdx .unit hPtrNot4 hREffEq rfl rfl]
                   | ptr p sz =>
                     rw [resolveStackThinPtrTargetProjWithResidual?_nil_nonagg_of_uint
                       locals (.ptr p sz) entry ptrVal (d :: ds) layouts uKind rpIdx tIdx
@@ -4628,7 +5799,7 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                     rw [hOffEq, hT,
                       decodeSubValueAtByteOffset?_nonagg_uint_eq_none
                         (d :: ds) layouts (.some { kind := .uint uKind, layoutIdx := tIdx })
-                        uKind rpIdx (.ptr p sz) hREffEq rfl rfl]
+                        uKind rpIdx (.ptr p sz) hPtrNot4 hREffEq rfl rfl]
                   | scalar sc =>
                     dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
                     cases hSlice : extractScalarSlice? sc 0 (uintBytesOfKind uKind) with
@@ -4657,15 +5828,15 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                       rw [hOffEq, hSlice, hT,
                         decodeSubValueAtByteOffset?_nonagg_uint_eq_none
                           (d :: ds) layouts (.some { kind := .uint uKind, layoutIdx := tIdx })
-                          uKind rpIdx (.scalar sc) hREffEq rfl hSlice,
+                          uKind rpIdx (.scalar sc) hPtrNot4 hREffEq rfl hSlice,
                         hSizeNe]
                   | aggregate varIdx fields =>
                     rw [resolveStackThinPtrTargetProjWithResidual?_nil_agg_of_uint
                       locals varIdx fields entry ptrVal (d :: ds) layouts uKind rpIdx tIdx rtIdx
-                      hTProj hOff hT hRTargetEq hRRTargetEq hRTargetKind hLayout]
+                      hPtrNot4 hTProj hOff hT hRTargetEq hRRTargetEq hRTargetKind hLayout]
                     have hDecAggNone :=
                       decodeSubValueAtByteOffset?_agg_uint_eq_none
-                        (d :: ds) layouts uKind tIdx rpIdx varIdx fields hREffEq hLayout
+                        (d :: ds) layouts uKind tIdx rpIdx varIdx fields hPtrNot4 hREffEq hLayout
                     cases varIdx with
                     | succ _ =>
                       dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?]
@@ -4707,11 +5878,11 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                           | unit =>
                             dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?, valueContainsUninit]
                             rw [decodeSubValueAtByteOffset?_nonagg_uint_eq_none
-                              (d :: ds) layouts .none uKind rpIdx .unit hREffEq rfl rfl]
+                              (d :: ds) layouts .none uKind rpIdx .unit hPtrNot4 hREffEq rfl rfl]
                           | ptr p sz =>
                             dsimp (config := { zetaHave := true }) only [extractValueScalarSlice0?, valueContainsUninit]
                             rw [decodeSubValueAtByteOffset?_nonagg_uint_eq_none
-                              (d :: ds) layouts .none uKind rpIdx (.ptr p sz) hREffEq rfl rfl]
+                              (d :: ds) layouts .none uKind rpIdx (.ptr p sz) hPtrNot4 hREffEq rfl rfl]
                           | aggregate _ _ =>
                             cases fRest <;> nomatch hHom
                           | scalar sc =>
@@ -4733,7 +5904,7 @@ theorem evalStackThinPtrTypedDerefRead_uint_eq
                               | some slicedSc => rfl
                               | none =>
                                 rw [decodeSubValueAtByteOffset?_nonagg_uint_eq_none
-                                  (d :: ds) layouts .none uKind rpIdx (.scalar sc) hREffEq rfl hSlice]
+                                  (d :: ds) layouts .none uKind rpIdx (.scalar sc) hPtrNot4 hREffEq rfl hSlice]
 
 /-- Static/value check for a thin-pointer dereference read `*loc` when the
 borrow target local holds a concrete scalar `.scalar sc`. -/
@@ -6021,15 +7192,18 @@ def symExtractDerefSlicePinEq
       | .some stmt1, .some stmt2 =>
         match symMatchDerefSymArgLoad body st stmt1, stmt2.kind with
         | .some (idx, uKind, tmpLoc, borrows₁),
-          .assign ⟨eqDstLoc, .nil⟩ (.binaryOp .eq (.move ⟨tmpLoc2, .nil⟩) (.constant { val := .scalar (.int expectedSc), .. })) =>
+          .assign ⟨eqDstLoc, .nil⟩ (.binaryOp .eq (.move ⟨tmpLoc2, .nil⟩) (.constant { ty := cTy2, val := .scalar (.int expectedSc) })) =>
           match
             Nat.beq tmpLoc tmpLoc2,
             Nat.beq (uintBytesOfKind uKind) expectedSc.sizeBytes,
             Nat.beq expectedSc.sizeBytes 0,
             isPtrOrUntypedOperand body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩),
+            Bool.or
+              (isFloatOptTy (operandTy body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩)))
+              (isFloatOptTy (operandTy body.localDecls body.layouts (.constant { ty := cTy2, val := .scalar (.int expectedSc) }))),
             set? st.slots tmpLoc (.concrete .uninit)
           with
-          | true, true, false, false, .some slotsAfterMove =>
+          | true, true, false, false, false, .some slotsAfterMove =>
             match get? slotsAfterMove eqDstLoc with
             | .none => .none
             | .some (.concrete .dead) => .none
@@ -6054,7 +7228,7 @@ def symExtractDerefSlicePinEq
                 }
                 .some (idx, expectedSc, stTrue, stFalse)
               | _, _ => .none
-          | _, _, _, _, _ => .none
+          | _, _, _, _, _, _ => .none
         | _, _ => .none
       | _, _ => .none
 
@@ -6144,6 +7318,16 @@ theorem symExtractDerefSlicePinEq_branch_sound
                                             | true => rw [hPtrOp] at hExt; nomatch hExt
                                             | false =>
                                               rw [hPtrOp] at hExt
+                                              have hFl :
+                                                  Bool.or
+                                                    (isFloatOptTy (operandTy body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩)))
+                                                    (isFloatOptTy (operandTy body.localDecls body.layouts (.constant { ty := cTy2, val := .scalar (.int sc0) }))) = false := by
+                                                cases h : Bool.or
+                                                    (isFloatOptTy (operandTy body.localDecls body.layouts (.move ⟨tmpLoc, .nil⟩)))
+                                                    (isFloatOptTy (operandTy body.localDecls body.layouts (.constant { ty := cTy2, val := .scalar (.int sc0) }))) with
+                                                | false => rfl
+                                                | true => rw [h] at hExt; nomatch hExt
+                                              rw [hFl] at hExt
                                               cases hSetMove : set? st.slots tmpLoc (.concrete .uninit) with
                                               | none => rw [hSetMove] at hExt; nomatch hExt
                                               | some slotsAfterMove =>
@@ -6213,19 +7397,50 @@ theorem symExtractDerefSlicePinEq_branch_sound
                                                             split
                                                             · rw [list_set_set_same st.slots tmpLoc (.concrete (.init (.scalar actualSc))) (.concrete .uninit), ← hAfterMoveEq]
                                                             · next hNot => exact absurd hBltTmp hNot
-                                                          have hLhsOp :
-                                                              evalSymOperand st1.slots (.move ⟨tmpLoc, .nil⟩) st1.borrows body.localDecls body.layouts =
-                                                                .some (.concrete (.scalar actualSc), slotsAfterMove) := by
-                                                            dsimp only [evalSymOperand]
-                                                            rw [hGetSt1Tmp, hSetSt1Move]
+                                                          have hLhsEval :
+                                                              evalOperand (concretizeSymSlots args st1.slots) (.move ⟨tmpLoc, .nil⟩)
+                                                                  borrows₁ body.allocations body.layouts .nil body.localDecls .nil =
+                                                                applyPlaceReadValid body.layouts body.localDecls ⟨tmpLoc, .nil⟩
+                                                                  (.ok (.scalar actualSc) (concretizeSymSlots args slotsAfterMove)) := by
+                                                            dsimp only [evalOperand, applyPlaceReadValid, readProjectedValue]
+                                                            rw [get?_concretizeSymSlots args st1.slots tmpLoc, hGetSt1Tmp]
+                                                            dsimp only [concretizeSymSlot, valueContainsUninit]
+                                                            rw [set?_concretizeSymSlots_concrete args .uninit st1.slots tmpLoc, hSetSt1Move]
+                                                            cases body.localDecls with
+                                                            | nil => rfl
+                                                            | cons d ds =>
+                                                              dsimp only
+                                                              cases materializeReadPtrValue body.layouts (placeTyResolved (d :: ds) body.layouts { local_ := tmpLoc, projection := [] }) (.scalar actualSc) with
+                                                              | none => rfl
+                                                              | some matVal =>
+                                                                dsimp only
+                                                                cases validateValueForTy? body.layouts (placeTyResolved (d :: ds) body.layouts { local_ := tmpLoc, projection := [] }) matVal <;> rfl
                                                           have hRhsOp :
                                                               evalSymOperand slotsAfterMove (.constant { ty := cTy2, val := .scalar (.int sc0) }) st1.borrows body.localDecls body.layouts =
                                                                 .some (.concrete (.scalar sc0), slotsAfterMove) := rfl
                                                           dsimp only [evalRvalue, concretizeSymState, concretizeSymMemory] at hHold
-                                                          rw [evalSymOperand_sound args st1.slots (.move ⟨tmpLoc, .nil⟩) borrows₁ body.allocations body.layouts (.concrete (.scalar actualSc)) slotsAfterMove hLhsOp] at hHold
-                                                          dsimp only [concretizeSymReadResult] at hHold
-                                                          rw [evalSymOperand_sound args slotsAfterMove (.constant { ty := cTy2, val := .scalar (.int sc0) }) borrows₁ body.allocations body.layouts (.concrete (.scalar sc0)) slotsAfterMove hRhsOp] at hHold
-                                                          dsimp only [concretizeSymReadResult, evalScalarBinOp] at hHold
+                                                          rw [hLhsEval] at hHold
+                                                          have hLhsOk :
+                                                              applyPlaceReadValid body.layouts body.localDecls ⟨tmpLoc, .nil⟩
+                                                                  (.ok (.scalar actualSc) (concretizeSymSlots args slotsAfterMove)) =
+                                                                .ok (.scalar actualSc) (concretizeSymSlots args slotsAfterMove) ∨
+                                                              applyPlaceReadValid body.layouts body.localDecls ⟨tmpLoc, .nil⟩
+                                                                  (.ok (.scalar actualSc) (concretizeSymSlots args slotsAfterMove)) = .ub := by
+                                                            cases body.localDecls with
+                                                            | nil => exact Or.inl rfl
+                                                            | cons d ds =>
+                                                              dsimp only [applyPlaceReadValid]
+                                                              rw [materializeReadPtrValue_eq_some_of_nonMat body.layouts _ (.scalar actualSc) rfl]
+                                                              dsimp only
+                                                              cases validateValueForTy? body.layouts _ (.scalar actualSc) with
+                                                              | true => exact Or.inl rfl
+                                                              | false => exact Or.inr rfl
+                                                          have hLhsEq := hLhsOk.resolve_right (fun hUb => by rw [hUb] at hHold; exact hHold)
+                                                          rw [hLhsEq] at hHold
+                                                          dsimp only at hHold
+                                                          rw [evalSymOperand_sound_concrete args slotsAfterMove (.constant { ty := cTy2, val := .scalar (.int sc0) }) borrows₁ body.allocations body.layouts (.scalar sc0) slotsAfterMove hRhsOp] at hHold
+                                                          rw [hFl] at hHold
+                                                          dsimp only [evalScalarBinOp] at hHold
                                                           have hActSzEq : actualSc.sizeBytes = sc0.sizeBytes :=
                                                             Eq.trans
                                                               (extractValueScalarSlice0?_sizeBytes v (uintBytesOfKind uKind) actualSc hSlice)
@@ -6647,6 +7862,17 @@ theorem symExtractPinEq_expSz0_false
                     | true => rw [hPtr] at hExt; nomatch hExt
                     | false =>
                       rw [hPtr] at hExt
+                      dsimp only at hExt
+                      have hFl :
+                          Bool.or
+                            (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                            (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) = false := by
+                        cases h : Bool.or
+                            (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                            (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+                        | false => rfl
+                        | true => rw [h] at hExt; nomatch hExt
+                      rw [hFl] at hExt
                       dsimp only at hExt
                       cases hLhs : evalSymOperand st.slots lhsOp st.borrows body.localDecls body.layouts with
                       | none => rw [hLhs] at hExt; nomatch hExt
@@ -8353,25 +9579,32 @@ def symExtractUpperBound1Stmt
       isPtrOrUntypedOperand localDecls layouts lhsOp
     with
     | true, false, false =>
-      match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
-      | .some (sv₁, slots₁) =>
-        match sv₁ with
-        | .symArg .zero =>
-          match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
-          | .some (sv₂, slots₂) =>
-            match sv₂ with
-            | .concrete (.scalar sc) =>
-              let tightSc : ScalarInt := {
-                bits := tightUnsignedUpperBoundBits op sc.bits
-                sizeBytes := sc.sizeBytes
-              }
-              match symFinishPinEq st dstLoc slots₂ 0 tightSc with
-              | .some (_, scOut, _, stFalse) => .some (scOut, stFalse)
-              | .none => .none
-            | _ => .none
-          | .none => .none
-        | _ => .none
-      | .none => .none
+      match
+        Bool.or
+          (isFloatOptTy (operandTy localDecls layouts lhsOp))
+          (isFloatOptTy (operandTy localDecls layouts rhsOp))
+      with
+      | true => .none
+      | false =>
+        match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
+        | .some (sv₁, slots₁) =>
+          match sv₁ with
+          | .symArg .zero =>
+            match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
+            | .some (sv₂, slots₂) =>
+              match sv₂ with
+              | .concrete (.scalar sc) =>
+                let tightSc : ScalarInt := {
+                  bits := tightUnsignedUpperBoundBits op sc.bits
+                  sizeBytes := sc.sizeBytes
+                }
+                match symFinishPinEq st dstLoc slots₂ 0 tightSc with
+                | .some (_, scOut, _, stFalse) => .some (scOut, stFalse)
+                | .none => .none
+              | _ => .none
+            | .none => .none
+          | _ => .none
+        | .none => .none
     | _, _, _ => .none
   | _ => .none
 
@@ -8458,6 +9691,17 @@ theorem symExtractUpperBound1_sound
                         | true => rw [h] at hExt; nomatch hExt
                       rw [hPtrTy] at hExt
                       dsimp only at hExt
+                      have hFl :
+                          Bool.or
+                            (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                            (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) = false := by
+                        cases h : Bool.or
+                            (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                            (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+                        | false => rfl
+                        | true => rw [h] at hExt; nomatch hExt
+                      rw [hFl] at hExt
+                      dsimp only at hExt
                       rw [evalStmt_assign_nil_eq] at hHold
                       dsimp only [evalRvalue] at hHold
                       cases hLhs : evalSymOperand st.slots lhsOp st.borrows body.localDecls body.layouts with
@@ -8510,9 +9754,16 @@ theorem symExtractUpperBound1_sound
                                               injection hPair with hScOut hStF
                                               subst hScOut
                                               subst hStF
-                                              rw [evalSymOperand_sound
-                                                args st.slots lhsOp st.borrows body.allocations body.layouts
-                                                (.symArg 0) slots1 hLhs] at hHold
+                                              have hLhsEq :
+                                                  evalOperand (concretizeSymSlots args st.slots) lhsOp st.borrows
+                                                    body.allocations body.layouts .nil body.localDecls .nil =
+                                                    concretizeSymReadResult args (.symArg 0) slots1 := by
+                                                rcases evalSymOperand_sound_or_ub
+                                                    args st.slots lhsOp st.borrows body.allocations body.layouts
+                                                    (.symArg 0) slots1 hLhs with hEq | hUb
+                                                · exact hEq
+                                                · rw [hUb] at hHold; exact False.elim hHold
+                                              rw [hLhsEq] at hHold
                                               dsimp only [concretizeSymReadResult] at hHold
                                               cases hArg0 : get? args 0 with
                                               | none =>
@@ -8528,10 +9779,9 @@ theorem symExtractUpperBound1_sound
                                                 | false =>
                                                   rw [hU0] at hHold
                                                   dsimp only at hHold
-                                                  rw [evalSymOperand_sound
+                                                  rw [evalSymOperand_sound_concrete
                                                     args slots1 rhsOp st.borrows body.allocations body.layouts
-                                                    (.concrete (.scalar sc0)) slots2 hRhs] at hHold
-                                                  dsimp only [concretizeSymReadResult] at hHold
+                                                    (.scalar sc0) slots2 hRhs] at hHold
                                                   cases vArg0 with
                                                   | uninit | unit | aggregate _ _ =>
                                                     exact False.elim hHold
@@ -8546,6 +9796,8 @@ theorem symExtractUpperBound1_sound
                                                   have hNotOff : op = .le ∨ op = .lt ∨ op = .eq := by
                                                     cases op <;> simp_all [isUnsignedUpperBoundOp]
                                                   rcases hNotOff with rfl | rfl | rfl <;> (
+                                                    dsimp only at hHold
+                                                    rw [hFl] at hHold
                                                     dsimp only at hHold
                                                     rw [hSig] at hHold
                                                     cases hActSz0 : Nat.beq actualSc.sizeBytes 0 with
@@ -9651,7 +10903,30 @@ theorem placeMentionOperandsInit_concretize_of_symPlaceMentionOk
       rw [hv]
       exact hIdx
 
-/-- Check that any symbolic argument index read or written by `symStepStmtConcrete` is `< argCount`. -/
+/-- Check that any symbolic argument read performed by `rv` is safe under
+`localDecls` / `layouts` for arguments satisfying `isNonPtrNonRawVal`. -/
+def symRvalueReadSafe
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (rv : Rvalue)
+    (sv : SymVal) :
+    Bool :=
+  match sv with
+  | .concrete _ => true
+  | .symGuarded _ _ => true
+  | .symArg _ =>
+    match rv with
+    | .use op => symArgSafeOp localDecls layouts op
+    | .copyForDeref place => symArgSafePlace localDecls layouts place
+    | _ => false
+  | .symPair0 v0 _ =>
+    match rv with
+    | .aggregate .tuple (_ :: op1 :: .nil) => symArgSafeOp localDecls layouts op1
+    | .use op => symPair0SafeOp localDecls layouts v0 op
+    | _ => match localDecls with | .nil => true | _ :: _ => false
+
+/-- Check that any symbolic argument index read or written by `symStepStmtConcrete` is `< argCount`
+and that any symbolic argument read satisfies `symRvalueReadSafe`. -/
 def symStepStmtInBounds
     (argCount : Nat)
     (localDecls : List LocalDecl)
@@ -9667,13 +10942,445 @@ def symStepStmtInBounds
   | .assign ⟨_, .nil⟩ rv =>
     match evalSymRvalueConcrete st.slots st.borrows st.nextTag .nil localDecls layouts rv with
     | .some (sv, _, _, _) =>
-      match sv with
-      | .concrete _ => true
-      | .symArg idx => Nat.blt idx argCount
-      | .symPair0 _ idx => Nat.blt idx argCount
-      | .symGuarded _ idx => Nat.blt idx argCount
+      Bool.and
+        (symRvalueReadSafe localDecls layouts rv sv)
+        (match sv with
+         | .concrete _ => true
+         | .symArg idx => Nat.blt idx argCount
+         | .symPair0 _ idx => Nat.blt idx argCount
+         | .symGuarded _ idx => Nat.blt idx argCount)
     | .none => false
   | _ => true
+
+theorem isNonPtrNonRawVal_of_extractValueScalarSlice0?
+    {v : Value} {targetBytes : Nat} {sc : ScalarInt}
+    (h : extractValueScalarSlice0? v targetBytes = .some sc) :
+    isNonPtrNonRawVal v = true := by
+  cases v with
+  | uninit | unit | ptr _ _ => nomatch h
+  | scalar _ => rfl
+  | aggregate varIdx fields =>
+    cases varIdx with
+    | succ _ => nomatch h
+    | zero =>
+      cases fields with
+      | nil => nomatch h
+      | cons f0 fRest =>
+        cases f0 with
+        | scalar _ => rfl
+        | _ => nomatch h
+
+def symValSafeForOp
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (op : Operand) : SymVal → Prop
+  | .concrete _ => True
+  | .symGuarded _ _ => True
+  | .symArg _ => symArgSafeOp localDecls layouts op = true
+  | .symPair0 v0 _ => symPair0SafeOp localDecls layouts v0 op = true
+
+theorem evalSymOperand_sound_of_safe
+    (args : List Value)
+    (slots : List SymSlot)
+    (op : Operand)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    {callerLocals : List LocalSlot}
+    {localDecls : List LocalDecl}
+    {callStack : List SavedCallerFrame}
+    (sv : SymVal)
+    (slots' : List SymSlot)
+    (hArgsNonPtr : ∀ idx w, get? args idx = .some w → isNonPtrNonRawVal w = true)
+    (hSafe : symValSafeForOp localDecls layouts op sv)
+    (h : evalSymOperand slots op borrows localDecls layouts = .some (sv, slots')) :
+    evalOperand (concretizeSymSlots args slots) op borrows globals layouts callerLocals localDecls
+        callStack =
+      concretizeSymReadResult args sv slots' := by
+  cases sv with
+  | concrete v =>
+    exact evalSymOperand_sound_concrete args slots op borrows globals layouts v slots' h
+  | symGuarded v0 idx =>
+    rw [evalSymOperand_sound args slots op borrows globals layouts (.symGuarded v0 idx) slots' h]
+    cases op with
+    | constant _ => rfl
+    | copy p =>
+      dsimp only [evalSymOperand] at h
+      cases hCopy : evalSymPlaceCopy slots p borrows localDecls layouts with
+      | none => rw [hCopy] at h; nomatch h
+      | some sv0 =>
+        rw [hCopy] at h; injection h with hP; injection hP with hS _; subst hS
+        dsimp only [concretizeSymReadResult, applyOperandReadValid]
+        cases get? args idx with
+        | none => rfl
+        | some _ => exact applyPlaceReadValid_of_symConcreteReadValid layouts localDecls p v0 _ (evalSymPlaceCopy_guarded_readValid hCopy)
+    | move p =>
+      cases p with
+      | mk loc proj =>
+        cases proj with
+        | nil =>
+          dsimp only [evalSymOperand] at h
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some sSlot =>
+            rw [hGet] at h
+            cases sSlot with
+            | symArg _ =>
+              dsimp only at h
+              cases hNM : isNonMatPtrPlace layouts localDecls { local_ := loc, projection := [] } with
+              | false => rw [hNM] at h; nomatch h
+              | true =>
+                rw [hNM] at h; dsimp only at h
+                cases hSet : set? slots loc (.concrete .uninit) <;> (rw [hSet] at h; nomatch h)
+            | symPair0 w _ =>
+              dsimp only at h
+              cases hU : valueContainsUninit w with
+              | true => rw [hU] at h; nomatch h
+              | false =>
+                rw [hU] at h; dsimp only at h
+                cases hSet : set? slots loc (.concrete .uninit) <;> (rw [hSet] at h; nomatch h)
+            | concrete cSlot =>
+              cases cSlot with
+              | dead | uninit => nomatch h
+              | init rv =>
+                dsimp only at h
+                cases hU : valueContainsUninit rv with
+                | true => rw [hU] at h; nomatch h
+                | false =>
+                  rw [hU] at h; dsimp only at h
+                  cases hRV : symConcreteReadValid layouts localDecls { local_ := loc, projection := [] } rv with
+                  | false => rw [hRV] at h; nomatch h
+                  | true =>
+                    rw [hRV] at h; dsimp only at h
+                    cases hSet : set? slots loc (.concrete .uninit) <;> (rw [hSet] at h; nomatch h)
+        | cons pHead pTail =>
+          dsimp only [evalSymOperand] at h
+          cases hCopy : evalSymPlaceCopy slots ⟨loc, pHead :: pTail⟩ borrows localDecls layouts with
+          | none => rw [hCopy] at h; nomatch h
+          | some sv0 =>
+            rw [hCopy] at h; injection h with hP; injection hP with hS _; subst hS
+            dsimp only [concretizeSymReadResult, applyOperandReadValid]
+            cases get? args idx with
+            | none => rfl
+            | some _ => exact applyPlaceReadValid_of_symConcreteReadValid layouts localDecls _ v0 _ (evalSymPlaceCopy_guarded_readValid hCopy)
+  | symArg idx =>
+    rw [evalSymOperand_sound args slots op borrows globals layouts (.symArg idx) slots' h]
+    dsimp only [concretizeSymReadResult]
+    cases hGet : get? args idx with
+    | none => cases op <;> rfl
+    | some v =>
+      dsimp only
+      cases valueContainsUninit v with
+      | true => cases op <;> rfl
+      | false =>
+        exact applyOperandReadValid_of_symArgSafe layouts localDecls op v _ hSafe (hArgsNonPtr idx v hGet)
+  | symPair0 v0 idx =>
+    rw [evalSymOperand_sound args slots op borrows globals layouts (.symPair0 v0 idx) slots' h]
+    dsimp only [concretizeSymReadResult]
+    cases hGet : get? args idx with
+    | none => cases op <;> rfl
+    | some v1 =>
+      dsimp only
+      cases valueContainsUninit v1 with
+      | true => cases op <;> rfl
+      | false =>
+        exact applyOperandReadValid_of_symPair0Safe layouts localDecls op v0 v1 _ hSafe (hArgsNonPtr idx v1 hGet)
+
+theorem evalSymRvalueConcrete_sound_of_safe
+    (args : List Value)
+    (slots : List SymSlot)
+    (mem : Memory)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (rv : Rvalue)
+    (sv : SymVal)
+    (slots' : List SymSlot)
+    (borrows' : List BorrowEntry)
+    (nextTag' : Nat)
+    (hArgsNonPtr : ∀ idx w, get? args idx = .some w → isNonPtrNonRawVal w = true)
+    (hSafe : symRvalueReadSafe localDecls layouts rv sv = true)
+    (h :
+      evalSymRvalueConcrete
+          slots mem.borrows mem.nextTag mem.activeProtectors localDecls layouts rv
+          (length mem.callStack) =
+        .some (sv, slots', borrows', nextTag')) :
+    evalRvalue (concretizeSymSlots args slots) rv mem localDecls layouts =
+      concretizeSymRvalueResult
+        args
+        sv
+        slots'
+        { mem with borrows := borrows', nextTag := nextTag' } := by
+  cases rv with
+  | use op =>
+    dsimp only [evalSymRvalueConcrete] at h
+    dsimp only [evalRvalue]
+    cases hOp : evalSymOperand slots op mem.borrows localDecls layouts with
+    | none => rw [hOp] at h; nomatch h
+    | some pair =>
+      rw [hOp] at h
+      rcases pair with ⟨sv0, s1⟩
+      dsimp only at h
+      cases hValid : symValidateLoadedValue layouts localDecls op sv0 with
+      | false => rw [hValid] at h; nomatch h
+      | true =>
+        rw [hValid] at h; dsimp only at h
+        cases hUB : symOperandReadTreeUB slots op mem.borrows mem.activeProtectors with
+        | true => rw [hUB] at h; nomatch h
+        | false =>
+          rw [hUB] at h
+          injection h with hTup; injection hTup with hV hR1; injection hR1 with hS hR2; injection hR2 with hB hT
+          subst hV; subst hS; subst hB; subst hT
+          have hOpSafe : symValSafeForOp localDecls layouts op sv0 := by
+            cases sv0 with
+            | concrete _ | symGuarded _ _ => exact True.intro
+            | symArg _ => exact hSafe
+            | symPair0 _ _ => exact hSafe
+          rw [evalSymOperand_sound_of_safe args slots op mem.borrows mem.globals layouts (localDecls := localDecls) sv0 s1 hArgsNonPtr hOpSafe hOp]
+          rw [memory_borrows_eta mem]
+          cases op with
+          | constant _ =>
+            dsimp only [freezeSymOperandReadBorrows]
+            exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.constant _) hValid
+          | copy p =>
+            cases p with
+            | mk loc proj =>
+              cases proj with
+              | nil =>
+                dsimp only [freezeSymOperandReadBorrows]
+                exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.copy { local_ := loc, projection := .nil }) hValid
+              | cons pHead pTail =>
+                cases pHead with
+                | deref =>
+                  dsimp only [evalSymOperand] at hOp
+                  cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows localDecls layouts with
+                  | none => rw [hCopy] at hOp; nomatch hOp
+                  | some _ => nomatch hCopy
+                | _ =>
+                  dsimp only [freezeSymOperandReadBorrows]
+                  exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls _ hValid
+          | move p =>
+            cases p with
+            | mk loc proj =>
+              cases proj with
+              | nil =>
+                dsimp only [freezeSymOperandReadBorrows]
+                exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls (Operand.move { local_ := loc, projection := .nil }) hValid
+              | cons pHead pTail =>
+                cases pHead with
+                | deref =>
+                  dsimp only [evalSymOperand] at hOp
+                  cases hCopy : evalSymPlaceCopy slots { local_ := loc, projection := .deref :: pTail } mem.borrows localDecls layouts with
+                  | none => rw [hCopy] at hOp; nomatch hOp
+                  | some _ => nomatch hCopy
+                | _ =>
+                  dsimp only [freezeSymOperandReadBorrows]
+                  exact concretizeSymReadResult_to_rvalue_valid args sv0 s1 mem layouts localDecls _ hValid
+  | copyForDeref place =>
+    dsimp only [evalSymRvalueConcrete] at h
+    dsimp only [evalRvalue]
+    cases hCopy : evalSymPlaceCopy slots place mem.borrows localDecls layouts with
+    | none => rw [hCopy] at h; nomatch h
+    | some sv0 =>
+      rw [hCopy] at h
+      cases hUB : symPlaceReadTreeUB slots place mem.borrows mem.activeProtectors with
+      | true => rw [hUB] at h; nomatch h
+      | false =>
+        rw [hUB] at h
+        injection h with hTup; injection hTup with hV hR1; injection hR1 with hS hR2; injection hR2 with hB hT
+        subst hV; subst hS; subst hB; subst hT
+        have hOpCopy : evalSymOperand slots (.copy place) mem.borrows localDecls layouts = .some (sv0, slots) := by
+          dsimp only [evalSymOperand]; rw [hCopy]
+        have hOpSafe : symValSafeForOp localDecls layouts (.copy place) sv0 := by
+          cases sv0 with
+          | concrete _ | symGuarded _ _ => exact True.intro
+          | symArg _ => exact hSafe
+          | symPair0 _ _ =>
+            dsimp only [symRvalueReadSafe] at hSafe
+            cases localDecls with
+            | nil => rfl
+            | cons _ _ => nomatch hSafe
+        rw [evalSymOperand_sound_of_safe args slots (.copy place) mem.borrows mem.globals layouts (localDecls := localDecls) sv0 slots hArgsNonPtr hOpSafe hOpCopy]
+        rw [memory_borrows_eta mem]
+        cases place with
+        | mk loc proj =>
+          cases proj with
+          | nil =>
+            dsimp only [freezeSymPlaceReadBorrows]
+            exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+          | cons pHead pTail =>
+            cases pHead with
+            | deref => nomatch hCopy
+            | _ =>
+              dsimp only [freezeSymPlaceReadBorrows]
+              exact concretizeSymReadResult_to_rvalue args sv0 slots mem
+  | aggregate aggKind ops =>
+    cases aggKind with
+    | tuple =>
+      dsimp only [evalSymRvalueConcrete] at h
+      dsimp only [evalRvalue]
+      cases hOps : evalSymOperandsConcrete slots ops mem.borrows localDecls layouts with
+      | some pair =>
+        rw [hOps] at h
+        rcases pair with ⟨vals, s1⟩
+        injection h with hTup; injection hTup with hV hR1; injection hR1 with hS hR2; injection hR2 with hB hT
+        subst hV; subst hS; subst hB; subst hT
+        rw [evalSymOperandsConcrete_sound args ops slots mem.borrows mem.globals layouts vals s1 hOps]
+        rfl
+      | none =>
+        rw [hOps] at h; dsimp only at h
+        cases ops with
+        | nil => nomatch h
+        | cons op0 opsRest1 =>
+          cases opsRest1 with
+          | nil => nomatch h
+          | cons op1 opsRest2 =>
+            cases opsRest2 with
+            | cons _ _ => nomatch h
+            | nil =>
+              dsimp only at h
+              cases hOp0 : evalSymOperand slots op0 mem.borrows localDecls layouts with
+              | none => rw [hOp0] at h; nomatch h
+              | some pair0 =>
+                rw [hOp0] at h
+                rcases pair0 with ⟨sv0, slots1⟩
+                cases sv0 with
+                | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch h
+                | concrete v0 =>
+                  dsimp only at h
+                  cases hOp1 : evalSymOperand slots1 op1 mem.borrows localDecls layouts with
+                  | none => rw [hOp1] at h; nomatch h
+                  | some pair1 =>
+                    rw [hOp1] at h
+                    rcases pair1 with ⟨sv1, slots2⟩
+                    cases sv1 with
+                    | concrete _ | symPair0 _ _ | symGuarded _ _ => nomatch h
+                    | symArg idx =>
+                      injection h with hTup; injection hTup with hV hR1; injection hR1 with hS hR2; injection hR2 with hB hT
+                      subst hV; subst hS; subst hB; subst hT
+                      dsimp only [evalOperands]
+                      rw [evalSymOperand_sound_concrete args slots op0 mem.borrows mem.globals layouts v0 slots1 hOp0]
+                      dsimp only
+                      rw [evalSymOperand_sound_of_safe args slots1 op1 mem.borrows mem.globals layouts (localDecls := localDecls) (.symArg idx) slots2 hArgsNonPtr hSafe hOp1]
+                      dsimp only [concretizeSymReadResult, concretizeSymRvalueResult]
+                      rw [memory_eta mem]
+                      cases get? args idx with
+                      | none => rfl
+                      | some v1 => dsimp only; cases valueContainsUninit v1 <;> rfl
+    | adt _ variantIdx activeField =>
+      cases activeField with
+      | some _ => nomatch h
+      | none =>
+        dsimp only [evalSymRvalueConcrete] at h
+        dsimp only [evalRvalue, evalAggregateAdt]
+        cases hOps : evalSymOperandsConcrete slots ops mem.borrows localDecls layouts with
+        | none => rw [hOps] at h; nomatch h
+        | some pair =>
+          rw [hOps] at h
+          rcases pair with ⟨vals, s1⟩
+          injection h with hTup; injection hTup with hV hR1; injection hR1 with hS hR2; injection hR2 with hB hT
+          subst hV; subst hS; subst hB; subst hT
+          rw [evalSymOperandsConcrete_sound args ops slots mem.borrows mem.globals layouts vals s1 hOps]
+          rfl
+    | _ => nomatch h
+  | ref borrowKind place =>
+    cases place with
+    | mk loc proj =>
+      cases proj with
+      | nil =>
+        dsimp only [evalSymRvalueConcrete, resolveSymBorrowProjectionElems] at h
+        dsimp only [evalRvalue, resolveBorrowProjectionElems]
+        rw [get?_concretizeSymSlots args slots loc]
+        cases hGet : get? slots loc with
+        | none => rw [hGet] at h; nomatch h
+        | some sSlot =>
+          rw [hGet] at h
+          have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
+          injection hOk with hTup; injection hTup with hV hR1; injection hR1 with hS hR2; injection hR2 with hB hT
+          subst hV; subst hS; subst hB; subst hT
+          dsimp only [projHasSubslice]
+          rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+            (rw [hSlot]; rfl)
+      | cons pHead pTail =>
+        cases pHead with
+        | deref => nomatch h
+        | index _ | subslice _ _ _ =>
+          dsimp only [evalSymRvalueConcrete, resolveSymBorrowProjectionElems] at h
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some sSlot =>
+            rw [hGet] at h
+            have ⟨_, hOk⟩ := symSlot_not_dead_of_match_some h
+            nomatch hOk
+        | field _ _ | constantIndex _ _ _ | downcast _ _ | opaqueCast _ | unwrapUnsafeBinder _ =>
+          dsimp only [evalSymRvalueConcrete, resolveSymBorrowProjectionElems] at h
+          dsimp only [evalRvalue, resolveBorrowProjectionElems]
+          rw [get?_concretizeSymSlots args slots loc]
+          cases hGet : get? slots loc with
+          | none => rw [hGet] at h; nomatch h
+          | some sSlot =>
+            rw [hGet] at h
+            have ⟨hNotDead, hOk⟩ := symSlot_not_dead_of_match_some h
+            cases hRes : resolveSymBorrowProjectionElems pTail with
+            | none => rw [hRes] at hOk; nomatch hOk
+            | some rest' =>
+              rw [hRes] at hOk
+              injection hOk with hTup; injection hTup with hV hR1; injection hR1 with hS hR2; injection hR2 with hB hT
+              subst hV; subst hS; subst hB; subst hT
+              rw [resolveSymBorrowProjectionElems_sound (concretizeSymSlots args slots) pTail rest' hRes]
+              dsimp only [projHasSubslice]
+              rw [projHasSubslice_of_resolveSymBorrowProjectionElems pTail rest' hRes]
+              dsimp only
+              rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
+                (rw [hSlot]; rfl)
+  | binaryOp op lhsOp rhsOp =>
+    dsimp only [evalSymRvalueConcrete] at h
+    dsimp only [evalRvalue]
+    cases hLhs : evalSymOperand slots lhsOp mem.borrows localDecls layouts with
+    | none => rw [hLhs] at h; nomatch h
+    | some pair1 =>
+      rw [hLhs] at h
+      rcases pair1 with ⟨sv1, slots1⟩
+      cases sv1 with
+      | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch h
+      | concrete v1 =>
+        cases v1 with
+        | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
+        | scalar lhs =>
+          dsimp only at h
+          rw [evalSymOperand_sound_concrete args slots lhsOp mem.borrows mem.globals layouts (.scalar lhs) slots1 hLhs]
+          dsimp only
+          cases hRhs : evalSymOperand slots1 rhsOp mem.borrows localDecls layouts with
+          | none => rw [hRhs] at h; nomatch h
+          | some pair2 =>
+            rw [hRhs] at h
+            rcases pair2 with ⟨sv2, slots2⟩
+            cases sv2 with
+            | symArg _ | symPair0 _ _ | symGuarded _ _ => nomatch h
+            | concrete v2 =>
+              cases v2 with
+              | uninit | unit | ptr _ _ | aggregate _ _ => nomatch h
+              | scalar rhs =>
+                dsimp only at h
+                rw [evalSymOperand_sound_concrete args slots1 rhsOp mem.borrows mem.globals layouts (.scalar rhs) slots2 hRhs]
+                cases hFl : Bool.or
+                    (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                    (isFloatOptTy (operandTy localDecls layouts rhsOp)) with
+                | true => rw [hFl] at h; nomatch h
+                | false =>
+                  rw [hFl] at h
+                  cases hBin : evalSymScalarBinOp op lhs rhs (operandIsSigned localDecls lhsOp layouts) with
+                  | none => rw [hBin] at h; nomatch h
+                  | some resVal =>
+                    rw [hBin] at h
+                    injection h with hTup; injection hTup with hV hR1; injection hR1 with hS hR2; injection hR2 with hB hT
+                    subst hV; subst hS; subst hB; subst hT
+                    cases op with
+                    | offset =>
+                      unfold evalSymScalarBinOp at hBin
+                      repeat' split at hBin
+                      all_goals contradiction
+                    | _ =>
+                      dsimp only
+                      exact evalSymScalarBinOp_sound _ lhs rhs (concretizeSymSlots args slots2) mem (operandIsSigned localDecls lhsOp layouts) resVal hBin
+  | _ => nomatch h
 
 theorem valueListContainsUninit_of_allFlatValuesOfSize (sz : Nat) :
     ∀ (xs : List Value),
@@ -9738,7 +11445,7 @@ theorem symStepStmtConcrete_step_of_inBounds
     (st st' : SymState)
     (stmt : Statement)
     (hLen : length args = body.argCount)
-    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false)
+    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false ∧ isNonPtrNonRawVal w = true)
     (hInB : symStepStmtInBounds body.argCount body.localDecls body.layouts st stmt = true)
     (h : symStepStmtConcrete body.localDecls body.layouts st stmt = .some st') :
     evalStmt (concretizeSymState body args st) stmt body.localDecls body.layouts =
@@ -9859,9 +11566,10 @@ theorem symStepStmtConcrete_step_of_inBounds
                 cases rest2 with
                 | mk borrows1 nextTag1 =>
                   dsimp only at h hInB
-                  rw [evalSymRvalueConcrete_sound
+                  rcases Bool.and_eq_true_iff.1 hInB with ⟨hSafe, hInB'⟩
+                  rw [evalSymRvalueConcrete_sound_of_safe
                     args st.slots (concretizeSymMemory body st) body.localDecls body.layouts
-                    rv sv slots1 borrows1 nextTag1 hRv]
+                    rv sv slots1 borrows1 nextTag1 (fun i w hg => (hArgsInit i w hg).2) hSafe hRv]
                   dsimp only [concretizeSymMemory]
                   cases hGet : get? slots1 dstLoc with
                   | none =>
@@ -9887,7 +11595,7 @@ theorem symStepStmtConcrete_step_of_inBounds
                         rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
                           (rw [hSlot]; rfl)
                     | symArg valIdx =>
-                      dsimp only at hOk hInB
+                      dsimp only at hOk hInB'
                       cases hSet : set? slots1 dstLoc (.symArg valIdx) with
                       | none =>
                         rw [hSet] at hOk
@@ -9899,12 +11607,12 @@ theorem symStepStmtConcrete_step_of_inBounds
                         dsimp only [concretizeSymRvalueResult]
                         cases hArgVal : get? args valIdx with
                         | none =>
-                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB) with ⟨_, hSome⟩
+                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB') with ⟨_, hSome⟩
                           rw [hArgVal] at hSome
                           nomatch hSome
                         | some val =>
                           dsimp only
-                          rw [hArgsInit valIdx val hArgVal]
+                          rw [(hArgsInit valIdx val hArgVal).1]
                           dsimp only
                           rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
                           have hSetSym := set?_concretizeSymSlots args (.symArg valIdx) slots1 dstLoc
@@ -9915,7 +11623,7 @@ theorem symStepStmtConcrete_step_of_inBounds
                           rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
                             (rw [hSlot]; rfl)
                     | symPair0 v0 valIdx =>
-                      dsimp only at hOk hInB
+                      dsimp only at hOk hInB'
                       cases hSet : set? slots1 dstLoc (.symPair0 v0 valIdx) with
                       | none =>
                         rw [hSet] at hOk
@@ -9927,12 +11635,12 @@ theorem symStepStmtConcrete_step_of_inBounds
                         dsimp only [concretizeSymRvalueResult]
                         cases hArgVal : get? args valIdx with
                         | none =>
-                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB) with ⟨_, hSome⟩
+                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB') with ⟨_, hSome⟩
                           rw [hArgVal] at hSome
                           nomatch hSome
                         | some val =>
                           dsimp only
-                          rw [hArgsInit valIdx val hArgVal]
+                          rw [(hArgsInit valIdx val hArgVal).1]
                           dsimp only
                           rw [get?_concretizeSymSlots args slots1 dstLoc, hGet]
                           have hSetSym := set?_concretizeSymSlots args (.symPair0 v0 valIdx) slots1 dstLoc
@@ -9943,7 +11651,7 @@ theorem symStepStmtConcrete_step_of_inBounds
                           rcases concretizeSymSlot_eq_of_not_dead args sSlot hNotDead with hSlot | ⟨_, hSlot⟩ <;>
                             (rw [hSlot]; rfl)
                     | symGuarded v0 valIdx =>
-                      dsimp only at hOk hInB
+                      dsimp only at hOk hInB'
                       cases hSet : set? slots1 dstLoc (.concrete (.init v0)) with
                       | none =>
                         rw [hSet] at hOk
@@ -9955,7 +11663,7 @@ theorem symStepStmtConcrete_step_of_inBounds
                         dsimp only [concretizeSymRvalueResult]
                         cases hArgVal : get? args valIdx with
                         | none =>
-                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB) with ⟨_, hSome⟩
+                          rcases get?_some_of_blt_length args valIdx (hLen.symm ▸ hInB') with ⟨_, hSome⟩
                           rw [hArgVal] at hSome
                           nomatch hSome
                         | some _ =>
@@ -9992,7 +11700,7 @@ theorem symStepConcreteInBounds_true_sound
     (args : List Value)
     (st st' : SymState)
     (hLen : length args = body.argCount)
-    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false)
+    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false ∧ isNonPtrNonRawVal w = true)
     (h : symStepConcreteInBounds body st = .some st')
     (hTrue : evalMirBoolTrueBounded fuel body (concretizeSymState body args st')) :
     evalMirBoolTrueBounded (.succ fuel) body (concretizeSymState body args st) := by
@@ -10190,7 +11898,7 @@ def checkSymReturnsTrue : Nat → CapturedMir → SymState → Bool
 theorem checkSymReturnsTrue_sound :
     ∀ (fuel : Nat) (body : CapturedMir) (args : List Value) (st : SymState),
       length args = body.argCount →
-      (∀ idx w, get? args idx = .some w → valueContainsUninit w = false) →
+      (∀ idx w, get? args idx = .some w → valueContainsUninit w = false ∧ isNonPtrNonRawVal w = true) →
       checkSymReturnsTrue fuel body st = true →
       evalMirBoolTrueBounded fuel body (concretizeSymState body args st)
   | .zero, _, _, _, _, _, hCheck => nomatch hCheck
@@ -10355,30 +12063,40 @@ def symExtractEnsuresUpperBound1Stmt
     Option (ScalarInt × SymState) :=
   match stmt.kind with
   | .assign ⟨dstLoc, .nil⟩ (.binaryOp op lhsOp rhsOp) =>
-    match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
-    | .some (sv₁, slots₁) =>
-      match sv₁ with
-      | .symArg (.succ .zero) =>
-        match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
-        | .some (sv₂, slots₂) =>
-          match sv₂ with
-          | .concrete (.scalar sc) =>
-            match
-              isUnsignedEnsuresUpperOp op sc.bits,
-              operandIsSigned localDecls lhsOp layouts,
-              Nat.beq sc.sizeBytes 0
-            with
-            | true, false, false =>
-              let tightSc : ScalarInt := {
-                bits := tightUnsignedUpperBoundBits op sc.bits
-                sizeBytes := sc.sizeBytes
-              }
-              symFinishEnsTrue st dstLoc slots₂ tightSc
-            | _, _, _ => .none
-          | _ => .none
-        | .none => .none
-      | _ => .none
-    | .none => .none
+    match symArgSafeOp localDecls layouts lhsOp with
+    | false => .none
+    | true =>
+      match evalSymOperand st.slots lhsOp st.borrows localDecls layouts with
+      | .some (sv₁, slots₁) =>
+        match sv₁ with
+        | .symArg (.succ .zero) =>
+          match evalSymOperand slots₁ rhsOp st.borrows localDecls layouts with
+          | .some (sv₂, slots₂) =>
+            match sv₂ with
+            | .concrete (.scalar sc) =>
+              match
+                isUnsignedEnsuresUpperOp op sc.bits,
+                operandIsSigned localDecls lhsOp layouts,
+                Nat.beq sc.sizeBytes 0
+              with
+              | true, false, false =>
+                match
+                  Bool.or
+                    (isFloatOptTy (operandTy localDecls layouts lhsOp))
+                    (isFloatOptTy (operandTy localDecls layouts rhsOp))
+                with
+                | true => .none
+                | false =>
+                  let tightSc : ScalarInt := {
+                    bits := tightUnsignedUpperBoundBits op sc.bits
+                    sizeBytes := sc.sizeBytes
+                  }
+                  symFinishEnsTrue st dstLoc slots₂ tightSc
+              | _, _, _ => .none
+            | _ => .none
+          | .none => .none
+        | _ => .none
+      | .none => .none
   | _ => .none
 
 /-- Extract a 2-argument `ensures` upper bound from the current statement of `body` at `st`. -/
@@ -10405,7 +12123,7 @@ theorem symExtractEnsuresUpperBound1_sound
     (stTrue : SymState)
     (r : Nat)
     (hLen : length args = body.argCount)
-    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false)
+    (hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false ∧ isNonPtrNonRawVal w = true)
     (hExt : symExtractEnsuresUpperBound1 body st = .some (boundSc, stTrue))
     (hTrue : checkSymReturnsTrue fuel body stTrue = true)
     (hArg1 : get? args 1 = .some (.scalar { bits := r, sizeBytes := boundSc.sizeBytes }))
@@ -10449,11 +12167,16 @@ theorem symExtractEnsuresUpperBound1_sound
                 cases rv with
                 | binaryOp op lhsOp rhsOp =>
                   dsimp only [symExtractEnsuresUpperBound1Stmt] at hExt
-                  cases hLhs : evalSymOperand st.slots lhsOp st.borrows body.localDecls body.layouts with
-                  | none =>
-                    rw [hLhs] at hExt
-                    nomatch hExt
-                  | some pair1 =>
+                  cases hLhsSafe : symArgSafeOp body.localDecls body.layouts lhsOp with
+                  | false => rw [hLhsSafe] at hExt; nomatch hExt
+                  | true =>
+                    rw [hLhsSafe] at hExt
+                    dsimp only at hExt
+                    cases hLhs : evalSymOperand st.slots lhsOp st.borrows body.localDecls body.layouts with
+                    | none =>
+                      rw [hLhs] at hExt
+                      nomatch hExt
+                    | some pair1 =>
                     rw [hLhs] at hExt
                     cases pair1 with
                     | mk sv1 slots1 =>
@@ -10501,6 +12224,17 @@ theorem symExtractEnsuresUpperBound1_sound
                                         | false =>
                                           rw [hSz0] at hExt
                                           dsimp only at hExt
+                                          have hFl :
+                                              Bool.or
+                                                (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                                                (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) = false := by
+                                            cases h : Bool.or
+                                                (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                                                (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+                                            | false => rfl
+                                            | true => rw [h] at hExt; nomatch hExt
+                                          rw [hFl] at hExt
+                                          dsimp only at hExt
                                           let tightSc : ScalarInt := {
                                             bits := tightUnsignedUpperBoundBits op sc0.bits
                                             sizeBytes := sc0.sizeBytes
@@ -10513,16 +12247,15 @@ theorem symExtractEnsuresUpperBound1_sound
                                           subst hScEq
                                           rw [evalStmt_assign_nil_eq]
                                           dsimp only [evalRvalue, concretizeSymState, concretizeSymMemory]
-                                          rw [evalSymOperand_sound
+                                          rw [evalSymOperand_sound_of_safe
                                             args st.slots lhsOp st.borrows body.allocations body.layouts
-                                            (.symArg 1) slots1 hLhs]
+                                            (.symArg 1) slots1 (fun i w hg => (hArgsInit i w hg).2) hLhsSafe hLhs]
                                           dsimp only [concretizeSymReadResult]
                                           rw [hArg1]
                                           dsimp only [valueContainsUninit]
-                                          rw [evalSymOperand_sound
+                                          rw [evalSymOperand_sound_concrete
                                             args slots1 rhsOp st.borrows body.allocations body.layouts
-                                            (.concrete (.scalar sc0)) slots2 hRhs]
-                                          dsimp only [concretizeSymReadResult]
+                                            (.scalar sc0) slots2 hRhs]
                                           have hUbOp : isUnsignedUpperBoundOp op = true :=
                                             isUnsignedUpperBoundOp_of_ensuresUpper hOp
                                           have hSzEq : Nat.beq sc0.sizeBytes sc0.sizeBytes = true :=
@@ -10530,6 +12263,8 @@ theorem symExtractEnsuresUpperBound1_sound
                                           have hNotOff : op = .le ∨ op = .lt ∨ op = .eq := by
                                             cases op <;> simp_all [isUnsignedUpperBoundOp]
                                           rcases hNotOff with rfl | rfl | rfl <;> (
+                                            dsimp only
+                                            rw [hFl]
                                             dsimp only
                                             rw [hSig]
                                             rw [evalScalarBinOp_unsignedUpperBound_eq
@@ -10583,7 +12318,7 @@ theorem checkSymEnsuresUpperBound1Loop_sound :
       (boundSc : ScalarInt)
       (r : Nat),
       length args = body.argCount →
-      (∀ idx w, get? args idx = .some w → valueContainsUninit w = false) →
+      (∀ idx w, get? args idx = .some w → valueContainsUninit w = false ∧ isNonPtrNonRawVal w = true) →
       checkSymEnsuresUpperBound1Loop fuel body st boundSc = true →
       get? args 1 = .some (.scalar { bits := r, sizeBytes := boundSc.sizeBytes }) →
       r ≤ boundSc.bits →
@@ -10671,7 +12406,8 @@ theorem checkMirEnsuresUpperBound1_sound
     (r : Nat)
     (h_check : checkMirEnsuresUpperBound1 fuel ensBody boundSc = true)
     (h_ble : r ≤ boundSc.bits)
-    (hV0 : valueContainsUninit v0 = false := by rfl) :
+    (hV0 : valueContainsUninit v0 = false := by rfl)
+    (hV0NonPtr : isNonPtrNonRawVal v0 = true := by rfl) :
     MirBoolPredicateHolds
       ensBody
       [v0, .scalar { bits := r, sizeBytes := boundSc.sizeBytes }] := by
@@ -10686,18 +12422,19 @@ theorem checkMirEnsuresUpperBound1_sound
     let args : List Value := [v0, .scalar { bits := r, sizeBytes := boundSc.sizeBytes }]
     have hLen : length args = ensBody.argCount :=
       Eq.symm (Nat.eq_of_beq_eq_true hArg2)
-    have hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false := by
+    have hArgsInit : ∀ idx w, get? args idx = .some w → valueContainsUninit w = false ∧ isNonPtrNonRawVal w = true := by
       intro idx w hGet
       cases idx with
       | zero =>
         injection hGet with hEq
         rw [← hEq]
-        exact hV0
+        exact ⟨hV0, hV0NonPtr⟩
       | succ idx1 =>
         cases idx1 with
         | zero =>
           injection hGet with hEq
           rw [← hEq]
+          exact ⟨rfl, rfl⟩
         | succ _ => nomatch hGet
     apply mirBoolPredicateHolds_of_evalMirBoolTrueBounded fuel ensBody args
     rw [← concretizeSymState_initSymState ensBody args hLen]
@@ -10770,7 +12507,8 @@ theorem optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
     (mem' : Memory)
     (h_ens_check : checkOptMirEnsuresUpperBound1 specFuel optEnsBody = true)
     (h_post : symOptEnsuresUpperPost optEnsBody retVal mem')
-    (hV0 : valueContainsUninit v0 = false := by rfl) :
+    (hV0 : valueContainsUninit v0 = false := by rfl)
+    (hV0NonPtr : isNonPtrNonRawVal v0 = true := by rfl) :
     OptMirBoolPredicateHolds optEnsBody [v0, retVal] := by
   cases optEnsBody with
   | none => exact True.intro
@@ -10787,7 +12525,7 @@ theorem optMirBoolPredicateHolds_of_symOptEnsuresUpperPost
       dsimp only at hSz hBle
       subst hSz
       exact checkMirEnsuresUpperBound1_sound
-        specFuel ensBody (peekMirUpperBound ensBody) v0 rBits h_ens_check hBle hV0
+        specFuel ensBody (peekMirUpperBound ensBody) v0 rBits h_ens_check hBle hV0 hV0NonPtr
 
 /-- Closed-term checker that `reqBody` and `optEnsBody` are valid 1-argument
 unsigned upper-bound companions for `subjectBody`. Forces `peekMirUpperBound reqBody`
@@ -12024,13 +13762,15 @@ theorem checkSymSliceBoolTrueBounded_sound :
     have hLen : length [v, v] = body.argCount := Eq.symm hArgCount
     have hVInit : valueContainsUninit v = false :=
       valueContainsUninit_of_extractValueScalarSlice0? hSlice
-    have hArgsInit : ∀ idx w, get? [v, v] idx = .some w → valueContainsUninit w = false := by
+    have hVNonPtr : isNonPtrNonRawVal v = true :=
+      isNonPtrNonRawVal_of_extractValueScalarSlice0? hSlice
+    have hArgsInit : ∀ idx w, get? [v, v] idx = .some w → valueContainsUninit w = false ∧ isNonPtrNonRawVal w = true := by
       intro idx w hGet
       cases idx with
-      | zero => injection hGet with hEq; rw [← hEq]; exact hVInit
+      | zero => injection hGet with hEq; rw [← hEq]; exact ⟨hVInit, hVNonPtr⟩
       | succ idx1 =>
         cases idx1 with
-        | zero => injection hGet with hEq; rw [← hEq]; exact hVInit
+        | zero => injection hGet with hEq; rw [← hEq]; exact ⟨hVInit, hVNonPtr⟩
         | succ _ => nomatch hGet
     cases hStep1 : symStepConcreteInBounds body st with
     | some st' =>
@@ -12166,19 +13906,20 @@ theorem wpCoalBounded_of_checkSymReturnsSymArg0 :
       (P : Value → Prop),
       body.argCount = 1 →
       valueContainsUninit v = false →
+      isNonPtrNonRawVal v = true →
       checkSymReturnsSymArg0 fuel body st = true →
       P v →
       wpCoalBounded fuel mirDefaultWP (stepMirState body)
         (fun out _ => ∀ retVal mem', out = .normal (retVal, mem') → P retVal)
         (.running (concretizeSymState body [v] st)) PUnit.unit
-  | .zero, _, _, _, _, _, _, hCheck, _ => nomatch hCheck
-  | .succ fuel, body, v, st, P, hArg1, hVInit, hCheck, hP => by
+  | .zero, _, _, _, _, _, _, _, hCheck, _ => nomatch hCheck
+  | .succ fuel, body, v, st, P, hArg1, hVInit, hVNonPtr, hCheck, hP => by
     dsimp only [checkSymReturnsSymArg0] at hCheck
     have hLen : length [v] = body.argCount := Eq.symm hArg1
-    have hArgsInit : ∀ idx w, get? [v] idx = .some w → valueContainsUninit w = false := by
+    have hArgsInit : ∀ idx w, get? [v] idx = .some w → valueContainsUninit w = false ∧ isNonPtrNonRawVal w = true := by
       intro idx w hGet
       cases idx with
-      | zero => injection hGet with hEq; rw [← hEq]; exact hVInit
+      | zero => injection hGet with hEq; rw [← hEq]; exact ⟨hVInit, hVNonPtr⟩
       | succ _ => nomatch hGet
     cases hStep : symStepConcreteInBounds body st with
     | none =>
@@ -12187,7 +13928,7 @@ theorem wpCoalBounded_of_checkSymReturnsSymArg0 :
     | some st' =>
       rw [hStep] at hCheck
       (dsimp only at hCheck; rw [strictSymStatePeriodic_eq] at hCheck)
-      have hRec := wpCoalBounded_of_checkSymReturnsSymArg0 fuel body v st' P hArg1 hVInit hCheck hP
+      have hRec := wpCoalBounded_of_checkSymReturnsSymArg0 fuel body v st' P hArg1 hVInit hVNonPtr hCheck hP
       dsimp only [symStepConcreteInBounds] at hStep
       unfold wpCoalBounded stepMirState
       dsimp only
@@ -12390,6 +14131,7 @@ theorem dischargeRustEqScalar1
           subjectFuel c.body v0 (initSymState c.body) (fun rv => c.post [v0] rv)
           (Nat.eq_of_beq_eq_true hSubjArg1)
           (valueContainsUninit_of_extractValueScalarSlice0? hSlice0)
+          (isNonPtrNonRawVal_of_extractValueScalarSlice0? hSlice0)
           hSubjRet0 hPostV0
   | false =>
     change OptArgsTypedForSubject

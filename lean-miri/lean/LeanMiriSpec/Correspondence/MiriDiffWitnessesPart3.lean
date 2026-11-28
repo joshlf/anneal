@@ -364,7 +364,10 @@ theorem step_assign_pairField0_simulation_ext
     (hnu : placeTouchesUnion body.localDecls body.layouts
       ⟨p, [.field 0 { kind := t0, layoutIdx := 0 }]⟩ = false := by rfl)
     (hvalid : validateLoadedValue body.layouts body.localDecls
-      (.copy ⟨p, [.field 0 { kind := t0, layoutIdx := 0 }]⟩) (.scalar sc0) = true := by rfl) :
+      (.copy ⟨p, [.field 0 { kind := t0, layoutIdx := 0 }]⟩) (.scalar sc0) = true := by rfl)
+    (hvty : validateValueForTy? body.layouts
+      (placeTyResolved body.localDecls body.layouts
+        ⟨p, [.field 0 { kind := t0, layoutIdx := 0 }]⟩) (.scalar sc0) = true := by rfl) :
     StepRel body m
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) ∧
@@ -475,13 +478,19 @@ theorem step_assign_pairField0_simulation_ext
         body.localDecls body.layouts = .ok (.scalar sc0) s.frame.locals s.memory := by
       have h_ld : evalOperand s.frame.locals (.copy ⟨p, [.field 0 { kind := t0, layoutIdx := 0 }]⟩)
           [] s.memory.globals body.layouts [] body.localDecls = .ok (.scalar sc0) s.frame.locals := by
-        have h0 := h_a'
-        unfold evalOperand at h0 ⊢
-        dsimp only at h0 ⊢
-        rw [hls] at h0 ⊢
-        dsimp only at h0 ⊢
+        unfold evalOperand
+        dsimp only
+        rw [hls]
+        dsimp only
         rw [hnu]
-        exact h0
+        simp only [readProjectedValue, get?, List.getElem?_cons_zero]
+        cases hld : body.localDecls with
+        | nil => rfl
+        | cons _ _ =>
+          have hmat : ∀ opt, materializeReadPtrValue body.layouts opt (.scalar sc0) = some (.scalar sc0) :=
+            fun opt => by cases opt <;> rfl
+          rw [hmat]; dsimp only
+          rw [← hld, hvty]
       unfold evalRvalue
       dsimp only
       rw [hbor, hcaller, hstack, h_ld]

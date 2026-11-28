@@ -2803,6 +2803,10 @@ theorem prim {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kind) 
   · exact Or.inr (Or.inr (Or.inl ⟨it, hk⟩))
   · exact Or.inr (Or.inr (Or.inr ⟨ut, hk⟩))
 
+theorem isFloatTy_false {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kind) :
+    isFloatTy ty = false := by
+  rcases h with ⟨it, hk⟩ | ⟨ut, hk⟩ <;> simp [isFloatTy, hk]
+
 theorem ne_bool {ty : Ty} {kind : Miri.MIR.IntegerKind} (h : IsIntegralTy ty kind) :
     ty.kind ≠ .bool := by
   rcases h with ⟨_, hk⟩ | ⟨_, hk⟩ <;> rw [hk] <;> nofun
@@ -3137,6 +3141,114 @@ theorem annealStepHooks_retag_ne_ok
         throw, throwThe, MonadExceptOf.throw, EStateM.throw]
       cases s₁.stack.currentFrame?.isNone <;> nofun
 
+/-- Scalar or pointer `RigidTy` kinds on which any non-zero-sized `ImmediateRel`
+value passes `materializeReadPtrValue` and `validateValueForTy?`. -/
+@[reducible] def IsScalarOrPtrTyKind : RigidTy → Bool
+  | .bool | .char | .int _ | .uint _ | .float _
+  | .rawPtr _ _ | .ref _ _ | .fnPtr _ _ _ _ => true
+  | _ => false
+
+theorem resolveTyWithLocalDecls_kind_eq_sim
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Ty) :
+    (resolveTyWithLocalDecls localDecls layouts ty).kind = ty.kind := by
+  unfold resolveTyWithLocalDecls
+  cases isUnresolvedLayoutIdx layouts ty.layoutIdx
+  · rfl
+  · dsimp only
+    cases findDeclOrContainerElemTyWithKind? localDecls layouts ty.kind
+    · dsimp only
+      cases Nat.beq ty.layoutIdx 0 <;> cases localDecls <;> try rfl
+      dsimp only
+      cases isPrimitiveScalarKind ty.kind <;> rfl
+    · rfl
+
+theorem placeTyResolved_root_kind_of_get?
+    {localDecls : List LocalDecl} {layouts : LayoutTable} {idx : Local} {decl : LocalDecl}
+    (hdecl : get? localDecls idx = some decl) :
+    ∃ rTy, placeTyResolved localDecls layouts ⟨idx, .nil⟩ = some rTy ∧
+      rTy.kind = decl.ty.kind :=
+  ⟨decl.ty, by simp [placeTyResolved, resolveProjectedTyResolved, hdecl], rfl⟩
+
+theorem ImmediateRel.readValid_of_scalarOrPtr
+    {ty rTy : Ty} {layouts : LayoutTable} {v : Value}
+    {imm : Miri.Interpreter.Immediate AnnealProv}
+    (himm : ImmediateRel ty layouts v imm)
+    (hsz_nz : (translateTy ty layouts).layout.size ≠ Miri.ABI.Size.ZERO)
+    (hkind : IsScalarOrPtrTyKind ty.kind = true)
+    (hrk : rTy.kind = ty.kind) :
+    materializeReadPtrValue layouts (some rTy) v = some v ∧
+    validateValueForTy? layouts (some rTy) v = true := by
+  cases himm with
+  | unit hzero => exact False.elim (hsz_nz hzero)
+  | scalarPair _ _ _ _ _ _ hagg _ =>
+    rcases hagg with ⟨_, hk⟩ | ⟨_, _, hk⟩ <;> simp [IsScalarOrPtrTyKind, hk] at hkind
+  | scalar sc msc hrel hlaysz hbool hchar =>
+    refine ⟨rfl, ?_⟩
+    rcases rTy with ⟨rk, rl⟩
+    dsimp only at hrk
+    unfold validateValueForTy? validateValueForTyAux
+    cases hk : ty.kind <;> simp [IsScalarOrPtrTyKind, hk] at hkind
+    all_goals (rw [hk] at hrk; subst hrk; dsimp only; try rfl)
+    · obtain ⟨hsz1, hbits⟩ := hbool hk
+      rcases hbits with hb | hb <;> (rw [hsz1, hb]; rfl)
+    · obtain ⟨hsz4, hvc⟩ := hchar hk
+      rw [hsz4, hvc]; rfl
+
+theorem evalOperand_copy_root_of_readValid
+    {locals : List LocalSlot} {idx : Local} {decl : LocalDecl} {v : Value}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {layouts : LayoutTable} {callerLocals : List LocalSlot}
+    {localDecls : List LocalDecl} {cs : List SavedCallerFrame}
+    (hslot : get? locals idx = some (.init v))
+    (hvc : valueContainsUninit v = false)
+    (hdecl : get? localDecls idx = some decl)
+    (hmat : ∀ rTy, rTy.kind = decl.ty.kind → materializeReadPtrValue layouts (some rTy) v = some v)
+    (hval : ∀ rTy, rTy.kind = decl.ty.kind → validateValueForTy? layouts (some rTy) v = true) :
+    evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals localDecls cs =
+      .ok v locals := by
+  cases localDecls with
+  | nil => nomatch hdecl
+  | cons d ds =>
+    obtain ⟨rTy, hrTy, hrk⟩ := placeTyResolved_root_kind_of_get? (layouts := layouts) hdecl
+    unfold evalOperand readProjectedValue
+    dsimp only
+    rw [hslot]
+    dsimp only
+    rw [hvc]
+    dsimp only
+    rw [hrTy, hmat rTy hrk]
+    dsimp only
+    rw [hval rTy hrk]
+
+theorem evalOperand_move_root_of_readValid
+    {locals locals' : List LocalSlot} {idx : Local} {decl : LocalDecl} {v : Value}
+    {borrows : List BorrowEntry} {globals : List CapturedAllocation}
+    {layouts : LayoutTable} {callerLocals : List LocalSlot}
+    {localDecls : List LocalDecl} {cs : List SavedCallerFrame}
+    (hslot : get? locals idx = some (.init v))
+    (hvc : valueContainsUninit v = false)
+    (hset : set? locals idx .uninit = some locals')
+    (hdecl : get? localDecls idx = some decl)
+    (hmat : ∀ rTy, rTy.kind = decl.ty.kind → materializeReadPtrValue layouts (some rTy) v = some v)
+    (hval : ∀ rTy, rTy.kind = decl.ty.kind → validateValueForTy? layouts (some rTy) v = true) :
+    evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals localDecls cs =
+      .ok v locals' := by
+  cases localDecls with
+  | nil => nomatch hdecl
+  | cons d ds =>
+    obtain ⟨rTy, hrTy, hrk⟩ := placeTyResolved_root_kind_of_get? (layouts := layouts) hdecl
+    unfold evalOperand readProjectedValue
+    dsimp only
+    rw [hslot]
+    dsimp only
+    rw [hvc]
+    dsimp only
+    rw [hrTy, hmat rTy hrk]
+    dsimp only
+    rw [hval rTy hrk]
+    dsimp only
+    rw [hset]
+
 /-- Syntactic well-typedness of a scalar or scalar-pair `MirAst.Operand` in `body`
 relative to `topFrame`.
 
@@ -3161,6 +3273,7 @@ inductive WellTypedScalarOperand
       get? body.localDecls idx = some decl →
       (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO →
       IsImmediateFrameLocal topFrame idx →
+      (hImmValid : IsScalarOrPtrTyKind decl.ty.kind = true := by decide) →
       WellTypedScalarOperand body topFrame (.copy ⟨idx, .nil⟩) decl.ty
 
 /-- A well-typed scalar operand (a constant or a copied bare local) is never a move of a place
@@ -3191,8 +3304,103 @@ theorem WellTypedScalarOperand.mono_immediate
   cases h with
   | constScalar c sc hval hprim hsz hcan hlaysz hbool hchar =>
     exact .constScalar c sc hval hprim hsz hcan hlaysz hbool hchar
-  | copyLocal idx decl hdecl hsz himm =>
-    exact .copyLocal idx decl hdecl hsz (hmono idx himm)
+  | copyLocal idx decl hdecl hsz himm hkind =>
+    exact .copyLocal idx decl hdecl hsz (hmono idx himm) hkind
+
+theorem WellTypedScalarOperand.evalOperand_ub_of_nil_ub
+    {body : CapturedMir}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {op : MirAst.Operand} {ty : Ty}
+    (hop : WellTypedScalarOperand body tf op ty)
+    {locals : List LocalSlot} {borrows : List BorrowEntry}
+    {globals : List CapturedAllocation} {callerLocals : List LocalSlot}
+    {cs' : List SavedCallerFrame}
+    (hub : evalOperand locals op borrows globals body.layouts callerLocals .nil cs' = .ub)
+    (cs : List SavedCallerFrame := .nil) :
+    evalOperand locals op borrows globals body.layouts callerLocals body.localDecls cs = .ub := by
+  cases hop with
+  | constScalar _ _ _ _ _ _ _ _ _ => exact hub
+  | copyLocal idx _ _ _ _ _ =>
+    unfold evalOperand at hub ⊢
+    dsimp only at hub ⊢
+    cases hslot : get? locals idx
+    · rfl
+    · rename_i sl
+      cases sl with
+      | dead | uninit => rfl
+      | init v =>
+        rw [hslot] at hub
+        dsimp only [readProjectedValue] at hub ⊢
+        cases hvc : valueContainsUninit v
+        · rw [hvc] at hub; nomatch hub
+        · rfl
+
+theorem WellTypedScalarOperand.evalOperand_localDecls_eq_of_frameRel
+    {body : CapturedMir} {mach : AnnealMachine} {af : StackFrame}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {op : MirAst.Operand} {ty : Ty}
+    (hop : WellTypedScalarOperand body tf op ty)
+    (hframe : FrameRel body mach af tf)
+    (borrows : List BorrowEntry := .nil)
+    (globals : List CapturedAllocation := .nil)
+    (callerLocals : List LocalSlot := .nil)
+    (cs : List SavedCallerFrame := .nil) :
+    evalOperand af.locals op borrows globals body.layouts callerLocals body.localDecls cs =
+      evalOperand af.locals op borrows globals body.layouts callerLocals .nil .nil := by
+  cases hop with
+  | constScalar _ _ _ _ _ _ _ _ _ => rfl
+  | copyLocal idx decl hdecl hsz_nz himm hkind =>
+    obtain ⟨slot, mls, _, _, hslot, hmls, _, hloc⟩ := hframe.lookup_local hdecl
+    have himm' := himm mls hmls
+    cases hloc with
+    | dead _ _ =>
+      cases body.localDecls <;> simp [evalOperand, hslot]
+    | indirect _ mp _ _ _ _ =>
+      exact False.elim (himm' mp rfl)
+    | immediate _ imm _ _ hval =>
+      rcases hval with ⟨rfl, rfl⟩ | ⟨v, rfl, himmRel⟩
+      · cases body.localDecls <;> simp [evalOperand, hslot]
+      · have hrhs : evalOperand af.locals (.copy ⟨idx, .nil⟩) borrows globals body.layouts
+            callerLocals .nil .nil = .ok v af.locals := by
+          simp [evalOperand, readProjectedValue, hslot, himmRel.valueContainsUninit_eq_false]
+        rw [hrhs]
+        exact evalOperand_copy_root_of_readValid hslot himmRel.valueContainsUninit_eq_false hdecl
+          (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz_nz hkind hrk).1)
+          (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz_nz hkind hrk).2)
+
+theorem WellTypedScalarOperand.evalOperand_scalar_ok_of_nil_ok
+    {body : CapturedMir}
+    {tf : Miri.Interpreter.Frame AnnealProv Miri.Interpreter.LocalLayout Unit}
+    {op : MirAst.Operand} {ty : Ty} {sc : MirAst.ScalarInt} {msc : Miri.Memory.ScalarInt}
+    (hop : WellTypedScalarOperand body tf op ty)
+    {locals locals' : List LocalSlot} {borrows : List BorrowEntry}
+    {globals : List CapturedAllocation} {callerLocals : List LocalSlot}
+    {cs' : List SavedCallerFrame}
+    (hok : evalOperand locals op borrows globals body.layouts callerLocals .nil cs' =
+      .ok (.scalar sc) locals')
+    (himmRel : ImmediateRel ty body.layouts (.scalar sc) (.scalar (.fromScalarInt msc)))
+    (cs : List SavedCallerFrame := .nil) :
+    evalOperand locals op borrows globals body.layouts callerLocals body.localDecls cs =
+      .ok (.scalar sc) locals' := by
+  cases hop with
+  | constScalar _ _ _ _ _ _ _ _ _ => exact hok
+  | copyLocal idx decl hdecl hsz_nz _ hkind =>
+    have hslot_eq : get? locals idx = some (.init (.scalar sc)) ∧ locals' = locals := by
+      unfold evalOperand at hok; dsimp only at hok
+      cases hg : get? locals idx <;> rw [hg] at hok
+      · nomatch hok
+      · rename_i sl
+        cases sl with
+        | dead | uninit => nomatch hok
+        | init v =>
+          dsimp only [readProjectedValue] at hok
+          cases hvc : valueContainsUninit v <;> rw [hvc] at hok
+          · injection hok with hv hl; subst hv hl; exact ⟨rfl, rfl⟩
+          · nomatch hok
+    rcases hslot_eq with ⟨hslot, rfl⟩
+    exact evalOperand_copy_root_of_readValid hslot rfl hdecl
+      (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz_nz hkind hrk).1)
+      (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz_nz hkind hrk).2)
 
 /-- Joint outcome relation for `evalOperand` (Anneal) vs
 `annealEvalOperand >>= annealReadImmediate` (`lean-miri`). -/
@@ -3228,7 +3436,7 @@ theorem WellTypedScalarOperand.operandTy_eq
     operandTy body.localDecls body.layouts op = some ty := by
   cases h with
   | constScalar _ _ _ _ _ _ _ _ _ => rfl
-  | copyLocal idx decl hdecl _ _ => simp [operandTy, resolveProjectedTy, hdecl]
+  | copyLocal idx decl hdecl _ _ _ => simp [operandTy, resolveProjectedTy, hdecl]
 
 theorem WellTypedScalarOperand.validateLoadedValue_eq_true
     {body : CapturedMir}
@@ -3240,7 +3448,7 @@ theorem WellTypedScalarOperand.validateLoadedValue_eq_true
   have hopTy := hop.operandTy_eq
   cases hop with
   | constScalar _ _ _ _ _ _ _ _ _ => rfl
-  | copyLocal idx decl hdecl _ _ =>
+  | copyLocal idx decl hdecl _ _ _ =>
     unfold validateLoadedValue
     dsimp only
     rw [hopTy]
@@ -3358,7 +3566,7 @@ theorem evalOperand_scalar_simulation
     rw [← hsame]
     exact .ok (.scalar sc) af.locals topFrame (.scalar (.fromScalarInt msc))
       hframe (.scalar sc msc hrel hlaysz hbool hchar) (fun _ h => h) rfl (fun hdisj => hdisj)
-  | copyLocal idx decl hdecl hsz_nz himm =>
+  | copyLocal idx decl hdecl hsz_nz himm hkind =>
     obtain ⟨slot, mls, _, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
     have hcache := hloc.layout_eq
     have himm' := himm mls hmls
@@ -3382,8 +3590,10 @@ theorem evalOperand_scalar_simulation
           (annealEvalOperand_copy_live hframes hlt_mf hdecl hmls_eq hcache)]
         exact .ub _ _
       · have ha : evalOperand af.locals (.copy ⟨idx, .nil⟩) .nil globals body.layouts .nil body.localDecls =
-            .ok v af.locals := by
-          simp [evalOperand, readProjectedValue, hslot, himmRel.valueContainsUninit_eq_false]
+            .ok v af.locals :=
+          evalOperand_copy_root_of_readValid hslot himmRel.valueContainsUninit_eq_false hdecl
+            (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz_nz hkind hrk).1)
+            (fun rTy hrk => (himmRel.readValid_of_scalarOrPtr hsz_nz hkind hrk).2)
         obtain ⟨hread, _⟩ :=
           annealReadImmediate_of_immediateRel himmRel hsz_nz (translateTy decl.ty body.layouts)
             { m with stack := ⟨#[topFrame']⟩ }
@@ -3954,6 +4164,25 @@ inductive WellTypedScalarBinOp (layouts : LayoutTable) (localDecls : List LocalD
       rhsTy.kind = .bool →
       dstTy.kind = .bool →
       WellTypedScalarBinOp layouts localDecls bop lhsTy rhsTy dstTy
+
+theorem WellTypedScalarUnOp.src_isFloatTy_false {uop : MirAst.UnOp} {srcTy dstTy : Ty}
+    (h : WellTypedScalarUnOp uop srcTy dstTy) :
+    isFloatTy srcTy = false := by
+  cases h with
+  | intNot _ _ _ hi _ => exact hi.isFloatTy_false
+  | boolNot _ _ hb _ => simp [isFloatTy, hb]
+  | intNeg _ _ _ hi _ _ => exact hi.isFloatTy_false
+
+theorem WellTypedScalarBinOp.operands_isFloatTy_false {layouts : LayoutTable}
+    {localDecls : List LocalDecl} {bop : MirAst.BinOp} {lhsTy rhsTy dstTy : Ty}
+    (h : WellTypedScalarBinOp layouts localDecls bop lhsTy rhsTy dstTy) :
+    isFloatTy lhsTy = false ∧ isFloatTy rhsTy = false := by
+  cases h with
+  | intArithOrBitwise _ _ hl hr _ => exact ⟨hl.isFloatTy_false, hr.isFloatTy_false⟩
+  | intCmp _ _ hl hr _ => exact ⟨hl.isFloatTy_false, hr.isFloatTy_false⟩
+  | intWithOverflow _ _ hl hr _ _ => exact ⟨hl.isFloatTy_false, hr.isFloatTy_false⟩
+  | intShift _ _ _ hl hr _ => exact ⟨hl.isFloatTy_false, hr.isFloatTy_false⟩
+  | boolBitwise _ hl hr _ => exact ⟨by simp [isFloatTy, hl], by simp [isFloatTy, hr]⟩
 
 /-- Syntactic well-typedness of a scalar `MirAst.Rvalue` producing `dstTy`. -/
 inductive WellTypedScalarRvalue
@@ -5075,7 +5304,11 @@ theorem step_assign_scalar_simulation_ext
               .ok v' locals₁ s.memory := by
             cases uop with
             | not => unfold evalRvalue; dsimp only; rw [hstack, hbor, hcaller, ha_op]; exact ha_uop
-            | neg => unfold evalRvalue; dsimp only; rw [hstack, hbor, hcaller, ha_op]; exact ha_uop
+            | neg =>
+              have hnf : isFloatOptTy (operandTy body.localDecls body.layouts op) = false := by
+                rw [hop.operandTy_eq]; simp [isFloatOptTy, huop.src_isFloatTy_false]
+              unfold evalRvalue; dsimp only; rw [hstack, hbor, hcaller, ha_op]; dsimp only
+              rw [hnf]; exact ha_uop
             | ptrMetadata => cases huop
           rw [hrv_ok]
           dsimp only
@@ -5224,6 +5457,10 @@ theorem step_assign_scalar_simulation_ext
             | boolBitwise h =>
               simp [IsNonOvfArithOrBitwiseBinOp, IsBitwiseBinOp, IsCmpBinOp,
                 IsWithOverflowBinOp, IsShiftBinOp] at h
+          have hnf_l : isFloatOptTy (operandTy body.localDecls body.layouts lhsOp) = false := by
+            rw [hlhsOp.operandTy_eq]; simp [isFloatOptTy, hbop.operands_isFloatTy_false.1]
+          have hnf_r : isFloatOptTy (operandTy body.localDecls body.layouts rhsOp) = false := by
+            rw [hrhsOp.operandTy_eq]; simp [isFloatOptTy, hbop.operands_isFloatTy_false.2]
           cases hbin_sim with
           | ub msg =>
             have ha_ub : evalStmt s stmt body.localDecls body.layouts = MirStepNode.fail .ub := by
@@ -5233,7 +5470,7 @@ theorem step_assign_scalar_simulation_ext
               dsimp only
               rw [ha_rhs]
               dsimp only
-              cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [ha_bin])
+              cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hnf_l, hnf_r]; dsimp only [Bool.or]; rw [ha_bin])
             have hm_err : Miri.Interpreter.Step.evalStatement
                 (annealStepHooks body.localDecls body.layouts) () (translateStmt stmt) m =
                 (m₂, .error (.undefinedBehavior msg)) := by
@@ -5262,7 +5499,7 @@ theorem step_assign_scalar_simulation_ext
                 dsimp only
                 rw [ha_rhs]
                 dsimp only
-                cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [ha_bin])
+                cases bop <;> first | exact absurd rfl hbop_ne | (dsimp only; rw [hnf_l, hnf_r]; dsimp only [Bool.or]; rw [ha_bin])
               rw [hrv_ok]
               dsimp only
               rw [hprot, hbor]
@@ -5611,6 +5848,7 @@ inductive WellTypedScalarOperandSyn
       get? body.localDecls idx = some decl →
       (translateTy decl.ty body.layouts).layout.size ≠ Miri.ABI.Size.ZERO →
       nonAddrTaken idx →
+      (hImmValid : IsScalarOrPtrTyKind decl.ty.kind = true := by decide) →
       WellTypedScalarOperandSyn body nonAddrTaken (.copy ⟨idx, .nil⟩) decl.ty
 
 /-- Purely syntactic rvalue well-typedness on `CapturedMir`. -/
@@ -5718,8 +5956,8 @@ theorem WellTypedScalarOperandSyn.toFrame
   cases h with
   | constScalar c sc hval hprim hsz hcan hlaysz hbool hchar =>
     exact .constScalar c sc hval hprim hsz hcan hlaysz hbool hchar
-  | copyLocal idx decl hdecl hsz hna =>
-    exact .copyLocal idx decl hdecl hsz (himm topFrame hframes idx decl hdecl hna)
+  | copyLocal idx decl hdecl hsz hna hkind =>
+    exact .copyLocal idx decl hdecl hsz (himm topFrame hframes idx decl hdecl hna) hkind
 
 theorem WellTypedScalarRvalueSyn.toFrame
     {body : CapturedMir} {nonAddrTaken : Nat → Prop}

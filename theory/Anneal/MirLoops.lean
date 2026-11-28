@@ -611,7 +611,7 @@ theorem bb2_converges_mem (n : Nat) (i : Nat) (mem : Memory) (h_callee : mem.act
   have h_step : stepMirFn (countToNBody n) (countStateMem 2 0 i mem) = MirStepNode.step (countStateMem 2 1 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) := by
       unfold stepMirFn
       dsimp [countStateMem]
-      simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?]
+      simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, readProjectedValue, evalRvalue, evalConstValue, advanceStmt, Trusted.Sequence.set?, placeTyResolved, placeTy, materializeReadPtrValue, validateValueForTy?]
   have h_term : stepMirFn (countToNBody n) (countStateMem 2 1 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) = MirStepNode.step (countStateMem 1 0 ((i + 1) % 4294967296) { mem with borrows := invalidateConflictingBorrows mem.borrows 1 none (length mem.callStack) }) := by
       unfold stepMirFn
       dsimp [countStateMem]
@@ -638,7 +638,7 @@ theorem bb3_converges_mem (n : Nat) (mem : Memory) (h_callee : mem.activeCallee 
   have h_step : stepMirFn (countToNBody n) (countStateMem 3 0 n mem) = MirStepNode.step (countStateMemRet 3 1 n { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack) }) := by
       unfold stepMirFn
       dsimp [countStateMem, countStateMemRet]
-      simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, readProjectedValue, evalRvalue, advanceStmt, Trusted.Sequence.set?]
+      simp [Option.getD, countToNBody, mkMirBody, constU32, get?, Trusted.Sequence.get?, evalStmt, h_callee, h_prot, evalOperand, readProjectedValue, evalRvalue, advanceStmt, Trusted.Sequence.set?, placeTyResolved, materializeReadPtrValue, validateValueForTy?]
   have h_term : stepMirFn (countToNBody n) (countStateMemRet 3 1 n { mem with borrows := invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack) }) = MirStepNode.retNormal (Value.scalar ⟨n, 4⟩) { mem with borrows := disableFrameBorrows (invalidateConflictingBorrows mem.borrows 0 none (length mem.callStack)) (length mem.callStack) 2 } := by
       unfold stepMirFn
       dsimp [countStateMemRet]
@@ -915,16 +915,34 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
         | .some (.init (.aggregate 0 (.ptr ptrVal ptrSz :: .scalar lenSc :: .nil))) =>
           evalSliceFatPtrDerefRead locals ptrVal ptrSz lenSc restProj borrows globals
             body.layouts callerLocals .none
+        | .some (.init (.aggregate 0 (.scalar ptrSc :: .scalar lenSc :: .nil))) =>
+          match Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq ptrSc.bits 0)) with
+          | true =>
+            evalSliceFatPtrDerefRead locals { allocId := 0, offsetBytes := ptrSc.bits }
+              ptrSc.sizeBytes lenSc restProj borrows globals body.layouts callerLocals .none
+          | false => .ub
         | _ => .ub
       | d :: ds, _ =>
         evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals (d :: ds)
           callStack
-    | _ =>
-      match placeTouchesUnion localDecls body.layouts p with
-      | true =>
-        evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals localDecls
+    | .nil =>
+      match localDecls with
+      | .nil =>
+        match get? locals p.local_ with
+        | .some (.init rootVal) =>
+          match readProjectedValue locals rootVal .nil with
+          | .ok fieldVal => .ok fieldVal locals
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub
+      | d :: ds =>
+        evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals (d :: ds)
           callStack
-      | false =>
+    | _ =>
+      match localDecls with
+      | .nil =>
         match get? locals p.local_ with
         | .some (.init rootVal) =>
           match readProjectedValue locals rootVal p.projection with
@@ -934,27 +952,32 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
         | .some .uninit => .ub
         | .some .dead => .ub
         | .none => .ub
+      | d :: ds =>
+        evalOperandFallback locals (.copy p) borrows globals body.layouts callerLocals (d :: ds)
+          callStack
   | .move p =>
     match p.projection with
     | .nil =>
-      match get? locals p.local_ with
-      | .some (.init v) =>
-        match readProjectedValue locals v .nil with
-        | .ok validVal =>
-          match set? locals p.local_ .uninit with
-          | .some locals' => .ok validVal locals'
-          | .none => .ub
-        | .ub => .ub
-        | .unsupported => .unsupported
-      | .some .uninit => .ub
-      | .some .dead => .ub
-      | .none => .ub
-    | .field idx ty :: rest =>
-      match placeTouchesUnion localDecls body.layouts p with
-      | true =>
-        evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
+      match localDecls with
+      | .nil =>
+        match get? locals p.local_ with
+        | .some (.init v) =>
+          match readProjectedValue locals v .nil with
+          | .ok validVal =>
+            match set? locals p.local_ .uninit with
+            | .some locals' => .ok validVal locals'
+            | .none => .ub
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub
+      | d :: ds =>
+        evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals (d :: ds)
           callStack
-      | false =>
+    | .field idx ty :: rest =>
+      match localDecls with
+      | .nil =>
         match get? locals p.local_ with
         | .some (.init rootVal) =>
           match readProjectedValue locals rootVal (.field idx ty :: rest) with
@@ -964,6 +987,9 @@ def evalOperandFast (body : CapturedMir) (locals : List LocalSlot) (op : Operand
         | .some .uninit => .ub
         | .some .dead => .ub
         | .none => .ub
+      | d :: ds =>
+        evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals (d :: ds)
+          callStack
     | _ =>
       evalOperandFallback locals (.move p) borrows globals body.layouts callerLocals localDecls
         callStack
@@ -989,37 +1015,34 @@ theorem evalOperandFast_eq (body : CapturedMir) (locals : List LocalSlot) (op : 
         cases localDecls <;> cases callStack <;> rfl
       | field _ _ | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
       | opaqueCast _ | unwrapUnsafeBinder _ =>
-        dsimp only [evalOperandFast, evalOperand, evalOperandFallback]
-        cases hGet : get? locals loc with
-        | none =>
-          cases placeTouchesUnion localDecls body.layouts ⟨loc, _⟩ <;> rfl
-        | some s =>
-          cases s with
-          | uninit | dead =>
-            cases placeTouchesUnion localDecls body.layouts ⟨loc, _⟩ <;> rfl
-          | init rootVal =>
-            cases hU : placeTouchesUnion localDecls body.layouts ⟨loc, _⟩
-            · simp only [hGet, hU]; rfl
-            · simp only [hGet, hU]
+        cases localDecls with
+        | nil =>
+          dsimp only [evalOperandFast, evalOperand]
+          cases get? locals loc with
+          | none => rfl
+          | some s =>
+            cases s with
+            | uninit | dead => rfl
+            | init rootVal => rfl
+        | cons d ds => rfl
   | move p =>
     rcases p with ⟨loc, proj⟩
     cases proj with
-    | nil => rfl
+    | nil =>
+      cases localDecls <;> rfl
     | cons hd tl =>
       cases hd with
       | field idx ty =>
-        dsimp only [evalOperandFast, evalOperand, evalOperandFallback]
-        cases hGet : get? locals loc with
-        | none =>
-          cases placeTouchesUnion localDecls body.layouts ⟨loc, _⟩ <;> rfl
-        | some s =>
-          cases s with
-          | uninit | dead =>
-            cases placeTouchesUnion localDecls body.layouts ⟨loc, _⟩ <;> rfl
-          | init rootVal =>
-            cases hU : placeTouchesUnion localDecls body.layouts ⟨loc, _⟩
-            · simp only [hGet, hU]; rfl
-            · simp only [hGet, hU]
+        cases localDecls with
+        | nil =>
+          dsimp only [evalOperandFast, evalOperand]
+          cases get? locals loc with
+          | none => rfl
+          | some s =>
+            cases s with
+            | uninit | dead => rfl
+            | init rootVal => rfl
+        | cons d ds => rfl
       | deref | downcast _ _ | index _ | constantIndex _ _ _ | subslice _ _ _
       | opaqueCast _ | unwrapUnsafeBinder _ => rfl
 
@@ -1237,8 +1260,14 @@ def evalRvalueFast
           | .offset =>
             evalScalarPtrOffsetBinOp locals₂ mem body.localDecls body.layouts lhsOp lhs rhs
           | _ =>
-            let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
-            evalScalarBinOp op lhs rhs locals₂ mem isSigned
+            let lhsTy := operandTy body.localDecls body.layouts lhsOp
+            let rhsTy := operandTy body.localDecls body.layouts rhsOp
+            match Bool.or (isFloatOptTy lhsTy) (isFloatOptTy rhsTy) with
+            | true =>
+              evalFloatScalarBinOp op lhs rhs lhsTy rhsTy locals₂ mem
+            | false =>
+              let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
+              evalScalarBinOp op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
@@ -1464,21 +1493,29 @@ def evalRvalueSymTreeFast
           match op with
           | .offset =>
             .leaf (evalScalarPtrOffsetBinOp locals₂ mem body.localDecls body.layouts lhsOp lhs rhs)
-          | .bitAnd =>
-            .branch (Nat.beq lhs.sizeBytes 0) (.leaf .unsupported)
-              (.branch (Nat.beq lhs.sizeBytes rhs.sizeBytes)
-                (.leaf
-                  (.ok
-                    (.scalar
-                      ⟨bitwiseAndBitsFast (Nat.mul lhs.sizeBytes 8) lhs.bits rhs.bits,
-                       lhs.sizeBytes⟩)
-                    locals₂ mem))
-                (.leaf .unsupported))
-          | .eq => evalScalarBinOpSymTree .eq lhs rhs locals₂ mem false
-          | .ne => evalScalarBinOpSymTree .ne lhs rhs locals₂ mem false
           | _ =>
-            let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
-            evalScalarBinOpSymTree op lhs rhs locals₂ mem isSigned
+            let lhsTy := operandTy body.localDecls body.layouts lhsOp
+            let rhsTy := operandTy body.localDecls body.layouts rhsOp
+            match Bool.or (isFloatOptTy lhsTy) (isFloatOptTy rhsTy) with
+            | true =>
+              .leaf (evalFloatScalarBinOp op lhs rhs lhsTy rhsTy locals₂ mem)
+            | false =>
+              match op with
+              | .bitAnd =>
+                .branch (Nat.beq lhs.sizeBytes 0) (.leaf .unsupported)
+                  (.branch (Nat.beq lhs.sizeBytes rhs.sizeBytes)
+                    (.leaf
+                      (.ok
+                        (.scalar
+                          ⟨bitwiseAndBitsFast (Nat.mul lhs.sizeBytes 8) lhs.bits rhs.bits,
+                           lhs.sizeBytes⟩)
+                        locals₂ mem))
+                    (.leaf .unsupported))
+              | .eq => evalScalarBinOpSymTree .eq lhs rhs locals₂ mem false
+              | .ne => evalScalarBinOpSymTree .ne lhs rhs locals₂ mem false
+              | _ =>
+                let isSigned := operandIsSigned body.localDecls lhsOp body.layouts
+                evalScalarBinOpSymTree op lhs rhs locals₂ mem isSigned
         | .ptr ptrVal sz, .scalar offsetSc =>
           match op with
           | .offset =>
@@ -1636,7 +1673,14 @@ theorem evalRvalueSymTreeFast_eq
         | scalar lhs =>
           cases v₂ with
           | scalar rhs =>
-            cases op <;> simp only [evalScalarBinOpSymTree, bitwiseAndBitsFast_eq]
+            cases op with
+            | offset => rfl
+            | _ =>
+              dsimp only
+              cases Bool.or (isFloatOptTy (operandTy body.localDecls body.layouts lhsOp))
+                  (isFloatOptTy (operandTy body.localDecls body.layouts rhsOp)) with
+              | true => rfl
+              | false => simp only [evalScalarBinOpSymTree, bitwiseAndBitsFast_eq]
           | _ => rfl
         | _ => cases v₂ <;> rfl
   | unaryOp uop op =>

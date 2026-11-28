@@ -11220,6 +11220,12 @@ private theorem stepMirFn_rawPtr_cmp_copy_eq
         span⟩ := by rfl)
     (hlhs : get? s.frame.locals lhsIdx = some (.init v₁) := by rfl)
     (hrhs : get? s.frame.locals rhsIdx = some (.init v₂) := by rfl)
+    (hop₁ : evalOperand s.frame.locals (.copy ⟨lhsIdx, .nil⟩) s.memory.borrows s.memory.globals
+      body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
+      .ok v₁ s.frame.locals := by rfl)
+    (hop₂ : evalOperand s.frame.locals (.copy ⟨rhsIdx, .nil⟩) s.memory.borrows s.memory.globals
+      body.layouts s.memory.callerLocals body.localDecls s.memory.callStack =
+      .ok v₂ s.frame.locals := by rfl)
     (hrel : isPtrRelationalBinOp bop body.localDecls body.layouts
       (.copy ⟨lhsIdx, .nil⟩) (.copy ⟨rhsIdx, .nil⟩) = true := by rfl)
     (hptr8 : layoutPointerBytes body.layouts = 8 := by rfl)
@@ -11257,14 +11263,8 @@ private theorem stepMirFn_rawPtr_cmp_copy_eq
   simp only [hbb, hstmt]
   unfold evalStmt evalRvalue
   dsimp only []
-  have hop₁ : evalOperand s.frame.locals (.copy ⟨lhsIdx, .nil⟩) s.memory.borrows s.memory.globals
-      body.layouts s.memory.callerLocals body.localDecls = .ok v₁ s.frame.locals := by
-    unfold evalOperand readProjectedValue; dsimp only []; rw [hlhs]
-    rcases hv₁ with rfl | ⟨p₁, rfl, _⟩ <;> rfl
-  have hop₂ : evalOperand s.frame.locals (.copy ⟨rhsIdx, .nil⟩) s.memory.borrows s.memory.globals
-      body.layouts s.memory.callerLocals body.localDecls = .ok (.ptr p₂ 8) s.frame.locals := by
-    unfold evalOperand readProjectedValue; dsimp only []; rw [hrhs]
-  rw [hstack, hop₁]; dsimp only []; rw [hop₂]; dsimp only []
+  rw [hstack] at hop₁ hop₂ ⊢
+  rw [hop₁]; dsimp only []; rw [hop₂]; dsimp only []
   rw [hrel, hptr8]
   rcases hv₁ with rfl | ⟨p₁, rfl, hpa₁⟩
   · dsimp only [hbeq8]; rw [hps₂]; dsimp only []; rw [hcmp]; dsimp only []

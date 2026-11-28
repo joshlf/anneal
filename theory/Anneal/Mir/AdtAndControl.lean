@@ -11830,7 +11830,10 @@ theorem readPlaceState_below_evalOperand_copy {slots : List LocalSlotState}
     (borrows : List BorrowEntry) (globals : List CapturedAllocation) (layouts : LayoutTable)
     (callerLocals : List LocalSlot) (localDecls : List LocalDecl := [])
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj])
+    (hValid : PlaceReadValid localDecls layouts place val := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalOperand locals (.copy place) borrows globals layouts callerLocals localDecls =
       .ok val locals := by
   have hNoDeref : projectionHasDeref place.projection = false := by
@@ -11840,17 +11843,29 @@ theorem readPlaceState_below_evalOperand_copy {slots : List LocalSlotState}
   obtain ⟨rootVal, hRoot, hProj⟩ := readPlaceState_below_refines hRel hRead
   rcases place with ⟨loc, _ | ⟨hd, tl⟩⟩
   · obtain ⟨hInit, rfl⟩ := readProjectedValue_nil_eq_ok_iff.mp hProj
-    unfold evalOperand
-    dsimp only
-    rw [hRoot]
-    dsimp only [readProjectedValue]
-    rw [hInit]
+    cases localDecls with
+    | nil =>
+      unfold evalOperand
+      dsimp only
+      rw [hRoot]
+      dsimp only [readProjectedValue]
+      rw [hInit]
+    | cons d ds =>
+      unfold evalOperand
+      dsimp only
+      rw [hRoot]
+      dsimp only [readProjectedValue]
+      rw [hInit]
+      dsimp only
+      rw [hValid.1]
+      dsimp only
+      rw [hValid.2]
   · have hNotDeref : hd ≠ .deref := by
       intro hEq
       subst hEq
       simp [projectionHasDeref] at hNoDeref
     exact evalOperand_copy_proj_of_noUnion locals loc hd tl borrows globals layouts
-      callerLocals localDecls rootVal val hNotDeref hNoUnion hRoot hProj
+      callerLocals localDecls rootVal val hNotDeref hNoUnion hRoot hProj hValid
 
 /-- `callStack`-generalized form of `readPlaceState_below_evalOperand_copy`: because a
 successful `readPlaceState` has no `Deref`, Trusted's `evalOperand (.copy place)` is
@@ -11862,7 +11877,10 @@ theorem readPlaceState_below_evalOperand_copy_cs {slots : List LocalSlotState}
     (callerLocals : List LocalSlot) (localDecls : List LocalDecl := [])
     (callStack : List SavedCallerFrame := .nil)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_decls, placeTouchesUnion_nil_proj])
+    (hValid : PlaceReadValid localDecls layouts place val := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalOperand locals (.copy place) borrows globals layouts callerLocals localDecls
       callStack = .ok val locals := by
   have hNoDeref : OperandNonDeref (.copy place) := by
@@ -11874,7 +11892,7 @@ theorem readPlaceState_below_evalOperand_copy_cs {slots : List LocalSlotState}
   rw [evalOperand_eq_nil_callStack_of_nonDeref locals (.copy place) borrows globals layouts
     callerLocals localDecls callStack hNoDeref]
   exact readPlaceState_below_evalOperand_copy hRel hRead borrows globals layouts
-    callerLocals localDecls hNoUnion
+    callerLocals localDecls hNoUnion hValid
 
 /-- Trusted's `evalStmt` on `.retag` faults when the retagged place's local is uninitialized or
 dead (its `evalOperand (.copy place)` read faults), for every `localDecls` / `layouts`, exactly
@@ -12180,7 +12198,11 @@ theorem evalStmt_retag_ref_refines {ctx : RetagCtx} {kind : RetagKind} {place : 
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hTy : retagKeepsFrameTy kind localDecls layouts place)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : ∀ p sz, PlaceReadValid localDecls layouts place (.ptr p sz) := by
+      intro _ _
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧ retagRefOk ctx pt p = true ∧
       ∀ entry, lookupBorrow s.memory.borrows p.tag = some entry → entry.perm ≠ .disabled →
         ∃ mem', evalStmt s ⟨.retag kind place, span⟩ localDecls layouts =
@@ -12189,7 +12211,7 @@ theorem evalStmt_retag_ref_refines {ctx : RetagCtx} {kind : RetagKind} {place : 
   have hRead := readPlaceState_of_projectFieldSlot_init hSt hLive hProj
   refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks, fun entry hLook hPerm => ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion (hReadValid p sz)
   rw [evalStmt_retag_borrow_ok hOp hLook hPerm hTy]
   cases kind <;> exact ⟨_, rfl⟩
 
@@ -12204,7 +12226,11 @@ theorem evalStmt_retag_disabled_ub {ctx : RetagCtx} {kind : RetagKind} {place : 
     (localDecls : List LocalDecl) (layouts : LayoutTable) {entry : BorrowEntry}
     (hDis : entry.perm = .disabled)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : ∀ p sz, PlaceReadValid localDecls layouts place (.ptr p sz) := by
+      intro _ _
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧
       (lookupBorrow s.memory.borrows p.tag = some entry →
         evalStmt s ⟨.retag kind place, span⟩ localDecls layouts = .fail .ub) := by
@@ -12212,7 +12238,7 @@ theorem evalStmt_retag_disabled_ub {ctx : RetagCtx} {kind : RetagKind} {place : 
   have hRead := readPlaceState_of_projectFieldSlot_init hSt hLive hProj
   refine ⟨p, sz, hRead, fun hLook => ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion (hReadValid p sz)
   cases kind with
   | raw => exact absurd rfl hKind
   | _ =>
@@ -12441,6 +12467,22 @@ theorem evalStmt_retag_ref_fnEntry_reborrow (s : MachineState) (loc : Nat) (span
       exact ⟨_, rfl, by simp [lookupBorrow]⟩
     | true => exact ⟨_, rfl, by simp [lookupBorrow]⟩
 
+private theorem placeReadValid_nil_ref (localDecls : List LocalDecl) (layouts : LayoutTable)
+    {loc : Nat} {m : Mutability} {inner : RigidTy} {lIdx : Nat} {p : ProvenancePtr} {sz : Nat}
+    (hTy : placeTy localDecls layouts ⟨loc, []⟩ = some { kind := .ref m inner, layoutIdx := lIdx }) :
+    PlaceReadValid localDecls layouts ⟨loc, []⟩ (.ptr p sz) := by
+  have hRes : placeTyResolved localDecls layouts ⟨loc, []⟩ =
+      some { kind := .ref m inner, layoutIdx := lIdx } := by
+    unfold placeTy at hTy
+    unfold placeTyResolved
+    cases hG : get? localDecls loc with
+    | none => rw [hG] at hTy; nomatch hTy
+    | some decl =>
+      rw [hG] at hTy
+      simpa [resolveProjectedTy, resolveProjectedTyResolved] using hTy
+  exact ⟨by simp [materializeReadPtrValue, hRes],
+    by simp [hRes, validateValueForTy?, validateValueForTyAux]⟩
+
 /-- **Stage-1 retires the thin frozen-`&mut` retag rejection
 (`evalStmt_retag_ref_frozen_mut_reborrows`)**: on below-related frames, for the thin pointer `p`
 Anneal's non-raw reference retag reads and validates at an unprojected local `_loc` of type
@@ -12494,7 +12536,8 @@ theorem evalStmt_retag_ref_frozen_mut_reborrows {ctx : RetagCtx} {kind : RetagKi
     exact congrArg LocalSlotState.init hProj
   refine ⟨p, sz, hRead, fun hLook hNoReadUB => ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack
+    layouts s.memory.callerLocals localDecls s.memory.callStack (by simp [placeTouchesUnion_nil_proj])
+    (placeReadValid_nil_ref localDecls layouts hMutTy)
   have hSt' : ctx.slots[loc]? = some (.init (.ptr p sz)) := hStInit ▸ hSt
   have hLt : loc < s.frame.locals.length := by
     rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
@@ -12556,7 +12599,8 @@ theorem evalStmt_retag_ref_typed_refines_upToTag {ctx : RetagCtx} {kind : RetagK
   refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks,
     fun entry hLook hPerm hNoReadUB => ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack
+    layouts s.memory.callerLocals localDecls s.memory.callStack (by simp [placeTouchesUnion_nil_proj])
+    (placeReadValid_nil_ref localDecls layouts hTy)
   have hSt' : ctx.slots[loc]? = some (.init (.ptr p sz)) := hStInit ▸ hSt
   have hLt : loc < s.frame.locals.length := by
     rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
@@ -12616,7 +12660,8 @@ theorem evalStmt_retag_ref_fnEntry_refines_upToTag {ctx : RetagCtx} {loc : Nat}
   refine ⟨p, sz, hRead, (retagRefOk_iff ctx pt p).mpr hChecks,
     fun entry hLook hPerm hNoReadUB => ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack
+    layouts s.memory.callerLocals localDecls s.memory.callStack (by simp [placeTouchesUnion_nil_proj])
+    (placeReadValid_nil_ref localDecls layouts hTy)
   have hSt' : ctx.slots[loc]? = some (.init (.ptr p sz)) := hStInit ▸ hSt
   have hLt : loc < s.frame.locals.length := by
     rcases SlotsRefine.get?_rel loc hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
@@ -12640,7 +12685,11 @@ theorem evalStmt_retag_raw_refines {ctx : RetagCtx} {place : Place} {ty : RetagT
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hTy : retagKeepsFrameTy .raw localDecls layouts place)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : ∀ p sz, PlaceReadValid localDecls layouts place (.ptr p sz) := by
+      intro _ _
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     b = true ∧ ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧
       ctx.addrOf p < 2 ^ ctx.ptrBits ∧
       ∀ entry, lookupBorrow s.memory.borrows p.tag = some entry → entry.perm ≠ .disabled →
@@ -12649,7 +12698,7 @@ theorem evalStmt_retag_raw_refines {ctx : RetagCtx} {place : Place} {ty : RetagT
   obtain ⟨hb, p, sz, hRead, hAddr⟩ := evalRetagPlace_raw_sound h
   refine ⟨hb, p, sz, hRead, hAddr, fun entry hLook hPerm => ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion (hReadValid p sz)
   exact evalStmt_retag_borrow_ok hOp hLook hPerm hTy
 
 /-- **Stage-1 `Retag(Raw)` of a raw-pointer-typed place is a no-op
@@ -12681,14 +12730,18 @@ theorem evalStmt_retag_raw_rawPtr_refines {ctx : RetagCtx} {place : Place} {ty :
     {lIdx : Nat}
     (hPTy : placeTy localDecls layouts place = some { kind := .rawPtr m inner, layoutIdx := lIdx })
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : ∀ p sz, PlaceReadValid localDecls layouts place (.ptr p sz) := by
+      intro _ _
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     b = true ∧ ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧
       ctx.addrOf p < 2 ^ ctx.ptrBits ∧
       evalStmt s ⟨.retag .raw place, span⟩ localDecls layouts =
         .step (advanceStmt s s.frame.locals) := by
   obtain ⟨hb, p, sz, hRead, hAddr⟩ := evalRetagPlace_raw_sound h
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion (hReadValid p sz)
   exact ⟨hb, p, sz, hRead, hAddr,
     evalStmt_retag_raw_rawPtr_steps s place span localDecls layouts hPTy hOp⟩
 
@@ -12707,7 +12760,11 @@ theorem evalStmt_retag_raw_global_refines {ctx : RetagCtx} {place : Place} {ty :
       some { kind := .ref m pointee, layoutIdx := lIdx } → rigidTyIsUninhabited 16 pointee = false)
     (hNotMut : ∀ inner, (placeTy localDecls layouts place).map (·.kind) ≠ some (.ref .mut inner))
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : ∀ p sz, PlaceReadValid localDecls layouts place (.ptr p sz) := by
+      intro _ _
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧
       ∀ alloc, lookupBorrow s.memory.borrows p.tag = none →
         lookupGlobalAlloc s.memory.globals p.allocId = some alloc →
@@ -12723,7 +12780,7 @@ theorem evalStmt_retag_raw_global_refines {ctx : RetagCtx} {place : Place} {ty :
   obtain ⟨_, p, sz, hRead, _⟩ := evalRetagPlace_raw_sound h
   refine ⟨p, sz, hRead, fun alloc hNoB hG hBounds => ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion (hReadValid p sz)
   cases hPTy : placeTy localDecls layouts place with
   | none => exact absurd hPTy hTyped
   | some pTy =>
@@ -12815,7 +12872,11 @@ theorem evalStmt_retag_raw_untracked_divergence {ctx : RetagCtx} {place : Place}
     (hNotRawPtr : ∀ m inner lIdx,
       placeTy localDecls layouts place ≠ some { kind := .rawPtr m inner, layoutIdx := lIdx })
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : ∀ p sz, PlaceReadValid localDecls layouts place (.ptr p sz) := by
+      intro _ _
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ p sz, readPlaceState ctx.slots place = .ok (.ptr p sz) ∧
       (lookupBorrow s.memory.borrows p.tag = none →
         lookupGlobalAlloc s.memory.globals p.allocId = none →
@@ -12823,7 +12884,7 @@ theorem evalStmt_retag_raw_untracked_divergence {ctx : RetagCtx} {place : Place}
   obtain ⟨_, p, sz, hRead, _⟩ := evalRetagPlace_raw_sound h
   refine ⟨p, sz, hRead, fun hNoB hNoG => ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion (hReadValid p sz)
   simp only [evalStmt, hOp]
   split
   · rename_i m inner l heq; exact absurd heq (hNotRawPtr m inner l)
@@ -12849,11 +12910,14 @@ theorem evalStmt_retag_raw_scalar_addr_reject {ctx : RetagCtx} {place : Place}
     (span : String) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hUntyped : placeTy localDecls layouts place = none)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place (.scalar sc) := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalRetagPlace ctx .raw place ty b = false ∧
       evalStmt s ⟨.retag .raw place, span⟩ localDecls layouts = .fail .ub := by
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion hReadValid
   refine ⟨?_, by simp only [evalStmt, hOp, hUntyped]⟩
   unfold evalRetagPlace
   split
@@ -12874,12 +12938,15 @@ theorem evalStmt_retag_raw_scalar_rawPtr_conservative {ctx : RetagCtx} {place : 
     {inner : RigidTy} {lIdx : Nat}
     (hPTy : placeTy localDecls layouts place = some { kind := .rawPtr m inner, layoutIdx := lIdx })
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place (.scalar sc) := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalRetagPlace ctx .raw place ty b = false ∧
       evalStmt s ⟨.retag .raw place, span⟩ localDecls layouts =
         .step (advanceStmt s s.frame.locals) := by
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion hReadValid
   refine ⟨?_, evalStmt_retag_raw_rawPtr_steps s place span localDecls layouts hPTy hOp⟩
   unfold evalRetagPlace
   split
@@ -12902,7 +12969,10 @@ theorem evalStmt_retag_noRef_scalar_divergence {ctx : RetagCtx} {kind : RetagKin
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hUntyped : placeTy localDecls layouts place = none)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place (.scalar sc) := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalRetagPlace ctx kind place ty b = true ∧
       evalStmt s ⟨.retag kind place, span⟩ localDecls layouts = .fail .ub := by
   have hLive : ∃ st, ctx.slots[place.local_]? = some st ∧ st ≠ .dead := by
@@ -12922,7 +12992,7 @@ theorem evalStmt_retag_noRef_scalar_divergence {ctx : RetagCtx} {kind : RetagKin
     | false => rfl
     | true => simp only [readPlaceState, hD] at hRead; nomatch hRead
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion hReadValid
   exact ⟨(evalRetagPlace_noRef hKind hNoRef).mpr
       ⟨hLive, hND, hIdx, checkPlaceSlotOk_of_readPlaceState hRead⟩,
     by simp only [evalStmt, hOp, hUntyped]⟩
@@ -12942,7 +13012,10 @@ theorem evalStmt_retag_noRef_scalar_agree {ctx : RetagCtx} {kind : RetagKind}
     (hPTy : placeTy localDecls layouts place = some pTy)
     (hNotPtr : ∀ m inner, pTy.kind ≠ .ref m inner ∧ pTy.kind ≠ .rawPtr m inner)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place (.scalar sc) := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalRetagPlace ctx kind place ty b = true ∧
       evalStmt s ⟨.retag kind place, span⟩ localDecls layouts =
         .step (advanceStmt s s.frame.locals) := by
@@ -12951,7 +13024,7 @@ theorem evalStmt_retag_noRef_scalar_agree {ctx : RetagCtx} {kind : RetagKind}
     (by simp [placeTouchesUnion_nil_decls])
   refine ⟨hA, ?_⟩
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead s.memory.borrows s.memory.globals
-    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion
+    layouts s.memory.callerLocals localDecls s.memory.callStack hNoUnion hReadValid
   simp only [evalStmt, hOp]
   split
   · rename_i m inner l heq
@@ -13899,8 +13972,11 @@ theorem evalCopySingleDirect_whole_local_refines {ptrBits : Nat} {env : CopyEnv}
       ∃ srcPt dstPt, operandPointeeTy localDecls layouts srcOp = some srcPt ∧
         operandPointeeTy localDecls layouts dstOp = some dstPt ∧
         sameRigidTyShape srcPt.kind dstPt.kind = true)
-    (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩) v = true := by
-      simp [placeTy, validateValueForTy?])
+    (hConv : convertCopySingleValue? layouts
+        (operandPointeeTy localDecls layouts srcOp)
+        (operandPointeeTy localDecls layouts dstOp)
+        (placeTyResolved localDecls layouts ⟨dl, []⟩) v = some v := by
+      simp [convertCopySingleValue?])
     (hVInit : valueContainsUninit v = false := by rfl) :
     evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃ =
         .step (advanceStmt s (locals₃.set dl (.init v))
@@ -13938,29 +14014,29 @@ theorem evalCopySingleDirect_whole_local_refines {ptrBits : Nat} {env : CopyEnv}
   have hSetDst : set? locals₃ dl (.init v) = some (locals₃.set dl (.init v)) :=
     set?_eq_some_iff.mpr ⟨hDlLt, rfl⟩
   have hWrite :
-      writePlaceValue locals₃ s.memory.borrows ⟨dl, []⟩ v localDecls layouts =
-        .ok (locals₃.set dl (.init v)) :=
-    writePlaceValue_root_of_valid locals₃ (locals₃.set dl (.init v)) s.memory.borrows dl tDst v
-      localDecls layouts hGetDst hTDstNotDead hValid hSetDst
+      writePlaceValueUntyped locals₃ s.memory.borrows ⟨dl, []⟩ v localDecls layouts =
+        .ok (locals₃.set dl (.init v)) := by
+    unfold writePlaceValueUntyped
+    cases tDst with
+    | dead => exact absurd rfl hTDstNotDead
+    | uninit => simp only [hGetDst, hSetDst]
+    | init _ => simp only [hGetDst, hSetDst]
   refine ⟨?_, evalCopyNonOverlappingState_whole_local_below hRel hSrcInit hTSrc⟩
   unfold evalCopySingleDirect
   rcases beq_cases srcPtr.tag dstPtr.tag with ⟨_, hEqTag⟩ | ⟨hBTag, _⟩
   · exact absurd hEqTag hTagNe
   · rcases beq_cases sl dl with ⟨_, hEqLoc⟩ | ⟨hBLoc, _⟩
     · exact absurd hEqLoc hNe
-    · rcases hPointee with hUntyped | ⟨srcPt, dstPt, hSPt, hDPt, hShape⟩
-      · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
-          get?_eq_getElem?, hTSrc, readProjectedValue, hVInit, hUntyped, hWrite]
-      · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
-          get?_eq_getElem?, hTSrc, readProjectedValue, hVInit, hSPt, hDPt, hShape, hWrite]
+    · have _ := hPointee
+      simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
+        get?_eq_getElem?, hTSrc, readProjectedValue, hVInit, hTDstSlot, hConv, hWrite]
 
-/-- **Documented untyped `copy_nonoverlapping` into `bool`/`char` root-local divergence**: in
-Rust/MiniRust, `core::intrinsics::copy_nonoverlapping` is an untyped byte copy (so copying e.g.
-`2u8` into a `bool` local via raw pointers succeeds in `evalCopyNonOverlappingState` and only a
-subsequent typed load of the `bool` faults), whereas when `dl` is declared `bool` or `char` with
-`validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩) v = false` (which already forces
-`localDecls ≠ []`), Trusted's value-based `writePlaceValue` rejects the root write at
-`evalCopySingleDirect` with `.fail .ub`. -/
+/-- **`Kani#5205` untyped `copy_nonoverlapping` into `bool`/`char` root-local read-time validity
+agreement (upgraded from prior write-time divergence)**: in Rust/MiniRust and upgraded `Trusted`,
+`core::intrinsics::copy_nonoverlapping` is an untyped byte copy: copying e.g. `2u8` into a `bool`
+local via raw pointers succeeds without premature write-time UB in BOTH `evalCopyNonOverlappingState`
+and `evalCopySingleDirect`, and the subsequent typed load (`evalOperand (.copy ⟨dl, []⟩)`) faults
+with `.ub` when `validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨dl, []⟩) v = false`. -/
 theorem evalCopySingleDirect_whole_local_invalid_bool_char_divergence {ptrBits : Nat}
     {env : CopyEnv} {slots : List LocalSlotState} {locals₃ : List LocalSlot}
     {src dst : CopyPtr} {elemSize elemAlign sl dl : Nat} {v : Value}
@@ -13981,49 +14057,45 @@ theorem evalCopySingleDirect_whole_local_invalid_bool_char_divergence {ptrBits :
       ∃ srcPt dstPt, operandPointeeTy localDecls layouts srcOp = some srcPt ∧
         operandPointeeTy localDecls layouts dstOp = some dstPt ∧
         sameRigidTyShape srcPt.kind dstPt.kind = true)
-    (hInvalid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩) v = false)
+    (hInvalid : validateValueForTy? layouts (placeTyResolved localDecls layouts ⟨dl, []⟩) v = false)
+    (hMat : materializeReadPtrValue layouts (placeTyResolved localDecls layouts ⟨dl, []⟩) v = some v := by
+      simp [materializeReadPtrValue])
+    (hConv : convertCopySingleValue? layouts
+        (operandPointeeTy localDecls layouts srcOp)
+        (operandPointeeTy localDecls layouts dstOp)
+        (placeTyResolved localDecls layouts ⟨dl, []⟩) v = some v := by
+      simp [convertCopySingleValue?])
     (hVInit : valueContainsUninit v = false := by rfl) :
     evalCopyNonOverlappingState ptrBits env slots src dst 1 elemSize elemAlign =
         some (slots.set dl (.init v)) ∧
       evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
-        locals₃ = .fail .ub := by
-  obtain ⟨dstSt, hDstLive, _⟩ := copyWholeLocal_live_of_not_copyTargetDead hDstW hLive.2
+        locals₃ =
+        .step (advanceStmt s (locals₃.set dl (.init v))
+          { s.memory with
+            borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
+              (length s.memory.callStack) }) ∧
+      evalOperand (locals₃.set dl (.init v)) (.copy ⟨dl, []⟩) s.memory.borrows s.memory.globals
+        layouts s.memory.callerLocals localDecls s.memory.callStack = .ub := by
+  obtain ⟨dstSt, hDstLive, hDstNotDead⟩ := copyWholeLocal_live_of_not_copyTargetDead hDstW hLive.2
   have hEq := evalCopyNonOverlappingState_whole_local_copies_slot hChk hSrcW hDstW hLive
     (Or.inr hNe) hSrcInit
-  have hTSrc : locals₃[sl]? = some (.init v) := by
-    rcases SlotsRefine.get?_rel sl hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, hAT⟩
-    · simp only [get?_eq_getElem?] at hA; rw [hA] at hSrcInit; nomatch hSrcInit
-    · simp only [get?_eq_getElem?] at hA hT
-      rw [hA] at hSrcInit; cases hSrcInit
-      cases t with
-      | init w => have hvw : v = w := hAT; subst hvw; exact hT
-      | _ => simp [SlotBelow] at hAT
-  have hTDst : ∃ tDst, locals₃[dl]? = some tDst := by
+  have hStep := (evalCopySingleDirect_whole_local_refines hRel hChk hSrcW hDstW hLive hNe hSrcInit
+    hEq s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry hTagNe hSrcEntry hDstEntry
+    hPointee hConv hVInit).1
+  have hDlLt : dl < locals₃.length := by
     rcases SlotsRefine.get?_rel dl hRel with ⟨hA, _⟩ | ⟨a, t, hA, hT, _⟩
     · simp only [get?_eq_getElem?] at hA; rw [hA] at hDstLive; nomatch hDstLive
-    · simp only [get?_eq_getElem?] at hA hT
-      rw [hA] at hDstLive; cases hDstLive
-      exact ⟨t, hT⟩
-  obtain ⟨tDst, hTDstSlot⟩ := hTDst
-  have hWriteUb :
-      writePlaceValue locals₃ s.memory.borrows ⟨dl, []⟩ v localDecls layouts = .ub := by
+    · simp only [get?_eq_getElem?] at hT; exact (List.getElem?_eq_some_iff.mp hT).1
+  have hReadUb :
+      evalOperand (locals₃.set dl (.init v)) (.copy ⟨dl, []⟩) s.memory.borrows s.memory.globals
+        layouts s.memory.callerLocals localDecls s.memory.callStack = .ub := by
     cases localDecls with
-    | nil => simp [placeTy, validateValueForTy?] at hInvalid
+    | nil => simp [placeTyResolved, validateValueForTy?] at hInvalid
     | cons d ds =>
-      unfold writePlaceValue
-      dsimp only
-      rw [hInvalid]
-  refine ⟨hEq, ?_⟩
-  unfold evalCopySingleDirect
-  rcases beq_cases srcPtr.tag dstPtr.tag with ⟨_, hEqTag⟩ | ⟨hBTag, _⟩
-  · exact absurd hEqTag hTagNe
-  · rcases beq_cases sl dl with ⟨_, hEqLoc⟩ | ⟨hBLoc, _⟩
-    · exact absurd hEqLoc hNe
-    · rcases hPointee with hUntyped | ⟨srcPt, dstPt, hSPt, hDPt, hShape⟩
-      · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
-          get?_eq_getElem?, hTSrc, readProjectedValue, hVInit, hUntyped, hWriteUb, hTDstSlot]
-      · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
-          get?_eq_getElem?, hTSrc, readProjectedValue, hVInit, hSPt, hDPt, hShape, hWriteUb, hTDstSlot]
+      unfold evalOperand
+      simp only [get?_eq_getElem?, List.getElem?_set_self hDlLt, readProjectedValue, hVInit,
+        hMat, hInvalid]
+  exact ⟨hEq, hStep, hReadUb⟩
 
 /-! ### Section 2h: `ShallowInitBox`, `WrapUnsafeBinder`, and `PointerCoercion` -/
 
@@ -14183,7 +14255,10 @@ theorem evalOperandState_below_refines (slots slots' : List LocalSlotState)
     (hEval : evalOperandState slots op layouts globals = (.ok val, slots'))
     (localDecls : List LocalDecl := [])
     (hNoUnion : operandTouchesUnion localDecls layouts op = false := by
-      simp [operandTouchesUnion_nil_decls, placeTouchesUnion_nil_proj]) :
+      simp [operandTouchesUnion_nil_decls, placeTouchesUnion_nil_proj])
+    (hValid : OperandReadValid localDecls layouts op val := by
+      simp [OperandReadValid, PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     ∃ locals', evalOperand locals op borrows globals layouts callerLocals localDecls =
         .ok val locals' ∧
       SlotsRefine SlotBelow slots' locals' := by
@@ -14244,8 +14319,13 @@ theorem evalOperandState_below_refines (slots slots' : List LocalSlotState)
     dsimp only at hEval
     injection hEval with hRead hSlots
     subst hSlots
-    exact ⟨locals, readPlaceState_below_evalOperand_copy hRel hRead borrows globals layouts
-      callerLocals localDecls hNoUnion, hRel⟩
+    cases localDecls with
+    | nil =>
+      exact ⟨locals, readPlaceState_below_evalOperand_copy hRel hRead borrows globals layouts
+        callerLocals [] hNoUnion, hRel⟩
+    | cons d ds =>
+      exact ⟨locals, readPlaceState_below_evalOperand_copy hRel hRead borrows globals layouts
+        callerLocals (d :: ds) hNoUnion hValid, hRel⟩
   | move place =>
     rcases place with ⟨loc, proj⟩
     unfold evalOperandState movePlaceState at hEval
@@ -14270,21 +14350,40 @@ theorem evalOperandState_below_refines (slots slots' : List LocalSlotState)
           set?_eq_some_iff.mpr ⟨hLtT, rfl⟩
         refine ⟨locals.set loc .uninit, ?_,
           SlotsRefine.set (R := SlotBelow) (a := .uninit) (t := .uninit) trivial loc hRel⟩
-        dsimp only [evalOperand]
-        rw [hGetT]
-        dsimp only [readProjectedValue]
-        rw [hInit]
-        dsimp only
-        rw [hSetT]
+        cases localDecls with
+        | nil =>
+          dsimp only [evalOperand]
+          rw [hGetT]
+          dsimp only [readProjectedValue]
+          rw [hInit]
+          dsimp only
+          rw [hSetT]
+        | cons d ds =>
+          dsimp only [evalOperand]
+          rw [hGetT]
+          dsimp only [readProjectedValue]
+          rw [hInit]
+          dsimp only
+          rw [hValid.1]
+          dsimp only
+          rw [hValid.2]
+          dsimp only
+          rw [hSetT]
       | cons p rest =>
         injection hEval with hRes hSlots
         injection hRes with hV
         subst hV hSlots
         refine ⟨locals, ?_, hRel⟩
         have hNotDeref : p ≠ .deref := fun hEq => hNoDeref rest (congrArg (· :: rest) hEq)
-        exact evalOperand_move_proj_of_noUnion locals loc p rest borrows globals layouts
-          callerLocals localDecls rootVal outVal hNotDeref hNoUnion hGetT hTRead
-          (readPlaceState_not_opaqueCast hRead)
+        cases localDecls with
+        | nil =>
+          exact evalOperand_move_proj_of_noUnion locals loc p rest borrows globals layouts
+            callerLocals [] rootVal outVal hNotDeref hNoUnion hGetT hTRead
+            (readPlaceState_not_opaqueCast hRead)
+        | cons d ds =>
+          exact evalOperand_move_proj_of_noUnion locals loc p rest borrows globals layouts
+            callerLocals (d :: ds) rootVal outVal hNotDeref hNoUnion hGetT hTRead
+            (readPlaceState_not_opaqueCast hRead) hValid
 
 /-- A successful Anneal place read has no `Deref`. -/
 theorem readPlaceState_ok_noDeref {slots : List LocalSlotState} {place : Place} {v : Value}
@@ -14308,7 +14407,10 @@ theorem evalAdtDiscriminant_refines_evalRvalue {slots : List LocalSlotState}
     (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hTy : placeTy localDecls layouts place = none)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place (.aggregate v fields) := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalRvalue locals (.discriminant place) mem localDecls layouts =
         .ok (.scalar ⟨v, 8⟩) locals mem ∧
       spec.discriminants[v]? = some d := by
@@ -14321,7 +14423,7 @@ theorem evalAdtDiscriminant_refines_evalRvalue {slots : List LocalSlotState}
   refine ⟨?_, hD⟩
   unfold evalRvalue
   simp only [readPlaceState_below_evalOperand_copy_cs hRel hRead mem.borrows mem.globals layouts
-    mem.callerLocals localDecls mem.callStack hNoUnion]
+    mem.callerLocals localDecls mem.callStack hNoUnion hReadValid]
   rcases hp : place.projection with _ | ⟨hd, tl⟩
   · rw [hp] at hProj
     obtain ⟨_, rfl⟩ := readProjectedValue_nil_eq_ok_iff.mp hProj
@@ -14358,13 +14460,16 @@ theorem evalUseRvalue_copy {slots : List LocalSlotState} {locals : List LocalSlo
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place v := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     Trusted.Rustc.V2026_06_01.MirSemantics.evalUseRvalue locals (.copy place) mem localDecls
         layouts =
       .ok v locals mem := by
   have hNoDeref := readPlaceState_ok_noDeref hRead
   have hOp := readPlaceState_below_evalOperand_copy_cs hRel hRead mem.borrows mem.globals layouts
-    mem.callerLocals localDecls mem.callStack hNoUnion
+    mem.callerLocals localDecls mem.callStack hNoUnion hReadValid
   obtain ⟨loc, proj⟩ := place
   unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalUseRvalue
   simp only [hOp, hValid]
@@ -14395,13 +14500,16 @@ theorem evalShallowInitBox_agrees_evalRvalue {τ : Type} {slots : List LocalSlot
     (hAnneal : evalShallowInitBox ptrBits opTy inner a = some (q, ty))
     (hInWidth : a.addr < 2 ^ ptrBits)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place (.ptr p sz) := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     q = a ∧ ty = ⟨inner, true⟩ ∧
       evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
         .ok (.ptr p sz) locals mem := by
   obtain ⟨_, hTyEq, _, _, hSame⟩ := evalShallowInitBox_preserves hAnneal
   refine ⟨hSame hInWidth, hTyEq, ?_⟩
-  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion hReadValid
   show Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy place) contentTy
       mem localDecls layouts = _
   unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox
@@ -14420,10 +14528,13 @@ theorem evalRvalue_shallowInitBox_nonPtr {slots : List LocalSlotState} {locals :
     (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
     (hNotPtr : ∀ p sz, v ≠ .ptr p sz)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place v := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
       .unsupported := by
-  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion hReadValid
   show Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy place) contentTy
       mem localDecls layouts = _
   unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox
@@ -14448,7 +14559,10 @@ theorem evalWrapUnsafeBinder_identity_eq_evalRvalue {slots : List LocalSlotState
     (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
     (hNoBinder : binderStructLayout? localDecls layouts targetTy = none)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place v := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     out = v ∧
       evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
         (match (match resolvedTyLayout? localDecls layouts targetTy with
@@ -14460,7 +14574,7 @@ theorem evalWrapUnsafeBinder_identity_eq_evalRvalue {slots : List LocalSlotState
     evalWrapUnsafeBinder_preserves h locals targetTy (valueContainsUninit_eq_false_of_readPlaceState hRead)
   rcases hCase with ⟨_, rfl⟩ | ⟨hW, _⟩
   · refine ⟨rfl, ?_⟩
-    have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+    have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion hReadValid
     show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals (.copy place)
         targetTy mem localDecls layouts = _
     unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
@@ -14491,7 +14605,10 @@ theorem evalWrapUnsafeBinder_wrap_eq_evalRvalue {slots : List LocalSlotState}
     (hOpTy : operandTy localDecls layouts (.copy place) = some opTy)
     (hDistinct : rigidTyEq opTy.kind targetTy.kind = false)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place v := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     out = .aggregate 0 [v] ∧ evalValueProjRead locals out [.field 0 targetTy] = .ok v ∧
       evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
         (match scalarValidRangeOk l v with
@@ -14502,7 +14619,7 @@ theorem evalWrapUnsafeBinder_wrap_eq_evalRvalue {slots : List LocalSlotState}
   rcases hCase with ⟨hW, _⟩ | ⟨_, rfl, hField⟩
   · nomatch hW
   · refine ⟨rfl, hField, ?_⟩
-    have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+    have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion hReadValid
     show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals (.copy place)
         targetTy mem localDecls layouts = _
     unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
@@ -14539,7 +14656,10 @@ theorem evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported
     (localDecls : List LocalDecl) (layouts : LayoutTable)
     (hValid : validateLoadedValue layouts localDecls (.copy place) v = true)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place v := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     (∀ p sz, v = .ptr p sz → sz ≠ layoutPointerBytes layouts →
       evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
         .unsupported) ∧
@@ -14561,7 +14681,7 @@ theorem evalShallowInitBox_wrongWidth_or_nonRawPtr_unsupported
           some (a, ⟨inner, true⟩) ∧
       evalRvalue locals (.shallowInitBox (.copy place) contentTy) mem localDecls layouts =
         .ok (.ptr p (layoutPointerBytes layouts)) locals mem) := by
-  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion hReadValid
   refine ⟨?_, ?_, ?_⟩
   · intro p sz hV hNe
     subst hV
@@ -14627,14 +14747,17 @@ theorem evalShallowInitBox_deref_read_roundtrip
     (hEval : evalRvalue locals (.shallowInitBox (.copy srcPlace) contentTy) mem localDecls layouts =
       .ok boxVal locals mem)
     (hNoUnion : placeTouchesUnion localDecls layouts srcPlace = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts srcPlace (.ptr p sz) := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     boxVal = .ptr p sz ∧
     extractDerefPtrVal? boxVal = some p ∧
     evalPlaceRead (locals.set boxLoc (.init boxVal)) ⟨boxLoc, .deref :: restProj⟩
         mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack =
       evalPlaceRead (locals.set boxLoc (.init (.ptr p sz))) ⟨boxLoc, .deref :: restProj⟩
         mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack := by
-  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion hReadValid
   change Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox locals (.copy srcPlace)
       contentTy mem localDecls layouts = .ok boxVal locals mem at hEval
   unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalShallowInitBox at hEval
@@ -14724,7 +14847,10 @@ theorem evalWrapUnsafeBinder_niche_iff_evalRvalue {slots : List LocalSlotState}
     (hOpTy : operandTy localDecls layouts (.copy place) = some opTy)
     (hDistinct : rigidTyEq opTy.kind targetTy.kind = false)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place (.scalar sc) := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     scalarValidRangeOk l (.scalar sc) = r.contains sc.bits bitWidth ∧
     (r.contains sc.bits bitWidth = true →
       evalWrapUnsafeBinder wf true (some (r, bitWidth)) (.scalar sc) =
@@ -14739,7 +14865,7 @@ theorem evalWrapUnsafeBinder_niche_iff_evalRvalue {slots : List LocalSlotState}
       decide_eq_true hLt, Bool.true_and]
     unfold scalarValidRangeOk ScalarValidRange.toWrappingRange
     rw [hRepr]
-  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+  have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion hReadValid
   have hEvalT :
       evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
         match r.contains sc.bits bitWidth with
@@ -14781,7 +14907,10 @@ theorem evalWrapUnsafeBinder_sameAdt_identity_and_unwrap_roundtrip {slots : List
     (hOpTy : operandTy localDecls layouts (.copy place) = some opTy)
     (hSame : rigidTyEq opTy.kind targetTy.kind = true)
     (hNoUnion : placeTouchesUnion localDecls layouts place = false := by
-      simp [placeTouchesUnion_nil_proj]) :
+      simp [placeTouchesUnion_nil_proj])
+    (hReadValid : PlaceReadValid localDecls layouts place v := by
+      simp [PlaceReadValid, placeTyResolved, placeTy, resolveTyWithLocalDecls,
+        materializeReadPtrValue, validateValueForTy?]) :
     out = v ∧
     evalRvalue locals (.wrapUnsafeBinder (.copy place) targetTy) mem localDecls layouts =
       (match scalarValidRangeOk l v with
@@ -14800,7 +14929,7 @@ theorem evalWrapUnsafeBinder_sameAdt_identity_and_unwrap_roundtrip {slots : List
   obtain ⟨_, hCase⟩ := evalWrapUnsafeBinder_preserves h locals targetTy hVInit
   rcases hCase with ⟨_, rfl⟩ | ⟨hW, _⟩
   · refine ⟨rfl, ?_, rfl, rfl, ?_⟩
-    · have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion
+    · have hUse := evalUseRvalue_copy hRel hRead mem localDecls layouts hValid hNoUnion hReadValid
       show Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder locals (.copy place) targetTy
           mem localDecls layouts = _
       unfold Trusted.Rustc.V2026_06_01.MirSemantics.evalWrapUnsafeBinder
@@ -15008,6 +15137,8 @@ def LIntrinsicOp.fromRustIntrinsicKind? : RustIntrinsicKind → Option LIntrinsi
   | .constEvalSelect => none
   | .copyNonOverlapping => none
   | .writeBytes => none
+  | .copy | .compareBytes | .rawEq | .typedSwapNonOverlapping
+  | .ptrOffsetFrom | .ptrOffsetFromUnsigned | .ptrMask | .blackBox => none
 
 /-- Map a value-returning `LIntrinsicOp` handled by `evalNonSelectIntrinsicCall` to its
 `RustIntrinsicKind` counterpart. -/
@@ -16855,7 +16986,11 @@ private theorem evalDirectRustIntrinsic_of_nonSelect
         locals' destination targetBb) := by
   unfold evalDirectRustIntrinsic?
   rw [hClass]
-  cases kind <;> first | contradiction | rfl | (cases op <;> cases hKind)
+  cases kind <;> first
+    | contradiction
+    | rfl
+    | (simp only []; done)
+    | (cases op <;> cases hKind)
 
 /-- Internal strengthening of `evalLoweredTerminator_call_refines_evalTerminator` recording that
 every `.goto` transition preserves `s'.memory = s.memory` and `.returned` is impossible. -/
@@ -22899,13 +23034,19 @@ theorem evalCopyNonOverlappingSubplace_refines {arityOf : Ty → VariantIdx → 
         operandPointeeTy localDecls layouts dstOp = some dstPt ∧
         sameRigidTyShape srcPt.kind dstPt.kind = true)
     (hNoUnion : placeTouchesUnion localDecls layouts ⟨dl, dh :: dt⟩ = false)
-    (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, dh :: dt⟩) v = true) :
+    (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, dh :: dt⟩) v = true)
+    (hConv : convertCopySingleValue? layouts
+        (operandPointeeTy localDecls layouts srcOp)
+        (operandPointeeTy localDecls layouts dstOp)
+        (placeTyResolved localDecls layouts ⟨dl, dh :: dt⟩) v = some v := by
+      simp [convertCopySingleValue?]) :
     ∃ locals₄, evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
         locals₃ = .step (advanceStmt s locals₄
           { s.memory with
             borrows := invalidateConflictingBorrows s.memory.borrows dl (some dstPtr.tag)
               (length s.memory.callStack) }) ∧
       SlotsRefine SlotBelow slots' locals₄ := by
+  have _ := hValid
   have hDp : projectionHasDeref (dh :: dt) = false := by
     cases dh with
     | deref => exact absurd rfl hDh
@@ -22954,11 +23095,18 @@ theorem evalCopyNonOverlappingSubplace_refines {arityOf : Ty → VariantIdx → 
           have hWP := evalValueProjWrite_refines_writeProjectedValue _ _ _ _ _ hWT
           have hSet : set? locals₃ dl (.init droot') = some (locals₃.set dl (.init droot')) :=
             set?_eq_some_iff.mpr ⟨hLtD, rfl⟩
-          have hWrite : writePlaceValue locals₃ s.memory.borrows ⟨dl, dh :: dt⟩ v localDecls layouts =
-              .ok (locals₃.set dl (.init droot')) :=
-            writePlaceValue_proj_of_noUnion locals₃ s.memory.borrows dl dh dt v droot droot' _
-              localDecls layouts hDh hNoUnion hValid (by simp [get?_eq_getElem?, hTD]) hWP hSet
-              (evalValueProjWrite_not_opaqueCast hWT)
+          have hNotCast := evalValueProjWrite_not_opaqueCast hWT
+          have hWrite : writePlaceValueUntyped locals₃ s.memory.borrows ⟨dl, dh :: dt⟩ v localDecls layouts =
+              .ok (locals₃.set dl (.init droot')) := by
+            have hWriteL :=
+              (writeProjectedForLocal_of_placeTouchesUnion_false locals₃ localDecls layouts dl droot
+                (dh :: dt) v hNoUnion).trans hWP
+            cases dh with
+            | deref => exact False.elim (hDh rfl)
+            | opaqueCast ty => exact False.elim (hNotCast ty rfl)
+            | _ =>
+              unfold writePlaceValueUntyped
+              simp only [get?_eq_getElem?, hTD, hWriteL, hSet]
           refine ⟨locals₃.set dl (.init droot'), ?_,
             SlotsRefine.set (a := .init droot') (t := .init droot') rfl dl hRel⟩
           unfold evalCopySingleDirect
@@ -22967,11 +23115,9 @@ theorem evalCopyNonOverlappingSubplace_refines {arityOf : Ty → VariantIdx → 
           · rcases beq_cases sl dl with ⟨_, hEqLoc⟩ | ⟨hBLoc, _⟩
             · exact absurd hEqLoc hNe
             · simp only [get?_eq_getElem?] at hTS
-              rcases hPointee with hUntyped | ⟨srcPt, dstPt, hSPt, hDPt, hShape⟩
-              · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
-                  get?_eq_getElem?, hTS, hTSR, hUntyped, hWrite]
-              · simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
-                  get?_eq_getElem?, hTS, hTSR, hSPt, hDPt, hShape, hWrite]
+              have _ := hPointee
+              simp only [hSrcEntry.1, hSrcEntry.2, hDstEntry.1, hDstEntry.2, hBTag, hBLoc,
+                get?_eq_getElem?, hTS, hTSR, hTD, hConv, hWrite]
 
 /-- **Trusted's `evalStmt` reaches `evalCopySingleDirect` (`evalStmt_copyNonOverlapping_singleDirect`)**:
 for a `copy_nonoverlapping(src, dst, 1)` whose operands evaluate (without changing the frame) to
@@ -22995,7 +23141,29 @@ theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp
     (hSrcU : resolveUnionEndpoint? localDecls layouts s.frame.locals srcEntry = none)
     (hDstU : resolveUnionEndpoint? localDecls layouts s.frame.locals dstEntry = none)
     (hSrcOff : srcPtr.offsetBytes = 0) (hDstOff : dstPtr.offsetBytes = 0)
-    (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl) :
+    (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl)
+    (hNoSizeMismatch :
+      (let elemSzOpt := copyPointeeByteSize? localDecls layouts
+        (operandPointeeTy localDecls layouts srcOp) (operandPointeeTy localDecls layouts dstOp)
+       (match elemSzOpt, get? s.frame.locals srcEntry.targetLocal with
+        | .some eSz, .some _ =>
+          match placeTyResolved localDecls layouts ⟨srcEntry.targetLocal, srcEntry.targetProjection⟩ with
+          | .some sPlaceTy =>
+            match tyByteSize localDecls layouts sPlaceTy with
+            | .some pSz => Bool.not (Nat.beq pSz eSz)
+            | .none => false
+          | .none => false
+        | _, _ => false) = false ∧
+       (match elemSzOpt, get? s.frame.locals dstEntry.targetLocal with
+        | .some eSz, .some _ =>
+          match placeTyResolved localDecls layouts ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ with
+          | .some dPlaceTy =>
+            match tyByteSize localDecls layouts dPlaceTy with
+            | .some pSz => Bool.not (Nat.beq pSz eSz)
+            | .none => false
+          | .none => false
+        | _, _ => false) = false) := by
+      simp [copyPointeeByteSize?, operandPointeeTy, placeTyResolved]) :
     evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩ localDecls layouts =
       evalCopySingleDirect s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry
         s.frame.locals := by
@@ -23010,7 +23178,72 @@ theorem evalStmt_copyNonOverlapping_singleDirect (s : MachineState) (srcOp dstOp
     | _ => rcases hDstP with hd | hd <;> simp [hd]
   simp only [evalStmt, evalCopyNonOverlapping, hSrc, hDst, hCnt, hOne, hPermOk]
   unfold evalCopyNonOverlappingPermOk
-  simp only [hSrcU, hDstU, hSrcOff, hDstOff, Nat.beq_refl, Bool.and_self]
+  simp only [hSrcU, hDstU, hSrcOff, hDstOff, Nat.beq_refl]
+  obtain ⟨hS, hD⟩ := hNoSizeMismatch
+  cases hE : copyPointeeByteSize? localDecls layouts
+      (operandPointeeTy localDecls layouts srcOp)
+      (operandPointeeTy localDecls layouts dstOp) with
+  | none => rfl
+  | some eSz =>
+    simp only [hE] at hS hD ⊢
+    cases hGLS : get? s.frame.locals srcEntry.targetLocal with
+    | none =>
+      simp only [hGLS] at hS ⊢
+      cases hGLD : get? s.frame.locals dstEntry.targetLocal with
+      | none => rfl
+      | some dSlot =>
+        simp only [hGLD] at hD ⊢
+        cases hPTD : placeTyResolved localDecls layouts ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ with
+        | none => rfl
+        | some dTy =>
+          simp only [hPTD] at hD ⊢
+          cases hSzD : tyByteSize localDecls layouts dTy with
+          | none => rfl
+          | some dSz => simp only [hSzD] at hD ⊢; rw [hD]; rfl
+    | some sSlot =>
+      simp only [hGLS] at hS ⊢
+      cases hPTS : placeTyResolved localDecls layouts ⟨srcEntry.targetLocal, srcEntry.targetProjection⟩ with
+      | none =>
+        cases hGLD : get? s.frame.locals dstEntry.targetLocal with
+        | none => rfl
+        | some dSlot =>
+          simp only [hGLD] at hD ⊢
+          cases hPTD : placeTyResolved localDecls layouts ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ with
+          | none => rfl
+          | some dTy =>
+            simp only [hPTD] at hD ⊢
+            cases hSzD : tyByteSize localDecls layouts dTy with
+            | none => rfl
+            | some dSz => simp only [hSzD] at hD ⊢; rw [hD]; rfl
+      | some sTy =>
+        simp only [hPTS] at hS ⊢
+        cases hSzS : tyByteSize localDecls layouts sTy with
+        | none =>
+          cases hGLD : get? s.frame.locals dstEntry.targetLocal with
+          | none => rfl
+          | some dSlot =>
+            simp only [hGLD] at hD ⊢
+            cases hPTD : placeTyResolved localDecls layouts ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ with
+            | none => rfl
+            | some dTy =>
+              simp only [hPTD] at hD ⊢
+              cases hSzD : tyByteSize localDecls layouts dTy with
+              | none => rfl
+              | some dSz => simp only [hSzD] at hD ⊢; rw [hD]; rfl
+        | some sSz =>
+          simp only [hSzS] at hS ⊢
+          rw [hS]
+          cases hGLD : get? s.frame.locals dstEntry.targetLocal with
+          | none => rfl
+          | some dSlot =>
+            simp only [hGLD] at hD ⊢
+            cases hPTD : placeTyResolved localDecls layouts ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ with
+            | none => rfl
+            | some dTy =>
+              simp only [hPTD] at hD ⊢
+              cases hSzD : tyByteSize localDecls layouts dTy with
+              | none => rfl
+              | some dSz => simp only [hSzD] at hD ⊢; rw [hD]; rfl
 
 /-- **Sub-place `CopyNonOverlapping` refines Trusted's `evalStmt`
 (`evalStmt_copyNonOverlapping_subplace_refines`)**: on below-related frames, a successful Anneal
@@ -23058,7 +23291,34 @@ theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantId
         sameRigidTyShape srcPt.kind dstPt.kind = true)
     (hNoUnion : placeTouchesUnion localDecls layouts ⟨dl, dh :: dt⟩ = false)
     (hValid : validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, dh :: dt⟩) v = true)
-    (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl) :
+    (hActive : copyEntriesTargetActiveFrame s.memory.callStack srcEntry dstEntry = true := by rfl)
+    (hNoSizeMismatch :
+      (let elemSzOpt := copyPointeeByteSize? localDecls layouts
+        (operandPointeeTy localDecls layouts srcOp) (operandPointeeTy localDecls layouts dstOp)
+       (match elemSzOpt, get? s.frame.locals srcEntry.targetLocal with
+        | .some eSz, .some _ =>
+          match placeTyResolved localDecls layouts ⟨srcEntry.targetLocal, srcEntry.targetProjection⟩ with
+          | .some sPlaceTy =>
+            match tyByteSize localDecls layouts sPlaceTy with
+            | .some pSz => Bool.not (Nat.beq pSz eSz)
+            | .none => false
+          | .none => false
+        | _, _ => false) = false ∧
+       (match elemSzOpt, get? s.frame.locals dstEntry.targetLocal with
+        | .some eSz, .some _ =>
+          match placeTyResolved localDecls layouts ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ with
+          | .some dPlaceTy =>
+            match tyByteSize localDecls layouts dPlaceTy with
+            | .some pSz => Bool.not (Nat.beq pSz eSz)
+            | .none => false
+          | .none => false
+        | _, _ => false) = false) := by
+      simp [copyPointeeByteSize?, operandPointeeTy, placeTyResolved])
+    (hConv : convertCopySingleValue? layouts
+        (operandPointeeTy localDecls layouts srcOp)
+        (operandPointeeTy localDecls layouts dstOp)
+        (placeTyResolved localDecls layouts ⟨dl, dh :: dt⟩) v = some v := by
+      simp [convertCopySingleValue?]) :
     ∃ locals₄, evalStmt s ⟨.intrinsic (.copyNonOverlapping srcOp dstOp countOp), span⟩
         localDecls layouts = .step (advanceStmt s locals₄
           { s.memory with
@@ -23066,10 +23326,10 @@ theorem evalStmt_copyNonOverlapping_subplace_refines {arityOf : Ty → VariantId
               (length s.memory.callStack) }) ∧
       SlotsRefine SlotBelow slots' locals₄ := by
   rw [evalStmt_copyNonOverlapping_singleDirect s srcOp dstOp countOp span localDecls layouts hSrcOp
-    hDstOp hCnt hOne hSrcE hDstE hSrcP hDstP hSrcU hDstU hSrcOff hDstOff hActive]
+    hDstOp hCnt hOne hSrcE hDstE hSrcP hDstP hSrcU hDstU hSrcOff hDstOff hActive hNoSizeMismatch]
   exact evalCopyNonOverlappingSubplace_refines hRel hSrcR hDstR hNe hSrcRead hSrcSlot hDstRoot hDh
     hDt h s srcOp dstOp localDecls layouts srcPtr dstPtr srcEntry dstEntry hTagNe hSrcEntry hDstEntry
-    hPointee hNoUnion hValid
+    hPointee hNoUnion hValid hConv
 
 theorem appendValues_eq_append : ∀ (xs ys : List Value), appendValues xs ys = xs ++ ys
   | [], _ => rfl
@@ -23346,17 +23606,14 @@ theorem evalCopyNonOverlappingSubplace_window_refines
         some (locals₃.set dl
           (.init (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)))) :=
       set?_eq_some_iff.mpr ⟨hLtD3, rfl⟩
-    have hWPV0 : writePlaceValue locals₃ s.memory.borrows ⟨dl, []⟩
+    have hWPV0 : writePlaceValueUntyped locals₃ s.memory.borrows ⟨dl, []⟩
         (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems))
         localDecls layouts =
         .ok (locals₃.set dl
           (.init (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)))) := by
-      unfold writePlaceValue
-      by_cases hLD : localDecls = []
-      · subst hLD
-        simp only [get?_eq_getElem?, hTDst, hSetD]
-      · obtain ⟨d, ds, rfl⟩ := List.exists_cons_of_ne_nil hLD
-        simp only [hDstValid hLD, get?_eq_getElem?, hTDst, hSetD]
+      have _ := hDstValid
+      unfold writePlaceValueUntyped
+      simp only [get?_eq_getElem?, hTDst, hSetD]
     have hSrcOffIdx : byteOffsetToElemIdx? srcPtr.offsetBytes elemSize = .some s0 := by
       rw [hSrcOff]; exact byteOffsetToElemIdx?_mul s0 elemSize hElemSz
     have hDstOffIdx : byteOffsetToElemIdx? dstPtr.offsetBytes elemSize = .some d0 := by
@@ -24400,17 +24657,14 @@ theorem evalCopyNonOverlappingSubplace_window_same_or_disjoint_refines
         some (locals₃.set dl
           (.init (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)))) :=
       set?_eq_some_iff.mpr ⟨hLtD3, rfl⟩
-    have hWPV0 : writePlaceValue locals₃ s.memory.borrows ⟨dl, []⟩
+    have hWPV0 : writePlaceValueUntyped locals₃ s.memory.borrows ⟨dl, []⟩
         (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems))
         localDecls layouts =
         .ok (locals₃.set dl
           (.init (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)))) := by
-      unfold writePlaceValue
-      by_cases hLD : localDecls = []
-      · subst hLD
-        simp only [get?_eq_getElem?, hTDst, hSetD]
-      · obtain ⟨d, ds, rfl⟩ := List.exists_cons_of_ne_nil hLD
-        simp only [hDstValid hLD, get?_eq_getElem?, hTDst, hSetD]
+      have _ := hDstValid
+      unfold writePlaceValueUntyped
+      simp only [get?_eq_getElem?, hTDst, hSetD]
     have hSrcOffIdx : byteOffsetToElemIdx? srcPtr.offsetBytes elemSize = .some s0 := by
       rw [hSrcOff]; exact byteOffsetToElemIdx?_mul s0 elemSize hElemSz
     have hDstOffIdx : byteOffsetToElemIdx? dstPtr.offsetBytes elemSize = .some d0 := by
@@ -26202,7 +26456,7 @@ theorem witness_trusted_retag_u32_field :
     witness_retag_noRef hRead rfl hRel "" witnessLocalDecls emptyLayoutTable
     (pTy := witnessU32) (by with_unfolding_all rfl)
     (fun m inner => ⟨fun h => (by simp [witnessU32] at h), fun h => (by simp [witnessU32] at h)⟩)
-    (by with_unfolding_all rfl)
+    (by with_unfolding_all rfl) (by exact ⟨rfl, rfl⟩)
   obtain ⟨-, hU⟩ := evalStmt_retag_noRef_scalar_divergence (kind := .default) (b := false) hNotRaw
     witness_retag_noRef hRead rfl hRel "" [] emptyLayoutTable rfl
     (by simp [placeTouchesUnion_nil_decls])
@@ -26398,7 +26652,7 @@ theorem witness_trusted_retag_ref_anneal :
         SlotsRefine, SlotBelow]
     obtain ⟨p, sz, hRead, hUB⟩ := evalStmt_retag_disabled_ub hNotRaw hA hRelD ""
       witnessRefLocalDecls emptyLayoutTable (entry := { witnessChildEntry with perm := .disabled })
-      rfl (by with_unfolding_all rfl)
+      rfl (by with_unfolding_all rfl) (by intro _ _; exact ⟨rfl, rfl⟩)
     rw [hReadP] at hRead
     cases hRead
     exact hUB (by simp [witnessReborrowState, lookupBorrow, witnessChildEntry, witnessPtrT,
@@ -30371,6 +30625,17 @@ private theorem lowerIntrinsicKind_V2026_06_01_off_literals {defPath : DefPath}
     (hMem : defPath ∉ adapterLiteralDefPaths_V2026_06_01) :
     lowerIntrinsicKind_V2026_06_01 defPath = none ∧
       ep1LowerIntrinsicKind_V2026_06_01 defPath = none := by
+  -- The 8 core memory & pointer intrinsics (Episode 1 of `ws-tcb-core-mem-and-ptr-intrinsics`)
+  -- classify in `Trusted` but lower to no `LIntrinsicOp` (`fromRustIntrinsicKind?`), so both
+  -- adapters return `none` on them as well.
+  by_cases hNew : defPath ∈ ["core::intrinsics::copy", "core::intrinsics::compare_bytes",
+      "core::intrinsics::raw_eq", "core::intrinsics::typed_swap_nonoverlapping",
+      "core::intrinsics::ptr_offset_from", "core::intrinsics::ptr_offset_from_unsigned",
+      "core::intrinsics::ptr_mask", "core::intrinsics::black_box"]
+  · simp only [List.mem_cons, List.not_mem_nil, or_false] at hNew
+    rcases hNew with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+      exact ⟨by decide +kernel, by decide +kernel⟩
+  simp only [List.mem_cons, List.not_mem_nil, or_false, not_or] at hNew
   simp only [adapterLiteralDefPaths_V2026_06_01, ep1RustIntrinsicDefPaths_V2026_06_01,
     ep1UnreachableDefPaths_V2026_06_01, ep1AbortingPanicDefPaths_V2026_06_01,
     ep1UnwindingPanicDefPaths_V2026_06_01, List.map_cons, List.map_nil, List.cons_append,
@@ -30379,7 +30644,7 @@ private theorem lowerIntrinsicKind_V2026_06_01_off_literals {defPath : DefPath}
     isUnreachableCallTarget, isAbortingPanicDefPath, isUnwindingPanicDefPath,
     ep1RustIntrinsicDefPaths_V2026_06_01,
     ep1UnreachableDefPaths_V2026_06_01, ep1AbortingPanicDefPaths_V2026_06_01,
-    ep1UnwindingPanicDefPaths_V2026_06_01, stringEq_eq_decide, hMem]
+    ep1UnwindingPanicDefPaths_V2026_06_01, stringEq_eq_decide, hMem, hNew]
 
 /-- **Episode 1 adapter parity (`lowerIntrinsicKind_V2026_06_01_eq_ep1Table`)**: for every
 `DefPath`, `lowerIntrinsicKind_V2026_06_01` is Episode 1's `lower_intrinsic_kind_v2026_06_01`
@@ -30674,8 +30939,8 @@ theorem writeBytesAction_and_call_corner_cases
             bodyLayouts argOps argVals = .noWrite ∧
         evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
             destination targetBb = writeIntrinsicReturn s locals' destination targetBb .unit) ∧
-      -- (5) Aligned single-element primitive scalar store -> .store with repeatByteBits when bit-valid,
-      --     and fail-closed .fault .unsupported when bit-invalid (e.g. 2 in bool)
+      -- (5) Aligned single-element primitive scalar store -> .store with repeatByteBits
+      --     unconditionally (Kani#5205: untyped byte fill defers validity checking to typed reads)
       (count = 1 →
         Nat.beq elemSize 0 = false →
         dstPtr.offsetBytes = 0 →
@@ -30684,18 +30949,10 @@ theorem writeBytesAction_and_call_corner_cases
           intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts dstPlaceTy.kind = some elemSize) →
         rigidTyEq dstPlaceTy.kind elemTy = true →
         isPrimitiveScalarKind elemTy = true →
-        (validateValueForTy? bodyLayouts (some dstPlaceTy)
-            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩) = true →
-          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
-              bodyLayouts argOps argVals =
-            .store ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ dstEntry.targetLocal dstPtr.tag
-              (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩)) ∧
-        (validateValueForTy? bodyLayouts (some dstPlaceTy)
-            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩) = false →
-          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
-              bodyLayouts argOps argVals = .fault .unsupported ∧
-          evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
-              destination targetBb = MirStepNode.unsupported))) := by
+        writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
+            bodyLayouts argOps argVals =
+          .store ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ dstEntry.targetLocal dstPtr.tag
+            (.scalar ⟨repeatByteBits valBits elemSize, elemSize⟩))) := by
   intro ptrBytes maxObjSize target argVals
   have hValBlt : Nat.blt valBits 256 = true := Nat.blt_eq.mpr hValLt
   have hPtrBeq : Nat.beq ptrBytes ptrBytes = true := Nat.beq_refl ptrBytes
@@ -30788,12 +31045,8 @@ theorem writeBytesAction_and_call_corner_cases
       have hBase :
           writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
               bodyLayouts argOps argVals =
-            match validateValueForTy? bodyLayouts (some dstPlaceTy)
-                (.scalar ⟨writeBytesFillBits valBits elemSize, elemSize⟩) with
-            | true =>
-              .store ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ dstEntry.targetLocal dstPtr.tag
-                (.scalar ⟨writeBytesFillBits valBits elemSize, elemSize⟩)
-            | false => .fault .unsupported := by
+            .store ⟨dstEntry.targetLocal, dstEntry.targetProjection⟩ dstEntry.targetLocal dstPtr.tag
+              (.scalar ⟨writeBytesFillBits valBits elemSize, elemSize⟩) := by
         cases hProj : dstEntry.targetProjection with
         | nil =>
           have hPlaceSz : intrinsicRigidTyByteSize bodyLocalDecls bodyLayouts dstPlaceTy.kind =
@@ -30838,12 +31091,7 @@ theorem writeBytesAction_and_call_corner_cases
           rw [hAlNz, hAlDiv, hOff0, hMod0, hAddr, hMul1, hSzNz, hProj, hTyEq, hPrim]
           cases hP : dstEntry.perm <;> first | rfl | exact absurd hP hNotFrz | exact absurd hP hNotDis
       rw [repeatByteBits_eq_writeBytesFillBits]
-      refine ⟨fun hVOk => by rw [hBase, hVOk], fun hVBad => ?_⟩
-      have hActUnsup :
-          writeBytesAction s.memory.borrows (length s.memory.callStack) target bodyLocalDecls
-              bodyLayouts argOps argVals = .fault .unsupported := by
-        rw [hBase, hVBad]
-      exact ⟨hActUnsup, by unfold evalWriteBytesCall; rw [hActUnsup]; rfl⟩
+      exact hBase
 
 /-- **Call-form `copy_nonoverlapping` rejects non-`usize` count widths as undefined behavior
 (`evalCopyNonOverlappingCall_wrongCountWidth_ub`)**:
@@ -30875,10 +31123,10 @@ theorem evalCopyNonOverlappingCall_wrongCountWidth_ub
 4. **Sub-place sibling borrow preservation**: writing via `&raw mut _1.0` (`tag = 1`,
    `targetProjection = [.field 0 u32]`) disables an overlapping unprotected foreign borrow on
    `_1.0` (`tag = 2`) while preserving a disjoint sibling `&mut _1.1` borrow (`tag = 3`, `.unique`).
-5. **`bool` bit-validity fail-closed discipline**: `write_bytes::<bool>(&raw mut _1, 1, 1)` stores
-   `true` (`⟨1, 1⟩`), whereas `write_bytes::<bool>(&raw mut _1, 2, 1)` fails closed with
-   `MirStepNode.unsupported` (neither misclassifying deferred Rust validity as eager `.ub` nor
-   storing an unvalidated typed `bool`). -/
+5. **`bool` deferred read-time bit-validity discipline (`Kani#5205`)**: `write_bytes::<bool>(&raw mut _1, 1, 1)`
+   stores `true` (`⟨1, 1⟩`), whereas `write_bytes::<bool>(&raw mut _1, 2, 1)` succeeds as an untyped byte
+   write storing `⟨2, 1⟩` without premature write-time UB, and a subsequent typed read (`Operand.copy` of
+   `_1 : bool`) faults with `PlaceReadResult.ub`. -/
 theorem evalWriteBytesCall_tree_borrows_and_bool_validity :
     let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
     let boolTy : Ty := { kind := .bool, layoutIdx := 0 }
@@ -30946,7 +31194,7 @@ theorem evalWriteBytesCall_tree_borrows_and_bool_validity :
               [ { tag := 1, targetLocal := 1, targetProjection := [.field 0 u32Ty], perm := .unique }
               , { tag := 2, targetLocal := 1, targetProjection := [.field 0 u32Ty], perm := .disabled }
               , { tag := 3, targetLocal := 1, targetProjection := [.field 1 u32Ty], perm := .unique } ] } }
-    -- (5) bool write_bytes: 1 -> .step storing true; 2 -> .unsupported
+    -- (5) bool write_bytes: 1 -> .step storing true; 2 -> .step storing raw byte 2, typed read -> .ub
     let sBool0 : MachineState :=
       { frame := ⟨0, 0, localsBool0⟩
         memory :=
@@ -30954,6 +31202,11 @@ theorem evalWriteBytesCall_tree_borrows_and_bool_validity :
             borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }] } }
     let sBool1 : MachineState :=
       { frame := ⟨1, 0, [.init .unit, .init (.scalar ⟨1, 1⟩)]⟩
+        memory :=
+          { emptyMemory with
+            borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }] } }
+    let sBool2 : MachineState :=
+      { frame := ⟨1, 0, [.init .unit, .init (.scalar ⟨2, 1⟩)]⟩
         memory :=
           { emptyMemory with
             borrows := [{ tag := 1, targetLocal := 1, targetProjection := [], perm := .unique }] } }
@@ -30974,8 +31227,11 @@ theorem evalWriteBytesCall_tree_borrows_and_bool_validity :
       MirStepNode.step sBool1 ∧
     evalWriteBytesCall sBool0 tgtBool declsBool emptyLayoutTable []
         [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 1⟩, .scalar ⟨1, 8⟩] localsBool0 ⟨0, []⟩ 1 =
-      MirStepNode.unsupported :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+      MirStepNode.step sBool2 ∧
+    evalOperand sBool2.frame.locals (.copy ⟨1, []⟩) sBool2.memory.borrows sBool2.memory.globals
+        emptyLayoutTable sBool2.memory.callerLocals declsBool sBool2.memory.callStack =
+      PlaceReadResult.ub :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Layouts for the `write_bytes` packed-field witness: entry `1` is
 `#[repr(packed)] struct WbPacked { a: u8, b: u32 }` (size `5`, align `1`, `b` at byte
@@ -32026,8 +32282,10 @@ theorem evalLoweredTerminator_call_nonReturning_with_target_extCall
 /-- **Target-presence boundary Part 2 (`evalLoweredTerminator_call_value_without_target_extCall`)**:
 a hand-built diverging (`target = none`) direct call to any of the 25 value-returning intrinsics is
 rejected fail-closed by `evalLoweredTerminator` (`= none`), whereas `Trusted`'s `evalTerminator`
-dispatches value intrinsics only on `target = some _` calls and falls through to
-`MirStepNode.extCall` with `resumeExternalDivergingCall`. -/
+dispatches a diverging call through `evalDivergingRustIntrinsic?` (Episode 1 of
+`ws-tcb-core-mem-and-ptr-intrinsics`: a diverging call to a returning intrinsic turns its normal
+return into `.fail .ub`) and otherwise falls through to `MirStepNode.extCall` with
+`resumeExternalDivergingCall`. -/
 theorem evalLoweredTerminator_call_value_without_target_extCall
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
     {slots slotsAfterArgs : List LocalSlotState} {unwinding : Option Nat} {s : MachineState}
@@ -32049,8 +32307,12 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
         evalOperands s.frame.locals args s.memory.borrows env.globals env.layouts
             s.memory.callerLocals = .ok avs locals2 ∧
           evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) =
-            .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
-              (resumeExternalDivergingCall s locals2 u) := by
+            (match evalDivergingRustIntrinsic? s { defPath := defPath, typeArgs := typeArgs }
+                cm.localDecls env.layouts args avs locals2 dest with
+             | some stepNode => stepNode
+             | none =>
+               .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
+                 (resumeExternalDivergingCall s locals2 u)) := by
   have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
     trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
   have hNotDiv : op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind := by
@@ -32100,14 +32362,16 @@ theorem evalLoweredTerminator_call_value_without_target_extCall
       fun _ _ => rfl
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-        hLayouts, hCorr.globals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
+        hLayouts, hCorr.globals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]
+      rfl⟩
 
 /-- **Target-presence boundary for call-form memory intrinsics
 (`evalLoweredTerminator_call_memIntrinsic_without_target_extCall`)**:
 a hand-built diverging (`target = none`) direct call to `core::intrinsics::copy_nonoverlapping` or
 `core::intrinsics::write_bytes` is rejected fail-closed (`= none`) by `evalLoweredTerminator` for
 **every** `env.memIntrinsic` callback, while `Trusted`'s `evalTerminator` dispatches memory
-intrinsics inline only on `target = some _` calls and falls through to `MirStepNode.extCall` with
+intrinsics on diverging calls through `evalDivergingRustIntrinsic?` (Episode 1 of
+`ws-tcb-core-mem-and-ptr-intrinsics`) and otherwise falls through to `MirStepNode.extCall` with
 `resumeExternalDivergingCall`. -/
 theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
     {env : CfgEnv} {body : LBody} {cm : CapturedMir} {bb : Nat} {b : LBlock}
@@ -32133,8 +32397,12 @@ theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
         evalOperands s.frame.locals args s.memory.borrows env.globals env.layouts
             s.memory.callerLocals = .ok avs locals2 ∧
           evalTerminator s ⟨b.terminator.toTrusted, span⟩ (some cm) =
-            .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
-              (resumeExternalDivergingCall s locals2 u) := by
+            (match evalDivergingRustIntrinsic? s { defPath := defPath, typeArgs := typeArgs }
+                cm.localDecls env.layouts args avs locals2 dest with
+             | some stepNode => stepNode
+             | none =>
+               .extCall { defPath := defPath, typeArgs := typeArgs, args := avs, memory := s.memory }
+                 (resumeExternalDivergingCall s locals2 u)) := by
   have hLower : lowerIntrinsicKind_V2026_06_01 defPath = some op :=
     trustedSupportsIntrinsicDefPath_iff_lowerIntrinsicKind.mp hSupp
   have hNotDiv : op ≠ .unreachableUnchecked ∧ op ≠ .abort ∧ op ≠ .panicUnwind := by
@@ -32181,7 +32449,8 @@ theorem evalLoweredTerminator_call_memIntrinsic_without_target_extCall
       fun _ _ => rfl
     exact ⟨locals2, hTOps, by
       simp only [hT, LTerminator.toTrusted, evalTerminator, bodyLocalDeclsOf, hResTgt,
-        hLayouts, hGlobals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]⟩
+        hLayouts, hGlobals, hTOpsCS, hNoCallee, hNotUnr, hNotAb, hNotPan]
+      rfl⟩
 
 /-! #### 5g.2: `three_way_compare` `Ordering` ADT Encoding (`orderingVariant?`, `intrinsic.rs:108-136`) -/
 

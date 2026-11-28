@@ -556,68 +556,182 @@ theorem fc_uint8_ofNat_toNat (n : Nat) : (UInt8.ofNat n).toBitVec.toNat = n % 25
   show (UInt8.ofNat n).toNat = n % 256
   simp
 
-/-- **Anneal's `encodeLittleEndianBytes` is MiniRust's `Type.encode` byte image** (`scalarBytes`),
-byte for byte, for every bit pattern, width, signedness, and provenance (which `fcByteToMR`
-erases; integer and float encodings carry none). -/
-theorem fc_map_encodeLittleEndianBytes (s : Signedness) (prov : Option (Nat × Nat)) :
-    ∀ (n bits : Nat), (encodeLittleEndianBytes bits n prov).map fcByteToMR = scalarBytes ⟨s, ⟨n⟩⟩ bits
+private theorem fc_map_encodePlainLittleEndianBytes (s : Signedness) :
+    ∀ (n bits : Nat), (encodePlainLittleEndianBytes bits n).map fcByteToMR = scalarBytes ⟨s, ⟨n⟩⟩ bits
   | 0, _ => rfl
   | n + 1, bits => by
-    have ih := fc_map_encodeLittleEndianBytes s prov n (bits / 256)
+    have ih := fc_map_encodePlainLittleEndianBytes s n (bits / 256)
     simp only [scalarBytes] at ih ⊢
-    show fcByteToMR (.init (UInt8.ofNat bits) prov) ::
-        (encodeLittleEndianBytes (bits / 256) n prov).map fcByteToMR =
+    show fcByteToMR (.init (UInt8.ofNat bits) none) ::
+        (encodePlainLittleEndianBytes (bits / 256) n).map fcByteToMR =
       (UInt8.ofNat (bits % 256) :: leBytes (bits / 256) n).map (fun b => Gen.AbstractByte.Init b none)
     rw [ih, fc_uint8_ofNat_mod]
     rfl
 
+private theorem fc_map_encodePtrBytesAux (s : Signedness) (a t origOff ptrBytes : Nat) :
+    ∀ (n idx bits : Nat),
+      (encodePtrBytesAux a t origOff ptrBytes bits idx n).map fcByteToMR = scalarBytes ⟨s, ⟨n⟩⟩ bits
+  | 0, _, _ => rfl
+  | n + 1, idx, bits => by
+    have ih := fc_map_encodePtrBytesAux s a t origOff ptrBytes n (idx + 1) (bits / 256)
+    simp only [scalarBytes] at ih ⊢
+    show fcByteToMR (.init (UInt8.ofNat bits) (some ⟨a, t, idx, origOff, ptrBytes⟩)) ::
+        (encodePtrBytesAux a t origOff ptrBytes (bits / 256) (idx + 1) n).map fcByteToMR =
+      (UInt8.ofNat (bits % 256) :: leBytes (bits / 256) n).map (fun b => Gen.AbstractByte.Init b none)
+    rw [ih, fc_uint8_ofNat_mod]
+    rfl
+
+/-- **Anneal's `encodeLittleEndianBytes` is MiniRust's `Type.encode` byte image** (`scalarBytes`),
+byte for byte, for every bit pattern, width, signedness, and provenance (which `fcByteToMR`
+erases; integer and float encodings carry none). -/
+theorem fc_map_encodeLittleEndianBytes (s : Signedness) (prov : Option (Nat × Nat))
+    (n bits : Nat) : (encodeLittleEndianBytes bits n prov).map fcByteToMR = scalarBytes ⟨s, ⟨n⟩⟩ bits := by
+  cases prov with
+  | none => exact fc_map_encodePlainLittleEndianBytes s n bits
+  | some p => exact fc_map_encodePtrBytesAux s p.1 p.2 (normPtrByteOffset n bits) n n 0 bits
+
+private theorem fc_seqLength_encodePlain :
+    ∀ (n bits : Nat), Trusted.Sequence.length (encodePlainLittleEndianBytes bits n) = n
+  | 0, _ => rfl
+  | n + 1, bits => by
+    show Nat.succ (Trusted.Sequence.length (encodePlainLittleEndianBytes (bits / 256) n)) = n + 1
+    rw [fc_seqLength_encodePlain n (bits / 256)]
+
+private theorem fc_seqLength_encodePtrAux (a t origOff ptrBytes : Nat) :
+    ∀ (n idx bits : Nat), Trusted.Sequence.length (encodePtrBytesAux a t origOff ptrBytes bits idx n) = n
+  | 0, _, _ => rfl
+  | n + 1, idx, bits => by
+    show Nat.succ (Trusted.Sequence.length (encodePtrBytesAux a t origOff ptrBytes (bits / 256) (idx + 1) n)) = n + 1
+    rw [fc_seqLength_encodePtrAux a t origOff ptrBytes n (idx + 1) (bits / 256)]
+
 /-- `Trusted.Sequence.length` of `encodeLittleEndianBytes bits n prov` is `n`. -/
-theorem fc_seqLength_encodeLittleEndianBytes (prov : Option (Nat × Nat)) :
-    ∀ (n bits : Nat), Trusted.Sequence.length (encodeLittleEndianBytes bits n prov) = n
-  | 0, _ => rfl
-  | n + 1, bits => by
-    show Nat.succ (Trusted.Sequence.length (encodeLittleEndianBytes (bits / 256) n prov)) = n + 1
-    rw [fc_seqLength_encodeLittleEndianBytes prov n (bits / 256)]
+theorem fc_seqLength_encodeLittleEndianBytes (prov : Option (Nat × Nat))
+    (n bits : Nat) : Trusted.Sequence.length (encodeLittleEndianBytes bits n prov) = n := by
+  cases prov with
+  | none => exact fc_seqLength_encodePlain n bits
+  | some p => exact fc_seqLength_encodePtrAux p.1 p.2 (normPtrByteOffset n bits) n n 0 bits
 
-theorem fc_length_encodeLittleEndianBytes (prov : Option (Nat × Nat)) :
-    ∀ (n bits : Nat), (encodeLittleEndianBytes bits n prov).length = n
-  | 0, _ => rfl
-  | n + 1, bits => by
-    show (encodeLittleEndianBytes (bits / 256) n prov).length + 1 = n + 1
-    rw [fc_length_encodeLittleEndianBytes prov n (bits / 256)]
+theorem fc_length_encodeLittleEndianBytes (prov : Option (Nat × Nat))
+    (n bits : Nat) : (encodeLittleEndianBytes bits n prov).length = n :=
+  fc_seqLength_encodeLittleEndianBytes prov n bits
 
-theorem fc_mergeByteProvenance_none_right (p : Option (Nat × Nat)) :
-    mergeByteProvenance p none = p := by cases p <;> rfl
+private theorem fc_nat_beq_refl : ∀ n : Nat, Nat.beq n n = true
+  | 0 => rfl
+  | n + 1 => fc_nat_beq_refl n
 
-theorem fc_mergeByteProvenance_self (p : Option (Nat × Nat)) :
-    mergeByteProvenance p p = p := by cases p <;> rfl
+theorem fc_mergeByteProvenance_none_right : ∀ p : Option (Nat × Nat),
+    mergeByteProvenance p none = none
+  | none => rfl
+  | some (_, _) => rfl
 
-/-- Anneal's little-endian decoder inverts its encoder on every in-range bit pattern, returning
-the encoding's provenance. -/
-theorem fc_decodeLittleEndianBytes_encode (prov : Option (Nat × Nat)) :
+theorem fc_mergeByteProvenance_self : ∀ p : Option (Nat × Nat),
+    mergeByteProvenance p p = p
+  | none => rfl
+  | some (a, t) => by
+    show (match Bool.and (Nat.beq a a) (Nat.beq t t) with
+      | true => some (a, t)
+      | false => none) = some (a, t)
+    rw [fc_nat_beq_refl a, fc_nat_beq_refl t]
+    rfl
+
+private theorem fc_decodeLittleEndianBits_encodePlain :
     ∀ (n bits : Nat), bits < 256 ^ (n + 1) →
-      decodeLittleEndianBytes (encodeLittleEndianBytes bits (n + 1) prov) = some (bits, prov)
+      decodeLittleEndianBits (encodePlainLittleEndianBytes bits (n + 1)) = some bits
   | 0, bits, h => by
-    show (some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 0),
-      mergeByteProvenance prov none)) = some (bits, prov)
-    rw [fc_uint8_ofNat_toNat, fc_mergeByteProvenance_none_right,
-      Nat.mod_eq_of_lt (by simpa using h)]
+    show some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 0)) = some bits
+    rw [fc_uint8_ofNat_toNat, Nat.mod_eq_of_lt (by simpa using h)]
     rfl
   | n + 1, bits, h => by
     have hdiv : bits / 256 < 256 ^ (n + 1) := by
       rw [Nat.pow_succ] at h
       exact (Nat.div_lt_iff_lt_mul (by decide)).mpr h
-    have ih := fc_decodeLittleEndianBytes_encode prov n (bits / 256) hdiv
-    show (match decodeLittleEndianBytes (encodeLittleEndianBytes (bits / 256) (n + 1) prov) with
-      | some (highBits, restProv) =>
-        some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 highBits),
-          mergeByteProvenance prov restProv)
-      | none => none) = some (bits, prov)
+    have ih := fc_decodeLittleEndianBits_encodePlain n (bits / 256) hdiv
+    show (match decodeLittleEndianBits (encodePlainLittleEndianBytes (bits / 256) (n + 1)) with
+      | some highBits => some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 highBits))
+      | none => none) = some bits
     rw [ih]
     dsimp only
-    rw [fc_uint8_ofNat_toNat, fc_mergeByteProvenance_self]
-    simp only [Option.some.injEq, Prod.mk.injEq, and_true]
+    rw [fc_uint8_ofNat_toNat]
+    simp only [Option.some.injEq]
     exact Nat.mod_add_div bits 256
+
+private theorem fc_decodeLittleEndianBits_encodePtrAux (a t origOff ptrBytes : Nat) :
+    ∀ (n idx bits : Nat), bits < 256 ^ (n + 1) →
+      decodeLittleEndianBits (encodePtrBytesAux a t origOff ptrBytes bits idx (n + 1)) = some bits
+  | 0, idx, bits, h => by
+    show some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 0)) = some bits
+    rw [fc_uint8_ofNat_toNat, Nat.mod_eq_of_lt (by simpa using h)]
+    rfl
+  | n + 1, idx, bits, h => by
+    have hdiv : bits / 256 < 256 ^ (n + 1) := by
+      rw [Nat.pow_succ] at h
+      exact (Nat.div_lt_iff_lt_mul (by decide)).mpr h
+    have ih := fc_decodeLittleEndianBits_encodePtrAux a t origOff ptrBytes n (idx + 1) (bits / 256) hdiv
+    show (match decodeLittleEndianBits (encodePtrBytesAux a t origOff ptrBytes (bits / 256) (idx + 1) (n + 1)) with
+      | some highBits => some (Nat.add (UInt8.ofNat bits).toBitVec.toNat (Nat.mul 256 highBits))
+      | none => none) = some bits
+    rw [ih]
+    dsimp only
+    rw [fc_uint8_ofNat_toNat]
+    simp only [Option.some.injEq]
+    exact Nat.mod_add_div bits 256
+
+private theorem fc_coherent_encodePtrAux (a t origOff ptrBytes : Nat) :
+    ∀ (n idx bits : Nat),
+      abstractBytesCoherentPtrProvAux a t origOff ptrBytes idx
+        (encodePtrBytesAux a t origOff ptrBytes bits idx n) =
+        Nat.beq (Nat.add idx n) ptrBytes
+  | 0, _, _ => rfl
+  | n + 1, idx, bits => by
+    show Bool.and
+        (Bool.and (Nat.beq a a)
+          (Bool.and (Nat.beq t t)
+            (Bool.and (Nat.beq idx idx)
+              (Bool.and (Nat.beq origOff origOff)
+                (Nat.beq ptrBytes ptrBytes)))))
+        (abstractBytesCoherentPtrProvAux a t origOff ptrBytes (Nat.add idx 1)
+          (encodePtrBytesAux a t origOff ptrBytes (Nat.div bits 256) (Nat.add idx 1) n)) =
+      Nat.beq (Nat.add idx (n + 1)) ptrBytes
+    rw [fc_nat_beq_refl a, fc_nat_beq_refl t, fc_nat_beq_refl idx, fc_nat_beq_refl origOff,
+      fc_nat_beq_refl ptrBytes,
+      fc_coherent_encodePtrAux a t origOff ptrBytes n (Nat.add idx 1) (Nat.div bits 256)]
+    have hIdx : Nat.add (Nat.add idx 1) n = Nat.add idx (n + 1) := by
+      show (idx + 1) + n = idx + (n + 1)
+      rw [Nat.add_assoc, Nat.add_comm 1 n]
+    rw [hIdx]
+    rfl
+
+private theorem fc_coherent_encodePtr (a t n bits : Nat) :
+    abstractBytesCoherentPtrProv? (encodeLittleEndianBytes bits (n + 1) (some (a, t))) =
+      some ({ allocId := a, tag := t, byteIdx := 0, origOffset := normPtrByteOffset (n + 1) bits, ptrBytes := n + 1 } : PtrByteFrag) := by
+  show (match Bool.and (Nat.blt 0 (n + 1))
+      (Bool.and (Nat.beq 0 0)
+        (abstractBytesCoherentPtrProvAux a t (normPtrByteOffset (n + 1) bits) (n + 1) 1
+          (encodePtrBytesAux a t (normPtrByteOffset (n + 1) bits) (n + 1) (Nat.div bits 256) 1 n))) with
+    | true => some ({ allocId := a, tag := t, byteIdx := 0, origOffset := normPtrByteOffset (n + 1) bits, ptrBytes := n + 1 } : PtrByteFrag)
+    | false => none) = _
+  rw [fc_coherent_encodePtrAux a t (normPtrByteOffset (n + 1) bits) (n + 1) n 1 (Nat.div bits 256)]
+  have hLen : Nat.add 1 n = n + 1 := Nat.add_comm 1 n
+  have hPos : Nat.blt 0 (n + 1) = true := rfl
+  rw [hLen, hPos, fc_nat_beq_refl (n + 1)]
+  rfl
+
+/-- Anneal's little-endian decoder inverts its encoder on every in-range bit pattern, returning
+the encoding's coherent pointer provenance. -/
+theorem fc_decodeLittleEndianBytes_encode (prov : Option (Nat × Nat))
+    (n bits : Nat) (h : bits < 256 ^ (n + 1)) :
+    decodeLittleEndianBytes (encodeLittleEndianBytes bits (n + 1) prov) = some (bits, prov) := by
+  cases prov with
+  | none =>
+    unfold encodeLittleEndianBytes decodeLittleEndianBytes
+    rw [fc_decodeLittleEndianBits_encodePlain n bits h]
+  | some p =>
+    rcases p with ⟨a, t⟩
+    unfold decodeLittleEndianBytes
+    rw [fc_coherent_encodePtr a t n bits]
+    have hBits : decodeLittleEndianBits (encodeLittleEndianBytes bits (n + 1) (some (a, t))) = some bits :=
+      fc_decodeLittleEndianBits_encodePtrAux a t (normPtrByteOffset (n + 1) bits) (n + 1) n 0 bits h
+    rw [hBits]
 
 /-- Anneal's scalar decoder inverts the little-endian encoder on every in-range bit pattern (for
 both signedness flags). -/
@@ -637,19 +751,25 @@ theorem fc_abstractBytesHaveProv_encode_none :
 theorem fc_abstractBytesHaveProv_encode_some (p : Nat × Nat) (n bits : Nat) :
     abstractBytesHaveProv (encodeLittleEndianBytes bits (n + 1) (some p)) = true := rfl
 
-/-- **Uninitialized bytes, Anneal side**: the little-endian decoder fails exactly on byte
-sequences containing an uninitialized byte. -/
-theorem fc_decodeLittleEndianBytes_eq_none_iff :
+private theorem fc_decodeLittleEndianBits_eq_none_iff :
     ∀ bs : List MirSemantics.AbstractByte,
-      decodeLittleEndianBytes bs = none ↔ MirSemantics.AbstractByte.uninit ∈ bs
-  | [] => by simp [decodeLittleEndianBytes]
-  | .uninit :: _ => by simp [decodeLittleEndianBytes]
+      decodeLittleEndianBits bs = none ↔ MirSemantics.AbstractByte.uninit ∈ bs
+  | [] => by simp [decodeLittleEndianBits]
+  | .uninit :: _ => by simp [decodeLittleEndianBits]
   | .init b p :: rest => by
-    have ih := fc_decodeLittleEndianBytes_eq_none_iff rest
-    simp only [decodeLittleEndianBytes, List.mem_cons, reduceCtorEq, false_or]
-    cases h : decodeLittleEndianBytes rest with
+    have ih := fc_decodeLittleEndianBits_eq_none_iff rest
+    simp only [decodeLittleEndianBits, List.mem_cons, reduceCtorEq, false_or]
+    cases h : decodeLittleEndianBits rest with
     | none => simp_all
     | some r => simp_all
+
+/-- **Uninitialized bytes, Anneal side**: the little-endian decoder fails exactly on byte
+sequences containing an uninitialized byte. -/
+theorem fc_decodeLittleEndianBytes_eq_none_iff (bs : List MirSemantics.AbstractByte) :
+    decodeLittleEndianBytes bs = none ↔ MirSemantics.AbstractByte.uninit ∈ bs := by
+  rw [← fc_decodeLittleEndianBits_eq_none_iff]
+  unfold decodeLittleEndianBytes
+  cases decodeLittleEndianBits bs <;> simp
 
 /-- **Uninitialized bytes, MiniRust side**: `AbstractByte::data` fails (`try_map` returns `None`)
 on the MiniRust image of exactly the same byte sequences. -/
@@ -3315,37 +3435,48 @@ theorem fc_anneal_ptr_transmute_and_cast_boundary
     rw [fc_evalByteCast_of_encode locals locals' op mem decls fcLayouts _ _ _ 8 _ hOpPtr
       (fc_tyByteSize_bytes8 decls) hTyPtr (fc_tyByteSize_rawPtrU8 decls) hEncPtr hLenPtr,
       fc_resolve_bytes8, hDecB8]
-  · have hUnif : abstractBytesUniformProv
-        (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = true := by
-      simp [abstractBytesUniformProv, abstractBytesAllProvAux, Nat.beq_refl]
+  · have hCoh : abstractBytesCoherentPtrProv?
+        (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) =
+        some { allocId := p.allocId, tag := p.tag, byteIdx := 0,
+               origOffset := normPtrByteOffset 8 p.offsetBytes, ptrBytes := 8 } :=
+      fc_coherent_encodePtr p.allocId p.tag 7 p.offsetBytes
+    have hBitsPtr : decodeLittleEndianBits
+        (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) =
+        some p.offsetBytes :=
+      fc_decodeLittleEndianBits_encodePtrAux p.allocId p.tag
+        (normPtrByteOffset 8 p.offsetBytes) 8 7 0 p.offsetBytes hp256
     have hDecPtr : decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcRawPtrU8Ty
         (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) =
         some (.ptr { allocId := p.allocId, offsetBytes := p.offsetBytes } 8) := by
       change decodePtrBytesNoForge false (.uint .u8) 8
           (encodeLittleEndianBytes p.offsetBytes 8 (some (p.allocId, p.tag))) = _
       dsimp only [decodePtrBytesNoForge]
-      rw [fc_seqLength_encodeLittleEndianBytes,
-        fc_decodeScalarBytes_encode (some (p.allocId, p.tag)) false 7 p.offsetBytes hp256, hUnif]
+      rw [fc_seqLength_encodeLittleEndianBytes, hBitsPtr, hCoh]
+      rfl
     show evalByteCast locals op fcRawPtrU8Ty mem decls fcLayouts = _
     rw [fc_evalByteCast_of_encode locals locals' op mem decls fcLayouts _ _ _ 8 _ hOpPtr
       (fc_tyByteSize_rawPtrU8 decls) hTyPtr (fc_tyByteSize_rawPtrU8 decls) hEncPtr hLenPtr,
       hResPtr, hDecPtr]
-  · have hDecSc : decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcRawPtrU8Ty
+  · have hBitsSc : decodeLittleEndianBits (encodeLittleEndianBytes bits 8 none) = some bits :=
+      fc_decodeLittleEndianBits_encodePlain 7 bits hb256
+    have hDecSc : decodeTypedValueFromBytes defaultCodecFuel fcLayouts fcRawPtrU8Ty
         (encodeLittleEndianBytes bits 8 none) = some (.scalar ⟨bits, 8⟩) := by
       change decodePtrBytesNoForge false (.uint .u8) 8 (encodeLittleEndianBytes bits 8 none) = _
       dsimp only [decodePtrBytesNoForge]
-      rw [fc_seqLength_encodeLittleEndianBytes,
-        fc_decodeScalarBytes_encode none false 7 bits hb256]
+      rw [fc_seqLength_encodeLittleEndianBytes, hBitsSc]
+      rfl
     show evalByteCast locals opScalar fcRawPtrU8Ty mem decls fcLayouts = _
     rw [fc_evalByteCast_of_encode locals locals' opScalar mem decls fcLayouts _ _ _ 8 _ hOpSc
       (fc_tyByteSize_rawPtrU8 decls) hTySc (fc_tyByteSize_f64 decls) hEncSc hLenSc,
       hResPtr, hDecSc]
-  · have hDecRef : decodeTypedValueFromBytes defaultCodecFuel fcLayouts refU8Ty
+  · have hBitsSc : decodeLittleEndianBits (encodeLittleEndianBytes bits 8 none) = some bits :=
+      fc_decodeLittleEndianBits_encodePlain 7 bits hb256
+    have hDecRef : decodeTypedValueFromBytes defaultCodecFuel fcLayouts refU8Ty
         (encodeLittleEndianBytes bits 8 none) = none := by
       change decodePtrBytesNoForge true (.uint .u8) 8 (encodeLittleEndianBytes bits 8 none) = _
       dsimp only [decodePtrBytesNoForge]
-      rw [fc_seqLength_encodeLittleEndianBytes,
-        fc_decodeScalarBytes_encode none false 7 bits hb256]
+      rw [fc_seqLength_encodeLittleEndianBytes, hBitsSc]
+      rfl
     show evalByteCast locals opScalar refU8Ty mem decls fcLayouts = _
     rw [fc_evalByteCast_of_encode locals locals' opScalar mem decls fcLayouts _ _ _ 8 _ hOpSc
       hSzRef hTySc (fc_tyByteSize_f64 decls) hEncSc hLenSc,
@@ -5023,13 +5154,13 @@ info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_length_encodeLittleEndianBytes
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_length_encodeLittleEndianBytes
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mergeByteProvenance_none_right' does not depend on any axioms
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mergeByteProvenance_none_right' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mergeByteProvenance_none_right
 
 /--
-info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mergeByteProvenance_self' does not depend on any axioms
+info: 'MiniRustSpec.Correspondence.FloatCastMR.fc_mergeByteProvenance_self' depends on axioms: [propext]
 -/
 #guard_msgs (whitespace := lax) in
 #print axioms MiniRustSpec.Correspondence.FloatCastMR.fc_mergeByteProvenance_self

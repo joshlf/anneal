@@ -613,39 +613,53 @@ theorem mir_unsize_array_to_slice_coercion_corresponds
   have h_unsize : stringEq "Unsize" "Unsize" = true := rfl
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy, placeTyResolved,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
       readProjectedValue, get?, h_no_borrow, h_no_global, h_nonnull, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy, placeTyResolved,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
       readProjectedValue, get?, h_no_borrow, h_no_global, h_nonnull, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy, placeTyResolved,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
       readProjectedValue, get?, h_no_borrow, h_no_global, h_nonnull, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy, placeTyResolved,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
       readProjectedValue, get?, h_no_borrow, h_no_global, h_nonnull, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy, placeTyResolved,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
       readProjectedValue, get?, h_no_borrow, h_no_global, h_nonnull, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy,
+      evalUnsizeCoercion, unsizeArrayToSliceSpec?, operandTy, placeTy, placeTyResolved,
       resolveProjectedTy, layoutPointerBytes, evalOperand,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
       readProjectedValue, get?, h_no_borrow, h_no_global, h_nonnull, h_elem_eq]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, lookupBorrow, evalOperand, readProjectedValue, get?]
+      evalUnsizeCoercion, lookupBorrow, evalOperand, placeTyResolved,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
+      readProjectedValue, get?]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, operandTy, placeTy,
-      resolveProjectedTy, evalOperand, readProjectedValue, get?, h_no_borrow]
+      evalUnsizeCoercion, operandTy, placeTy, placeTyResolved,
+      resolveProjectedTy, evalOperand,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
+      readProjectedValue, get?, h_no_borrow]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, operandTy, placeTy,
-      resolveProjectedTy, evalOperand, readProjectedValue, get?, h_no_borrow]
+      evalUnsizeCoercion, operandTy, placeTy, placeTyResolved,
+      resolveProjectedTy, evalOperand,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
+      readProjectedValue, get?, h_no_borrow]
   · simp [evalRvalue, evalReifyFnPointer, h_reify, h_unsize,
-      evalUnsizeCoercion, evalOperand, readProjectedValue, get?]
+      evalUnsizeCoercion, evalOperand, placeTyResolved,
+      materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
+      readProjectedValue, get?]
 
 /--
 **Theorem L3.18 (`mir_rvalue_len_array_and_slice_corresponds`)**:
@@ -697,11 +711,13 @@ theorem mir_rvalue_len_array_and_slice_corresponds
     evalRvalue sliceLocals (.len { local_ := 0, projection := .nil }) mem =
       .ub := by
   refine ⟨rfl, ?_, ?_, rfl⟩
-  · simp [evalRvalue, evalPlaceLen, placeTy, resolveProjectedTy,
-      layoutPointerBytes, evalPlaceRead, readProjectedValue, get?,
+  · simp [evalRvalue, evalPlaceLen, splitLastDeref?, placeTy, placeTyResolved, resolveProjectedTy,
+      layoutPointerBytes, evalPlaceRead, evalOperand, readProjectedValue, get?,
+      Trusted.Sequence.length, Nat.blt, materializeReadPtrValue, validateValueForTy?, validateValueForTyAux,
       h_no_borrow, h_no_global, h_nonnull]
-  · simp [evalRvalue, evalPlaceLen, placeTy, resolveProjectedTy,
-      evalPlaceRead, readProjectedValue, get?, lookupBorrow]
+  · simp [evalRvalue, evalPlaceLen, splitLastDeref?, placeTy, placeTyResolved, resolveProjectedTy,
+      evalPlaceRead, evalOperand, readProjectedValue, get?, lookupBorrow,
+      Trusted.Sequence.length, Nat.blt, materializeReadPtrValue, validateValueForTy?, validateValueForTyAux]
 
 /--
 **Theorem L3.19 (`mir_evalConstValue_and_global_deref_read_corresponds`)**:
@@ -961,9 +977,9 @@ theorem mir_slice_fat_ptr_write_reborrow_retag_and_edge_cases_corresponds
     -- 1. 0-byte global slice bounds check at offset = len vs offset > len
     globalAllocSliceToAbstractBytes alloc2 2 0 = .some [] ∧
     globalAllocSliceToAbstractBytes alloc2 3 0 = .none ∧
-    -- 2. ConstValue.slice (.int s) normalizes to Value.ptr fat pointer
+    -- 2. ConstValue.slice (.int s) stays provenance-less (never forges Value.ptr)
     evalConstValue (.slice (.int ⟨4, 8⟩) 0) =
-      .some (.aggregate 0 [.ptr { allocId := 0, offsetBytes := 4 } 8, .scalar ⟨0, 8⟩]) ∧
+      .some (.aggregate 0 [.scalar ⟨4, 8⟩, .scalar ⟨0, 8⟩]) ∧
     -- 3. Dereferenced slice fat-pointer write: in-bounds (idx = 1 < 2) vs OOB (idx = 2 >= 2)
     writePlaceValue locals3 activeBorrows { local_ := 1, projection := [.deref, .constantIndex 1 0 false] } w1 =
       .ok [.init (.aggregate 0 [v0, w1, v2]), .init sliceFatVal] ∧

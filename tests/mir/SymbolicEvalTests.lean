@@ -1683,8 +1683,12 @@ def polyIdMir : CapturedMir := {
 def polyIdClaimFor (typeArgs : TypeSubst) : Claim where
   body := polyIdMir.instantiate typeArgs
   pre args :=
+    let instBody := polyIdMir.instantiate typeArgs
+    let argTyOpt := placeTyResolved instBody.localDecls instBody.layouts { local_ := 1, projection := [] }
     ∃ v : Value, args = [v] ∧
       valueContainsUninit v = false ∧
+      materializeReadPtrValue instBody.layouts argTyOpt v = .some v ∧
+      validateValueForTy? instBody.layouts argTyOpt v = true ∧
       -- Typed loads (`Operand.move`) validate `bool` (`0`/`1`) and `char`
       -- (4-byte Unicode scalar value, `DIV-LM-RAW-OVERWRITE-CHAR-COPY`).
       (match typeArgs with
@@ -1710,18 +1714,24 @@ theorem polyId_all_typeArgs_verified :
     | cons head2 tail2 => intro h_len; dsimp [TypeSubst.length] at h_len; have : polyIdMir.typeParamCount = 1 := rfl; omega
     | nil =>
       rcases head with ⟨t, l⟩
-      intro h_len args s rfl ⟨v, h_args, h_v_init, hv⟩ h_ctx
+      intro h_len args s rfl ⟨v, h_args, h_v_init, h_mat, h_val, hv⟩ h_ctx
       subst h_args
       have h_non_bc :
           t ≠ .bool → t ≠ .char →
           ∀ v : Value,
             valueContainsUninit v = false →
+            materializeReadPtrValue (polyIdMir.instantiate [(t, l)]).layouts
+              (placeTyResolved (polyIdMir.instantiate [(t, l)]).localDecls
+                (polyIdMir.instantiate [(t, l)]).layouts { local_ := 1, projection := [] }) v = .some v →
+            validateValueForTy? (polyIdMir.instantiate [(t, l)]).layouts
+              (placeTyResolved (polyIdMir.instantiate [(t, l)]).localDecls
+                (polyIdMir.instantiate [(t, l)]).layouts { local_ := 1, projection := [] }) v = true →
             wpMirSym 8 (polyIdClaimFor [(t, l)]).body
               (initMachineStateWithCallees (polyIdClaimFor [(t, l)]).body [v]
                 (polyIdClaimFor [(t, l)]).callees)
               (mirNormalPost (fun retVal _ =>
                 (polyIdClaimFor [(t, l)]).post [v] retVal)) := by
-        intro h_nb h_nc v h_v_init
+        intro h_nb h_nc v h_v_init h_mat_v h_val_v
         let body_t := (polyIdClaimFor [(t, l)]).body
         let s0 := initMachineStateWithCallees body_t [v] (polyIdClaimFor [(t, l)]).callees
         have h_op :
@@ -1733,9 +1743,22 @@ theorem polyId_all_typeArgs_verified :
               s0.memory.callStack =
             .ok v [.uninit, .uninit] := by
           rw [evalOperand_move_nil_eq]
-          (conv in peekLocalInitOrUnit _ _ => whnf)
-          rw [h_v_init]
-          rfl
+          change (match valueContainsUninit v with
+            | true => PlaceReadResult.ub
+            | false =>
+              match materializeReadPtrValue (polyIdMir.instantiate [(t, l)]).layouts
+                  (placeTyResolved (polyIdMir.instantiate [(t, l)]).localDecls
+                    (polyIdMir.instantiate [(t, l)]).layouts { local_ := 1, projection := [] }) v with
+              | .none => PlaceReadResult.ub
+              | .some matVal =>
+                match validateValueForTy? (polyIdMir.instantiate [(t, l)]).layouts
+                    (placeTyResolved (polyIdMir.instantiate [(t, l)]).localDecls
+                      (polyIdMir.instantiate [(t, l)]).layouts { local_ := 1, projection := [] }) matVal with
+                | false => PlaceReadResult.ub
+                | true => PlaceReadResult.ok matVal [.uninit, .uninit]) = PlaceReadResult.ok v [.uninit, .uninit]
+          rw [h_v_init, h_mat_v]
+          dsimp only
+          rw [h_val_v]
         have h_s1 :
             stepMirFn body_t s0 =
             MirStepNode.step
@@ -1778,6 +1801,47 @@ theorem polyId_all_typeArgs_verified :
         unfold wpMirSym wpMirExecSym
         rw [evalSymNodeTree_eq, stepMirExecSymTree_eval]
         (conv in stepMirState _ _ => whnf)
+        have h_op_char :
+            evalOperand
+              (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }] (polyIdClaimFor [(.char, l)]).callees).frame.locals
+              (.move { local_ := 1, projection := [] })
+              (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }] (polyIdClaimFor [(.char, l)]).callees).memory.borrows
+              (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }] (polyIdClaimFor [(.char, l)]).callees).memory.globals
+              ((initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }]
+                (polyIdClaimFor [(.char, l)]).callees).memory.activeCallee.getD
+                (polyIdClaimFor [(.char, l)]).body).layouts
+              (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }] (polyIdClaimFor [(.char, l)]).callees).memory.callerLocals
+              ((initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }]
+                (polyIdClaimFor [(.char, l)]).callees).memory.activeCallee.getD
+                (polyIdClaimFor [(.char, l)]).body).localDecls
+              (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }] (polyIdClaimFor [(.char, l)]).callees).memory.callStack =
+            .ok (.scalar { bits := bits, sizeBytes := 4 }) [.uninit, .uninit] := by
+          rw [evalOperand_move_nil_eq]
+          change (match valueContainsUninit (.scalar { bits := bits, sizeBytes := 4 }) with
+            | true => PlaceReadResult.ub
+            | false =>
+              match materializeReadPtrValue (polyIdMir.instantiate [(.char, l)]).layouts
+                  (placeTyResolved (polyIdMir.instantiate [(.char, l)]).localDecls
+                    (polyIdMir.instantiate [(.char, l)]).layouts { local_ := 1, projection := [] })
+                  (.scalar { bits := bits, sizeBytes := 4 }) with
+              | .none => PlaceReadResult.ub
+              | .some matVal =>
+                match validateValueForTy? (polyIdMir.instantiate [(.char, l)]).layouts
+                    (placeTyResolved (polyIdMir.instantiate [(.char, l)]).localDecls
+                      (polyIdMir.instantiate [(.char, l)]).layouts { local_ := 1, projection := [] }) matVal with
+                | false => PlaceReadResult.ub
+                | true => PlaceReadResult.ok matVal [.uninit, .uninit]) =
+            PlaceReadResult.ok (.scalar { bits := bits, sizeBytes := 4 }) [.uninit, .uninit]
+          rw [h_v_init, h_mat]
+          dsimp only
+          rw [h_val]
         have h_rv :
             evalRvalue
               (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
@@ -1794,18 +1858,28 @@ theorem polyId_all_typeArgs_verified :
                 [.scalar { bits := bits, sizeBytes := 4 }]
                 (polyIdClaimFor [(.char, l)]).callees).memory.activeCallee.getD
                 (polyIdClaimFor [(.char, l)]).body).layouts =
-            match isValidCharCode bits with
-            | false => .ub
+            .ok (.scalar { bits := bits, sizeBytes := 4 })
+              [.uninit, .uninit]
+              (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
+                [.scalar { bits := bits, sizeBytes := 4 }]
+                (polyIdClaimFor [(.char, l)]).callees).memory := by
+          unfold evalRvalue
+          dsimp only [Rvalue.instantiate, Operand.instantiate, Place.instantiate]
+          rw [h_op_char]
+          change (match isValidCharCode bits with
+            | false => RvalueEvalResult.ub
             | true =>
-              .ok (.scalar { bits := bits, sizeBytes := 4 })
+              RvalueEvalResult.ok (.scalar { bits := bits, sizeBytes := 4 })
                 [.uninit, .uninit]
                 (initMachineStateWithCallees (polyIdClaimFor [(.char, l)]).body
                   [.scalar { bits := bits, sizeBytes := 4 }]
-                  (polyIdClaimFor [(.char, l)]).callees).memory := rfl
-        rw [h_rv, h_char]
+                  (polyIdClaimFor [(.char, l)]).callees).memory) = _
+          dsimp only at h_char
+          rw [h_char]
+        rw [h_rv]
         rfl
       all_goals
-        exact h_non_bc (by intro h; nomatch h) (by intro h; nomatch h) v h_v_init
+        exact h_non_bc (by intro h; nomatch h) (by intro h; nomatch h) v h_v_init h_mat h_val
 
 /--
 `#[external_spec]` sidecar for `core::slice::from_raw_parts_mut` and a modular

@@ -495,6 +495,105 @@ def isNonUnionTypeLayout (l : Layout.TypeLayout) : Bool :=
   | .union _ => false
   | _ => true
 
+/-- Whether `ScalarLayout` `s` accepts every valid bit pattern of `IntType` `it`
+under `MirSemantics.validateScalarLayoutValForTy?` (rejecting scalar niches such as
+`NonZero<u32>` and `char`-shaped ranges from being translated as unconstrained integers). -/
+def scalarLayoutAcceptsAllInt (it : Gen.IntType) (s : Layout.ScalarLayout) : Bool :=
+  match s with
+  | .union _ => true
+  | .initialized (.pointer _) vr =>
+    decide (vr.start = 0 ∧ 2 ^ (8 * it.size.bytes) - 1 ≤ vr.end_)
+  | .initialized _ vr =>
+    decide (vr.start = 0 ∧ 2 ^ (8 * it.size.bytes) - 1 ≤ vr.end_ ∧
+      !(it.size.bytes = 4 ∧ vr.start = 0 ∧ vr.end_ = 0x10FFFF))
+
+/-- Fuel-bounded check that `MirSemantics.validateValueForTyAux` accepts every
+`TupleSpec.valOk`-valid value at layout index `lIdx` (closing the `Kani#5205` niche
+gap for `.adt` structs translated as `TupleSpec`). -/
+def adtLayoutAcceptsSpec (layouts : Layout.LayoutTable) : Nat → Nat → TupleSpec → Bool
+  | 0, _, _ => true
+  | fuel' + 1, lIdx, spec =>
+    match Layout.LayoutTable.lookup layouts lIdx with
+    | none => true
+    | some l =>
+      if l.isUninhabited then false
+      else
+        match l.variants with
+        | .empty => false
+        | .multiple _ _ _ => true
+        | .single _ =>
+          match l.fields, spec with
+          | .union _, _ => true
+          | .primitive, .scalar it =>
+            Nat.beq l.size.bytes 0 ||
+              match l.backendRepr with
+              | .scalar s0 => scalarLayoutAcceptsAllInt it s0
+              | _ => true
+          | .primitive, .tuple _ _ _ =>
+            Nat.beq l.size.bytes 0 ||
+              match l.backendRepr with
+              | .scalar _ => false
+              | _ => true
+          | .arbitrary offsets _, .scalar it =>
+            match offsets, l.backendRepr with
+            | [_], .scalar s0 => scalarLayoutAcceptsAllInt it s0
+            | _, _ => true
+          | .arbitrary offsets _, .tuple fields _ _ =>
+            if Nat.beq l.fieldLayouts.length fields.length then
+              (l.fieldLayouts.zip fields).all (fun p =>
+                adtLayoutAcceptsSpec layouts fuel' p.1 p.2.2)
+            else
+              match offsets, fields, l.backendRepr with
+              | [_], [(_, .scalar it0)], .scalar s0 => scalarLayoutAcceptsAllInt it0 s0
+              | [_, _], [(_, .scalar it0), (_, .scalar it1)], .scalarPair s0 s1 =>
+                scalarLayoutAcceptsAllInt it0 s0 && scalarLayoutAcceptsAllInt it1 s1
+              | [_], _, .scalar _ => false
+              | [_, _], _, .scalarPair _ _ => false
+              | _, _, _ => true
+          | .array _ _, .scalar _ => true
+          | .array _ _, .tuple _ _ _ =>
+            match l.fieldLayouts with
+            | [] => true
+            | _ :: _ => false
+
+/-- Pairwise helper mirroring `MirSemantics.validateTyTupleFieldsWith`. -/
+def tyLayoutAcceptsTupleFields (layouts : Layout.LayoutTable)
+    (f : MirAst.RigidTy → Nat → TupleSpec → Bool) (defaultLayoutIdx : Nat) :
+    List MirAst.RigidTy → List Nat → List (Nat × TupleSpec) → Bool
+  | [], _, [] => true
+  | k :: ks, fIdx :: fRest, (_, spec) :: sRest =>
+    f k fIdx spec && tyLayoutAcceptsTupleFields layouts f defaultLayoutIdx ks fRest sRest
+  | k :: ks, [], (_, spec) :: sRest =>
+    f k defaultLayoutIdx spec && tyLayoutAcceptsTupleFields layouts f defaultLayoutIdx ks [] sRest
+  | _, _, _ => false
+
+/-- Fuel-bounded check that `MirSemantics.validateValueForTyAux` accepts every
+`TupleSpec.valOk`-valid value at `ty` (closing the `Kani#5205` niche gap for
+tuples and `.adt` structs translated as `TupleSpec`). -/
+def tyLayoutAcceptsSpec (layouts : Layout.LayoutTable) : Nat → MirAst.Ty → TupleSpec → Bool
+  | 0, _, _ => true
+  | fuel' + 1, ty, spec =>
+    match ty.kind, spec with
+    | .uint _, .scalar _ => true
+    | .int _, .scalar _ => true
+    | .tuple ks, .tuple fields _ _ =>
+      if Nat.beq fields.length ks.length then
+        let fls : List Nat :=
+          match Layout.LayoutTable.lookup layouts ty.layoutIdx with
+          | some l => if Nat.beq l.fieldLayouts.length ks.length then l.fieldLayouts else []
+          | none => []
+        tyLayoutAcceptsTupleFields layouts
+          (fun k lIdx fSpec =>
+            tyLayoutAcceptsSpec layouts fuel' { kind := k, layoutIdx := lIdx } fSpec)
+          (MirSemantics.unresolvedLayoutIdx layouts)
+          ks fls fields
+      else true
+    | .adt _ _, _ =>
+      adtLayoutAcceptsSpec layouts (fuel' + 1) ty.layoutIdx spec
+    | .bool, _ | .char, _ | .uint _, _ | .int _, _ | .float _, _
+    | .rawPtr _ _, _ | .ref _ _, _ | .fnPtr _ _ _ _, _ | .array _ _, _ | .tuple _, _ => false
+    | _, _ => true
+
 mutual
 
 /-- `minimize`'s tuple and struct layout extraction (`tooling/minimize/src/ty.rs`):
@@ -543,16 +642,24 @@ def specOfRigidTy (layouts : Layout.LayoutTable) : MirAst.RigidTy → Nat → Op
     | .single 0, false, .arbitrary offsets _ =>
       if offsets.length = fieldKinds.length && layouts.entries.all isNonUnionTypeLayout then do
         let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
-        pure (.tuple fields l.size.bytes l.align.bytes)
+        let spec := TupleSpec.tuple fields l.size.bytes l.align.bytes
+        if tyLayoutAcceptsSpec layouts MirSemantics.defaultCodecFuel
+            { kind := .tuple fieldKinds, layoutIdx := layoutIdx } spec then
+          pure spec
+        else none
       else none
     | _, _, _ => none
-  | .adt _ fieldKinds, layoutIdx => do
+  | .adt defPath fieldKinds, layoutIdx => do
     let l ← Layout.LayoutTable.lookup layouts layoutIdx
     match l.variants, l.isUninhabited, l.fields with
     | .single 0, false, .arbitrary offsets _ =>
       if offsets.length = fieldKinds.length && layouts.entries.all isNonUnionTypeLayout then do
         let fields ← specOfFieldList layouts offsets fieldKinds l.fieldLayouts
-        pure (.tuple fields l.size.bytes l.align.bytes)
+        let spec := TupleSpec.tuple fields l.size.bytes l.align.bytes
+        if tyLayoutAcceptsSpec layouts MirSemantics.defaultCodecFuel
+            { kind := .adt defPath fieldKinds, layoutIdx := layoutIdx } spec then
+          pure spec
+        else none
       else none
     | _, _, _ => none
   | _, _ => none
@@ -2568,6 +2675,7 @@ def isAssume (s : MirAst.Statement) : Bool :=
   | .intrinsic (.assume _) => true
   | _ => false
 
+-- TODO-check-disable
 /-- `minimize`'s statement translation including `NonDivergingIntrinsic::Assume`
 and the integer-pointer provenance casts (`tooling/minimize/src/bb.rs`):
 > "match rval {
@@ -2590,6 +2698,7 @@ and the integer-pointer provenance casts (`tooling/minimize/src/bb.rs`):
 >     }
 >     _ => {}
 > }" -/
+-- TODO-check-enable
 def translateStmtOrIntrinsic (decls : List MirAst.LocalDecl) (s : MirAst.Statement)
     (layouts : Layout.LayoutTable := ⟨64, true, []⟩) :
     Option StmtTranslation :=
@@ -3514,9 +3623,14 @@ def operandIsOrdering (decls : List MirAst.LocalDecl) : MirAst.Operand → Bool
 /-- A projection-free `Ordering` operand: an `Ordering` local (`Ordering`
 constants are rejected by `translateOperand`; see
 `translateOperand_ordering_const`). -/
-def operandOkO (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
+def operandOkO (decls : List MirAst.LocalDecl) (op : MirAst.Operand)
+    (layouts : Layout.LayoutTable := ⟨64, true, []⟩) : Bool :=
   match op with
-  | .copy ⟨j, []⟩ => decide (j < decls.length) && operandIsOrdering decls op
+  | .copy ⟨j, []⟩ =>
+    decide (j < decls.length) &&
+    match decls[j]? with
+    | some d => isOrderingTy d.ty && orderingDiscrLayoutOk layouts d.ty
+    | none => false
   | .constant _ => operandIsOrdering decls op && (translateOperand decls op).isSome
   | _ => false
 
@@ -3524,7 +3638,7 @@ def operandOkO (decls : List MirAst.LocalDecl) (op : MirAst.Operand) : Bool :=
 a three-way comparison `Cmp` of two integers of one type or of two `bool`s. -/
 def rvalueOkO (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
     (decls : List MirAst.LocalDecl) : MirAst.Rvalue → Bool
-  | .use op => operandOkO decls op
+  | .use op => operandOkO decls op layouts
   | .binaryOp .cmp a b => relOperandsOk layouts decls a b
   | _ => false
 
@@ -3584,7 +3698,14 @@ def tuplePlaceSpec (layouts : Layout.LayoutTable := ⟨64, true, []⟩)
       let (_, leafSpec) ←
         resolveFieldPath layouts (.tuple fields size align) (.field idx fieldTy :: rest)
       match leafSpec with
-      | .tuple subFields subSize subAlign => some (subFields, subSize, subAlign)
+      | .tuple subFields subSize subAlign =>
+        let validOk : Bool :=
+          match MirSemantics.placeTyResolved decls layouts ⟨j, .field idx fieldTy :: rest⟩ with
+          | some leafTy =>
+            tyLayoutAcceptsSpec layouts MirSemantics.defaultCodecFuel leafTy
+              (.tuple subFields subSize subAlign)
+          | none => true
+        if validOk then some (subFields, subSize, subAlign) else none
       | .scalar _ => none
     else none
   | _ => none
@@ -5771,7 +5892,7 @@ def callArgOk (layouts : Layout.LayoutTable) (decls : List MirAst.LocalDecl)
     | _ => true
   shapeOk &&
   if isBoolTy paramDecl.ty then operandOkB layouts decls (copyOp op)
-  else if isOrderingTy paramDecl.ty then operandOkO decls (copyOp op)
+  else if isOrderingTy paramDecl.ty then operandOkO decls (copyOp op) layouts
   else
     match intBoolTupleOf paramDecl.ty with
     | some it => operandOkTuple decls it (copyOp op)

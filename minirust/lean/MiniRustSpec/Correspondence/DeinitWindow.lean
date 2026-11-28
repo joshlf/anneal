@@ -1612,7 +1612,21 @@ private theorem opAgrees_copy_other (l0 : List LocalSlot) {t q : Nat} (hqt : q �
     cases sl with
     | dead | uninit => simp
     | init v =>
-      cases hU : MirSemantics.valueContainsUninit v <;> simp [MirSemantics.readProjectedValue, hU]
+      cases hU : MirSemantics.valueContainsUninit v with
+      | true => simp [MirSemantics.readProjectedValue, hU]
+      | false =>
+        simp only [MirSemantics.readProjectedValue, hU, postReadCheck]
+        cases decls with
+        | nil => simp
+        | cons d ds =>
+          dsimp only
+          cases hmat : MirSemantics.materializeReadPtrValue layouts
+              (MirSemantics.placeTyResolved (d :: ds) layouts ⟨q, []⟩) v with
+          | none => simp
+          | some mv =>
+            dsimp only
+            cases hval : MirSemantics.validateValueForTy? layouts
+                (MirSemantics.placeTyResolved (d :: ds) layouts ⟨q, []⟩) mv <;> simp
 
 private theorem opAgrees_copy_disjoint {layouts : Layout.LayoutTable}
     (l0 : List LocalSlot) {decls : List LocalDecl} {t : Nat} {d : LocalDecl}
@@ -1641,7 +1655,21 @@ private theorem opAgrees_copy_disjoint {layouts : Layout.LayoutTable}
   unfold OpAgrees
   simp only [evalOperand_copy_nonDeref _ ⟨t, .field idx fTy :: rest⟩ hnd m.borrows m.globals
     layouts m.callerLocals decls hnu, Trusted.Sequence.get?, List.getElem?_set_self hlt, hs0, hrd]
-  cases MirSemantics.readProjectedValue l0 rootVal0 (.field idx fTy :: rest) <;> simp
+  cases MirSemantics.readProjectedValue l0 rootVal0 (.field idx fTy :: rest) with
+  | ok fv =>
+    simp only [postReadCheck]
+    cases decls with
+    | nil => simp
+    | cons d ds =>
+      dsimp only
+      cases hmat : MirSemantics.materializeReadPtrValue layouts
+          (MirSemantics.placeTyResolved (d :: ds) layouts ⟨t, .field idx fTy :: rest⟩) fv with
+      | none => simp
+      | some mv =>
+        dsimp only
+        cases hval : MirSemantics.validateValueForTy? layouts
+            (MirSemantics.placeTyResolved (d :: ds) layouts ⟨t, .field idx fTy :: rest⟩) mv <;> simp
+  | ub | unsupported => simp
 
 private def RvalAgrees (l0 lH : List LocalSlot) (rv : Rvalue) (m : Memory)
     (decls : List LocalDecl) (layouts : Layout.LayoutTable) : Prop :=
@@ -1705,6 +1733,19 @@ private theorem evalScalarBinOp_agrees (op : MirAst.BinOp) (lhs rhs : ScalarInt)
   have hself := evalScalarBinOp_locals op lhs rhs l0 l0 m b
   cases h : MirSemantics.evalScalarBinOp op lhs rhs l0 m b <;> simp_all [rvWithLocals]
 
+private theorem evalFloatScalarBinOp_agrees (op : MirAst.BinOp) (lhs rhs : ScalarInt)
+    (lhsTy? rhsTy? : Option MirAst.Ty) (l0 lH : List LocalSlot) (m : Memory) :
+    (∀ v l' m', MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? l0 m = .ok v l' m' →
+      l' = l0 ∧ MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? lH m = .ok v lH m') ∧
+    (MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? l0 m = .ub →
+      MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? lH m = .ub) ∧
+    (MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? l0 m = .unsupported →
+      MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? lH m = .unsupported) := by
+  rw [evalFloatScalarBinOp_locals op lhs rhs lhsTy? rhsTy? l0 lH m]
+  have hself := evalFloatScalarBinOp_locals op lhs rhs lhsTy? rhsTy? l0 l0 m
+  cases h : MirSemantics.evalFloatScalarBinOp op lhs rhs lhsTy? rhsTy? l0 m <;>
+    simp_all [rvWithLocals]
+
 private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
     {decls : List LocalDecl} {l0 : List LocalSlot} {t q : Nat} {dq : LocalDecl}
     {it : Gen.IntType} {op : MirAst.BinOp} {iop : Gen.IntBinOp} {c : ConstOperand}
@@ -1757,15 +1798,23 @@ private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
         | init val =>
           dsimp only [MirSemantics.readProjectedValue] at hL0
           cases hu : MirSemantics.valueContainsUninit val <;> rw [hu] at hL0
-          · simp only [PlaceReadResult.ok.injEq] at hL0
-            rcases hL0 with ⟨hvalEq, _⟩
-            subst val
-            have hsc := scalarTypeOf_int hitq
-            have hsl := (DeclSlotOk_of_scalarTypeOf hsc (.init vL)).mp (hslots0 q dq (.init vL) hdq hsq)
+          · have hsc := scalarTypeOf_int hitq
+            have hsl := (DeclSlotOk_of_scalarTypeOf hsc (.init val)).mp (hslots0 q dq (.init val) hdq hsq)
             obtain ⟨hTq, _⟩ := tyOf_int (layouts := layouts) hitq
             rw [hTq] at hsl
-            cases vL with
-            | scalar sc => exact ⟨sc, rfl⟩
+            cases val with
+            | scalar sc =>
+              have hval_ok : MirSemantics.validateValueForTy? layouts
+                  (MirSemantics.placeTyResolved decls layouts ⟨q, []⟩) (.scalar sc) = true := by
+                simp only [MirSemantics.placeTyResolved, Trusted.Sequence.get?, hdq,
+                  MirSemantics.resolveProjectedTyResolved]
+                exact validateValueForTy?_scalar_of_intTypeOf hitq sc
+              have hpost := evalOperand_post_read_ok layouts decls ⟨q, []⟩ (.scalar sc) l0
+                (materializeReadPtrValue_scalar layouts _ sc) hval_ok
+              dsimp only at hL0 hpost
+              rw [hpost] at hL0
+              cases hL0
+              exact ⟨sc, rfl⟩
             | aggregate vi vs =>
               rcases vi with _ | _ <;> rcases vs with _ | ⟨a, _ | ⟨b, _ | _⟩⟩ <;>
                 (try cases a) <;> (try cases b) <;> simp [SlotOk, tupleIntOfTy] at hsl
@@ -1784,9 +1833,19 @@ private theorem rvalAgrees_binaryOp_int {layouts : Layout.LayoutTable}
         simp only [evalOperand, MirSemantics.evalConstValue] at hR0
         (repeat' split at hR0) <;> simp_all <;> exact ⟨_, hR0.symm⟩
       obtain ⟨rhsSc, rfl⟩ := hvRSc
+      dsimp only
       cases op <;> (try exact absurd rfl hnotOff) <;>
-        exact evalScalarBinOp_agrees _ lhsSc rhsSc l0 (l0.set t (.init vH)) m
-          (MirSemantics.operandIsSigned decls (.copy ⟨q, []⟩) layouts)
+        cases Bool.or
+            (MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts (.copy ⟨q, []⟩)))
+            (MirSemantics.isFloatOptTy (MirSemantics.operandTy decls layouts (.constant c))) with
+        | false =>
+          exact evalScalarBinOp_agrees _ lhsSc rhsSc l0 (l0.set t (.init vH)) m
+            (MirSemantics.operandIsSigned decls (.copy ⟨q, []⟩) layouts)
+        | true =>
+          exact evalFloatScalarBinOp_agrees _ lhsSc rhsSc
+            (MirSemantics.operandTy decls layouts (.copy ⟨q, []⟩))
+            (MirSemantics.operandTy decls layouts (.constant c))
+            l0 (l0.set t (.init vH)) m
     · simp [hopR.2.1 hR0]
     · simp [hopR.2.2 hR0]
   · simp [hopL.2.1 hL0]
@@ -3851,7 +3910,10 @@ theorem step_window_retag {body : CapturedMir} {f : Gen.Function}
             (fun _ h => nomatch h) s.memory.borrows s.memory.globals body.layouts
             s.memory.callerLocals body.localDecls
             (placeTouchesUnion_false_of_tupleTypeOf body.localDecls ht _)]
-          simp [Trusted.Sequence.get?, hs0, hprojRead s.frame.locals]
+          simp only [Trusted.Sequence.get?, hs0, hprojRead s.frame.locals]
+          exact evalOperand_post_read_ok body.layouts body.localDecls ⟨t, .field idx fTy :: rest⟩
+            (.scalar sc) s.frame.locals (materializeReadPtrValue_scalar body.layouts _ sc)
+            (validateValueForTy?_scalar_of_resolveFieldPath hd (specOfRigidTy_of_tupleTypeOf ht) hres' sc)
         have hopH :=
           ((opAgrees_copy_disjoint s.frame.locals s.memory hd ht hrootWf hrootVal hs0 hres hres'
             hdis hw0).1 (.scalar sc) s.frame.locals hop0).2

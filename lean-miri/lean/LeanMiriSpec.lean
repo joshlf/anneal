@@ -59,6 +59,9 @@ import LeanMiriSpec.Correspondence.Safety
 import LeanMiriSpec.Correspondence.MiriDiffWitnesses
 import LeanMiriSpec.Correspondence.WideSliceDstLM
 import LeanMiriSpec.UnwindSetDiscrAndFnPtrLM
+import LeanMiriSpec.FloatArithLM
+import LeanMiriSpec.ClosureFnPtrLM
+import LeanMiriSpec.PtrByteCoherenceLM
 import LeanMiriSpec.Audit
 
 /-!
@@ -485,6 +488,59 @@ import LeanMiriSpec.Audit
   `unwrapUnsafeBinder`, and `AggregateKind.closure`; the Trusted strict checks
   the overlay does not enforce, and both sides' binder-read validity verdicts,
   are pinned by `w_ep2_strictCheck_and_validity`.
+* `LeanMiriSpec.FloatArithLM`: IEEE-754 floating-point arithmetic (`add`, `sub`,
+  `mul`, `div`, `rem`), bitwise negation (`neg`, preserving sNaN/qNaN payloads),
+  comparisons (`eq`, `ne`, `lt`, `le`, `gt`, `ge`), ordered `nanChoices`
+  correspondence (`f32`/`f64`, deterministic and nondeterministic modes, with
+  both authorities passing the original un-negated rhs for `.sub`),
+  `FloatOps.{unary, binary}` soundness and index-exact completeness
+  (`floatOps_binary_arith_pure_index_exact`), the nonempty-valid default binary
+  selector `annealChooseBinaryNaN` (contrasting with `annealChooseQuietedNaN`,
+  which fails on 2-element `∞ - ∞` lists), conservative step-hook overlay
+  (`annealStepHooksFloatArith`), real `Miri.Interpreter.Step.step` vs.
+  `stepMirFn` / `EvalRvalueFloatRel` simulations (immediate and indirect locals;
+  deterministic `copy/copy`, `const/const`, mixed `copy/const` & `const/copy`,
+  and `move/copy` arithmetic; nondeterministic `copy/copy` AND `const/const`
+  soundness + index-exact completeness plus index-exact mixed `const/copy` &
+  `copy/const`; exact-message uninit unary & binary UB lockstep; and
+  exact-message `f16`/`f128` + invalid-`BinOp` fail-closed boundaries),
+  `Ptr2IntTransmutePolicy` (`ucg#630` CTFE rejection vs. `reference#1752`
+  runtime provenance-stripping, provenance-free `{to,from}_bits` agreement,
+  explicit raw-pointer `usize -> *const T` / `*const T -> *const U` acceptance
+  vs. no-forgery `usize -> &T` / `usize -> fn()` and uninit UB under both
+  policies via `miriTransmuteScalarCheck`), and concrete witnesses
+  `w1_lm_finite_subnormal_overflow` .. `w12_lm_copy_const_nondet_sub_and_order_flip`
+  (including the `%` dividend sign on exactly-zero remainders, all five
+  IEEE-754 indeterminate forms, real `binary64` `Step.step`, and the mixed
+  `const/copy` vs. `copy/const` `.sub` candidate order; 71 public theorems, all
+  pinned by `axiomAudit_floatArithLM` and `#assert_float_arith_lm_standard_axioms`).
+* `LeanMiriSpec.ClosureFnPtrLM`: Episode 2 dual-authority correspondence for
+  non-capturing closure function pointers between the real `stepMirFn` and the
+  unmodified vendored `Step.step` / `Cast.cast` / `Call.evalCallTerminator`:
+  frame-directed closure-aware `CastHooks` / `CallHooks` (`resolve_closure` to
+  the body item for `FnOnce` and to `ClosureOnceShim` for `Fn` / `FnMut`, the
+  vendored `nonCapturingClosure`), universal vendored `nonCapturingClosure`,
+  `Cast.cast` (`ClosureFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr` pointer
+  identity), `Call.passArgument`, and `Call.initStackFrame` laws (all
+  instantiated on concrete states), the full-stack stuttering simulation
+  `CfStutterSim` with exact receiver-mode `_1` checking (`cfClosureEnvRel`) and
+  a universally sound certificate checker (`cfStutterCheck_sound`,
+  `cfStutterSim_zero_lockstep`), kernel-checked `FnOnce` lockstep and
+  `Fn` / `FnMut` stuttering simulations across `ClosureOnceShim` (including full
+  reproducer parity `159` and `9147 : u32`, panic unwinding across
+  `ClosureOnceShim` + cleanup blocks, and Episode 1's `w_c8` end-to-end
+  closure), kernel-checked fail-closed negatives, boundaries, and the
+  non-closure-specific thin-pointer / `usize`-vs-`u64` false-positive UB
+  divergence witnesses, the correspondence-gap postmortem, and
+  `#assert_closure_fn_ptr_lm_audit`.
+* `LeanMiriSpec.PtrByteCoherenceLM`: Episode 2 dual-authority correspondence for
+  pointer-byte fragment coherence (`UCG#558` / `rust#148259`) against the unmodified
+  vendored `Miri.Memory.ProvenanceMap` (`fromParts`, `readPtr`, `inspectFragments`):
+  byte-vector injectivity of `normPtrByteOffset`, universal `Trusted` ↔ vendored `readPtr`
+  correspondence for 4- and 8-byte fragment streams in runtime and CTFE modes, three-way
+  witnesses for every named attack, `Kani#5205` via vendored `Validity.checkPrimitive`,
+  `V2026_06_01 ↔ V2026_08_01` parity, the correspondence-gap postmortem, and
+  `#assert_ptr_byte_coherence_lm_audit`.
 * `LeanMiriSpec.Audit`: statement pins and axiom audit (`#assert_standard_axioms`
   plus exhaustive environment-wide verification across `LeanMiriSpec.*` and
   `Miri.*`).

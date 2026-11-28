@@ -113,19 +113,19 @@ open Trusted.Rustc.V2026_06_01.MirSemantics
 private theorem evalOperand_copy_nil_any
     (locals : List LocalSlot) (idx : Local) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) :
     evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals
-        localDecls callStack =
+        [] callStack =
       evalOperand locals (.copy ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
 
 private theorem evalOperand_move_nil_any
     (locals : List LocalSlot) (idx : Local) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) :
     evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals
-        localDecls callStack =
+        [] callStack =
       evalOperand locals (.move ⟨idx, .nil⟩) borrows globals layouts callerLocals := rfl
 
 private theorem evalOperandWithBodyCast_copy_nil_any
@@ -4619,15 +4619,15 @@ theorem WellTypedCallArgs.evalOperands_any
     (h : WellTypedCallArgs callerBody calleeBody tf ops decls)
     (locals : List LocalSlot) (borrows : List BorrowEntry)
     (globals : List CapturedAllocation) (layouts : LayoutTable)
-    (callerLocals : List LocalSlot) (localDecls : List LocalDecl)
+    (callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) :
-    evalOperands locals ops borrows globals layouts callerLocals localDecls callStack =
+    evalOperands locals ops borrows globals layouts callerLocals [] callStack =
       evalOperands locals ops borrows globals layouts callerLocals := by
   induction h generalizing locals with
   | nil _ => rfl
   | cons op restOps argDecl restDecls hop _ ih =>
     have hop_eq :
-        evalOperand locals op borrows globals layouts callerLocals localDecls callStack =
+        evalOperand locals op borrows globals layouts callerLocals [] callStack =
           evalOperand locals op borrows globals layouts callerLocals := by
       cases hop with
       | scalarOp _ _ _ hsc _ _ =>
@@ -4665,7 +4665,7 @@ theorem WellTypedCallArgs.evalOperandsWithBodyCast_any
       rw [hop_nc]
       exact ih
   rw [evalOperandsWithBodyCast_eq_evalOperands _ _ _ _ _ _ _ _ hnc]
-  exact h.evalOperands_any locals borrows globals layouts callerLocals [] callStack
+  exact h.evalOperands_any locals borrows globals layouts callerLocals callStack
 
 /-- Pointwise relation between evaluated Anneal argument values `argVals`,
 `lean-miri` argument immediates `argImms`, and the callee's post-`_0`
@@ -4775,7 +4775,7 @@ theorem evalCallArgOperand_simulation
         hframe
         hlay_eq
         (himm_tr _ _ (.scalar sc msc hrel hlaysz hbool hchar))
-    | copyLocal idx decl hdecl hsz_nz himm =>
+    | copyLocal idx decl hdecl hsz_nz himm _ =>
       obtain ⟨slot, mls, _, hlt_mf, hslot, hmls, hmls_eq, hloc⟩ := hframe.lookup_local hdecl
       have hcache := hloc.layout_eq
       have himm' := himm mls hmls
@@ -7976,7 +7976,10 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
       have hback_tf : m.stack.frames.back? = some topFrame₀ := by rw [harr]; simp
       have htf_eq : topFrame = topFrame₀ := Option.some.inj (hback.symm.trans hback_tf)
       subst htf_eq
-      have ha_base :
+      -- The non-panic (`isUnwindingPanicDefPath defPath = false`) branch is left
+      -- abstract (`rest`): it dispatches `evalDivergingRustIntrinsic?` before the
+      -- external call, and neither conjunct below depends on its shape.
+      obtain ⟨rest, ha_base⟩ : ∃ rest : MirStepNode,
           stepMirFn rootBody s =
             match isAbortingPanicDefPath defPath with
             | true => .retOutcome .abort
@@ -7987,11 +7990,7 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
                 | .running nextState => .step nextState
                 | .halted out => .retOutcome out
                 | .faulted fk => .fail fk
-              | false =>
-                .extCall
-                  { defPath := defPath, typeArgs := extractCalleeTypeArgs func,
-                    args := [], memory := s.memory }
-                  (resumeExternalDivergingCall s s.frame.locals unwind) := by
+              | false => rest := ⟨_, by
         rw [stepMirFn_activeMirBody_eq rootBody s hphase]
         have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by simp [hstmt_len]
         simp only [hbb, hstmt_none, hbeq_len, ↓reduceIte]
@@ -8002,7 +8001,7 @@ theorem step_terminator_call_diverging_panic_vs_unlinked
         rw [hfunc]
         dsimp only [evalOperandsWithBodyCast, evalOperands]
         rw [hcallee_none, hnot_unreach]
-        rfl
+        rfl⟩
       have htk :
           (translateTerminator bb.terminator).kind =
             .Call (translateCalleeOperand func)
@@ -8921,6 +8920,13 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
   · intro fnEntry calleeBody retDecl restDecls calleeBb0 hoff0 hlookup_some htargs_nil
       habi_a habi_m hcallee htparam hcallee_decls hcallee_bb0 hcal_abi hdest_deinit hcallee_unwind
     obtain ⟨hdest_wf_d, hdest_live_d⟩ := hdest_deinit tfDeinit rfl
+    have hshape_none : calleeOwnClosureShape? calleeBody = .none := by
+      have hac : calleeBody.argCount = 0 := by
+        unfold annealCalleeAbiCompatible at hcal_abi
+        simp only [Bool.and_eq_true] at hcal_abi
+        exact Nat.eq_of_beq_eq_true hcal_abi.2.1
+      unfold calleeOwnClosureShape?
+      rw [hac]
     have hsz_eq0 :
         (Miri.ABI.Size.ofBytes (baseAddr + UInt64.ofNat ptrVal.offsetBytes - baseAddr) !=
           Miri.ABI.Size.ZERO) = false := by
@@ -9016,6 +9022,10 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
             calleeBody 0 = true := by
         unfold checkCalleeTargetCompatible
         dsimp only []
+        rw [hshape_none]
+        dsimp only []
+        unfold checkFnPtrTargetCompatible
+        dsimp only []
         unfold annealCalleeAbiCompatible at hcal_abi
         exact hcal_abi
       rw [ha_step_eq, hm_step_eq]
@@ -9047,6 +9057,15 @@ theorem step_terminator_call_indirect_fnPtr_move_simulation
       simp only [Option.isSome_some, hsize_ne,
         Bool.false_eq_true, ↓reduceIte, Except.map, pure, Pure.pure,
         miriFinishStep]
+      have hentry :
+          calleeEntryArgs
+            { defPath := fnEntry.defPath, typeArgs := [],
+              fnSig := fnEntry.fnSig, isIndirect := true }
+            calleeBody [] = [] := by
+        unfold calleeEntryArgs
+        dsimp only []
+        rw [hshape_none]
+      rw [hentry]
       apply StepRelMultiFrame.step
       let savedCaller : SavedCallerFrame :=
         { callerBody := activeMirBody rootBody s
@@ -9726,6 +9745,8 @@ theorem step_stmt_assign_reifyFnPointer_to_indirectFnPtrMovePre_simulation
         rw [htraits_nil, hcheck_sig]
         dsimp only []
         rw [← hfn_ty, hfind_none, halloc_id]
+        dsimp only []
+        rw [show isClosureFnPointerCoercion "ReifyFnPointer" = false from by decide]
         dsimp only []
         rw [hslot_f]
         cases hslot_cases : slot_f with
