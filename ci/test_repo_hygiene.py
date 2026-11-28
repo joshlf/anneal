@@ -46,22 +46,28 @@ def _tracked_files() -> list[str]:
     ]
 
 
-def _tracked_text(path: Path, rel: str = "") -> str | None:
+def _tracked_blob(path: Path, rel: str = "") -> tuple[str, bool] | None:
     """Read a file, or a symlink's target, as `check_pr_hygiene.py` does.
 
-    Bytes are decoded by `cph.scannable_text` without newline translation;
-    binary content yields `None`.
+    Bytes are decoded by `cph.decode_blob` without newline translation into
+    `(text, binary)`; `None` means there is nothing to read.
     """
     try:
         if path.is_symlink():
             raw = os.fsencode(os.readlink(path))
-            return cph.scannable_text(raw, rel or path.name, is_symlink=True)
+            return cph.decode_blob(raw, rel or path.name, is_symlink=True)
         if path.is_file():
-            raw = path.read_bytes()
-            return cph.scannable_text(raw, rel or path.name)
+            return cph.decode_blob(path.read_bytes(), rel or path.name)
         return None
     except OSError:
         return None
+
+
+def _hits(blob: tuple[str, bool] | None) -> list[tuple[int, str]]:
+    if blob is None:
+        return []
+    text, binary = blob
+    return cph.internal_reference_hits(text, binary=binary)
 
 
 class RepoHygieneTests(unittest.TestCase):
@@ -87,38 +93,31 @@ class RepoHygieneTests(unittest.TestCase):
             root = Path(tmp)
             cr_file = root / "cr.txt"
             cr_file.write_bytes(f"first\rsecond\n{cli}\n".encode())
-            cr_text = _tracked_text(cr_file)
-            self.assertIsNotNone(cr_text)
-            self.assertEqual(
-                cph.internal_reference_hits(cr_text or ""),
-                [(2, "internal-cli")],
-            )
+            self.assertEqual(_hits(_tracked_blob(cr_file)),
+                             [(2, "internal-cli")])
             broken = root / "dangling"
             os.symlink(mnt, broken)
-            link_text = _tracked_text(broken)
-            self.assertEqual(link_text, mnt)
-            self.assertEqual(
-                cph.internal_reference_hits(link_text or ""),
-                [(1, "internal-mount")],
-            )
+            self.assertEqual(_tracked_blob(broken), (mnt, False))
+            self.assertEqual(_hits(_tracked_blob(broken)),
+                             [(1, "internal-mount")])
+            # Binary blobs skip only the shortest patterns.
             binary = root / "bad.bin"
-            binary.write_bytes(b"\x00\xff\xfe" + cli.encode())
-            self.assertIsNone(_tracked_text(binary))
+            binary.write_bytes(b"\x00\xff\xfe " + cli.encode() + b" "
+                               + mnt.encode())
+            self.assertTrue(_tracked_blob(binary)[1])
+            self.assertEqual(_hits(_tracked_blob(binary)),
+                             [(1, "internal-mount")])
             # A stray invalid byte in text does not hide a reference.
             latin1 = root / "latin1.txt"
             latin1.write_bytes(b"caf\xe9\n" + cli.encode() + b"\n")
-            self.assertEqual(
-                cph.internal_reference_hits(_tracked_text(latin1) or ""),
-                [(2, "internal-cli")],
-            )
-            # Known source/prose extensions are scanned even with NUL + 0xff.
+            self.assertEqual(_hits(_tracked_blob(latin1)),
+                             [(2, "internal-cli")])
+            # Known source/prose paths are text even with NUL + 0xff.
             sneaky_md = root / "sneaky.md"
-            sneaky_md.write_bytes(b"\x00\xff\n" + mnt.encode() + b"\n")
+            sneaky_md.write_bytes(b"\x00\xff\n" + cli.encode() + b"\n")
             self.assertEqual(
-                cph.internal_reference_hits(
-                    _tracked_text(sneaky_md, "docs/sneaky.md") or ""
-                ),
-                [(2, "internal-mount")],
+                _hits(_tracked_blob(sneaky_md, "docs/sneaky.md")),
+                [(2, "internal-cli")],
             )
 
     def test_tracked_files_ignores_ambient_git_dir(self) -> None:
@@ -150,10 +149,7 @@ class RepoHygieneTests(unittest.TestCase):
         for rel in _tracked_files():
             if rel.startswith(_EXCLUDED_PREFIXES):
                 continue
-            text = _tracked_text(REPO_ROOT / rel, rel)
-            if text is None:
-                continue
-            for line_no, label in cph.internal_reference_hits(text):
+            for line_no, label in _hits(_tracked_blob(REPO_ROOT / rel, rel)):
                 violations.append(f"{rel}:{line_no} [{label}]")
         self.assertEqual(
             violations,

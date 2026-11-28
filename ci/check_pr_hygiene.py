@@ -43,8 +43,8 @@ tree at `--head`:
   that `ci/test_repo_hygiene.py` imports. With `--base`, they cover changed
   paths, the added lines of changed files, and every line of files entering
   Anneal scope or turning from binary into text; without it, every path and
-  line in scope at `--head`. Binary blobs (see `scannable_text`) and commit
-  messages are not scanned.
+  line in scope at `--head`. Binary blobs skip only the shortest patterns
+  (see `decode_blob`), and commit messages are not scanned.
 - `layout`: the candidate head changes the repository layout that the
   target base uses.
 
@@ -239,6 +239,10 @@ _BANNED_LITERALS = tuple(
 )
 _FOLD_EXTRA = (("\u0130", "i"), ("\u0131", "i"), ("\u017f", "s"),
                ("\u212a", "k"))
+# Binary blobs skip literals shorter than this: a three-letter literal such
+# as the internal CLI's name matches random bytes about once per 4 MB, while
+# a four-character one matches about once per 3 GB.
+_BINARY_MIN_LITERAL = 4
 
 
 def _fold(text: str) -> str:
@@ -251,12 +255,13 @@ def _fold(text: str) -> str:
 
 
 def internal_reference_hits(
-    text: str, lines: set[int] | None = None
+    text: str, lines: set[int] | None = None, *, binary: bool = False
 ) -> list[tuple[int, str]]:
     """Return a `(line, label)` pair per banned reference in `text`.
 
     Lines are numbered from 1 and split at LF only, as Git numbers them.
-    `lines`, if given, limits the scan to those line numbers.
+    `lines`, if given, limits the scan to those line numbers. `binary` (see
+    `decode_blob`) skips patterns too short to be meaningful in binary data.
     """
     if lines is not None and not lines:
         return []
@@ -264,7 +269,7 @@ def internal_reference_hits(
     present = [
         (label, pat, lit)
         for (label, pat), lit in zip(BANNED_CONTENT_PATTERNS, _BANNED_LITERALS)
-        if lit in folded
+        if lit in folded and not (binary and len(lit) < _BINARY_MIN_LITERAL)
     ]
     if not present:
         return []
@@ -1752,24 +1757,25 @@ def _always_text_path(path: str, is_symlink: bool = False) -> bool:
     )
 
 
-def scannable_text(
+def decode_blob(
     raw: bytes, path: str = "", *, is_symlink: bool = False
-) -> str | None:
-    """Decode a blob for the internal-reference scan; `None` if binary.
+) -> tuple[str, bool]:
+    """Decode a blob for the internal-reference scan.
 
-    Valid UTF-8 is always scanned, as are symlinks and known source, prose,
-    or config paths (`_always_text_path`). Other non-UTF-8 content is scanned
-    with U+FFFD replacements unless Git would also call it binary (a NUL byte
-    in its first 8000 bytes), where short patterns would match by chance.
-    Replacement never consumes a line feed, so line numbers are kept.
+    Returns the text, with U+FFFD for invalid UTF-8 (replacement never
+    consumes a line feed, so line numbers are kept), and whether the blob is
+    binary: not valid UTF-8, holding a NUL byte in its first 8000 bytes as
+    Git decides, and neither a symlink nor a known source, prose, or config
+    path (`_always_text_path`). Binary blobs are still scanned, but only for
+    patterns long enough not to match random bytes by chance (see
+    `_BINARY_MIN_LITERAL`), so no byte trick hides a file entirely.
     """
     try:
-        return raw.decode("utf-8")
+        return raw.decode("utf-8"), False
     except UnicodeDecodeError:
-        if (not _always_text_path(path, is_symlink)
-                and b"\0" in raw[:_BINARY_SNIFF_BYTES]):
-            return None
-        return raw.decode("utf-8", "replace")
+        binary = (not _always_text_path(path, is_symlink)
+                  and b"\0" in raw[:_BINARY_SNIFF_BYTES])
+        return raw.decode("utf-8", "replace"), binary
 
 
 def internal_findings(
@@ -1782,15 +1788,16 @@ def internal_findings(
     With `files` (diff mode), checks each non-deleted in-scope changed path,
     every line of a file entering Anneal scope or text scope (added, copied,
     renamed from outside scope, changed from a non-blob, or changed from a
-    binary-skipped entry at `base` to scannable text at `head`), and the added
-    lines of other files, so untouched already-scanned lines never fail a
-    change. Without `files` (tree mode), checks every in-scope path and line.
-    Like `ci/test_repo_hygiene.py`, content scanning skips binary blobs (see
-    `scannable_text`); a symbolic link is scanned as its target text.
+    binary blob at `base` to text at `head`), and the added lines of other
+    files, so untouched already-scanned lines never fail a change. Without
+    `files` (tree mode), checks every in-scope path and line. Like
+    `ci/test_repo_hygiene.py`, binary blobs are scanned for long patterns
+    only (see `decode_blob`); a symbolic link is scanned as its target text.
     """
     out: list[Finding] = []
     # `(path, is_sym, oid, prev_oid, prev_path, prev_sym, lines)`.
-    scan: list[tuple[str, bool, str, str | None, str, bool, set[int] | None]] = []
+    scan: list[tuple[str, bool, str, str | None, str, bool,
+                     set[int] | None]] = []
     if files is None:
         records = git.tree_records(head)
         for path in sorted(records):
@@ -1862,16 +1869,17 @@ def internal_findings(
     ]
     blobs = git.blobs(need_oids)
     for path, is_sym, oid, prev_oid, prev_path, prev_sym, lines in scan:
-        text = scannable_text(blobs[oid], path, is_symlink=is_sym)
-        if text is None:
-            continue
-        if (prev_oid is not None
-                and scannable_text(blobs[prev_oid], prev_path,
-                                   is_symlink=prev_sym) is None):
+        text, binary = decode_blob(blobs[oid], path, is_symlink=is_sym)
+        # A binary blob turning into text gains the short patterns on every
+        # line, not just the added ones.
+        if (prev_oid is not None and not binary
+                and decode_blob(blobs[prev_oid], prev_path,
+                                is_symlink=prev_sym)[1]):
             lines = None
         if lines == set():
             continue
-        for lineno, label in internal_reference_hits(text, lines):
+        for lineno, label in internal_reference_hits(text, lines,
+                                                     binary=binary):
             out.append(Finding(
                 "internal-reference",
                 f"internal-infrastructure reference ({label}); public "

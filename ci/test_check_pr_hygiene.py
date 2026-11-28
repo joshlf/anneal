@@ -1557,17 +1557,24 @@ class InternalHygieneMixin:
         self.commit()
         self.assertEqual(self.internal(), set())
 
-    def test_binary_blobs_are_skipped(self):
-        # A NUL byte early in the blob makes it binary, as Git decides.
+    def test_binary_blobs_skip_only_short_patterns(self):
+        # A NUL byte early in the blob makes it binary, as Git decides. Short
+        # literals match random bytes too often to check there, but longer
+        # ones are still caught, so a NUL cannot hide a whole file.
         path = self.repo / self.ROOT / "assets" / "blob.bin"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe " + self.CLI.encode()
-                         + b" \x00 " + self.MOUNT.encode() + b"\n\x80\n")
+        png = b"\x89PNG\r\n\x1a\n\xff\xfe " + self.CLI.encode() + b" \x00"
+        path.write_bytes(png + b"\n\x80\n")
         self.commit()
         for base in ("base", None):
             code, report = self.run_check(base=base)
             self.assertEqual(code, 0, report)
             self.assertEqual(report["findings"], [], report)
+        path.write_bytes(png + b" " + self.MOUNT.encode() + b"\n\x80\n")
+        self.commit()
+        expected = {self.ref("assets/blob.bin", 3, "internal-mount")}
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
 
     def test_valid_utf8_with_nul_bytes_is_scanned(self):
         path = self.repo / self.ROOT / "assets" / "data.bin"
@@ -1855,26 +1862,40 @@ class InternalUnitTests(unittest.TestCase):
                              ("skills/other/x", solo)):
             self.assertIsNone(cph.internal_path_message(path, layout), path)
 
-    def test_scannable_text(self):
-        self.assertEqual(cph.scannable_text(b"ok\n"), "ok\n")
+    def test_decode_blob(self):
+        dec = cph.decode_blob
+        self.assertEqual(dec(b"ok\n"), ("ok\n", False))
         # Valid UTF-8 is text even with NUL bytes.
-        self.assertEqual(cph.scannable_text(b"\x00ok"), "\x00ok")
-        self.assertIsNone(cph.scannable_text(b"\x00\xff"))
-        self.assertIsNone(cph.scannable_text(b"\x00\xff", "assets/blob.bin"))
-        self.assertEqual(cph.scannable_text(b"\x00\xff", "docs/note.MD"),
-                         "\x00\ufffd")
-        self.assertEqual(cph.scannable_text(b"\x00\xff", "AGENTS.md"),
-                         "\x00\ufffd")
-        self.assertEqual(cph.scannable_text(b"\x00\xff", is_symlink=True),
-                         "\x00\ufffd")
-        self.assertEqual(cph.scannable_text(b"a\xff\nb"), "a\ufffd\nb")
+        self.assertEqual(dec(b"\x00ok"), ("\x00ok", False))
+        self.assertEqual(dec(b"\x00\xff"), ("\x00\ufffd", True))
+        self.assertEqual(dec(b"\x00\xff", "assets/blob.bin"),
+                         ("\x00\ufffd", True))
+        # Symlinks and source, prose, or config paths are never binary.
+        for path in ("docs/note.MD", "AGENTS.md", "lakefile.toml",
+                     "data/x.json"):
+            self.assertEqual(dec(b"\x00\xff", path), ("\x00\ufffd", False))
+        self.assertEqual(dec(b"\x00\xff", is_symlink=True),
+                         ("\x00\ufffd", False))
+        self.assertEqual(dec(b"a\xff\nb"), ("a\ufffd\nb", False))
         # Git only sniffs the first 8000 bytes for NUL.
         late = b"x" * 8000 + b"\x00\xff"
-        self.assertIsNotNone(cph.scannable_text(late))
-        self.assertIsNone(cph.scannable_text(late[1:]))
+        self.assertFalse(dec(late)[1])
+        self.assertTrue(dec(late[1:])[1])
         # A truncated sequence before a line feed keeps the line count.
-        text = cph.scannable_text(b"a\xe2\x82\nb\n")
+        text, _ = dec(b"a\xe2\x82\nb\n")
         self.assertEqual(text.split("\n"), ["a\ufffd", "b", ""])
+
+    def test_binary_scan_skips_only_short_literals(self):
+        short = [label for (label, _), lit in zip(cph.BANNED_CONTENT_PATTERNS,
+                                                  cph._BANNED_LITERALS)
+                 if len(lit) < cph._BINARY_MIN_LITERAL]
+        self.assertEqual(short, ["internal-cli"])
+        for (label, _), lit in zip(cph.BANNED_CONTENT_PATTERNS,
+                                   cph._BANNED_LITERALS):
+            text = f"\x00 {lit} \ufffd\n"
+            hits = cph.internal_reference_hits(text, binary=True)
+            with self.subTest(label=label):
+                self.assertEqual(hits, [] if label in short else [(1, label)])
 
     def test_every_banned_pattern_matches_and_respects_boundaries(self):
         for (label, pat), lit in zip(cph.BANNED_CONTENT_PATTERNS,
