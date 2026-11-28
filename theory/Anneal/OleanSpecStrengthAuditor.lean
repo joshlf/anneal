@@ -1502,18 +1502,20 @@ structure PrivateAuditEnv where
   loadedModules : List (List String)
   toolchainModules : List (List String) := []
   toolchainNames : List (List String) := []
+  compilerReservedNames : List (List String) := []
   decls : List EnvDeclModel := []
   deriving DecidableEq, Repr
 
-/-- Reserved-root and toolchain-name spoofing classifier for a private user suffix `us` claimed by
-module `ms`. An empty suffix fails closed. -/
+/-- Reserved-root, compiler-reserved, and toolchain-name spoofing classifier for a private user
+suffix `us` claimed by module `ms`. An empty suffix fails closed. -/
 def privateUserForbiddenModel (env : PrivateAuditEnv) (ms us : List String) : Bool :=
   match us with
   | [] => true
   | r :: _ =>
     reservedAlwaysRootsModel.contains r ||
       (reservedDomainRootsModel.contains r && !(ms.head? == some r)) ||
-      env.toolchainNames.contains us || isShareCommonNameModel us
+      env.compilerReservedNames.contains us || env.toolchainNames.contains us ||
+      isShareCommonNameModel us
 
 /-- Strip a byte prefix. -/
 def stripBytePrefix : List UInt8 → List UInt8 → Option (List UInt8)
@@ -1527,11 +1529,17 @@ def decDigitsValue : List UInt8 → Nat → Option Nat
   | c :: cs, acc =>
     if 48 ≤ c.toNat && c.toNat ≤ 57 then decDigitsValue cs (acc * 10 + (c.toNat - 48)) else none
 
-/-- Parse `<pfx><decimal>` with at least one digit. -/
+/-- Canonical decimal digits: `"0"` or a non-zero digit followed by ASCII digits (rejects leading
+zeros such as `"01"` so `eq_01` cannot spoof `eq_1`). -/
+def isCanonicalDecDigits : List UInt8 → Bool
+  | [] => false
+  | [c] => 48 ≤ c.toNat && c.toNat ≤ 57
+  | c :: rest => 49 ≤ c.toNat && c.toNat ≤ 57 && rest.all (fun d => 48 ≤ d.toNat && d.toNat ≤ 57)
+
+/-- Parse `<pfx><decimal>` with canonical decimal digits (no leading zeros on multi-digit values). -/
 def parseDecSuffixModel (pfx s : String) : Option Nat :=
   match stripBytePrefix (strBytes pfx) (strBytes s) with
-  | some [] => none
-  | some ds => decDigitsValue ds 0
+  | some ds => if isCanonicalDecDigits ds then decDigitsValue ds 0 else none
   | none => none
 
 /-- The closed set of lazily realized auxiliary suffixes a foreign private name may carry. -/
@@ -1717,7 +1725,8 @@ theorem privateUserForbidden_reserved_domain_root (env : PrivateAuditEnv) (ms : 
     privateUserForbiddenModel env ms (root :: us) = true := by
   show (reservedAlwaysRootsModel.contains root ||
     (reservedDomainRootsModel.contains root && !(ms.head? == some root)) ||
-    env.toolchainNames.contains (root :: us) || isShareCommonNameModel (root :: us)) = true
+    env.compilerReservedNames.contains (root :: us) || env.toolchainNames.contains (root :: us) ||
+    isShareCommonNameModel (root :: us)) = true
   rw [hr, hm]
   cases reservedAlwaysRootsModel.contains root <;> rfl
 
@@ -1728,9 +1737,22 @@ theorem privateUserForbidden_reserved_always_root (env : PrivateAuditEnv) (ms : 
     privateUserForbiddenModel env ms (root :: us) = true := by
   show (reservedAlwaysRootsModel.contains root ||
     (reservedDomainRootsModel.contains root && !(ms.head? == some root)) ||
-    env.toolchainNames.contains (root :: us) || isShareCommonNameModel (root :: us)) = true
+    env.compilerReservedNames.contains (root :: us) || env.toolchainNames.contains (root :: us) ||
+    isShareCommonNameModel (root :: us)) = true
   rw [hr]
   rfl
+
+/-- A user suffix matching a compiler-reserved intrinsic name is forbidden in every module. -/
+theorem privateUserForbidden_compiler_reserved (env : PrivateAuditEnv) (ms : List String)
+    (root : String) (us : List String)
+    (hc : env.compilerReservedNames.contains (root :: us) = true) :
+    privateUserForbiddenModel env ms (root :: us) = true := by
+  show (reservedAlwaysRootsModel.contains root ||
+    (reservedDomainRootsModel.contains root && !(ms.head? == some root)) ||
+    env.compilerReservedNames.contains (root :: us) || env.toolchainNames.contains (root :: us) ||
+    isShareCommonNameModel (root :: us)) = true
+  rw [hc]
+  exact bor_intro_left (bor_intro_left (bor_intro_right rfl))
 
 /-- **V1 non-evasion (foreign axiom / opaque).** A private axiom or opaque constant whose name
 claims a module other than the one storing it is never accepted, whatever its suffix, shape
@@ -1855,6 +1877,185 @@ theorem checkPrivateName_accepted_sound (env : PrivateAuditEnv) (inp : PrivateCh
     · obtain ⟨hl, hk⟩ := checkForeignPrivate_accepted_inv env inp r hforeign
       exact Or.inr ⟨hl, foreignKindVerdict_accepted_inv env inp r inp.kind hk⟩
 
+/-- Split a hierarchical name on `.str "_at_"` separators for IR specialization-name auditing. -/
+def splitOnAt : AuditName → List AuditName
+  | [] => [[]]
+  | .str s :: rest =>
+    if s == "_at_" then [] :: splitOnAt rest
+    else match splitOnAt rest with
+      | [] => [[.str s]]
+      | seg :: segs => (.str s :: seg) :: segs
+  | .num k :: rest =>
+    match splitOnAt rest with
+    | [] => [[.num k]]
+    | seg :: segs => (.num k :: seg) :: segs
+
+/-- Compiler-emitted IR auxiliary suffixes allowed at the tail of specialization sites. -/
+def isIRAuxSuffixModel (s : String) : Bool :=
+  s == "_redArg" || s == "_cstage1" || s == "_cstage2" ||
+    (parseDecSuffixModel "_boxed_const_" s).isSome
+
+/-- Strip trailing `_boxed` / IR-aux / `spec_<k>` suffixes from a reversed site segment. -/
+def stripSpecTailRev : Nat → AuditName → Nat → Option (AuditName × Nat)
+  | 0, rev, sp => if rev.isEmpty then none else some (rev.reverse, sp)
+  | fuel + 1, rev, sp =>
+    match rev with
+    | .str s :: r =>
+      if isIRAuxSuffixModel s || s == "_boxed" then stripSpecTailRev fuel r sp
+      else if (parseDecSuffixModel "spec_" s).isSome then stripSpecTailRev fuel r (sp + 1)
+      else some (rev.reverse, sp)
+    | _ => if rev.isEmpty then none else some (rev.reverse, sp)
+
+/-- Strip trailing specialization suffixes from an `_at_` site segment, returning `(site, specs)`. -/
+def stripSpecTailModel (seg : AuditName) : Option (AuditName × Nat) :=
+  stripSpecTailRev 6 seg.reverse 0
+
+/-- Check the base declaration head of a `_private` `_at_` specialization IR helper. -/
+def checkIRAtHeadModel (env : PrivateAuditEnv) (head : AuditName) : Bool :=
+  if head.isEmpty then false
+  else if hasPrivateMentionModel head then
+    match parseStrictPrivateName head with
+    | some r =>
+      env.loadedModules.contains r.moduleSegs && !isShareCommonNameModel r.userComps &&
+        (env.toolchainModules.contains r.moduleSegs ||
+          !privateUserForbiddenModel env r.moduleSegs r.userComps)
+    | none => false
+  else
+    match allStrComps head with
+    | some us => !isShareCommonNameModel us
+    | none => false
+
+/-- Check one `_at_` specialization site segment (`isLast = true` for the final site). -/
+def checkIRAtSiteModel (env : PrivateAuditEnv) (declaringMod : List String) (isLast : Bool)
+    (seg : AuditName) : Option Nat :=
+  (stripSpecTailModel seg).bind fun p =>
+    let site := p.1
+    let sp := p.2
+    if isLast && sp == 0 then none
+    else if hasPrivateMentionModel site then
+      match parseStrictPrivateName site with
+      | some r =>
+        if env.loadedModules.contains r.moduleSegs &&
+            !privateUserForbiddenModel env r.moduleSegs r.userComps &&
+            (!isLast || r.moduleSegs == declaringMod) then some sp
+        else none
+      | none => none
+    else
+      match allStrComps site with
+      | some us =>
+        if !isShareCommonNameModel us &&
+            (!isLast || !privateUserForbiddenModel env declaringMod us) then some sp
+        else none
+      | none => none
+
+/-- Check all `_at_` site tails in order and sum their `spec_<k>` counts. -/
+def checkIRAtTailsModel (env : PrivateAuditEnv) (declaringMod : List String) :
+    List AuditName → Option Nat
+  | [] => some 0
+  | [seg] => checkIRAtSiteModel env declaringMod true seg
+  | seg :: rest =>
+    (checkIRAtSiteModel env declaringMod false seg).bind fun sp =>
+      (checkIRAtTailsModel env declaringMod rest).map (fun tot => sp + tot)
+
+/-- Model of the IR-helper `_at_` specialization name audit (`OleanEnvAuditor.checkPrivateName`). -/
+def checkIRAtSpecModel (env : PrivateAuditEnv) (declaringMod : List String)
+    (n : AuditName) : Bool :=
+  match splitOnAt n with
+  | head :: t :: ts =>
+    checkIRAtHeadModel env head &&
+      (match checkIRAtTailsModel env declaringMod (t :: ts) with
+       | some tot => tot == (t :: ts).length
+       | none => false)
+  | _ => false
+
+theorem checkIRAtSiteModel_none_of_forbidden_last (env : PrivateAuditEnv)
+    (declaringMod : List String) (seg : AuditName) (us : List String) (sp : Nat)
+    (hstrip : stripSpecTailModel seg = some (AuditName.ofStrings us, sp))
+    (hclean : hasPrivateMentionModel (AuditName.ofStrings us) = false)
+    (hforb : privateUserForbiddenModel env declaringMod us = true) :
+    checkIRAtSiteModel env declaringMod true seg = none := by
+  unfold checkIRAtSiteModel
+  rw [hstrip]
+  show (if (true && sp == 0) = true then none
+    else if hasPrivateMentionModel (AuditName.ofStrings us) = true then
+      match parseStrictPrivateName (AuditName.ofStrings us) with
+      | some r =>
+        if env.loadedModules.contains r.moduleSegs &&
+            !privateUserForbiddenModel env r.moduleSegs r.userComps &&
+            (!true || r.moduleSegs == declaringMod) then some sp
+        else none
+      | none => none
+    else
+      match allStrComps (AuditName.ofStrings us) with
+      | some us' =>
+        if !isShareCommonNameModel us' && (!true || !privateUserForbiddenModel env declaringMod us') then
+          some sp
+        else none
+      | none => none) = none
+  cases hsp : (sp == 0) with
+  | true => rfl
+  | false =>
+    rw [hclean, allStrComps_ofStrings us]
+    show (if (!isShareCommonNameModel us && (!true || !privateUserForbiddenModel env declaringMod us)) = true then
+      some sp else none) = none
+    rw [hforb]
+    cases isShareCommonNameModel us <;> rfl
+
+theorem checkIRAtTailsModel_none_of_last (env : PrivateAuditEnv) (declaringMod : List String)
+    (mid : List AuditName) (last : AuditName)
+    (hlast : checkIRAtSiteModel env declaringMod true last = none) :
+    checkIRAtTailsModel env declaringMod (mid ++ [last]) = none := by
+  induction mid with
+  | nil => exact hlast
+  | cons seg rest ih =>
+    cases rest with
+    | nil =>
+      show (checkIRAtSiteModel env declaringMod false seg).bind (fun sp =>
+        (checkIRAtTailsModel env declaringMod [last]).map (fun tot => sp + tot)) = none
+      have hl : checkIRAtTailsModel env declaringMod [last] = none := hlast
+      rw [hl]
+      cases checkIRAtSiteModel env declaringMod false seg <;> rfl
+    | cons seg2 rest2 =>
+      show (checkIRAtSiteModel env declaringMod false seg).bind (fun sp =>
+        (checkIRAtTailsModel env declaringMod ((seg2 :: rest2) ++ [last])).map
+          (fun tot => sp + tot)) = none
+      rw [ih]
+      cases checkIRAtSiteModel env declaringMod false seg <;> rfl
+
+/-- **V1 non-evasion (`_at_` site spoofing).** Any `_at_` specialization name whose final site
+resolves to a reserved/forbidden namespace (such as `Trusted.forged_site.spec_0`) is rejected. -/
+theorem checkIRAtSpec_rejects_forged_site (env : PrivateAuditEnv) (declaringMod : List String)
+    (n head : AuditName) (mid : List AuditName) (last : AuditName) (us : List String) (sp : Nat)
+    (hsplit : splitOnAt n = head :: (mid ++ [last]))
+    (hstrip : stripSpecTailModel last = some (AuditName.ofStrings us, sp))
+    (hclean : hasPrivateMentionModel (AuditName.ofStrings us) = false)
+    (hforb : privateUserForbiddenModel env declaringMod us = true) :
+    checkIRAtSpecModel env declaringMod n = false := by
+  have hnone : checkIRAtTailsModel env declaringMod (mid ++ [last]) = none :=
+    checkIRAtTailsModel_none_of_last env declaringMod mid last
+      (checkIRAtSiteModel_none_of_forbidden_last env declaringMod last us sp hstrip hclean hforb)
+  unfold checkIRAtSpecModel
+  rw [hsplit]
+  cases hm : mid with
+  | nil =>
+    rw [hm] at hnone
+    have hnone' : checkIRAtTailsModel env declaringMod [last] = none := hnone
+    show (checkIRAtHeadModel env head &&
+      (match checkIRAtTailsModel env declaringMod [last] with
+       | some tot => tot == ([last]).length
+       | none => false)) = false
+    rw [hnone']
+    exact Bool.and_false _
+  | cons seg rest =>
+    rw [hm] at hnone
+    have hnone' : checkIRAtTailsModel env declaringMod (seg :: (rest ++ [last])) = none := hnone
+    show (checkIRAtHeadModel env head &&
+      (match checkIRAtTailsModel env declaringMod (seg :: (rest ++ [last])) with
+       | some tot => tot == (seg :: (rest ++ [last])).length
+       | none => false)) = false
+    rw [hnone']
+    exact Bool.and_false _
+
 /-! ## 9. V2 — Whole-Module Unreferenced Top-Level Axiom Sweep (`leanprover/lean4#16781`)
 
 Reachability-only axiom auditing (`#print axioms`-style closure from the claims) cannot see a
@@ -1883,6 +2084,11 @@ structure DeclEntryModel where
   inAssumptionsMod : Bool := false
   /-- The name is `Classical.choice`. -/
   isClassicalChoice : Bool := false
+  /-- The name is `sorryAx`. -/
+  isSorry : Bool := false
+  /-- The name is a native-evaluation axiom (`Lean.ofReduceBool`, `Lean.ofReduceNat`,
+  `Lean.trustCompiler`, or `_native.ax_*`). -/
+  isNative : Bool := false
   /-- Constants the declaration's type and value refer to. -/
   deps : List String := []
   deriving DecidableEq, Repr
@@ -1901,12 +2107,13 @@ structure ModuleInventoryModel where
 def ModuleInventoryModel.allEntries (inv : ModuleInventoryModel) : List DeclEntryModel :=
   inv.constants ++ inv.stage2 ++ inv.transitiveDeps
 
-/-- Axiom policy for one stored axiom: it must be stored by the module it is attributed to, and
-either be a foundational axiom of a pinned toolchain module (with `Classical.choice` subject to
-the constructive policy), or be a non-foundational file-local test axiom whose `Assumptions.*`
-name, if any, lives in an `Assumptions.*` module. -/
+/-- Axiom policy for one stored axiom: it must be stored by the module it is attributed to, must
+never be `sorryAx` or a native-evaluation axiom, and must either be a foundational axiom of a
+pinned toolchain module (with `Classical.choice` subject to the constructive policy), or be a
+non-foundational file-local test axiom whose `Assumptions.*` name, if any, lives in an
+`Assumptions.*` module. -/
 abbrev AxiomEntryAuthorized (allowClassical : Bool) (e : DeclEntryModel) : Prop :=
-  e.originMod = e.declaringMod ∧
+  e.originMod = e.declaringMod ∧ e.isSorry = false ∧ e.isNative = false ∧
   ((e.isToolchainMod = true ∧ e.isFoundational = true ∧
       (e.isClassicalChoice = true → allowClassical = true)) ∨
    (e.isToolchainMod = false ∧ e.isFoundational = false ∧
@@ -2051,7 +2258,7 @@ theorem axiomEntry_foundational_redecl_unauthorized (allowClassical : Bool) (e :
     (hf : e.isFoundational = true) (ht : e.isToolchainMod = false) :
     ¬ AxiomEntryAuthorized allowClassical e := by
   intro h
-  rcases h.2 with ⟨ht', _⟩ | ⟨_, hf', _⟩
+  rcases h.2.2.2 with ⟨ht', _⟩ | ⟨_, hf', _⟩
   · rw [ht] at ht'; cases ht'
   · rw [hf] at hf'; cases hf'
 
@@ -2060,7 +2267,7 @@ theorem axiomEntry_foreign_assumptions_unauthorized (allowClassical : Bool) (e :
     (hp : e.isAssumptionsPrefix = true) (hm : e.inAssumptionsMod = false)
     (ht : e.isToolchainMod = false) : ¬ AxiomEntryAuthorized allowClassical e := by
   intro h
-  rcases h.2 with ⟨ht', _⟩ | ⟨_, _, ha, _⟩
+  rcases h.2.2.2 with ⟨ht', _⟩ | ⟨_, _, ha, _⟩
   · rw [ht] at ht'; cases ht'
   · have hin := ha hp
     rw [hm] at hin
@@ -2085,6 +2292,35 @@ theorem wholeModuleAxiomSweep_rejects_foreign_assumptions (allowClassical : Bool
   wholeModuleAxiomSweep_complete allowClassical inv e hmem hax
     (axiomEntry_foreign_assumptions_unauthorized allowClassical e hp hm ht)
 
+/-- **V2 (d).** `sorryAx` is never authorized, even inside a file-local test-axiom module. -/
+theorem wholeModuleAxiomSweep_rejects_sorry_in_local_mod (allowClassical : Bool)
+    (inv : ModuleInventoryModel) (e : DeclEntryModel) (hmem : e ∈ inv.allEntries)
+    (hax : e.kind = .axiomDecl) (hs : e.isSorry = true) :
+    e.name ∈ (wholeModuleAxiomSweep allowClassical inv).violations :=
+  wholeModuleAxiomSweep_complete allowClassical inv e hmem hax fun h => by
+    have hsf := h.2.1
+    rw [hs] at hsf
+    cases hsf
+
+/-- **V2 (e).** Native-evaluation axioms (`Lean.ofReduceBool`, `_native.ax_*`, ...) are never
+authorized, even inside a file-local test-axiom module. -/
+theorem wholeModuleAxiomSweep_rejects_native_in_local_mod (allowClassical : Bool)
+    (inv : ModuleInventoryModel) (e : DeclEntryModel) (hmem : e ∈ inv.allEntries)
+    (hax : e.kind = .axiomDecl) (hn : e.isNative = true) :
+    e.name ∈ (wholeModuleAxiomSweep allowClassical inv).violations :=
+  wholeModuleAxiomSweep_complete allowClassical inv e hmem hax fun h => by
+    have hnf := h.2.2.1
+    rw [hn] at hnf
+    cases hnf
+
+/-- **V2 (f).** A masked top-level axiom re-declaration (`originMod ≠ declaringMod`) is always
+rejected. -/
+theorem wholeModuleAxiomSweep_rejects_masked_redecl (allowClassical : Bool)
+    (inv : ModuleInventoryModel) (e : DeclEntryModel) (hmem : e ∈ inv.allEntries)
+    (hax : e.kind = .axiomDecl) (hne : e.originMod ≠ e.declaringMod) :
+    e.name ∈ (wholeModuleAxiomSweep allowClassical inv).violations :=
+  wholeModuleAxiomSweep_complete allowClassical inv e hmem hax fun h => hne h.1
+
 /-! ## 10. V3 — Artifact Root Containment & Acyclic Compacted-Region Bounds (`leanprover/lean4#16737`)
 
 Loading a compiled artifact maps its compacted object region into memory and trusts every
@@ -2099,9 +2335,11 @@ structure PathCompModel where
   isSymlink : Bool := false
   deriving DecidableEq, Repr
 
-/-- A component that is a real directory entry: not empty, `.`, `..`, or a symlink. -/
+/-- A component that is a real directory entry: not empty, `.`, `..`, a symlink, or containing
+path separators (`/`) or NUL bytes. -/
 def pathCompClean (c : PathCompModel) : Bool :=
-  c.name != "" && c.name != "." && c.name != ".." && !c.isSymlink
+  c.name != "" && c.name != "." && c.name != ".." && !c.isSymlink &&
+    !(strBytes c.name).contains 47 && !(strBytes c.name).contains 0
 
 /-- Component-boundary containment of `target` inside `root`. -/
 def pathWithinRootModel (root target : List PathCompModel) : Bool :=
@@ -2233,18 +2471,23 @@ structure OleanHeaderModel where
   rootPtr : Nat
   deriving DecidableEq, Repr
 
-/-- One compacted region: header, byte size, reachable objects, and validated parent layers. -/
+/-- One compacted region: header, byte size, reachable objects, validated parent layers of the same
+chain, and separate-chain layers (e.g. `.olean*` when validating `.ir*`) that must stay disjoint
+and cannot be pointed into or re-exported as parents. -/
 structure CompactedRegionModel where
   header : OleanHeaderModel
   fileSize : Nat
   objs : List CompactedObjModel := []
   parents : List ParentLayerModel := []
+  disjointLayers : List ParentLayerModel := []
   deriving DecidableEq, Repr
 
 /-- Address the region is mapped at. -/
 abbrev CompactedRegionModel.base (r : CompactedRegionModel) : Nat := r.header.base
 
-/-- Kind-specific header consistency and in-bounds extent of one object. -/
+/-- Kind-specific header consistency and in-bounds extent of one object.
+For `tag = 250` (`LeanMPZ`), `capacity` models the raw 32-bit `_mp_alloc` word (must be `< 2^31`
+so signed `int32` `_mp_alloc` is non-negative) and `size` models `|_mp_size|`. -/
 abbrev ObjExtentOk (r : CompactedRegionModel) (o : CompactedObjModel) : Prop :=
   (o.tag ≤ 243 ∧ (o.csSz = 0 ∨ 8 + 8 * o.other ≤ o.csSz) ∧
       o.off + max o.csSz (8 + 8 * o.other) ≤ r.fileSize) ∨
@@ -2253,7 +2496,7 @@ abbrev ObjExtentOk (r : CompactedRegionModel) (o : CompactedObjModel) : Prop :=
       o.off + 24 + o.other * o.capacity ≤ r.fileSize) ∨
   (o.tag = 249 ∧ 1 ≤ o.size ∧ o.size ≤ o.capacity ∧ o.strNulOk = true ∧ o.strLen < o.size ∧
       o.off + 32 + o.capacity ≤ r.fileSize) ∨
-  (o.tag = 250 ∧ (o.csSz = 0 ∨ 24 ≤ o.csSz) ∧ o.size ≤ o.capacity ∧
+  (o.tag = 250 ∧ (o.csSz = 0 ∨ 24 ≤ o.csSz) ∧ o.capacity < 2147483648 ∧ o.size ≤ o.capacity ∧
       (o.capacity = 0 ∨ (o.dataPtr % 8 = 0 ∧ r.base + 96 ≤ o.dataPtr ∧
         o.dataPtr + 8 * o.capacity ≤ r.base + r.fileSize)) ∧
       o.off + max o.csSz 24 ≤ r.fileSize)
@@ -2307,9 +2550,9 @@ abbrev RootShapeOk (r : CompactedRegionModel) : Prop :=
     ∃ o ∈ r.objs, r.base + o.off = r.header.rootPtr ∧ o.rc = 0 ∧ o.tag = 0 ∧ o.other = 5 ∧
       o.csSz = 56 ∧ o.off + 56 ≤ r.fileSize ∧ rootKidsOk r 0 o.fields = true
 
-/-- The region overlaps no validated parent layer. -/
+/-- The region overlaps no validated parent layer or separate-chain disjoint layer. -/
 abbrev LayersDisjoint (r : CompactedRegionModel) : Prop :=
-  ∀ p ∈ r.parents, r.base + r.fileSize ≤ p.base ∨ p.base + p.size ≤ r.base
+  ∀ p ∈ r.parents ++ r.disjointLayers, r.base + r.fileSize ≤ p.base ∨ p.base + p.size ≤ r.base
 
 /-- A 96-byte empty delta layer: header only, re-exporting a parent's root. -/
 abbrev EmptyDeltaLayer (r : CompactedRegionModel) : Prop :=
@@ -2360,7 +2603,7 @@ theorem parentPtr_not_own (r : CompactedRegionModel) (c : Nat) (hdis : LayersDis
     (hp : ParentPtr r c) : ¬ (r.base ≤ c ∧ c < r.base + r.fileSize) := by
   obtain ⟨_, p, hpm, hlo, hhi, _⟩ := hp
   intro hown
-  rcases hdis p hpm with h | h
+  rcases hdis p (List.mem_append.mpr (Or.inl hpm)) with h | h
   · exact Nat.lt_irrefl c (Nat.lt_of_lt_of_le hown.2
       (Nat.le_trans h (Nat.le_trans (Nat.le_add_right _ _) hlo)))
   · have hc8 : c < c + 8 := Nat.lt_add_of_pos_right (by decide)
@@ -2468,7 +2711,7 @@ theorem validateOleanRegion_rejects_oob_mpz (r : CompactedRegionModel) (o : Comp
     validateOleanRegionModel r = false :=
   validateOleanRegion_false r fun h => by
     obtain ⟨_, _, _, hext, _⟩ := regionWF_objs r h o ho
-    rcases hext with ⟨hle, _⟩ | ⟨he, _⟩ | ⟨he, _⟩ | ⟨he, _⟩ | ⟨_, _, _, hlimbs, _⟩
+    rcases hext with ⟨hle, _⟩ | ⟨he, _⟩ | ⟨he, _⟩ | ⟨he, _⟩ | ⟨_, _, _, _, hlimbs, _⟩
     · rw [htag] at hle; exact absurd hle (by decide)
     · rw [htag] at he; exact absurd he (by decide)
     · rw [htag] at he; exact absurd he (by decide)
@@ -2478,6 +2721,19 @@ theorem validateOleanRegion_rejects_oob_mpz (r : CompactedRegionModel) (o : Comp
       · rcases hoob with hlt | hlt
         · exact Nat.lt_irrefl _ (Nat.lt_of_lt_of_le hlt hlo)
         · exact Nat.lt_irrefl _ (Nat.lt_of_lt_of_le hlt hhi)
+
+/-- **V3 (c).** A big integer with a negative signed 32-bit `_mp_alloc` (`≥ 2^31`) is rejected. -/
+theorem validateOleanRegion_rejects_negative_mpz_alloc (r : CompactedRegionModel)
+    (o : CompactedObjModel) (ho : o ∈ r.objs) (htag : o.tag = 250)
+    (hneg : 2147483648 ≤ o.capacity) : validateOleanRegionModel r = false :=
+  validateOleanRegion_false r fun h => by
+    obtain ⟨_, _, _, hext, _⟩ := regionWF_objs r h o ho
+    rcases hext with ⟨hle, _⟩ | ⟨he, _⟩ | ⟨he, _⟩ | ⟨he, _⟩ | ⟨_, _, hlt, _⟩
+    · rw [htag] at hle; exact absurd hle (by decide)
+    · rw [htag] at he; exact absurd he (by decide)
+    · rw [htag] at he; exact absurd he (by decide)
+    · rw [htag] at he; exact absurd he (by decide)
+    · exact Nat.lt_irrefl _ (Nat.lt_of_lt_of_le hlt hneg)
 
 /-- **V3 (c).** A scalar array with element size `0` is rejected. -/
 theorem validateOleanRegion_rejects_zero_elem_scalarArray (r : CompactedRegionModel)
@@ -2515,9 +2771,44 @@ theorem validateOleanRegion_rejects_overlap (r : CompactedRegionModel) (p : Pare
     (hp : p ∈ r.parents) (h1 : p.base < r.base + r.fileSize) (h2 : r.base < p.base + p.size) :
     validateOleanRegionModel r = false :=
   validateOleanRegion_false r fun h => by
-    rcases h.2.2.2.2.2.2.1 p hp with hd | hd
+    rcases h.2.2.2.2.2.2.1 p (List.mem_append.mpr (Or.inl hp)) with hd | hd
     · exact Nat.lt_irrefl _ (Nat.lt_of_lt_of_le h1 hd)
     · exact Nat.lt_irrefl _ (Nat.lt_of_lt_of_le h2 hd)
+
+/-- **V3 (c).** A region (such as `.ir`) overlapping a separate-chain disjoint layer (such as
+`.olean`) is rejected. -/
+theorem validateOleanRegion_rejects_disjoint_overlap (r : CompactedRegionModel)
+    (p : ParentLayerModel) (hp : p ∈ r.disjointLayers) (h1 : p.base < r.base + r.fileSize)
+    (h2 : r.base < p.base + p.size) : validateOleanRegionModel r = false :=
+  validateOleanRegion_false r fun h => by
+    rcases h.2.2.2.2.2.2.1 p (List.mem_append.mpr (Or.inr hp)) with hd | hd
+    · exact Nat.lt_irrefl _ (Nat.lt_of_lt_of_le h1 hd)
+    · exact Nat.lt_irrefl _ (Nat.lt_of_lt_of_le h2 hd)
+
+/-- **V3 (c).** An in-region root whose object does not match the 56-byte, 5-field, tag-`0`
+`ModuleData` root header is rejected. -/
+theorem validateOleanRegion_rejects_short_root (r : CompactedRegionModel) (hin : RootInRegion r)
+    (hbad : ∀ o ∈ r.objs, r.base + o.off = r.header.rootPtr →
+      o.tag ≠ 0 ∨ o.other ≠ 5 ∨ o.csSz ≠ 56) : validateOleanRegionModel r = false :=
+  validateOleanRegion_false r fun h => by
+    rcases h.2.2.2.2.2.2.2 with ⟨_, ⟨_, o, ho, haddr, _, htag, hoth, hcs, _⟩, _⟩ | ⟨hnin, _⟩
+    · rcases hbad o ho haddr with h1 | h2 | h3
+      · exact h1 htag
+      · exact h2 hoth
+      · exact h3 hcs
+    · exact hnin hin
+
+/-- **V3 (c).** An out-of-region root pointer that is not a 96-byte empty delta layer over a
+validated parent chain is rejected. -/
+theorem validateOleanRegion_rejects_bad_empty_delta (r : CompactedRegionModel)
+    (hout : ¬ RootInRegion r) (hbad : r.parents = [] ∨ r.fileSize ≠ 96) :
+    validateOleanRegionModel r = false :=
+  validateOleanRegion_false r fun h => by
+    rcases h.2.2.2.2.2.2.2 with ⟨hin, _⟩ | ⟨_, hne, h96, _⟩
+    · exact hout hin
+    · rcases hbad with hnil | hne96
+      · exact hne hnil
+      · exact hne96 h96
 
 /-! ## 11. V4 — `Init.ShareCommon` Ban (`leanprover/lean4#16779`), Compiler-Override Hook Summary
 (`google/zerocopy#4321`), and Non-Blocking `leanprover/lean4#14896` Readiness Scanner -/
@@ -2694,11 +2985,12 @@ theorem compilerHookSummary_flags_phase_mismatch (s : CompilerHookSummary) (p : 
     ⟨p, List.mem_filter.mpr ⟨hmem, by rw [h]; rfl⟩, rfl⟩))
 
 /-- **V4 hook soundness of acceptance.** In a passing module every hook, from either artifact,
-is admitted, and the specialization cache is empty. -/
+is admitted, the specialization cache is empty, and every recorded phase return is consistent. -/
 theorem compilerHookSummary_ok_sound (s : CompilerHookSummary) (hok : s.ok = true) :
-    (∀ e, e ∈ s.oleanHooks ++ s.irHooks → HookEntryAdmitted e) ∧ s.specCacheEntries = [] := by
+    (∀ e, e ∈ s.oleanHooks ++ s.irHooks → HookEntryAdmitted e) ∧ s.specCacheEntries = [] ∧
+      (∀ p, p ∈ s.phaseReturns → p.consistent = true) := by
   have hnil : s.violations = [] := List.isEmpty_iff.mp hok
-  refine ⟨fun e hmem => Decidable.byContradiction fun hbad => ?_, ?_⟩
+  refine ⟨fun e hmem => Decidable.byContradiction fun hbad => ?_, ?_, fun p hmem => ?_⟩
   · have hin := compilerHookSummary_flags s e hmem hbad
     rw [hnil] at hin
     cases hin
@@ -2709,12 +3001,19 @@ theorem compilerHookSummary_ok_sound (s : CompilerHookSummary) (hok : s.ok = tru
         List.mem_append.mpr (Or.inl (List.mem_append.mpr (Or.inr (by rw [hsc]; exact List.mem_cons_self))))
       rw [hnil] at hin
       cases hin
+  · cases hc : p.consistent with
+    | true => rfl
+    | false =>
+      have hin := compilerHookSummary_flags_phase_mismatch s p hmem hc
+      rw [hnil] at hin
+      cases hin
 
 /-- Expression skeleton scanned for `leanprover/lean4#14896` readiness: once theorems become
 opaque to delta reduction, a theorem sitting in a recursor major premise or a projection
-scrutinee no longer reduces. -/
+scrutinee — directly, wrapped, or via a `let`-binding — no longer reduces. -/
 inductive ReadinessExpr : Type where
   | const (name : String) (isTheorem : Bool)
+  | bvar (idx : Nat)
   | app (f a : ReadinessExpr)
   | lam (body : ReadinessExpr)
   | letE (value body : ReadinessExpr)
@@ -2722,41 +3021,157 @@ inductive ReadinessExpr : Type where
   | recursorApp (minors major : ReadinessExpr)
   deriving DecidableEq, Repr
 
+/-- Does de Bruijn index `i` refer to a `let`-bound theorem-carrying local in `bm`? -/
+def bvarHasThm : List Bool → Nat → Bool
+  | [], _ => false
+  | b :: _, 0 => b
+  | _ :: rest, i + 1 => bvarHasThm rest i
+
+/-- Pointwise monotonicity of theorem-carrying local environments. -/
+abbrev BmLe (bm1 bm2 : List Bool) : Prop :=
+  ∀ i, bvarHasThm bm1 i = true → bvarHasThm bm2 i = true
+
+theorem bmLe_nil (bm : List Bool) : BmLe [] bm := fun _ h => by cases h
+
+theorem bmLe_cons {a b : Bool} {bm1 bm2 : List Bool} (hab : a = true → b = true)
+    (h : BmLe bm1 bm2) : BmLe (a :: bm1) (b :: bm2) := by
+  intro i hi
+  cases i with
+  | zero => exact hab hi
+  | succ i' => exact h i' hi
+
 /-- Is the head of the application spine a theorem constant (the direct form)? -/
 def ReadinessExpr.headIsTheorem : ReadinessExpr → Bool
   | .const _ t => t
   | .app f _ => f.headIsTheorem
   | _ => false
 
-/-- Does a scrutinee carry a theorem constant, directly or through wrapper applications
-(`@id T thm`) and `let` bodies? This is a conservative superset of the head test. -/
-def ReadinessExpr.carriesTheorem : ReadinessExpr → Bool
+/-- Does a scrutinee carry a theorem constant under local `let`-binding environment `bm`, directly
+or through wrapper applications (`@id T thm`) and `let` bodies? -/
+def ReadinessExpr.carriesTheoremAt (bm : List Bool) : ReadinessExpr → Bool
   | .const _ t => t
-  | .app f a => f.carriesTheorem || a.carriesTheorem
+  | .bvar i => bvarHasThm bm i
+  | .app f a => f.carriesTheoremAt bm || a.carriesTheoremAt bm
   | .lam _ => false
-  | .letE v b => v.carriesTheorem || b.carriesTheorem
-  | .proj s => s.carriesTheorem
-  | .recursorApp minors major => minors.carriesTheorem || major.carriesTheorem
+  | .letE v b => v.carriesTheoremAt bm || b.carriesTheoremAt (v.carriesTheoremAt bm :: bm)
+  | .proj s => s.carriesTheoremAt bm
+  | .recursorApp minors major => minors.carriesTheoremAt bm || major.carriesTheoremAt bm
+
+/-- Closed-environment scrutinee theorem test (`bm = []`). -/
+def ReadinessExpr.carriesTheorem (e : ReadinessExpr) : Bool := e.carriesTheoremAt []
 
 /-- Does the expression put a theorem in a recursor major premise or projection scrutinee,
-at any depth? -/
-def ReadinessExpr.flagged : ReadinessExpr → Bool
+at any depth under local `let`-binding environment `bm`? -/
+def ReadinessExpr.flaggedAt (bm : List Bool) : ReadinessExpr → Bool
   | .const _ _ => false
-  | .app f a => f.flagged || a.flagged
-  | .lam b => b.flagged
-  | .letE v b => v.flagged || b.flagged
-  | .proj s => s.carriesTheorem || s.flagged
-  | .recursorApp minors major => major.carriesTheorem || minors.flagged || major.flagged
-
-/-- Every scrutinee position (recursor major premise, projection target) is theorem-free. -/
-def ReadinessExpr.scrutineesTheoremFree : ReadinessExpr → Bool
-  | .const _ _ => true
-  | .app f a => f.scrutineesTheoremFree && a.scrutineesTheoremFree
-  | .lam b => b.scrutineesTheoremFree
-  | .letE v b => v.scrutineesTheoremFree && b.scrutineesTheoremFree
-  | .proj s => !s.carriesTheorem && s.scrutineesTheoremFree
+  | .bvar _ => false
+  | .app f a => f.flaggedAt bm || a.flaggedAt bm
+  | .lam b => b.flaggedAt (false :: bm)
+  | .letE v b => v.flaggedAt bm || b.flaggedAt (v.carriesTheoremAt bm :: bm)
+  | .proj s => s.carriesTheoremAt bm || s.flaggedAt bm
   | .recursorApp minors major =>
-    !major.carriesTheorem && minors.scrutineesTheoremFree && major.scrutineesTheoremFree
+    major.carriesTheoremAt bm || minors.flaggedAt bm || major.flaggedAt bm
+
+/-- Does the closed expression put a theorem in a recursor major premise or projection scrutinee? -/
+def ReadinessExpr.flagged (e : ReadinessExpr) : Bool := e.flaggedAt []
+
+/-- Every scrutinee position (recursor major premise, projection target) is theorem-free under
+local `let`-binding environment `bm`. -/
+def ReadinessExpr.scrutineesTheoremFreeAt (bm : List Bool) : ReadinessExpr → Bool
+  | .const _ _ => true
+  | .bvar _ => true
+  | .app f a => f.scrutineesTheoremFreeAt bm && a.scrutineesTheoremFreeAt bm
+  | .lam b => b.scrutineesTheoremFreeAt (false :: bm)
+  | .letE v b =>
+    v.scrutineesTheoremFreeAt bm && b.scrutineesTheoremFreeAt (v.carriesTheoremAt bm :: bm)
+  | .proj s => !s.carriesTheoremAt bm && s.scrutineesTheoremFreeAt bm
+  | .recursorApp minors major =>
+    !major.carriesTheoremAt bm && minors.scrutineesTheoremFreeAt bm &&
+      major.scrutineesTheoremFreeAt bm
+
+/-- Every scrutinee position of the closed expression is theorem-free. -/
+def ReadinessExpr.scrutineesTheoremFree (e : ReadinessExpr) : Bool := e.scrutineesTheoremFreeAt []
+
+theorem carriesTheoremAt_mono (e : ReadinessExpr) :
+    ∀ {bm1 bm2 : List Bool}, BmLe bm1 bm2 →
+      e.carriesTheoremAt bm1 = true → e.carriesTheoremAt bm2 = true := by
+  induction e with
+  | const n t => intro _ _ _ h; exact h
+  | bvar i => intro _ _ hle h; exact hle i h
+  | app f a ihf iha =>
+    intro bm1 bm2 hle h
+    cases hf : f.carriesTheoremAt bm1 with
+    | true => exact bor_intro_left (ihf hle hf)
+    | false =>
+      have h' : (f.carriesTheoremAt bm1 || a.carriesTheoremAt bm1) = true := h
+      rw [hf] at h'
+      exact bor_intro_right (iha hle h')
+  | lam _ _ => intro _ _ _ h; cases h
+  | letE v b ihv ihb =>
+    intro bm1 bm2 hle h
+    cases hv : v.carriesTheoremAt bm1 with
+    | true => exact bor_intro_left (ihv hle hv)
+    | false =>
+      have h' : (v.carriesTheoremAt bm1 || b.carriesTheoremAt (v.carriesTheoremAt bm1 :: bm1)) = true := h
+      rw [hv] at h'
+      have hb : b.carriesTheoremAt (false :: bm1) = true := h'
+      exact bor_intro_right (ihb (bmLe_cons (fun hc => by cases hc) hle) hb)
+  | proj s ihs => intro _ _ hle h; exact ihs hle h
+  | recursorApp minors major ihm ihM =>
+    intro bm1 bm2 hle h
+    cases hm : minors.carriesTheoremAt bm1 with
+    | true => exact bor_intro_left (ihm hle hm)
+    | false =>
+      have h' : (minors.carriesTheoremAt bm1 || major.carriesTheoremAt bm1) = true := h
+      rw [hm] at h'
+      exact bor_intro_right (ihM hle h')
+
+theorem flaggedAt_mono (e : ReadinessExpr) :
+    ∀ {bm1 bm2 : List Bool}, BmLe bm1 bm2 →
+      e.flaggedAt bm1 = true → e.flaggedAt bm2 = true := by
+  induction e with
+  | const _ _ => intro _ _ _ h; cases h
+  | bvar _ => intro _ _ _ h; cases h
+  | app f a ihf iha =>
+    intro bm1 bm2 hle h
+    cases hf : f.flaggedAt bm1 with
+    | true => exact bor_intro_left (ihf hle hf)
+    | false =>
+      have h' : (f.flaggedAt bm1 || a.flaggedAt bm1) = true := h
+      rw [hf] at h'
+      exact bor_intro_right (iha hle h')
+  | lam b ihb =>
+    intro bm1 bm2 hle h
+    exact ihb (bmLe_cons (fun hc => hc) hle) h
+  | letE v b ihv ihb =>
+    intro bm1 bm2 hle h
+    cases hv : v.flaggedAt bm1 with
+    | true => exact bor_intro_left (ihv hle hv)
+    | false =>
+      have h' : (v.flaggedAt bm1 || b.flaggedAt (v.carriesTheoremAt bm1 :: bm1)) = true := h
+      rw [hv] at h'
+      exact bor_intro_right (ihb (bmLe_cons (carriesTheoremAt_mono v hle) hle) h')
+  | proj s ihs =>
+    intro bm1 bm2 hle h
+    cases hc : s.carriesTheoremAt bm1 with
+    | true => exact bor_intro_left (carriesTheoremAt_mono s hle hc)
+    | false =>
+      have h' : (s.carriesTheoremAt bm1 || s.flaggedAt bm1) = true := h
+      rw [hc] at h'
+      exact bor_intro_right (ihs hle h')
+  | recursorApp minors major ihm ihM =>
+    intro bm1 bm2 hle h
+    cases hc : major.carriesTheoremAt bm1 with
+    | true => exact bor_intro_left (bor_intro_left (carriesTheoremAt_mono major hle hc))
+    | false =>
+      have h' : (major.carriesTheoremAt bm1 || minors.flaggedAt bm1 || major.flaggedAt bm1) = true := h
+      rw [hc] at h'
+      cases hm : minors.flaggedAt bm1 with
+      | true => exact bor_intro_left (bor_intro_right (ihm hle hm))
+      | false =>
+        have h'' : (false || minors.flaggedAt bm1 || major.flaggedAt bm1) = true := h'
+        rw [hm] at h''
+        exact bor_intro_right (ihM hle h'')
 
 /-- One declaration submitted to the readiness scanner. -/
 structure ReadinessDecl where
@@ -2821,6 +3236,7 @@ theorem ReadinessExpr.carriesTheorem_of_headIsTheorem (e : ReadinessExpr)
     (h : e.headIsTheorem = true) : e.carriesTheorem = true := by
   induction e with
   | const n t => exact h
+  | bvar _ => cases h
   | app f a ihf _ =>
     show (f.carriesTheorem || a.carriesTheorem) = true
     rw [ihf h]
@@ -2844,6 +3260,27 @@ theorem readinessScanner_flags_proj_scrutinee_theorem (s : ReadinessExpr)
   show (s.carriesTheorem || s.flagged) = true
   rw [h]
   rfl
+
+/-- **V4 readiness (b′).** A `let`-bound theorem placed in a recursor major premise (directly or
+through a wrapper such as `wrap h`) is flagged. -/
+theorem readinessScanner_flags_let_bound_theorem (v minors : ReadinessExpr)
+    (hv : v.carriesTheorem = true) :
+    (ReadinessExpr.letE v (.recursorApp minors (.bvar 0))).flagged = true := by
+  show (v.flaggedAt [] ||
+    (bvarHasThm (v.carriesTheoremAt [] :: []) 0 ||
+      minors.flaggedAt (v.carriesTheoremAt [] :: []) || false)) = true
+  have hv' : v.carriesTheoremAt [] = true := hv
+  rw [hv']
+  exact bor_intro_right rfl
+
+/-- **V4 readiness (b″).** A `let`-bound theorem placed in a projection scrutinee is flagged. -/
+theorem readinessScanner_flags_let_bound_proj (v : ReadinessExpr)
+    (hv : v.carriesTheorem = true) :
+    (ReadinessExpr.letE v (.proj (.bvar 0))).flagged = true := by
+  show (v.flaggedAt [] || (bvarHasThm (v.carriesTheoremAt [] :: []) 0 || false)) = true
+  have hv' : v.carriesTheoremAt [] = true := hv
+  rw [hv']
+  exact bor_intro_right rfl
 
 /-- The direct and `@id`-wrapped major-premise forms, for every theorem name and minor premise. -/
 theorem readinessScanner_flags_direct_and_id_wrapped (minors ty : ReadinessExpr) (thm : String) :
@@ -2872,45 +3309,55 @@ theorem readinessScanner_flag_propagates {s e : ReadinessExpr} (hc : ReadinessEx
   cases hc with
   | appFn f a => exact bor_intro_left h
   | appArg f a => exact bor_intro_right h
-  | lamBody b => exact h
-  | letValue v b => exact bor_intro_left h
-  | letBody v b => exact bor_intro_right h
+  | lamBody _ => exact flaggedAt_mono s (bmLe_nil _) h
+  | letValue _ _ => exact bor_intro_left h
+  | letBody _ _ => exact bor_intro_right (flaggedAt_mono s (bmLe_nil _) h)
   | projScrutinee s => exact bor_intro_right h
   | recMinors minors major => exact bor_intro_left (bor_intro_right h)
   | recMajor minors major => exact bor_intro_right h
 
-/-- **V4 readiness (c).** An expression whose scrutinee positions are all theorem-free is not
-flagged, however many theorems it uses elsewhere. -/
-theorem readinessScanner_clean_zero_flags (e : ReadinessExpr)
-    (h : e.scrutineesTheoremFree = true) : e.flagged = false := by
+theorem readinessScanner_clean_zero_flags_at (e : ReadinessExpr) :
+    ∀ (bm : List Bool), e.scrutineesTheoremFreeAt bm = true → e.flaggedAt bm = false := by
   induction e with
-  | const n t => rfl
+  | const _ _ => intro _ _; rfl
+  | bvar _ => intro _ _; rfl
   | app f a ihf iha =>
-    have h' : (f.scrutineesTheoremFree && a.scrutineesTheoremFree) = true := h
-    show (f.flagged || a.flagged) = false
-    rw [ihf (band_elim_left h'), iha (band_elim_right h')]
+    intro bm h
+    have h' : (f.scrutineesTheoremFreeAt bm && a.scrutineesTheoremFreeAt bm) = true := h
+    show (f.flaggedAt bm || a.flaggedAt bm) = false
+    rw [ihf bm (band_elim_left h'), iha bm (band_elim_right h')]
     rfl
-  | lam b ih => exact ih h
+  | lam b ih => intro bm h; exact ih (false :: bm) h
   | letE v b ihv ihb =>
-    have h' : (v.scrutineesTheoremFree && b.scrutineesTheoremFree) = true := h
-    show (v.flagged || b.flagged) = false
-    rw [ihv (band_elim_left h'), ihb (band_elim_right h')]
+    intro bm h
+    have h' : (v.scrutineesTheoremFreeAt bm &&
+      b.scrutineesTheoremFreeAt (v.carriesTheoremAt bm :: bm)) = true := h
+    show (v.flaggedAt bm || b.flaggedAt (v.carriesTheoremAt bm :: bm)) = false
+    rw [ihv bm (band_elim_left h'), ihb (v.carriesTheoremAt bm :: bm) (band_elim_right h')]
     rfl
   | proj s ih =>
-    have h' : (!s.carriesTheorem && s.scrutineesTheoremFree) = true := h
-    show (s.carriesTheorem || s.flagged) = false
-    rw [ih (band_elim_right h')]
-    cases hs : s.carriesTheorem with
+    intro bm h
+    have h' : (!s.carriesTheoremAt bm && s.scrutineesTheoremFreeAt bm) = true := h
+    show (s.carriesTheoremAt bm || s.flaggedAt bm) = false
+    rw [ih bm (band_elim_right h')]
+    cases hs : s.carriesTheoremAt bm with
     | false => rfl
     | true => rw [hs] at h'; cases h'
   | recursorApp minors major ihm ihM =>
-    have h' : (!major.carriesTheorem && minors.scrutineesTheoremFree &&
-      major.scrutineesTheoremFree) = true := h
-    show (major.carriesTheorem || minors.flagged || major.flagged) = false
-    rw [ihm (band_elim_right (band_elim_left h')), ihM (band_elim_right h')]
-    cases hs : major.carriesTheorem with
+    intro bm h
+    have h' : (!major.carriesTheoremAt bm && minors.scrutineesTheoremFreeAt bm &&
+      major.scrutineesTheoremFreeAt bm) = true := h
+    show (major.carriesTheoremAt bm || minors.flaggedAt bm || major.flaggedAt bm) = false
+    rw [ihm bm (band_elim_right (band_elim_left h')), ihM bm (band_elim_right h')]
+    cases hs : major.carriesTheoremAt bm with
     | false => rfl
     | true => rw [hs] at h'; cases h'
+
+/-- **V4 readiness (c).** An expression whose scrutinee positions are all theorem-free is not
+flagged, however many theorems it uses elsewhere. -/
+theorem readinessScanner_clean_zero_flags (e : ReadinessExpr)
+    (h : e.scrutineesTheoremFree = true) : e.flagged = false :=
+  readinessScanner_clean_zero_flags_at e [] h
 
 /-- Filtering with a predicate that is `false` on every element yields `[]`. -/
 theorem filter_nil_of_all_false {α : Type} (p : α → Bool) :

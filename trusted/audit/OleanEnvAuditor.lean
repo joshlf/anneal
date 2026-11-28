@@ -2663,7 +2663,7 @@ worst-case work is strictly `O(fuel)` even on exponentially branching types (`A4
 Marks `.opaqueInfo` native evaluators `Lean.reduceBool` and `Lean.reduceNat` as undecided
 (`certainWhnf := false`) so pure scanning fails closed (`A4-5a`), while stuck variables,
 constructors, and stuck recursors on variables return `certainWhnf := true` (`0` false candidates). -/
-public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : HeadNormResult fuel :=
+public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) (unfoldThm : Bool := true) : HeadNormResult fuel :=
   match fuel with
   | 0 => { expr := e, certainWhnf := false, rem := ⟨0, Nat.le_refl 0⟩ }
   | fuel' + 1 =>
@@ -2674,24 +2674,24 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
     let liftRem {k : Nat} (hk : k ≤ fuel') (r : { x : Nat // x ≤ k }) : { x : Nat // x ≤ fuel' + 1 } :=
       ⟨r.1, Nat.le_trans r.2 (Nat.le_trans hk (Nat.le_succ _))⟩
     match e with
-    | .mdata _ b => liftRes (Nat.le_refl _) (headNormalizeBudget env b fuel')
-    | .letE _ _ v b _ => liftRes (Nat.le_refl _) (headNormalizeBudget env (b.instantiate1 v) fuel')
+    | .mdata _ b => liftRes (Nat.le_refl _) (headNormalizeBudget env b fuel' unfoldThm)
+    | .letE _ _ v b _ => liftRes (Nat.le_refl _) (headNormalizeBudget env (b.instantiate1 v) fuel' unfoldThm)
     | _ =>
       let fn := e.getAppFn
       let args := e.getAppArgs
       match fn with
       | .mdata _ inner =>
-        liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN inner args) fuel')
+        liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN inner args) fuel' unfoldThm)
       | .letE _ _ v b _ =>
-        liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN (b.instantiate1 v) args) fuel')
+        liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN (b.instantiate1 v) args) fuel' unfoldThm)
       | .lam _ _ body _ =>
         if hEmpty : args.isEmpty then
           { expr := e, certainWhnf := true, rem := ⟨fuel', Nat.le_succ _⟩ }
         else
           let next := mkAppN (body.instantiate1 args[0]!) (args.extract 1 args.size)
-          liftRes (Nat.le_refl _) (headNormalizeBudget env next fuel')
+          liftRes (Nat.le_refl _) (headNormalizeBudget env next fuel' unfoldThm)
       | .proj structName idx s =>
-        let sRes := headNormalizeBudget env s fuel'
+        let sRes := headNormalizeBudget env s fuel' unfoldThm
         match env.find? structName with
         | some (.inductInfo iv) =>
           match iv.ctors with
@@ -2703,7 +2703,7 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                 let fieldIdx := cv.numParams + idx
                 if hF : fieldIdx < sArgs.size then
                   have : sRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le sRes.rem.2
-                  liftRes sRes.rem.2 (headNormalizeBudget env (mkAppN sArgs[fieldIdx] args) sRes.rem.1)
+                  liftRes sRes.rem.2 (headNormalizeBudget env (mkAppN sArgs[fieldIdx] args) sRes.rem.1 unfoldThm)
                 else
                   { expr := mkAppN (.proj structName idx sRes.expr) args
                     certainWhnf := false
@@ -2715,7 +2715,7 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                   -- and keeps reducing; a literal is never a certain stuck structure value.
                   have : sRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le sRes.rem.2
                   liftRes sRes.rem.2
-                    (headNormalizeBudget env (mkAppN (.proj structName idx ofList) args) sRes.rem.1)
+                    (headNormalizeBudget env (mkAppN (.proj structName idx ofList) args) sRes.rem.1 unfoldThm)
                 | none =>
                   { expr := mkAppN (.proj structName idx sRes.expr) args
                     certainWhnf := sRes.certainWhnf
@@ -2735,7 +2735,7 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
           | some (.defnInfo dv) =>
             if dv.levelParams.length == us.length then
               let body := dv.value.instantiateLevelParams dv.levelParams us
-              let r := liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN body args) fuel')
+              let r := liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN body args) fuel' unfoldThm)
               -- The kernel evaluates these `Nat` functions on literals with GMP and never looks at
               -- their bodies, so a body that is stuck (on an axiom inside a well-foundedness proof,
               -- say) proves nothing about the kernel: only a constructor or literal result is certain.
@@ -2749,9 +2749,10 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
             -- `has_value`), while `Meta.whnf` never does (`getUnfoldableConst?` answers `none` for
             -- `.thm` at every transparency): a recursor whose major premise is a theorem (`Acc.rec`,
             -- any subsingleton eliminator) reduces in the kernel and is stuck in `MetaM`.
-            if tv.levelParams.length == us.length then
+            if !unfoldThm then { expr := e, certainWhnf := true, rem := ⟨fuel', Nat.le_succ _⟩ }
+            else if tv.levelParams.length == us.length then
               let body := tv.value.instantiateLevelParams tv.levelParams us
-              liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN body args) fuel')
+              liftRes (Nat.le_refl _) (headNormalizeBudget env (mkAppN body args) fuel' unfoldThm)
             else
               { expr := e, certainWhnf := false, rem := ⟨fuel', Nat.le_succ _⟩ }
           | some (.recInfo rv) =>
@@ -2765,13 +2766,13 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                 | [r] =>
                   if r.nfields == 0 && rv.levelParams.length == us.length then
                     let next := mkAppN (r.rhs.instantiateLevelParams rv.levelParams us) (pmm ++ extra)
-                    liftRes (Nat.le_refl _) (headNormalizeBudget env next fuel')
+                    liftRes (Nat.le_refl _) (headNormalizeBudget env next fuel' unfoldThm)
                   else
                     { expr := e, certainWhnf := false, rem := ⟨fuel', Nat.le_succ _⟩ }
                 | _ =>
                   { expr := e, certainWhnf := false, rem := ⟨fuel', Nat.le_succ _⟩ }
               else
-                let majRes := headNormalizeBudget env args[majorIdx] fuel'
+                let majRes := headNormalizeBudget env args[majorIdx] fuel' unfoldThm
                 let majExpr := (natLitToCtor? majRes.expr).getD majRes.expr
                 let majFn := majExpr.getAppFn
                 let majArgs := majExpr.getAppArgs
@@ -2784,7 +2785,7 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                     let fields := majArgs.extract (majArgs.size - r.nfields) majArgs.size
                     let next := mkAppN (r.rhs.instantiateLevelParams rv.levelParams us) (pmm ++ fields ++ extra)
                     have : majRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le majRes.rem.2
-                    liftRes majRes.rem.2 (headNormalizeBudget env next majRes.rem.1)
+                    liftRes majRes.rem.2 (headNormalizeBudget env next majRes.rem.1 unfoldThm)
                   else
                     { expr := e, certainWhnf := false, rem := liftRem (Nat.le_refl _) majRes.rem }
                 | none =>
@@ -2794,7 +2795,7 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                     -- before applying recursor rules (`A1-4`).
                     let nextArgs := args.set! majorIdx ofList
                     have : majRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le majRes.rem.2
-                    liftRes majRes.rem.2 (headNormalizeBudget env (mkAppN fn nextArgs) majRes.rem.1)
+                    liftRes majRes.rem.2 (headNormalizeBudget env (mkAppN fn nextArgs) majRes.rem.1 unfoldThm)
                   | none =>
                     let etaNext? : Option Expr := do
                       guard (rv.levelParams.length == us.length)
@@ -2806,7 +2807,7 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
                     match etaNext? with
                     | some next =>
                       have : majRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le majRes.rem.2
-                      liftRes majRes.rem.2 (headNormalizeBudget env next majRes.rem.1)
+                      liftRes majRes.rem.2 (headNormalizeBudget env next majRes.rem.1 unfoldThm)
                     | none =>
                       { expr := e, certainWhnf := majRes.certainWhnf, rem := liftRem (Nat.le_refl _) majRes.rem }
             else
@@ -2815,26 +2816,26 @@ public def headNormalizeBudget (env : Environment) (e : Expr) (fuel : Nat) : Hea
             match qv.kind with
             | .lift =>
               if hMaj : 5 < args.size then
-                let qRes := headNormalizeBudget env args[5] fuel'
+                let qRes := headNormalizeBudget env args[5] fuel' unfoldThm
                 if qRes.expr.isAppOf ``Quot.mk && qRes.expr.getAppArgs.size ≥ 3 then
                   let a := qRes.expr.getAppArgs[2]!
                   let f := args[3]!
                   let extra := args.extract 6 args.size
                   have : qRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le qRes.rem.2
-                  liftRes qRes.rem.2 (headNormalizeBudget env (mkAppN f (#[a] ++ extra)) qRes.rem.1)
+                  liftRes qRes.rem.2 (headNormalizeBudget env (mkAppN f (#[a] ++ extra)) qRes.rem.1 unfoldThm)
                 else
                   { expr := e, certainWhnf := qRes.certainWhnf, rem := liftRem (Nat.le_refl _) qRes.rem }
               else
                 { expr := e, certainWhnf := true, rem := ⟨fuel', Nat.le_succ _⟩ }
             | .ind =>
               if hMaj : 4 < args.size then
-                let qRes := headNormalizeBudget env args[4] fuel'
+                let qRes := headNormalizeBudget env args[4] fuel' unfoldThm
                 if qRes.expr.isAppOf ``Quot.mk && qRes.expr.getAppArgs.size ≥ 3 then
                   let a := qRes.expr.getAppArgs[2]!
                   let f := args[3]!
                   let extra := args.extract 5 args.size
                   have : qRes.rem.1 < fuel' + 1 := Nat.lt_succ_of_le qRes.rem.2
-                  liftRes qRes.rem.2 (headNormalizeBudget env (mkAppN f (#[a] ++ extra)) qRes.rem.1)
+                  liftRes qRes.rem.2 (headNormalizeBudget env (mkAppN f (#[a] ++ extra)) qRes.rem.1 unfoldThm)
                 else
                   { expr := e, certainWhnf := qRes.certainWhnf, rem := liftRem (Nat.le_refl _) qRes.rem }
               else
@@ -3818,26 +3819,28 @@ def failWithViolations (req : Request) (violations : Array Violation) : IO α :=
   let tagSummary := ",".intercalate ((tags.toArray.qsort (fun a b => a.1 < b.1)).toList.map fun (t, c) => s!"{t}={c}")
   fail s!"olean-audit rejected ({violations.size} violation(s); {tagSummary}): {"; ".intercalate shown}{more}"
 
-/-- Non-blocking `leanprover/lean4#14896` readiness check (theorem in major-premise/`.proj` scrutinee). -/
+/-- Non-blocking `leanprover/lean4#14896` readiness check (theorem in major-premise/`.proj` scrutinee, including wrappers and `let`-bindings). -/
 def exprUsesOpaqueTheorem (env : Environment) (e : Expr) (fuel : Nat := 100000) : Bool := Id.run do
-  let headIsThm (x : Expr) := match x.getAppFn with | .const c _ => (env.find? c matches some (.thmInfo _)) | _ => false
-  let mut (seen, stack) : Std.HashSet Expr × List Expr := ({}, [e])
+  let scrutineeHasThm (x : Expr) (bm : Nat) : Bool :=
+    match (headNormalizeBudget env x 64 false).expr.getAppFn with
+    | .const c _ => (env.find? c matches some (.thmInfo _)) | .bvar i => (bm >>> i) &&& 1 == 1 | _ => false
+  let mut (seen, stack) : Std.HashSet (Expr × Nat) × List (Expr × Nat) := ({}, [(e, 0)])
   for _ in [0:fuel] do
     match stack with
     | [] => return false
-    | x :: rest =>
-      stack := rest; if seen.contains x then continue; seen := seen.insert x
+    | (x, bm) :: rest =>
+      stack := rest; if seen.contains (x, bm) then continue; seen := seen.insert (x, bm)
       match x with
-      | .proj _ _ s => if headIsThm s then return true else stack := s :: stack
+      | .proj _ _ s => if scrutineeHasThm s bm then return true else stack := (s, bm) :: stack
       | .app f a =>
         if let .const c _ := x.getAppFn then
           let args := x.getAppArgs
           let mi := match env.find? c with | some (.recInfo rv) => rv.getMajorIdx | some (.quotInfo qv) => (match qv.kind with | .lift => 5 | .ind => 4 | _ => args.size) | _ => args.size
-          if h : mi < args.size then if headIsThm args[mi] then return true
-        stack := f :: a :: stack
-      | .lam _ t b _ | .forallE _ t b _ => stack := t :: b :: stack
-      | .letE _ t v b _ => stack := t :: v :: b :: stack
-      | .mdata _ b => stack := b :: stack
+          if h : mi < args.size then if scrutineeHasThm args[mi] bm then return true
+        stack := (f, bm) :: (a, bm) :: stack
+      | .lam _ t b _ | .forallE _ t b _ => stack := (t, bm) :: (b, bm <<< 1) :: stack
+      | .letE _ t v b _ => stack := (t, bm) :: (v, bm) :: (b, (bm <<< 1) ||| (if scrutineeHasThm v bm then 1 else 0)) :: stack
+      | .mdata _ b => stack := (b, bm) :: stack
       | _ => pure ()
   return false
 

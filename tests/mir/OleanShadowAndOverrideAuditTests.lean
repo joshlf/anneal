@@ -40,9 +40,10 @@ def rawPrivate (pre : List String) (post : AuditName) : AuditName :=
 /-- Loaded world: audited modules `M`, `Other`, `Trusted.Core`; `Other` owns a private helper with
 its first two equation lemmas, a matcher, and a proof realized downstream. -/
 def v1Env : PrivateAuditEnv where
-  loadedModules := [["M"], ["Other"], ["Trusted"], ["Trusted", "Core"]]
+  loadedModules := [["M"], ["Other"], ["Trusted"], ["Trusted", "Core"], ["Init", "Prelude"]]
   toolchainModules := [["Init", "Prelude"]]
   toolchainNames := [["Nat", "add"]]
+  compilerReservedNames := [["lcUnreachable"], ["Eq", "rec"]]
   decls := [
     { name := mkPrivateName ["Other"] ["helper"], kind := .defnDecl, origin := ["Other"] },
     { name := mkPrivateName ["Other"] ["helper", "eq_1"], kind := .thmDecl, origin := ["M"] },
@@ -230,9 +231,43 @@ example : classifyRealizedAuxSuffix "eq_def" = some .eqDef := by decide
 example : classifyRealizedAuxSuffix "proof_7" = some (.proof 7) := by decide
 example : classifyRealizedAuxSuffix "_sparseCasesOn_2" = some (.sparseCasesOn 2) := by decide
 example : classifyRealizedAuxSuffix "eq_" = none := by decide
+example : classifyRealizedAuxSuffix "eq_01" = none := by decide
+example : classifyRealizedAuxSuffix "match_001" = none := by decide
+example : classifyRealizedAuxSuffix "proof_01" = none := by decide
 example : classifyRealizedAuxSuffix "eq_1a" = none := by decide
 example : classifyRealizedAuxSuffix "xeq_1" = none := by decide
 example : classifyRealizedAuxSuffix "helper" = none := by decide
+-- Compiler-reserved name spoofing inside a private user suffix.
+example : inM (mkPrivateName ["M"] ["lcUnreachable"]) .defnDecl = .reservedUserSpoof := by decide
+example : inM (mkPrivateName ["M"] ["lcUnreachable"]) .defnDecl = .reservedUserSpoof :=
+  checkPrivateName_rejects_reserved_user_spoof v1Env _ ⟨["M"], ["lcUnreachable"]⟩ (by decide)
+    (by decide) (privateUserForbidden_compiler_reserved v1Env ["M"] "lcUnreachable" [] (by decide))
+-- Leading-zero sibling `eq_01` cannot authorize `eq_2`.
+example : checkPrivateNameModel
+    { v1Env with decls := [
+        { name := mkPrivateName ["Other"] ["helper"], kind := .defnDecl, origin := ["Other"] },
+        { name := mkPrivateName ["Other"] ["helper", "eq_01"], kind := .thmDecl, origin := ["M"] }] }
+    { declaringMod := ["M"], name := mkPrivateName ["Other"] ["helper", "eq_2"],
+      kind := some .thmDecl } = .foreignOutsideRealizedAux := by decide
+-- IR `_at_` specialization names: valid positive control vs forged `Trusted` site and foreign final site.
+example : checkIRAtSpecModel v1Env ["M"]
+    (mkPrivateName ["Init", "Prelude"] ["Array", "fold"] ++
+      [.str "_at_", .str "M", .str "pubFn", .str "spec_0"]) = true := by decide
+example : checkIRAtSpecModel v1Env ["M"]
+    (mkPrivateName ["Init", "Prelude"] ["Array", "fold"] ++
+      [.str "_at_", .str "Trusted", .str "forged_site", .str "spec_0"]) = false :=
+  checkIRAtSpec_rejects_forged_site v1Env ["M"] _
+    (mkPrivateName ["Init", "Prelude"] ["Array", "fold"]) []
+    [.str "Trusted", .str "forged_site", .str "spec_0"] ["Trusted", "forged_site"] 1
+    (by decide) (by decide) (by decide)
+    (privateUserForbidden_reserved_domain_root v1Env ["M"] "Trusted" ["forged_site"] (by decide)
+      (by decide))
+example : checkIRAtSpecModel v1Env ["M"]
+    (mkPrivateName ["Init", "Prelude"] ["Array", "fold"] ++
+      [.str "_at_"] ++ mkPrivateName ["Other"] ["site", "spec_0"]) = false := by decide
+example : checkIRAtSpecModel v1Env ["M"]
+    (mkPrivateName ["Init", "Prelude"] ["Array", "fold"] ++
+      [.str "_at_", .str "M", .str "noSpec"]) = false := by decide
 
 /-! ## 2. V2 — whole-module unreferenced axiom sweep -/
 
@@ -316,6 +351,28 @@ example : "live_stage2_ax" ∈ (wholeModuleAxiomSweep true adversarialInventory)
   wholeModuleAxiomSweep_flags_stage2_axiom true adversarialInventory
     { kind := .axiomDecl, name := "live_stage2_ax", declaringMod := "T", originMod := "T",
       isLocalAxiomMod := true } (by decide) rfl
+example : "masked" ∈ (wholeModuleAxiomSweep true adversarialInventory).violations :=
+  wholeModuleAxiomSweep_rejects_masked_redecl true adversarialInventory
+    { kind := .axiomDecl, name := "masked", declaringMod := "T", originMod := "Elsewhere",
+      isLocalAxiomMod := true } (by decide) rfl (by decide)
+-- `sorryAx` and native-evaluation axioms are rejected even inside `localAxiomModules`.
+def localSorryAndNativeInventory : ModuleInventoryModel where
+  constants := [
+    { kind := .axiomDecl, name := "sorryAx", declaringMod := "T", originMod := "T",
+      isLocalAxiomMod := true, isSorry := true },
+    { kind := .axiomDecl, name := "_native.ax_0", declaringMod := "T", originMod := "T",
+      isLocalAxiomMod := true, isNative := true }]
+
+example : (wholeModuleAxiomSweep true localSorryAndNativeInventory).violations =
+    ["sorryAx", "_native.ax_0"] := by decide
+example : "sorryAx" ∈ (wholeModuleAxiomSweep true localSorryAndNativeInventory).violations :=
+  wholeModuleAxiomSweep_rejects_sorry_in_local_mod true localSorryAndNativeInventory
+    { kind := .axiomDecl, name := "sorryAx", declaringMod := "T", originMod := "T",
+      isLocalAxiomMod := true, isSorry := true } (by decide) rfl rfl
+example : "_native.ax_0" ∈ (wholeModuleAxiomSweep true localSorryAndNativeInventory).violations :=
+  wholeModuleAxiomSweep_rejects_native_in_local_mod true localSorryAndNativeInventory
+    { kind := .axiomDecl, name := "_native.ax_0", declaringMod := "T", originMod := "T",
+      isLocalAxiomMod := true, isNative := true } (by decide) rfl rfl
 
 /-- Positive control: toolchain foundational axioms, a file-local test axiom, and an
 `Assumptions.*` axiom inside an `Assumptions.*` test module. -/
@@ -373,6 +430,8 @@ example : pathWithinRootModel [⟨"tmp", false⟩, ⟨"root", true⟩]
 example : pathWithinRootModel (plainPath ["tmp", "root"]) (plainPath ["var", "root", "M.olean"]) =
     false := by decide
 example : pathWithinRootModel (plainPath ["tmp", "root"]) (plainPath ["tmp"]) = false := by decide
+example : pathWithinRootModel (plainPath ["tmp", "root"])
+    (plainPath ["tmp", "root", "sub/evil"]) = false := by decide
 -- Positive controls: a nested artifact and the root itself.
 example : pathWithinRootModel (plainPath ["tmp", "root"])
     (plainPath ["tmp", "root", "Sub", "M.olean"]) = true := by decide
@@ -531,6 +590,15 @@ example : validateOleanRegionModel
   decide
 example : validateOleanRegionModel
     (mutated { mpzObj with size := 3 } strObj sarrObj impObj arr0 rootObj) = false := by decide
+-- Negative signed `int32` `_mp_alloc` (`≥ 2^31`) is rejected even if size ≤ capacity.
+example : validateOleanRegionModel
+    (mutated { mpzObj with capacity := 2147483648 } strObj sarrObj impObj arr0 rootObj) = false :=
+  validateOleanRegion_rejects_negative_mpz_alloc _ { mpzObj with capacity := 2147483648 }
+    (by decide) rfl (by decide)
+-- Short root and invalid empty delta theorem instantiations.
+example : validateOleanRegionModel
+    (mutated mpzObj strObj sarrObj impObj arr0 { rootObj with csSz := 48 }) = false :=
+  validateOleanRegion_rejects_short_root _ (by decide) (by decide)
 
 -- Scalar array with element size `0`; string without its NUL, with zero size, and with a
 -- code-point length that is not below its byte size.
@@ -617,6 +685,28 @@ example : validateOleanRegionModel
 example : validateOleanRegionModel
     { emptyDelta with header := { base := rb + 200, rootPtr := rb + 368 } } = false :=
   validateOleanRegion_rejects_overlap _ parentLayer (by decide) (by decide) (by decide)
+example : validateOleanRegionModel { emptyDelta with parents := [] } = false :=
+  validateOleanRegion_rejects_bad_empty_delta _ (by decide) (Or.inl rfl)
+example : validateOleanRegionModel { emptyDelta with fileSize := 104 } = false :=
+  validateOleanRegion_rejects_bad_empty_delta _ (by decide) (Or.inr (by decide))
+
+-- Separate-chain disjoint layers (`.ir` vs `.olean`): disjoint is accepted, overlapping is
+-- rejected, and `.ir` cannot re-export or point into a disjoint `.olean` layer.
+def irLayerClean : CompactedRegionModel :=
+  { header := { base := 8192, rootPtr := 8192 + 368 }, fileSize := 424,
+    objs := ([mpzObj, strObj, sarrObj, impObj, arr0] ++ emptyArrs ++ [rootObj]).map (fun o =>
+      { o with
+        dataPtr := if o.dataPtr ≥ rb then o.dataPtr - rb + 8192 else o.dataPtr
+        fields := o.fields.map (fun f => if f ≥ rb then f - rb + 8192 else f) }),
+    disjointLayers := [parentLayer] }
+
+example : validateOleanRegionModel irLayerClean = true := by decide
+example : validateOleanRegionModel
+    { irLayerClean with header := { base := rb + 200, rootPtr := rb + 200 + 368 } } = false :=
+  validateOleanRegion_rejects_disjoint_overlap _ parentLayer (by decide) (by decide) (by decide)
+example : validateOleanRegionModel
+    { header := { base := 8192, rootPtr := rb + 368 }, fileSize := 96,
+      disjointLayers := [parentLayer] } = false := by decide
 
 /-- Positive control: a non-empty upper layer whose root re-uses four parent slots and whose own
 array points at a validated parent object. -/
@@ -752,6 +842,8 @@ example : hookClean.violations = [] := by decide
 example : hookClean.ok = true := by decide
 example : ∀ e, e ∈ hookClean.oleanHooks ++ hookClean.irHooks → HookEntryAdmitted e :=
   (compilerHookSummary_ok_sound hookClean (by decide)).1
+example : ∀ p, p ∈ hookClean.phaseReturns → p.consistent = true :=
+  (compilerHookSummary_ok_sound hookClean (by decide)).2.2
 -- Phase-return compatibility table.
 example : simpleRetCompatModel (.natLit 0) (.natLit 1) = false := by decide
 example : simpleRetCompatModel (.strLit "a") (.strLit "b") = false := by decide
@@ -798,6 +890,23 @@ example : (ReadinessExpr.app (.app (.const "id" false) (.const "ty" false))
     (.const "myEq" true)).headIsTheorem = false := by decide
 example : (ReadinessExpr.app (.app (.const "id" false) (.const "ty" false))
     (.const "myEq" true)).carriesTheorem = true := by decide
+-- `let`-bound theorem placed in a recursor major premise or `.proj` scrutinee (direct or wrapped).
+def letBoundRecUse : ReadinessExpr :=
+  .letE (.const "myEq" true) (.recursorApp (.const "seven" false) (.bvar 0))
+def letBoundWrappedRecUse : ReadinessExpr :=
+  .letE (.const "myEq" true)
+    (.recursorApp (.const "seven" false) (.app (.const "wrap" false) (.bvar 0)))
+def letBoundProjUse : ReadinessExpr := .letE (.const "andThm" true) (.proj (.bvar 0))
+def letBoundArgOnly : ReadinessExpr :=
+  .letE (.const "myEq" true) (.app (.lam (.const "three" false)) (.bvar 0))
+
+example : letBoundRecUse.flagged = true :=
+  readinessScanner_flags_let_bound_theorem _ _ rfl
+example : letBoundWrappedRecUse.flagged = true := by decide
+example : letBoundProjUse.flagged = true :=
+  readinessScanner_flags_let_bound_proj _ rfl
+example : letBoundArgOnly.flagged = false := by decide
+example : letBoundArgOnly.scrutineesTheoremFree = true := by decide
 -- Positive control: `0` flags.
 example : cleanUse.flagged = false := by decide
 example : cleanUse.scrutineesTheoremFree = true := by decide
@@ -1031,7 +1140,7 @@ never `Classical.choice`, `sorryAx`, or a native-evaluation axiom.
 #guard_msgs in
 #print axioms regionWF_objs
 
-/-- info: 'Anneal.OleanSpecStrengthAuditor.parentPtr_not_own' does not depend on any axioms -/
+/-- info: 'Anneal.OleanSpecStrengthAuditor.parentPtr_not_own' depends on axioms: [propext] -/
 #guard_msgs in
 #print axioms parentPtr_not_own
 
@@ -1212,5 +1321,84 @@ never `Classical.choice`, `sorryAx`, or a native-evaluation axiom.
 /-- info: 'Anneal.OleanShadowAndOverrideAuditTests.cycle3_path' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms cycle3_path
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.privateUserForbidden_compiler_reserved' does not depend on any axioms -/
+#guard_msgs in
+#print axioms privateUserForbidden_compiler_reserved
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.checkIRAtSiteModel_none_of_forbidden_last' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms checkIRAtSiteModel_none_of_forbidden_last
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.checkIRAtTailsModel_none_of_last' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms checkIRAtTailsModel_none_of_last
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.checkIRAtSpec_rejects_forged_site' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms checkIRAtSpec_rejects_forged_site
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.checkIRAtSpecModel' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms checkIRAtSpecModel
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.wholeModuleAxiomSweep_rejects_sorry_in_local_mod' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms wholeModuleAxiomSweep_rejects_sorry_in_local_mod
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.wholeModuleAxiomSweep_rejects_native_in_local_mod' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms wholeModuleAxiomSweep_rejects_native_in_local_mod
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.wholeModuleAxiomSweep_rejects_masked_redecl' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms wholeModuleAxiomSweep_rejects_masked_redecl
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.validateOleanRegion_rejects_negative_mpz_alloc' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms validateOleanRegion_rejects_negative_mpz_alloc
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.validateOleanRegion_rejects_disjoint_overlap' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms validateOleanRegion_rejects_disjoint_overlap
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.validateOleanRegion_rejects_short_root' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms validateOleanRegion_rejects_short_root
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.validateOleanRegion_rejects_bad_empty_delta' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms validateOleanRegion_rejects_bad_empty_delta
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.bmLe_nil' does not depend on any axioms -/
+#guard_msgs in
+#print axioms bmLe_nil
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.bmLe_cons' does not depend on any axioms -/
+#guard_msgs in
+#print axioms bmLe_cons
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.carriesTheoremAt_mono' does not depend on any axioms -/
+#guard_msgs in
+#print axioms carriesTheoremAt_mono
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.flaggedAt_mono' does not depend on any axioms -/
+#guard_msgs in
+#print axioms flaggedAt_mono
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_flags_let_bound_theorem' does not depend on any axioms -/
+#guard_msgs in
+#print axioms readinessScanner_flags_let_bound_theorem
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_flags_let_bound_proj' does not depend on any axioms -/
+#guard_msgs in
+#print axioms readinessScanner_flags_let_bound_proj
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_clean_zero_flags_at' does not depend on any axioms -/
+#guard_msgs in
+#print axioms readinessScanner_clean_zero_flags_at
 
 end Anneal.OleanShadowAndOverrideAuditTests

@@ -2351,8 +2351,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                 assert needle in verdict["message"], (needle, verdict["message"])
             return verdict["message"]
 
-        # V1 positive control: private helpers, a `List.map` specialization over a private helper
-        # (IR `_at_` names), and a genuine one-constructor `ctorIdx` `@[macro_inline]`.
+        # V1 positive controls: non-module AND `module`-file private helpers, a `List.map`
+        # specialization over a private helper (IR `_at_` names), and a genuine one-constructor
+        # `ctorIdx` `@[macro_inline]`.
         olean_module(ol3, "OlG31Base", prelude_init + (
             "structure GoodBox where\n  x : Nat\n"
             "private def helper (n : Nat) : Nat := n + 1\n"
@@ -2362,6 +2363,16 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         g31_base = olean_accept(ol3, ["OlG31Base"])
         assert g31_base["replay"] is True and g31_base["privateNamesAudited"] >= 2, g31_base
         assert g31_base["oleanFilesValidated"] >= 1 and g31_base["opaqueTheoremReadinessFlags"] == 0, g31_base
+        olean_module(ol3, "OlG31ModPos", (
+            "module\nprelude\npublic import Init\n"
+            "public structure ModBox where\n  x : Nat\n"
+            "private def modHelper (n : Nat) : Nat := n + 1\n"
+            "private def modMapped (xs : List Nat) : List Nat := xs.map modHelper\n"
+            "public def modPubFn (xs : List Nat) : Nat := (modMapped xs).length + (ModBox.mk 1).ctorIdx\n"),
+            ["Init"], module_file=True)
+        g31_mod = olean_accept(ol3, ["OlG31ModPos"])
+        assert g31_mod["replay"] is True and g31_mod["privateNamesAudited"] >= 2, g31_mod
+        assert g31_mod["oleanFilesValidated"] >= 5 and g31_mod["opaqueTheoremReadinessFlags"] == 0, g31_mod
         # V1 attacks without metaprogramming: reserved-root user suffixes in an ordinary module.
         olean_module(ol3, "OlG31V1Src", prelude_init + (
             "namespace Trusted\nprivate def spoof : Nat := 1\nend Trusted\n"
@@ -2394,6 +2405,11 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "  addDecl (.axiomDecl {\n"
             "    name := g31P `OlG31Base 0 [\"cheat\"], levelParams := [], type := mkConst ``True,\n"
             "    isUnsafe := false })\n"
+            "  let opqN := g31P `OlG31Base 0 [\"forgedOpq\"]\n"
+            "  addDecl (.opaqueDecl {\n"
+            "    name := opqN, levelParams := [], type := mkConst ``Nat, value := mkNatLit 0,\n"
+            "    isUnsafe := false, all := [opqN] })\n"
+            "  g31Def (g31P `GhostMod 0 [\"fake\"])\n"
             "  let base := g31P `OlG31Base 0 [\"helper\"]\n"
             "  addDecl (.thmDecl {\n"
             "    name := base.str \"eq_999\", levelParams := [],\n"
@@ -2413,11 +2429,13 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                               "_private.OlG31V1Meta.0.sorryAx", "_private.OlG31V1Meta.0.Innocent.0.Trusted.foo",
                               "_private.OlG31V1Meta.0._private.nest", "Lead._private.nonlead",
                               "_private.OlG31V1Meta.1.nonzero", "_private.OlG31V1Meta.0.0.dbl",
+                              "_private.OlG31Base.0.cheat", "_private.OlG31Base.0.forgedOpq",
                               "foreign _private axiom/opaque claiming module OlG31Base",
+                              "_private.GhostMod.0.fake", "is not a loaded module",
                               "_private.OlG31Base.0.helper.eq_999", "_at_.Trusted.forged_site",
                               "malformed _private name shape", "outside verified realized-aux set",
                               "[compilerOverrideAttribute] trOnly (OlG31V1Meta)", "tagged_return", **lean_roots)
-        assert "privateNamespaceSpoofed=11" in v1_msg, v1_msg
+        assert "privateNamespaceSpoofed=13" in v1_msg, v1_msg
 
         # V2: an unreferenced top-level axiom nothing refers to; a foreign `Assumptions.*` axiom
         # inside a file-local test-axiom module; an unreferenced axiom of a transitively imported
@@ -2430,17 +2448,22 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "axiom localTestAx : True\ntheorem usesLocal : True := localTestAx\n"), ["Init"])
         olean_reject(ol3, ["OlG31V2Assm"], "[unapprovedAxiom]", "Assumptions.Other.ax",
                      "foreign Assumptions.* axiom", localAxiomModules=["OlG31V2Assm"])
+        olean_module(ol3, "OlG31V2Found", "prelude\naxiom propext : Type\n", [])
+        olean_reject(ol3, ["OlG31V2Found"], "[unapprovedAxiom]", "propext",
+                     "non-toolchain re-declaration of foundational axiom", localAxiomModules=["OlG31V2Found"])
         olean_module(ol3, "OlG31V2Dep", prelude_init + "axiom dep_cheat : False\ndef helperSpec : Nat := 1\n",
                      ["Init"])
         olean_module(ol3, "OlG31V2User", "prelude\nimport OlG31V2Dep\ntheorem claimUsesDep : helperSpec = 1 := rfl\n",
                      ["OlG31V2Dep"])
-        olean_reject(ol3, ["OlG31V2User"], "[unapprovedAxiom]", "dep_cheat")
+        olean_reject(ol3, ["OlG31V2Dep", "OlG31V2User"], "[unapprovedAxiom]", "dep_cheat")
         # V2 positive control: a file-local test axiom (referenced and unreferenced) is swept and admitted.
         olean_module(ol3, "OlG31V2Local", prelude_init + (
             "axiom localTestAx : True\naxiom unusedLocalAx : True\ntheorem usesLocal : True := localTestAx\n"), ["Init"])
         v2_ok = olean_accept(ol3, ["OlG31V2Local"], localAxiomModules=["OlG31V2Local"])
         assert v2_ok["moduleConstantsAxiomSwept"] >= 2 and v2_ok["localTestAxioms"] >= 1, v2_ok
-        # V2 through the spec-strength gate: the claim's dependency stores an unreferenced axiom.
+        # V2 through the spec-strength gate: isolate `auditDeclsForSpec` by admitting `OlG31V2Dep`
+        # in `localAxiomModules` (so `auditCore` accepts without `specStrengthChecks`, while
+        # `specStrengthChecks` walks transitive non-toolchain imports and rejects `dep_cheat`).
         olean_module(ol3, "Trusted.Rustc.V2026_06_01.MirSemantics", mir_stub, ["Init"], module_file=True)
         olean_module(ol3, "Trusted.VerificationResult", verif_stub,
                      ["Init", "Trusted.Rustc.V2026_06_01.MirSemantics"], module_file=True)
@@ -2471,8 +2494,11 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         assert spec_ok["specStrengthChecksPassed"] == 1, spec_ok
         olean_module(ol3, "OlG31SpecDep", g31_claim.format(dep="import OlG31V2Dep\n", ten="helperSpec * 10"),
                      ["Init", "Anneal.OleanSpecStrengthAuditor", "OlG31V2Dep"])
-        olean_reject(ol3, g31_spec_mods + ["OlG31SpecDep"], "[unapprovedAxiom]", "dep_cheat",
-                     specStrengthChecks=g31_check)
+        spec_dep_no_gate = olean_accept(ol3, g31_spec_mods + ["OlG31V2Dep", "OlG31SpecDep"],
+                                        localAxiomModules=["OlG31V2Dep"])
+        assert spec_dep_no_gate["replay"] is True, spec_dep_no_gate
+        olean_reject(ol3, g31_spec_mods + ["OlG31V2Dep", "OlG31SpecDep"], "[unapprovedAxiom]", "dep_cheat",
+                     "axiom outside locked policy", localAxiomModules=["OlG31V2Dep"], specStrengthChecks=g31_check)
 
         # V3: binary corruption of a compiled module file (all five parts), rejected by the Python
         # pre-validation AND by the auditor binary itself before `importModules` maps the region.
@@ -2511,7 +2537,7 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             assert struct.unpack_from("<Q", data, imports - base + 8)[0] >= 1, "module imports nothing"
             return struct.unpack_from("<Q", data, imports - base + 24)[0] - base
 
-        def v3_mutate(label, part_index, mutate):
+        def v3_mutate(label, part_index, mutate, py_needle, lean_needle):
             work = ol3.stage / f"g31-v3-{label}"
             work.mkdir()
             parts = [[], []]
@@ -2526,12 +2552,15 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             base, root = struct.unpack_from("<QQ", data, 80)
             data = mutate(data, base, root)
             target.write_bytes(bytes(data))
-            ol3.artifacts["OlG31V3"] = parts
-            try:
-                olean_reject(ol3, ["OlG31V3"], "[oleanBinaryInvalid] OlG31V3")
-            finally:
-                del ol3.artifacts["OlG31V3"]
-            direct_reject(["OlG31V3"], "[oleanBinaryInvalid]", artifacts=[["OlG31V3", parts]])
+            # Exercise Python pre-validation (`_validate_olean_parts` / `_walk_region`) via
+            # `audit_olean_request`, AND Lean pre-import validation (`validateOleanBytes` /
+            # `walkOleanRegion`) via the auditor binary directly.
+            expect_failure(
+                lambda: ol3.audit_olean_request(
+                    {"roots": ["OlG31V3"], "modules": ["OlG31V3"],
+                     "artifacts": [["OlG31V3", parts]], "scope": "g31"}),
+                1, "olean-audit", "[oleanBinaryInvalid] OlG31V3", py_needle)
+            direct_reject(["OlG31V3"], "[oleanBinaryInvalid]", lean_needle, artifacts=[["OlG31V3", parts]])
 
         def put(fmt, off, value):
             def mutate(data, base, root):
@@ -2542,20 +2571,35 @@ def self_test(checkout: Path, lean: Path | None) -> int:
         def at_obj(pred, delta):
             return lambda data, base, root: v3_walk(bytes(data), pred)[0] + delta
 
-        root_off = lambda data, base, root: root - base  # noqa: E731
         forged = 0x4141414141414140
         olean_ix, private_ix, ir_ix = 0, 2, 4  # `.olean`, `.olean.private`, `.ir` in the flattened part list.
-        v3_mutate("truncated", olean_ix, lambda data, base, root: data[:95])
-        v3_mutate("tag244", olean_ix, put("<B", lambda d, b, r: r - b + 7, 244))
-        v3_mutate("rc1", olean_ix, put("<i", root_off, 1))
-        v3_mutate("short-root", olean_ix, put("<H", lambda d, b, r: r - b + 4, 48))
+        olean_base = struct.unpack_from("<Q", Path(v3_genuine[0][0]).read_bytes(), 80)[0]
+        v3_mutate("truncated", olean_ix, lambda data, base, root: data[:95], "size 95", "byte size 95")
+        # Mutate a 2-hop non-root reachable `Import` object for tag 244 and rc=1 so `_walk_region` /
+        # `walkOleanRegion` (not merely the root-header check) is genuinely exercised.
+        v3_mutate("tag244-nonroot", olean_ix, put("<B", lambda d, b, r: v3_import_elem(bytes(d)) + 7, 244),
+                  "invalid object (tag 244)", "invalid object (tag=244)")
+        v3_mutate("rc1-nonroot", olean_ix, put("<i", lambda d, b, r: v3_import_elem(bytes(d)), 1),
+                  "invalid object (tag 0)", "invalid object (tag=0)")
+        v3_mutate("short-root", olean_ix, put("<H", lambda d, b, r: r - b + 4, 48),
+                  "invalid root object header", "invalid root object header")
+        v3_mutate("bad-empty-delta", olean_ix, put("<Q", lambda d, b, r: 88, forged),
+                  "invalid out-of-region rootPtr", "96-byte empty delta")
+        v3_mutate("ir-overlap-olean", ir_ix, put("<Q", lambda d, b, r: 80, olean_base),
+                  "overlapping compacted-region layer", "overlapping compacted-region layer")
         v3_mutate("array-oob", olean_ix, put("<Q", at_obj(lambda o, rc, cs, oth, tag, size, cap:
-                                                          tag == 246 and size >= 1, 24), forged))
+                                                          tag == 246 and size >= 1, 24), forged),
+                  "escapes the region", "out-of-region pointer")
         v3_mutate("array-capacity", olean_ix, put("<Q", at_obj(lambda o, rc, cs, oth, tag, size, cap:
-                                                               tag == 246 and size >= 1, 16), 1 << 40))
+                                                               tag == 246 and size >= 1, 16), 1 << 40),
+                  "invalid object (tag 246)", "invalid object (tag=246)")
         # The big-integer literal lives in the private layer (`.olean.private`) and in the `.ir`.
         v3_mutate("mpz-limbs", private_ix, put("<Q", at_obj(lambda o, rc, cs, oth, tag, size, cap: tag == 250, 16),
-                                               forged))
+                                               forged),
+                  "invalid object (tag 250)", "invalid object (tag=250)")
+        v3_mutate("mpz-neg-alloc", private_ix, put("<I", at_obj(lambda o, rc, cs, oth, tag, size, cap: tag == 250, 8),
+                                                   0xFFFFFFFF),
+                  "invalid object (tag 250)", "invalid object (tag=250)")
 
         def string_to_zero_elem_scalar_array(data, base, root):
             """Re-tag a reachable string as a scalar array with element size 0 and a 2^40 size."""
@@ -2563,7 +2607,8 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             struct.pack_into("<iHBBQQ", data, o, 0, 0, 0, 248, 1 << 40, 1 << 40)
             return data
 
-        v3_mutate("scalar-elem0", olean_ix, string_to_zero_elem_scalar_array)
+        v3_mutate("scalar-elem0", olean_ix, string_to_zero_elem_scalar_array,
+                  "invalid object (tag 248)", "invalid object (tag=248)")
         def clobber_string_nul(data, base, root):
             o, size = v3_walk(bytes(data), lambda o, rc, cs, oth, tag, size, cap: tag == 249 and size >= 2)
             data[o + 32 + size - 1] = 0x41
@@ -2577,11 +2622,15 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                 return data
             return mutate
 
-        v3_mutate("string-nul", olean_ix, clobber_string_nul)
-        v3_mutate("import-module-oob", olean_ix, import_module_field(lambda base, root, elem: forged))
+        v3_mutate("string-nul", olean_ix, clobber_string_nul,
+                  "invalid object (tag 249)", "invalid object (tag=249)")
+        v3_mutate("import-module-oob", olean_ix, import_module_field(lambda base, root, elem: forged),
+                  "escapes the region", "out-of-region pointer")
         for part_label, ix in (("olean", olean_ix), ("ir", ir_ix)):
-            v3_mutate(f"self-loop-{part_label}", ix, import_module_field(lambda base, root, elem: elem))
-            v3_mutate(f"cycle-to-root-{part_label}", ix, import_module_field(lambda base, root, elem: root))
+            v3_mutate(f"self-loop-{part_label}", ix, import_module_field(lambda base, root, elem: elem),
+                      "escapes the region", "out-of-region pointer")
+            v3_mutate(f"cycle-to-root-{part_label}", ix, import_module_field(lambda base, root, elem: root),
+                      "escapes the region", "out-of-region pointer")
         # V3 positive control on the genuine parts (MPZ, String, ByteArray objects all walked).
         ol3.artifacts["OlG31V3"] = v3_genuine
         v3_ok = olean_accept(ol3, ["OlG31V3"])
@@ -2663,17 +2712,58 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "def useTri (t : Tri) : Nat := t.ctorIdx\n"), ["Init"])
         olean_reject(ol3, ["OlG31V4Hooks"], "[compilerOverrideAttribute]", "unbox", "UBox", "never_extract", "neFn",
                      "macro_inline", "Tri.ctorIdx")
-        # Non-blocking `leanprover/lean4#14896` readiness: a theorem as an `Eq.rec` major premise
-        # (directly and behind `id`) is counted only when requested and never blocks acceptance.
+        # V4 IR-only override & intrinsic mismatch in a `module`-file (`.ir` extension tables).
+        olean_module(ol3, "OlG31V4IR", (
+            "module\nprelude\npublic import Init\n"
+            "@[unbox] public structure IrUBox where\n  x : Nat\n"
+            "@[never_extract] public def irNeFn (n : Nat) : Nat := n\n"
+            "public def irTarget (n : Nat) : Nat := n + 1\n"
+            "@[implemented_by irTarget] public def irImplFn (n : Nat) : Nat := n\n"),
+            ["Init"], module_file=True)
+        olean_reject(ol3, ["OlG31V4IR"], "[compilerOverrideAttribute]", "unbox", "IrUBox",
+                     "never_extract", "irNeFn", "implemented_by", "irImplFn")
+        # Non-blocking `leanprover/lean4#14896` readiness: direct, `@id`-wrapped (in `def` and in
+        # `theorem`), non-reducible-`def`-wrapped, `let`-bound, and `.proj` scrutinee theorems are
+        # all counted when requested, never block acceptance, and produce 0 flags on clean modules.
         olean_module(ol3, "OlG31Ready", prelude_init + (
+            "set_option linter.defProp false\n"
             "theorem myEq : (1 : Nat) = 1 := rfl\n"
+            "def wrapEq (h : (1 : Nat) = 1) : (1 : Nat) = 1 := h\n"
             "def usesThmInRec : Nat := Eq.rec (motive := fun _ _ => Nat) 7 myEq\n"
             "def usesIdThmInRec : Nat := Eq.rec (motive := fun _ _ => Nat) 8 (id myEq)\n"
+            "theorem thmUsesIdInRec : Eq.rec (motive := fun _ _ => Nat) 8 (id myEq) = 8 := rfl\n"
+            "def usesWrapThmInRec : Nat := Eq.rec (motive := fun _ _ => Nat) 9 (wrapEq myEq)\n"
+            "def usesLetThmInRec : Nat := let h := myEq; Eq.rec (motive := fun _ _ => Nat) 10 (wrapEq h)\n"
             "def usesThmAsArg : Nat := (fun (_ : (1 : Nat) = 1) => 3) myEq\n"), ["Init"])
         ready_off = olean_accept(ol3, ["OlG31Ready"])
         assert ready_off["opaqueTheoremReadinessFlags"] == 0, ready_off
         ready_on = olean_accept(ol3, ["OlG31Ready"], checkOpaqueTheoremReadiness=True)
-        assert ready_on["replay"] is True and ready_on["opaqueTheoremReadinessFlags"] >= 2, ready_on
+        assert ready_on["replay"] is True and ready_on["opaqueTheoremReadinessFlags"] == 5, ready_on
+        olean_module(ol3, "OlG31ReadyProj", (
+            "prelude\nimport Lean\nopen Lean\n"
+            "set_option linter.defProp false\n"
+            "structure PBox : Prop where\n  a : True\n"
+            "theorem myPBox : PBox := ⟨trivial⟩\n"
+            "def wrapP (p : PBox) : PBox := p\n"
+            "run_meta do\n"
+            "  addDecl (.defnDecl {\n"
+            "    name := `projDirect, levelParams := [], type := mkConst ``True,\n"
+            "    value := .proj ``PBox 0 (mkConst `myPBox), hints := .opaque, safety := .safe })\n"
+            "  addDecl (.defnDecl {\n"
+            "    name := `projWrap, levelParams := [], type := mkConst ``True,\n"
+            "    value := .proj ``PBox 0 (mkApp (mkConst `wrapP) (mkConst `myPBox)),\n"
+            "    hints := .opaque, safety := .safe })\n"), ["Lean"])
+        proj_on = olean_accept(ol3, ["OlG31ReadyProj"], checkOpaqueTheoremReadiness=True, **lean_roots)
+        assert proj_on["replay"] is True and proj_on["opaqueTheoremReadinessFlags"] == 2, proj_on
+        olean_module(ol3, "OlG31ReadyClean", prelude_init + (
+            "theorem myEq : (1 : Nat) = 1 := rfl\n"
+            "theorem myPf : (0 : Nat) < 1 := Nat.zero_lt_one\n"
+            "def usesThmAsArg : Nat := (fun (_ : (1 : Nat) = 1) => 3) myEq\n"
+            "def usesLetAsArg : Nat := let h := myEq; (fun (_ : (1 : Nat) = 1) => 4) h\n"
+            "def usesSubtypeProj : Nat := (Subtype.mk (p := fun _ : Nat => (0 : Nat) < 1) 42 myPf).val\n"),
+            ["Init"])
+        clean_ready = olean_accept(ol3, ["OlG31ReadyClean"], checkOpaqueTheoremReadiness=True)
+        assert clean_ready["replay"] is True and clean_ready["opaqueTheoremReadinessFlags"] == 0, clean_ready
         clean_on = olean_accept(ol3, ["OlG31Base"], checkOpaqueTheoremReadiness=True)
         assert clean_on["opaqueTheoremReadinessFlags"] == 0, clean_on
 
