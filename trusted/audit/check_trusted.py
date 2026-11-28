@@ -720,9 +720,9 @@ _OLEAN_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _check_no_toolchain_shadow(art_root: Path, phase: str) -> None:
-    """Refuse artifact roots that shadow `Init`/`Std`/`Lean` `.olean*` files or contain symlinks under them."""
+    """Refuse artifact roots that shadow `Init`/`Std`/`Lean` `.olean*`/`.ir*` files or contain symlinks under them."""
     for root_name in ("Init", "Std", "Lean"):
-        for ext in PARTS[:3]:
+        for ext in PARTS:
             cand = art_root / f"{root_name}.{ext}"
             if cand.exists() or cand.is_symlink():
                 raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact root shadows toolchain file: {cand}")
@@ -735,20 +735,20 @@ def _check_no_toolchain_shadow(art_root: Path, phase: str) -> None:
                     p = Path(directory) / name
                     if p.is_symlink():
                         raise Failure(1, phase, f"[moduleProvenanceSpoofed] symlink under shadowed toolchain dir: {p}")
-                    if any(name.endswith("." + ext) for ext in PARTS[:3]):
+                    if any(name.endswith("." + ext) for ext in PARTS):
                         raise Failure(1, phase, f"[moduleProvenanceSpoofed] artifact root shadows toolchain artifact: {p}")
 
 
 def _validate_olean_parts(module: str, olean_parts: list[str], phase: str, ir_parts=()) -> None:
     """Pre-`importModules` binary header & compacted-region bounds check (leanprover/lean4#16737) of the
-    `.olean*` layer chain and the `.ir.sig`/`.ir` chain (same compacted-region format, also mapped)."""
+    `.olean*` layer chain and the `.ir.sig`/`.ir` chain (same compacted-region format, disjoint regions)."""
     if len(olean_parts) not in (1, 3) or len(ir_parts) not in (0, 2):
         raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: expected 1 or 3 olean and 0 or 2 IR parts")
-    for chain in (olean_parts, ir_parts):
-        _validate_layer_chain(module, chain, phase)
+    ol_layers = _validate_layer_chain(module, olean_parts, phase)
+    _validate_layer_chain(module, ir_parts, phase, ol_layers)
 
 
-def _validate_layer_chain(module: str, chain, phase: str) -> None:
+def _validate_layer_chain(module: str, chain, phase: str, disjoint=()) -> list[tuple[int, int, int]]:
     parents: list[tuple[int, int, int]] = []
     for raw in chain:
         p = Path(raw)
@@ -767,7 +767,7 @@ def _validate_layer_chain(module: str, chain, phase: str) -> None:
                 base_addr, root_ptr = struct.unpack_from("<QQ", hdr, 80)
                 if base_addr == 0 or (base_addr & 7) != 0 or base_addr + size >= (1 << 64):
                     raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid/overflowing baseAddr in {p}")
-                if any(not (base_addr + size <= pb or pb + ps <= base_addr) for pb, ps, _ in parents):
+                if any(not (base_addr + size <= pb or pb + ps <= base_addr) for pb, ps, _ in (*parents, *disjoint)):
                     raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: overlapping compacted-region layer in {p}")
                 if base_addr + 96 <= root_ptr <= base_addr + size - 8:
                     if (root_ptr & 7) != 0:
@@ -792,12 +792,18 @@ def _validate_layer_chain(module: str, chain, phase: str) -> None:
                         in_par = (child & 7) == 0 and any(pb + 96 <= child <= pb + ps - 8 for pb, ps, _ in parents)
                         if not (in_own or in_par):
                             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: out-of-bounds root child ptr in {p}")
+                        if in_own:
+                            f.seek(child - base_addr)
+                            ch = f.read(8)
+                            if len(ch) != 8 or struct.unpack("<i", ch[:4])[0] != 0 or ch[7] > 249:
+                                raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root child object header in {p}")
                 else:
                     if not parents or size != 96 or not any(root_ptr == pr for _, _, pr in parents):
                         raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid out-of-region rootPtr in {p}")
                 parents.append((base_addr, size, root_ptr))
         except OSError as error:
             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: cannot read {p}: {error}") from error
+    return parents
 
 
 class Checker:
@@ -1722,8 +1728,8 @@ class Checker:
         self.expected_lean_sha = expected_lean_sha
         self.version = actual_version
         self.prefix = Path(self.process("prefix", ["--print-prefix"]).strip()).resolve()
-        if self.prefix != self.lean.parent.parent:
-            raise Failure(2, "toolchain", "compiler prefix differs from selected executable")
+        if self.prefix != self.lean.parent.parent or not _canonical_dir(self.prefix / "lib/lean"):
+            raise Failure(2, "toolchain", "compiler prefix/lib differs from selected executable")
         self.foundation = list(self.lock["modules"])
         if set(self.foundation) != set(self.lock["graph"]):
             raise Failure(2, "lock", "foundation module/DAG keys differ")

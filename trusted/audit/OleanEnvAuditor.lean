@@ -27,6 +27,7 @@ import Lean.Meta.ExprDefEq
 import Lean.Meta.SynthInstance
 import Lean.Meta.Instances
 import Lean.Meta.CasesInfo
+import Lean.Meta.Match.MatcherInfo
 import Lean.Meta.Constructions.CasesOn
 import Lean.Meta.Constructions.SparseCasesOn
 import Lean.Util.Path
@@ -365,8 +366,8 @@ def oleanMagicBytes : ByteArray := "olean".toUTF8
 def oleanVerBytes : ByteArray := "4.34.1".toUTF8
 def oleanGitBytes : ByteArray := "5045d0056413266e57c625dcd7c365b10e377c52".toUTF8
 
-/-- Pre-`importModules` binary validation of one `.olean*` layer (`leanprover/lean4#16737`). -/
-def validateOleanBytes (b : ByteArray) (parents : Array (Nat × Nat × Nat)) :
+/-- Pre-`importModules` binary validation of one `.olean*` or `.ir*` layer (`leanprover/lean4#16737`). -/
+def validateOleanBytes (b : ByteArray) (parents disjoint : Array (Nat × Nat × Nat)) :
     Except String (Nat × Nat × Nat) := do
   let sz := b.size
   unless sz >= 96 do throw s!"file smaller than 96-byte header ({sz})"
@@ -377,7 +378,7 @@ def validateOleanBytes (b : ByteArray) (parents : Array (Nat × Nat × Nat)) :
   let (baseAddr, rootPtr) := (readU64LE b 80, readU64LE b 88)
   unless baseAddr > 0 && baseAddr % 8 == 0 && baseAddr + sz < 18446744073709551616 do
     throw "invalid, unaligned, or overflowing .olean baseAddr"
-  for (pb, ps, _) in parents do
+  for (pb, ps, _) in parents ++ disjoint do
     unless baseAddr + sz <= pb || pb + ps <= baseAddr do throw "overlapping compacted-region layer"
   if baseAddr + 96 <= rootPtr && rootPtr <= baseAddr + sz - 8 then
     unless rootPtr % 8 == 0 do throw "unaligned .olean rootPtr"
@@ -389,25 +390,31 @@ def validateOleanBytes (b : ByteArray) (parents : Array (Nat × Nat × Nat)) :
     for k in [0:mOther] do
       let c := readU64LE b (off + 8 + 8 * k)
       if c % 2 == 1 then continue
-      unless c % 8 == 0 && ((baseAddr + 96 <= c && c <= baseAddr + sz - 8) ||
-          parents.any fun (pb, ps, _) => pb + 96 <= c && c <= pb + ps - 8) do
-        throw s!"out-of-bounds root child pointer at slot {k}"
+      let inOwn := c % 8 == 0 && baseAddr + 96 <= c && c <= baseAddr + sz - 8
+      let inPar := c % 8 == 0 && parents.any fun (pb, ps, _) => pb + 96 <= c && c <= pb + ps - 8
+      unless inOwn || inPar do throw s!"out-of-bounds root child pointer at slot {k}"
+      if inOwn then
+        let co := c - baseAddr
+        unless readU32LE b co == 0 && (b.get! (co + 7)).toNat <= 249 do
+          throw s!"invalid root child object header at slot {k}"
   else unless !parents.isEmpty && sz == 96 && parents.any fun (_, _, pr) => pr == rootPtr do
     throw "out-of-region rootPtr is not a valid 96-byte empty delta layer"
   return (baseAddr, sz, rootPtr)
 
-def validateOleanParts (m : Name) (oleanParts : Array System.FilePath) : AuditM Unit := do
+def validateOleanParts (m : Name) (oleanParts : Array System.FilePath)
+    (disjoint : Array (Nat × Nat × Nat) := #[]) : AuditM (Array (Nat × Nat × Nat)) := do
   let mut parents : Array (Nat × Nat × Nat) := #[]
   for p in oleanParts do
     let sz? ← (show IO (Option Nat) from do try pure (some (← p.metadata).byteSize.toNat) catch _ => pure none)
-    let some sz := sz? | report "oleanBinaryInvalid" m m s!"cannot stat {p}"; return
+    let some sz := sz? | report "oleanBinaryInvalid" m m s!"cannot stat {p}"; return parents
     unless sz >= 96 && sz <= 256 * 1024 * 1024 do
-      report "oleanBinaryInvalid" m m s!"{p} byte size {sz} outside [96, 256 MiB]"; return
+      report "oleanBinaryInvalid" m m s!"{p} byte size {sz} outside [96, 256 MiB]"; return parents
     let some bytes ← (show IO (Option ByteArray) from do try pure (some (← IO.FS.readBinFile p)) catch _ => pure none)
-      | report "oleanBinaryInvalid" m m s!"cannot read {p}"; return
-    match validateOleanBytes bytes parents with
+      | report "oleanBinaryInvalid" m m s!"cannot read {p}"; return parents
+    match validateOleanBytes bytes parents disjoint with
     | .ok layer => parents := parents.push layer; modify fun s => { s with oleanFilesValidated := s.oleanFilesValidated + 1 }
-    | .error e => report "oleanBinaryInvalid" m m s!"{p}: {e}"; return
+    | .error e => report "oleanBinaryInvalid" m m s!"{p}: {e}"; return parents
+  return parents
 
 /-- Canonical-path check of one artifact part: the path must be absolute, must be a regular file
 whose `realPath` is the path itself, and its directory must canonicalize to itself. -/
@@ -496,7 +503,7 @@ def sysrootParts (libDir : System.FilePath) (m : Name) : IO (Array System.FilePa
 
 def checkNoToolchainShadow (m : Name) (artRoot : System.FilePath) : AuditM Unit := do
   for r in #["Init", "Std", "Lean"] do
-    for ext in #["olean", "olean.server", "olean.private"] do
+    for ext in partNames do
       let f := artRoot / (r ++ "." ++ ext)
       if ← entryExistsOnDisk f then report "moduleProvenanceSpoofed" m m s!"artifact root shadows toolchain file {f}"
     let sub := artRoot / r
@@ -513,7 +520,7 @@ def checkNoToolchainShadow (m : Name) (artRoot : System.FilePath) : AuditM Unit 
               if let some emd ← (show IO (Option IO.FS.Metadata) from do try pure (some (← e.path.symlinkMetadata)) catch _ => pure none) then
                 if emd.type == .symlink then report "moduleProvenanceSpoofed" m m s!"symlink under shadowed toolchain dir {e.path}"
                 else if emd.type == .dir then pending := e.path :: pending
-                else if #["olean", "olean.server", "olean.private"].any (fun ext => e.fileName.endsWith ("." ++ ext)) then
+                else if partNames.any (fun ext => e.fileName.endsWith ("." ++ ext)) then
                   report "moduleProvenanceSpoofed" m m s!"artifact root shadows toolchain artifact {e.path}"
         unless done do report "auditFuelExhausted" m m s!"shadow scan under {sub} exhausted its fuel"
 
@@ -551,8 +558,8 @@ def preloadArtifactChecks (req : Request) (sysMods : Array Name) : AuditM Nat :=
       if !(olean ++ ir).contains p && (← entryExistsOnDisk p) then
         report "missingPrivateArtifact" m m s!"companion part {p} exists but was omitted from the artifacts"
     if allCanon then
-      -- `.ir.sig`/`.ir` are compacted regions in the same format and are mapped by `importModules` too.
-      validateOleanParts m olean; validateOleanParts m ir
+      -- `.ir.sig`/`.ir` are compacted regions in the same format and must stay disjoint from `.olean*`.
+      let olLayers ← validateOleanParts m olean; let _ ← validateOleanParts m ir olLayers
       if !isTool then
         let rootStr := (firstStr.dropEnd relSuffix.length).toString
         let artRoot : System.FilePath := ⟨if rootStr.isEmpty then "/" else rootStr⟩
@@ -580,7 +587,7 @@ def preloadArtifactChecks (req : Request) (sysMods : Array Name) : AuditM Nat :=
       let mut okAll := true
       for sp in sysOlean ++ sysIR do unless (← checkCanonicalPart sm sp) && pathWithinRoot libDir sp do okAll := false
       if okAll then
-        validateOleanParts sm sysOlean; validateOleanParts sm sysIR
+        let olLayers ← validateOleanParts sm sysOlean; let _ ← validateOleanParts sm sysIR olLayers
   return checked
 
 /-! ## Environment -/
@@ -1708,7 +1715,7 @@ def parseStrictPrivate (ps : List (String ⊕ Nat)) : Option (Name × Name) := d
   let rec splitMod (ms : List String) : List (String ⊕ Nat) → Option (List String × List (String ⊕ Nat))
     | .inl s :: xs => splitMod (s :: ms) xs | .inr 0 :: xs => some (ms.reverse, xs) | _ => none
   let (ms, tail) ← splitMod [] rest
-  guard (!ms.isEmpty && !tail.isEmpty && !(tail matches .inr 0 :: _) && !hasPrivateMention tail)
+  guard (!ms.isEmpty && !tail.isEmpty && !hasPrivateMention tail && tail.all Sum.isLeft)
   let modName := ms.foldl Name.str .anonymous
   guard (validModuleName modName)
   return (modName, partsToName tail)
@@ -1738,61 +1745,64 @@ def conclIsEqOf (base : Name) (ty : Expr) : Bool := Id.run do
   for _ in [0:128] do match cur with | .forallE _ _ b _ => cur := b | _ => break
   cur.isAppOfArity ``Eq 3 && cur.getAppArgs[1]!.getAppFn.isConstOf base
 
-def reservedAlwaysRoots : NameSet :=
-  [`Init, `Std, `Lean, `ShareCommon, `Classical, `Quot, `sorryAx].foldl (·.insert ·) {}
-
-def reservedDomainRoots : NameSet :=
-  [`Trusted, `Assumptions, `Verify, `CrateVerify].foldl (·.insert ·) {}
+def reservedAlwaysRoots : NameSet := [`Init, `Std, `Lean, `ShareCommon, `Classical, `Quot, `sorryAx].foldl (·.insert ·) {}
+def reservedDomainRoots : NameSet := [`Trusted, `Assumptions, `Verify, `CrateVerify].foldl (·.insert ·) {}
 
 def privateUserForbidden (m user : Name) (toolchainNames : Std.HashSet Name) : Bool :=
   let r := user.getRoot
   reservedAlwaysRoots.contains r || (reservedDomainRoots.contains r && m.getRoot != r) ||
   compilerReservedNames.contains user || toolchainNames.contains user || isShareCommonNamePure user
 
-def isVerifiedTrustedMatchRealization (env : Environment) (m n user : Name)
-    (ci? : Option ConstantInfo) (isIRHelper : Bool) : Bool := Id.run do
-  if user.getRoot != `Trusted then return false
-  let hasTrustedMatcher : Name → Bool
-    | matcher@(.str _ ms) => (parseDecSuffix? ms "match_").any (· >= 1) &&
-        (origin? env matcher).any (·.getRoot == `Trusted) && (env.find? matcher matches some (.defnInfo _))
-    | _ => false
-  match ci? with
-  | some (.axiomInfo _) | some (.opaqueInfo _) => return false
-  | some ci =>
-    match user, n with
-    | .str matcher "splitter", _ => return (ci matches .defnInfo _) && hasTrustedMatcher matcher
-    | .str matcher last, .str privBase _ =>
-      if let some k := parseDecSuffix? last "eq_" then
-        return (k >= 1 && (ci matches .thmInfo _) && hasTrustedMatcher matcher &&
-          (k == 1 || (env.find? (privBase.str s!"eq_{k - 1}")).isSome) && conclIsEqOf matcher ci.type)
-      else if (parseDecSuffix? last "_sparseCasesOn_").isSome then
-        match matcher with
-        | .str mBase "splitter" =>
-          return ((ci matches .defnInfo _) && isSparseCasesOn env n && hasTrustedMatcher mBase &&
-            origin? env privBase == some m && (env.find? privBase matches some (.defnInfo _)))
-        | _ => return false
-      else return false
+def matcherInfo? (env : Environment) (n : Name) : Option Meta.MatcherInfo :=
+  match env.getModuleIdxFor? n with
+  | some i => (Meta.Match.Extension.extension.getModuleEntries env i).findSome? fun e => if e.name == n then some e.info else none
+  | none => Meta.getMatcherInfoCore? env n
+
+def splitterTypeMatches (mi : Meta.MatcherInfo) (mTy sTy : Expr) : Bool := Id.run do
+  let mut (mt, st) := (mTy, sTy)
+  for i in [0:mi.numParams + 1 + mi.numDiscrs + mi.altInfos.size] do
+    match mt, st with
+    | .forallE _ md mb _, .forallE _ sd sb _ =>
+      if i < mi.numParams + 1 + mi.numDiscrs && md != sd then return false
+      mt := mb; st := sb
     | _, _ => return false
-  | none =>
+  return mt == st
+
+def isVerifiedTrustedMatchRealization (env : Environment) (m n user : Name) (ci? : Option ConstantInfo) (isIRHelper : Bool) : Bool := Id.run do
+  if user.getRoot != `Trusted then return false
+  let trustedM? : Name → Option (Meta.MatcherInfo × ConstantInfo)
+    | mt@(.str _ ms) => if (parseDecSuffix? ms "match_").any (· >= 1) && (origin? env mt).any (·.getRoot == `Trusted) then
+        match matcherInfo? env mt, env.find? mt with | some mi, some mci@(.defnInfo _) => some (mi, mci) | _, _ => none else none
+    | _ => none
+  match ci?, user, n with
+  | some (.axiomInfo _), _, _ | some (.opaqueInfo _), _, _ => return false
+  | some ci, .str mt "splitter", _ =>
+    return (trustedM? mt).any fun (mi, mci) => (ci matches .defnInfo _) && ci.levelParams == mci.levelParams && splitterTypeMatches mi mci.type ci.type
+  | some ci, .str mt last, .str privBase _ =>
+    if let some k := parseDecSuffix? last "eq_" then
+      return (k >= 1 && (ci matches .thmInfo _) && (trustedM? mt).isSome && (k == 1 || (env.find? (privBase.str s!"eq_{k - 1}")).isSome) && conclIsEqOf mt ci.type)
+    else if (parseDecSuffix? last "_sparseCasesOn_").isSome then
+      match mt with
+      | .str mBase "splitter" => return ((ci matches .defnInfo _) && isSparseCasesOn env n && (trustedM? mBase).isSome && origin? env privBase == some m && (env.find? privBase matches some (.defnInfo _)))
+      | _ => return false
+    else return false
+  | none, _, _ =>
     if !isIRHelper || (IR.findEnvDecl env n).isNone || origin? env n != some m then return false
-    let mut curU := user; let mut curN := n; let mut stripped := false
+    let mut (curU, curN, stripped) := (user, n, false)
     for _ in [0:4] do
       match curU, curN with
       | .str pu su, .str pn sn => if su == sn && (isIRAuxSuffix su || su == "_boxed") then curU := pu; curN := pn; stripped := true else break
       | _, _ => break
     match curU with
-    | .str matcher "splitter" =>
-      return (stripped && hasTrustedMatcher matcher && origin? env curN == some m && (env.find? curN matches some (.defnInfo _)))
+    | .str mt "splitter" => return (stripped && (trustedM? mt).isSome && origin? env curN == some m && (env.find? curN matches some (.defnInfo _)))
     | _ => return false
+  | _, _, _ => return false
 
 def irAuxBaseOwned (env : Environment) (n pMod : Name) (allowSelf : Bool) : Bool := Id.run do
   let owned (x : Name) := origin? env x == some pMod && ((env.find? x).isSome || (IR.findEnvDecl env x).isSome)
   if allowSelf && owned n then return true
   let mut cur := n
-  for _ in [0:4] do
-    match cur with
-    | .str p s => if isIRAuxSuffix s then cur := p; if owned cur then return true else break
-    | _ => break
+  for _ in [0:4] do match cur with | .str p s => if isIRAuxSuffix s then cur := p; if owned cur then return true else break | _ => break
   return false
 
 /-- Structural `_private.<mod>.0.<user>` de-mangling, provenance binding, reserved-root guard, and
@@ -1844,12 +1854,14 @@ def checkPrivateName (L : Loaded) (toolchainNames : Std.HashSet Name) (m n : Nam
     let ok := match n with
       | .str base last =>
         origin? env base == some pMod &&
-        if let some k := parseDecSuffix? last "match_" then k >= 1 && (ci matches .defnInfo _) && (env.find? base).isSome
+        if let some k := parseDecSuffix? last "match_" then k >= 1 && (ci matches .defnInfo _) && (matcherInfo? env n).isSome && (env.find? base).isSome
         else if let some k := parseDecSuffix? last "eq_" then
-          k >= 1 && (ci matches .thmInfo _) && isReservedName env n && (env.find? base matches some (.defnInfo _)) &&
+          k >= 1 && (ci matches .thmInfo _) && (env.find? base matches some (.defnInfo _)) &&
           (k == 1 || (env.find? (base.str s!"eq_{k - 1}")).isSome) && conclIsEqOf base ci.type
-        else if last == "eq_def" then (ci matches .thmInfo _) && isReservedName env n && (env.find? base matches some (.defnInfo _)) && conclIsEqOf base ci.type
-        else if let some k := parseDecSuffix? last "proof_" then k >= 1 && (ci matches .thmInfo _) && (env.find? base).isSome
+        else if last == "eq_def" then (ci matches .thmInfo _) && (env.find? base matches some (.defnInfo _)) && conclIsEqOf base ci.type
+        else if let some k := parseDecSuffix? last "proof_" then
+          k >= 1 && (ci matches .thmInfo _) && (k == 1 || (env.find? (base.str s!"proof_{k - 1}")).isSome) &&
+          (env.find? base).any fun bci => (declEdges bci).contains n
         else if (parseDecSuffix? last "_sparseCasesOn_").isSome then (ci matches .defnInfo _) && isSparseCasesOn env n && (env.find? base).isSome
         else false
       | _ => false
@@ -3087,7 +3099,7 @@ def nonToolchainCSimpTargets (env : Environment) (toolchainProv : Std.HashSet Na
   for h : i in [0:env.header.modules.size] do
     let m := env.header.modules[i].module
     let isTool := toolchainProv.contains m
-    for e in Compiler.CSimp.ext.ext.getModuleEntries env i do
+    for e in Compiler.CSimp.ext.ext.getModuleEntries env i ++ Compiler.CSimp.ext.ext.getModuleIREntries env i do
       let ent := match e with | .global a => a | .scoped _ a => a
       if isTool then
         toolTriples := toolTriples.insert (ent.fromDeclName, ent.toDeclName, ent.thmName)
@@ -3152,6 +3164,7 @@ public def auditDeclsForSpec (env : Environment) (ctx : SpecAuditCtx) (roots : A
         let some m := effectiveOrigin? env ctx n
           | addV "missingDeclaration" n .anonymous "dependency without module origin"; continue
         let isTool := ctx.toolchainProv.contains m
+        if !isTool then rootMods := rootMods.insert m
         unless declIsClosed ci do addV "openExpression" n m "open expression in stored declaration"
         if ci.isUnsafe then addV "unsafeDeclaration" n m "unsafe declaration reached"
         else if ci.isPartial then addV "partialOrUnsafeRecDependency" n m "partial declaration reached"
