@@ -265,23 +265,6 @@ const VTABLE_TEMPLATES: &[MiriTemplate] = &[
         expect: Expect::AgreeOrFalsePositiveUb,
     },
     MiriTemplate {
-        label: "closure_fn_ptr",
-        classes: &[FN_PTR],
-        mode: MutationMode::Pass,
-        has: &[
-            // `ClosureFnPointer(Safe)`, `ClosureFnPointer(Unsafe)`,
-            // `UnsafeFnPointer`, and `FnPtrToPtr`.
-            "__vt_cfp: fn(u32) -> u32 = |__vt_z: u32|",
-            "__vt_cufp: unsafe fn(u32) -> u32 = __vt_cfp",
-            "__vt_cufp_direct: unsafe fn(u32) -> u32 = |__vt_z: u32|",
-            "__vt_cfp as *const ()",
-            "__vt_cfp(__vt_seed)",
-            "unsafe { __vt_cufp_direct(",
-        ],
-        lacks: "__AnnealVtable",
-        expect: Expect::AgreeOrFalsePositiveUb,
-    },
-    MiriTemplate {
         label: "fn_ptr_callee_overflow",
         classes: &[FN_PTR],
         mode: MutationMode::Panic,
@@ -405,6 +388,25 @@ const CLOSURE_TEMPLATES: &[MiriTemplate] = &[
         ],
         lacks: "::__::apply_keep(",
         expect: Expect::Agree,
+    },
+    MiriTemplate {
+        label: "closure_fn_ptr",
+        classes: &[FN_PTR, CLOSURE],
+        mode: MutationMode::Pass,
+        has: &[
+            // `ClosureFnPointer(Safe)`, `ClosureFnPointer(Unsafe)`,
+            // `UnsafeFnPointer`, and `FnPtrToPtr`, owned by
+            // `ClosureAndAddrEqMutator` with `__clos_*` identifiers only.
+            "__clos_cfp: fn(u32) -> u32 = |__clos_z: u32|",
+            "__clos_cufp: unsafe fn(u32) -> u32 = __clos_cfp",
+            "__clos_cufp_direct: unsafe fn(u32) -> u32 = |__clos_z: u32|",
+            "__clos_cfp as *const ()",
+            "__clos_cfp(__clos_seed)",
+            "unsafe { __clos_cufp_direct(",
+        ],
+        // Zero `VTableAndFnPtrMutator` tokens (`__vt_*`, `__AnnealVtable*`).
+        lacks: "__vt_",
+        expect: Expect::AgreeOrFalsePositiveUb,
     },
     MiriTemplate {
         label: "wide_slices_oob_index",
@@ -771,10 +773,11 @@ fn tb_stacked_miri_candidates(
 /// an already-faulting seed by that prefix of its entry function's name),
 /// mutated under `MutationMode::PerturbAst`.
 ///
-/// The `VTableAndFnPtrMutator` cases deliberately reuse the PRNG seeds of
-/// `dyn_dispatch` and `closure_fn_ptr` to prove that `PerturbAst` never emits
-/// a conservative-UB template ahead of the seed's own fault, and
-/// `ub_perturb_clos_unit` exercises the `()` return-type prefix-sink path.
+/// The `VTableAndFnPtrMutator` and `ClosureAndAddrEqMutator` cases deliberately
+/// reuse the PRNG seeds of `dyn_dispatch` and `closure_fn_ptr` respectively to
+/// prove that `PerturbAst` never emits a conservative-UB template ahead of the
+/// seed's own fault, and `ub_perturb_clos_unit` exercises the `()` return-type
+/// prefix-sink path.
 fn perturb_fault_seed_miri_candidates(
     first_id: usize,
 ) -> Vec<(&'static MiriTemplate, GeneratedMiriCandidate)> {
@@ -787,7 +790,7 @@ fn perturb_fault_seed_miri_candidates(
             .1
             .seed_u64
     };
-    let cases: [(&str, &str, &dyn MiriAstMutator, u64, &'static MiriTemplate); 5] = [
+    let cases: [(&str, &str, &dyn MiriAstMutator, u64, &'static MiriTemplate); 7] = [
         (
             "panic_perturb_vt",
             "pub fn panic_perturb_vt() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
@@ -803,10 +806,17 @@ fn perturb_fault_seed_miri_candidates(
             &PERTURB_FAULT_TEMPLATES[0],
         ),
         (
+            "panic_perturb_clos_fn_ptr",
+            "pub fn panic_perturb_clos_fn_ptr() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
+            &ClosureAndAddrEqMutator,
+            seed_of("closure_fn_ptr"),
+            &PERTURB_FAULT_TEMPLATES[0],
+        ),
+        (
             "ub_perturb_vt",
             "pub fn ub_perturb_vt() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
             &VTableAndFnPtrMutator,
-            seed_of("closure_fn_ptr"),
+            seed_of("dyn_dispatch"),
             &PERTURB_FAULT_TEMPLATES[1],
         ),
         (
@@ -814,6 +824,13 @@ fn perturb_fault_seed_miri_candidates(
             "pub fn ub_perturb_clos() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
             &ClosureAndAddrEqMutator,
             seed_of("wide_slices"),
+            &PERTURB_FAULT_TEMPLATES[1],
+        ),
+        (
+            "ub_perturb_clos_fn_ptr",
+            "pub fn ub_perturb_clos_fn_ptr() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
+            &ClosureAndAddrEqMutator,
+            seed_of("closure_fn_ptr"),
             &PERTURB_FAULT_TEMPLATES[1],
         ),
         (
@@ -2071,7 +2088,7 @@ fn tb_stacked_and_perturb_fault_miri_candidates_place_probes_and_compile() {
 
     let perturb_cands = perturb_fault_seed_miri_candidates(tb_cands.len());
     let perturb_replay = perturb_fault_seed_miri_candidates(tb_cands.len());
-    assert_eq!(perturb_cands.len(), 5);
+    assert_eq!(perturb_cands.len(), 7);
     assert_eq!(perturb_cands.len(), perturb_replay.len());
     for ((_, cand), (_, replay)) in perturb_cands.iter().zip(&perturb_replay) {
         assert_eq!(cand, replay, "`{}` is not deterministic", cand.fn_name);
@@ -2085,13 +2102,20 @@ fn tb_stacked_and_perturb_fault_miri_candidates_place_probes_and_compile() {
             assert!(
                 cand.fn_source.contains("__anneal_fnptr_callee_")
                     && !cand.fn_source.contains("__AnnealVtable")
-                    && !cand.fn_source.contains("__vt_cfp"),
+                    && !cand.fn_source.contains("__vt_cfp")
+                    && !cand.fn_source.contains("__clos_cfp"),
                 "`{}` PerturbAst must emit the 100%-Agree fn_ptr_chain arm:\n{}",
                 cand.fn_name,
                 cand.fn_source
             );
             "__anneal_vt_driver_"
         } else {
+            assert!(
+                !cand.fn_source.contains("__clos_cfp") && !cand.fn_source.contains("__vt_"),
+                "`{}` PerturbAst must skip conservative-UB closure_fn_ptr arm:\n{}",
+                cand.fn_name,
+                cand.fn_source
+            );
             "__anneal_clos_driver_"
         };
         let fault_marker = if cand.fn_name.starts_with("panic_") {
@@ -2204,7 +2228,9 @@ fn checked_perturb_ast_sources(
                 mutator.name()
             );
             assert!(
-                !perturbed.contains("__AnnealVtable") && !perturbed.contains("__vt_cfp"),
+                !perturbed.contains("__AnnealVtable")
+                    && !perturbed.contains("__vt_cfp")
+                    && !perturbed.contains("__clos_cfp"),
                 "`{}` PerturbAst emitted a conservative-UB template ahead of faulting \
                  `{fn_name}` (template seed `{}`):\n{perturbed}",
                 mutator.name(),
@@ -2387,6 +2413,11 @@ fn scheduled_miri_and_itree_batches_emit_all_four_construct_classes_at_healthy_r
     let mut miri_clos_by_unique_ref = 0usize;
     let mut miri_classes: BTreeSet<&'static str> = BTreeSet::new();
 
+    let closure_fn_ptr_template = CLOSURE_TEMPLATES
+        .iter()
+        .find(|t| t.label == "closure_fn_ptr")
+        .expect("closure_fn_ptr template in CLOSURE_TEMPLATES");
+
     for cand in &miri_batch {
         if !cand
             .applied_mutators
@@ -2397,6 +2428,12 @@ fn scheduled_miri_and_itree_batches_emit_all_four_construct_classes_at_healthy_r
         }
         miri_indirect_cands += 1;
         let src = &cand.fn_source;
+        // `VTableAndFnPtrMutator` must never emit `ClosureFnPointer` code (`__vt_cfp`).
+        assert!(
+            !src.contains("__vt_cfp"),
+            "`{}` unexpectedly contains legacy VTable closure-fn-ptr token `__vt_cfp`:\n{src}",
+            cand.fn_name
+        );
         if VTABLE_TEMPLATES[1].has.iter().all(|m| has_marker(src, m)) {
             miri_dyn += 1;
             miri_classes.extend(VTABLE_TEMPLATES[1].classes.iter().copied());
@@ -2405,9 +2442,21 @@ fn scheduled_miri_and_itree_batches_emit_all_four_construct_classes_at_healthy_r
             miri_fn_ptr_chain += 1;
             miri_classes.extend(VTABLE_TEMPLATES[0].classes.iter().copied());
         }
-        if VTABLE_TEMPLATES[2].has.iter().all(|m| has_marker(src, m)) {
+        if closure_fn_ptr_template
+            .has
+            .iter()
+            .all(|m| has_marker(src, m))
+        {
+            assert!(
+                cand.applied_mutators
+                    .iter()
+                    .any(|m| m == "ClosureAndAddrEqMutator"),
+                "`{}` emitted closure_fn_ptr without ClosureAndAddrEqMutator: {:?}",
+                cand.fn_name,
+                cand.applied_mutators
+            );
             miri_closure_fn_ptr += 1;
-            miri_classes.extend(VTABLE_TEMPLATES[2].classes.iter().copied());
+            miri_classes.extend(closure_fn_ptr_template.classes.iter().copied());
         }
         if has_marker(src, "__anneal_wide_slice_addr_eq_") {
             miri_wide_slices += 1;
@@ -2622,6 +2671,92 @@ fn indirect_call_templates_run_through_live_miri_and_anneal_oracles() {
             "only {} of {total} templates agree ({conservative} may be conservative)",
             report.agree_count
         ));
+    }
+    // Verify `&dyn Trait` (`VTableAndFnPtrMutator`) and `ClosureFnPointer`
+    // (`ClosureAndAddrEqMutator`) remain attributed to their distinct mutators
+    // and surface distinct `failing_construct_hint` values when they diverge.
+    // A conservative `FalsePositiveUb` verdict on either template MUST produce
+    // its finding bundle, so the hint checks below can never pass vacuously.
+    for (fn_name, expected_hint) in [
+        ("vt_dyn_dispatch", "PointerCoercion::Unsize"),
+        ("clos_closure_fn_ptr", "PointerCoercion::ClosureFnPointer"),
+    ] {
+        let diverged = report.item_reports.iter().any(|r| {
+            r.name == fn_name
+                && matches!(
+                    r.verdict,
+                    ComparisonVerdict::Diverge(DivergenceKind::FalsePositiveUb { .. })
+                )
+        });
+        let finding = report.findings.iter().find(|f| f.fn_name == fn_name);
+        if diverged && finding.is_none() {
+            problems.push(format!(
+                "`{fn_name}` diverged with FalsePositiveUb but produced no finding bundle \
+                 (expected failing_construct_hint {expected_hint})"
+            ));
+        }
+    }
+    for finding in &report.findings {
+        if finding.fn_name == "vt_dyn_dispatch" {
+            if finding.applied_mutators != vec!["VTableAndFnPtrMutator".to_string()] {
+                problems.push(format!(
+                    "vt_dyn_dispatch finding attributed to {:?}",
+                    finding.applied_mutators
+                ));
+            }
+            if finding.failing_construct_hint.as_deref() != Some("PointerCoercion::Unsize") {
+                problems.push(format!(
+                    "vt_dyn_dispatch expected failing_construct_hint PointerCoercion::Unsize, got {:?}",
+                    finding.failing_construct_hint
+                ));
+            }
+        } else if finding.fn_name == "clos_closure_fn_ptr" {
+            if finding.applied_mutators != vec!["ClosureAndAddrEqMutator".to_string()] {
+                problems.push(format!(
+                    "clos_closure_fn_ptr finding attributed to {:?}",
+                    finding.applied_mutators
+                ));
+            }
+            if finding.mutant_source.contains("__vt_")
+                || finding.mutant_source.contains("__AnnealVtable")
+            {
+                problems.push(
+                    "clos_closure_fn_ptr reproducer leaked VTableAndFnPtrMutator tokens"
+                        .to_string(),
+                );
+            }
+            if finding.failing_construct_hint.as_deref()
+                != Some("PointerCoercion::ClosureFnPointer")
+            {
+                problems.push(format!(
+                    "clos_closure_fn_ptr expected failing_construct_hint PointerCoercion::ClosureFnPointer, got {:?}",
+                    finding.failing_construct_hint
+                ));
+            }
+        }
+        if finding.fn_name == "vt_dyn_dispatch" || finding.fn_name == "clos_closure_fn_ptr" {
+            let expected_hint = if finding.fn_name == "vt_dyn_dispatch" {
+                "PointerCoercion::Unsize"
+            } else {
+                "PointerCoercion::ClosureFnPointer"
+            };
+            let bundle_dir = dir.join("findings").join(&finding.finding_id);
+            let json_text = fs::read_to_string(bundle_dir.join("finding.json")).unwrap_or_default();
+            let summary_text =
+                fs::read_to_string(bundle_dir.join("SUMMARY.md")).unwrap_or_default();
+            if !json_text.contains(&format!("\"failing_construct_hint\": \"{expected_hint}\"")) {
+                problems.push(format!(
+                    "{} finding.json missing failing_construct_hint {expected_hint}",
+                    finding.fn_name
+                ));
+            }
+            if !summary_text.contains(&format!("- **Failing construct hint**: `{expected_hint}`")) {
+                problems.push(format!(
+                    "{} SUMMARY.md missing failing_construct_hint bullet for {expected_hint}",
+                    finding.fn_name
+                ));
+            }
+        }
     }
     assert!(
         problems.is_empty(),

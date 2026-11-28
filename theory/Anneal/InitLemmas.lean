@@ -13,24 +13,34 @@ import Init.SimpLemmas
 import Init.Data.Nat.Basic
 import Init.Data.Nat.Div.Basic
 import Init.Data.Nat.Bitwise.Basic
+import Init.Data.Fin.Basic
+import Init.Data.BitVec.BasicAux
+import Init.Data.UInt.BasicAux
 import Init.Data.Int.Basic
 import Init.Data.List.Basic
+
 
 /-!
 # Shared Foundation-Locked `Init` Lemmas (`Anneal.InitLemmas`)
 
 Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`,
-admitted theory tactics only) lemma pack consolidating five high-frequency
+admitted theory tactics only) lemma pack consolidating seven high-frequency
 helper clusters across `anneal/theory/` and `anneal/correspondence/`:
 
 1. `Bool` connectives and `ite`/`dite` branch reduction from propositional
    hypotheses.
-2. Generic `BEq` reflection bridges (`beq_refl` / `eq_of_beq` <-> `beq_iff`)
-   plus `natListBeq`.
-3. `Nat` power-of-two, division, and modulo identities.
-4. Constructive `IntBalance` sign-magnitude `Nat` bridge for `Int` reasoning
-   without `omega`.
+2. Generic `BEq` reflection bridges (`beq_refl` / `eq_of_beq` <-> `beq_iff`),
+   `natListBeq`, and polymorphic `List.beq` reflection (`list_beq_refl`,
+   `list_eq_of_beq`, `list_beq_iff`).
+3. `Nat` power-of-two monotonicity, division, and modulo identities.
+4. Constructive `IntBalance` sign-magnitude bridge, `Int` order, and
+   `Int.ofNat` subtraction lemmas over `Init.Data.Int.Basic` without `omega`.
 5. Total `@Nat.rec` list indexing, slicing, and range-replacement lemmas.
+6. `BitVec` bounded `toNat`/`ofNat`, non-wrapping `+`, and `<`/`<=` bridges
+   over `Init.Data.BitVec.BasicAux` (general `BitVec` `toNat` laws live in
+   `Anneal.BitVec`).
+7. Fixed-width `UInt8`/`UInt16`/`UInt32`/`UInt64` extensionality, bounded
+   `toNat`/`ofNat`, and nonzero lemmas over `Init.Data.UInt.BasicAux`.
 -/
 
 namespace Anneal.InitLemmas
@@ -221,6 +231,30 @@ theorem natListBeq_iff (xs ys : List Nat) :
   beq_iff_of_refl_and_eq natListBeq natListBeq_refl
     (fun h => eq_of_natListBeq h) xs ys
 
+theorem list_beq_refl {α : Type u} [BEq α] [LawfulBEq α] :
+    ∀ (xs : List α), List.beq xs xs = true
+  | [] => rfl
+  | x :: xs => by
+    change ((x == x) && List.beq xs xs) = true
+    rw [beq_self_eq_true x, list_beq_refl xs]
+    rfl
+
+theorem list_eq_of_beq {α : Type u} [BEq α] [LawfulBEq α] :
+    ∀ {xs ys : List α}, List.beq xs ys = true → xs = ys
+  | [], [], _ => rfl
+  | [], _ :: _, h => by nomatch h
+  | _ :: _, [], h => by nomatch h
+  | x :: xs, y :: ys, h => by
+    change ((x == y) && List.beq xs ys) = true at h
+    have hx : x = y := eq_of_beq (bool_and_left h)
+    have hxs : xs = ys := list_eq_of_beq (bool_and_right h)
+    rw [hx, hxs]
+
+theorem list_beq_iff {α : Type u} [BEq α] [LawfulBEq α] (xs ys : List α) :
+    List.beq xs ys = true ↔ xs = ys :=
+  beq_iff_of_refl_and_eq List.beq list_beq_refl
+    (fun h => list_eq_of_beq h) xs ys
+
 /-! ## 3. `Nat` Power, Division, and Modulo Lemmas -/
 
 theorem add_four_rearrange (a b c d : Nat) :
@@ -405,6 +439,60 @@ theorem div2_mod2_inj (m n : Nat)
   rw [hDiv, hMod] at hn
   rw [← hn, hm]
 
+theorem nat_two_pow_lt_succ (n : Nat) : Nat.pow 2 n < Nat.pow 2 (n + 1) := by
+  rw [nat_pow_succ, Nat.mul_two]
+  exact Nat.lt_add_of_pos_right (nat_two_pow_pos n)
+
+theorem nat_two_pow_lt_of_lt {i j : Nat} (h : i < j) :
+    Nat.pow 2 i < Nat.pow 2 j :=
+  Nat.lt_of_lt_of_le (nat_two_pow_lt_succ i)
+    (Nat.pow_le_pow_right (by decide : 0 < 2) h)
+
+theorem nat_two_pow_le_of_le {i j : Nat} (h : i ≤ j) :
+    Nat.pow 2 i ≤ Nat.pow 2 j :=
+  Nat.pow_le_pow_right (by decide : 0 < 2) h
+
+theorem nat_add_mul_div_left (x z : Nat) {y : Nat} (hy : 0 < y) :
+    Nat.div (x + y * z) y = Nat.div x y + z :=
+  Nat.add_mul_div_left x z hy
+
+theorem nat_mul_add_mod_self_left (a b c : Nat) :
+    Nat.mod (a * b + c) a = Nat.mod c a :=
+  Nat.mul_add_mod_self_left a b c
+
+theorem nat_add_mod_mod (a b m : Nat) :
+    Nat.mod (a + Nat.mod b m) m = Nat.mod (a + b) m := by
+  have hDiv : Nat.mod b m + m * Nat.div b m = b := by
+    rw [Nat.add_comm]
+    exact Nat.div_add_mod b m
+  have hStep :
+      Nat.mod (a + Nat.mod b m) m =
+        Nat.mod (a + Nat.mod b m + m * Nat.div b m) m :=
+    Eq.symm (nat_add_mul_mod_self_left (a + Nat.mod b m) m (Nat.div b m))
+  rw [Nat.add_assoc a (Nat.mod b m) (m * Nat.div b m), hDiv] at hStep
+  exact hStep
+
+theorem nat_mod_add_mod (a b m : Nat) :
+    Nat.mod (Nat.mod a m + b) m = Nat.mod (a + b) m := by
+  rw [Nat.add_comm (Nat.mod a m) b, nat_add_mod_mod, Nat.add_comm b a]
+
+theorem nat_mod_mod_mul_left (n a b : Nat) :
+    Nat.mod (Nat.mod n (a * b)) a = Nat.mod n a :=
+  nat_mod_mod_of_dvd (nat_mul_mod_right a b)
+
+theorem nat_mod_sq_sub_succ (p k : Nat) (hk : k < p) :
+    Nat.mod (p * p - (k + 1)) p = p - (k + 1) := by
+  have hPos : 0 < p := Nat.lt_of_lt_of_le (Nat.zero_lt_succ k) hk
+  have hFactor : p * p = p * (p - 1) + p := by
+    have hMul : p = (p - 1) + 1 := Eq.symm (Nat.sub_add_cancel hPos)
+    have hDist : p * ((p - 1) + 1) = p * (p - 1) + p := by
+      rw [Nat.mul_add, Nat.mul_one]
+    rw [← hMul] at hDist
+    exact hDist
+  rw [hFactor, Nat.add_sub_assoc hk, Nat.add_comm (p * (p - 1)) (p - (k + 1)),
+      nat_add_mul_mod_self_left]
+  exact Nat.mod_eq_of_lt (Nat.sub_lt hPos (Nat.zero_lt_succ k))
+
 /-! ## 4. Constructive `IntBalance` Sign-Magnitude `Nat` Bridge -/
 
 /-- Nonnegative magnitude component of an `Int`. -/
@@ -564,6 +652,141 @@ theorem int_neg_ofNat_succ (n : Nat) :
 theorem int_neg_negSucc (n : Nat) :
     Neg.neg (Int.negSucc n) = Int.ofNat (n + 1) := rfl
 
+theorem nonNeg_subNatNat_le {a b : Nat}
+    (h : Int.NonNeg (Int.subNatNat a b)) : b ≤ a := by
+  cases Nat.lt_or_ge a b with
+  | inl hLt =>
+    rw [int_subNatNat_of_lt hLt] at h
+    nomatch h
+  | inr hGe => exact hGe
+
+theorem le_nonNeg_subNatNat {a b : Nat} (h : b ≤ a) :
+    Int.NonNeg (Int.subNatNat a b) := by
+  rw [int_subNatNat_of_le h]
+  exact Int.NonNeg.mk (a - b)
+
+theorem int_ofNat_zero_le (n : Nat) : (0 : Int) ≤ Int.ofNat n :=
+  (int_ofNat_le_iff 0 n).mpr (Nat.zero_le n)
+
+theorem int_le_refl (a : Int) : a ≤ a := by
+  cases a with
+  | ofNat x => exact (int_ofNat_le_iff x x).mpr (Nat.le_refl x)
+  | negSucc x => exact (int_negSucc_le_negSucc_iff x x).mpr (Nat.le_refl x)
+
+theorem int_le_trans {a b c : Int} (hab : a ≤ b) (hbc : b ≤ c) : a ≤ c := by
+  cases a with
+  | ofNat x =>
+    cases b with
+    | ofNat y =>
+      cases c with
+      | ofNat z =>
+        exact (int_ofNat_le_iff x z).mpr (Nat.le_trans
+          ((int_ofNat_le_iff x y).mp hab) ((int_ofNat_le_iff y z).mp hbc))
+      | negSucc z => exact False.elim (int_not_ofNat_le_negSucc y z hbc)
+    | negSucc y => exact False.elim (int_not_ofNat_le_negSucc x y hab)
+  | negSucc x =>
+    cases b with
+    | ofNat y =>
+      cases c with
+      | ofNat z => exact int_negSucc_le_ofNat x z
+      | negSucc z => exact False.elim (int_not_ofNat_le_negSucc y z hbc)
+    | negSucc y =>
+      cases c with
+      | ofNat z => exact int_negSucc_le_ofNat x z
+      | negSucc z =>
+        exact (int_negSucc_le_negSucc_iff x z).mpr (Nat.le_trans
+          ((int_negSucc_le_negSucc_iff y z).mp hbc)
+          ((int_negSucc_le_negSucc_iff x y).mp hab))
+
+theorem int_lt_of_lt_of_le {a b c : Int} (hab : a < b) (hbc : b ≤ c) : a < c :=
+  int_le_trans hab hbc
+
+theorem int_add_one_le_add_one {a b : Int} (h : a ≤ b) : a + 1 ≤ b + 1 := by
+  cases a with
+  | ofNat x =>
+    cases b with
+    | ofNat y =>
+      exact (int_ofNat_le_iff (x + 1) (y + 1)).mpr
+        (Nat.succ_le_succ ((int_ofNat_le_iff x y).mp h))
+    | negSucc y => exact False.elim (int_not_ofNat_le_negSucc x y h)
+  | negSucc x =>
+    cases b with
+    | ofNat y =>
+      cases x with
+      | zero => exact (int_ofNat_le_iff 0 (y + 1)).mpr (Nat.zero_le (y + 1))
+      | succ x' => exact int_negSucc_le_ofNat x' (y + 1)
+    | negSucc y =>
+      have hyx : y ≤ x := (int_negSucc_le_negSucc_iff x y).mp h
+      cases x with
+      | zero =>
+        cases y with
+        | zero => exact (int_ofNat_le_iff 0 0).mpr (Nat.le_refl 0)
+        | succ y' =>
+          exact False.elim (Nat.not_lt_of_le hyx (Nat.zero_lt_succ y'))
+      | succ x' =>
+        cases y with
+        | zero => exact int_negSucc_le_ofNat x' 0
+        | succ y' =>
+          exact (int_negSucc_le_negSucc_iff x' y').mpr
+            (Nat.le_of_succ_le_succ hyx)
+
+theorem int_lt_of_le_of_lt {a b c : Int} (hab : a ≤ b) (hbc : b < c) : a < c :=
+  int_le_trans (int_add_one_le_add_one hab) hbc
+
+theorem int_le_antisymm {a b : Int} (hab : a ≤ b) (hba : b ≤ a) : a = b := by
+  cases a with
+  | ofNat x =>
+    cases b with
+    | ofNat y =>
+      exact congrArg Int.ofNat (Nat.le_antisymm
+        ((int_ofNat_le_iff x y).mp hab) ((int_ofNat_le_iff y x).mp hba))
+    | negSucc y => exact False.elim (int_not_ofNat_le_negSucc x y hab)
+  | negSucc x =>
+    cases b with
+    | ofNat y => exact False.elim (int_not_ofNat_le_negSucc y x hba)
+    | negSucc y =>
+      exact congrArg Int.negSucc (Nat.le_antisymm
+        ((int_negSucc_le_negSucc_iff y x).mp hba)
+        ((int_negSucc_le_negSucc_iff x y).mp hab))
+
+theorem int_not_add_one_le (a : Int) (h : a + 1 ≤ a) : False := by
+  cases a with
+  | ofNat n =>
+    exact Nat.not_lt_of_le ((int_ofNat_le_iff (n + 1) n).mp h)
+      (Nat.lt_succ_self n)
+  | negSucc m =>
+    cases m with
+    | zero => exact int_not_ofNat_le_negSucc 0 0 h
+    | succ k =>
+      exact Nat.not_lt_of_le ((int_negSucc_le_negSucc_iff k (k + 1)).mp h)
+        (Nat.lt_succ_self k)
+
+theorem int_not_lt_of_ge {a b : Int} (h : b ≤ a) : ¬ (a < b) :=
+  fun hlt => int_not_add_one_le a (int_le_trans hlt h)
+
+theorem int_not_le_of_gt {a b : Int} (h : b < a) : ¬ (a ≤ b) :=
+  fun hle => int_not_add_one_le b (int_le_trans h hle)
+
+theorem int_sub_ofNat_neg_swap (a b : Nat) :
+    Int.ofNat b - Int.ofNat a = Int.neg (Int.ofNat a - Int.ofNat b) := by
+  rw [int_ofNat_sub_eq_subNatNat b a, int_ofNat_sub_eq_subNatNat a b]
+  unfold Int.subNatNat
+  cases Nat.lt_or_ge a b with
+  | inl hab =>
+    rw [Nat.sub_eq_zero_of_le (Nat.le_of_lt hab)]
+    cases hS : b - a with
+    | zero =>
+      exact False.elim (Nat.not_lt_of_le (Nat.le_of_sub_eq_zero hS) hab)
+    | succ _ => rfl
+  | inr hba =>
+    rw [Nat.sub_eq_zero_of_le hba]
+    cases hS : a - b with
+    | zero =>
+      have hEq : a = b := Nat.le_antisymm (Nat.le_of_sub_eq_zero hS) hba
+      subst hEq
+      rfl
+    | succ _ => rfl
+
 /-! ## 5. Total `@Nat.rec` List Indexing and Slice Helpers -/
 
 /-- Total list element lookup returning `none` when `idx ≥ xs.length`. -/
@@ -687,7 +910,162 @@ theorem replaceSlice_length {α : Type u} (xs : List α) (off : Nat)
   rw [listTake_length_of_le off xs hOffLe, listDrop_length]
   exact Nat.add_sub_of_le hBound
 
-/-! ## 6. Kernel-Checked Edge-Case Canaries -/
+/-! ## 6. `BitVec` Bounded `toNat`, Non-Wrapping `+`, and Order -/
+
+/- `BitVec` extensionality from `toNat`, kept private because
+`Anneal.BitVec.eq_of_toNat_eq` and `Anneal.PureLift.BvLin.bv_eq_of_toNat_eq`
+already export it and `Anneal.MirSymExec.Bits` opens both
+`Anneal.InitLemmas` and `Anneal.PureLift.BvLin`. -/
+private theorem bitVec_eq_of_toNat_eq {w : Nat} {a b : BitVec w}
+    (h : a.toNat = b.toNat) : a = b := by
+  cases a with
+  | ofFin fa =>
+    cases b with
+    | ofFin fb =>
+      exact congrArg BitVec.ofFin (Fin.eq_of_val_eq h)
+
+theorem bv_toNat_lt {w : Nat} (x : BitVec w) : x.toNat < Nat.pow 2 w :=
+  x.toFin.isLt
+
+theorem bv_toNat_ofNat_of_lt {w n : Nat} (h : n < Nat.pow 2 w) :
+    (BitVec.ofNat w n).toNat = n :=
+  Nat.mod_eq_of_lt h
+
+theorem bv_toNat_add_of_lt {w : Nat} {x y : BitVec w}
+    (h : x.toNat + y.toNat < Nat.pow 2 w) :
+    (x + y).toNat = x.toNat + y.toNat :=
+  Nat.mod_eq_of_lt h
+
+theorem bv_add_ofNat_of_lt {w a b : Nat} (h : a + b < Nat.pow 2 w) :
+    BitVec.ofNat w a + BitVec.ofNat w b = BitVec.ofNat w (a + b) := by
+  apply bitVec_eq_of_toNat_eq
+  have ha : a < Nat.pow 2 w := Nat.lt_of_le_of_lt (Nat.le_add_right a b) h
+  have hb : b < Nat.pow 2 w := Nat.lt_of_le_of_lt (Nat.le_add_left b a) h
+  change
+      Nat.mod ((BitVec.ofNat w a).toNat + (BitVec.ofNat w b).toNat)
+        (Nat.pow 2 w) =
+      (BitVec.ofNat w (a + b)).toNat
+  rw [bv_toNat_ofNat_of_lt ha, bv_toNat_ofNat_of_lt hb, bv_toNat_ofNat_of_lt h]
+  exact Nat.mod_eq_of_lt h
+
+theorem bv_lt_iff_toNat_lt {w : Nat} (x y : BitVec w) :
+    (x < y) ↔ x.toNat < y.toNat := Iff.rfl
+
+theorem bv_le_iff_toNat_le {w : Nat} (x y : BitVec w) :
+    (x ≤ y) ↔ x.toNat ≤ y.toNat := Iff.rfl
+
+theorem bv_not_add_lt_left_of_lt {w : Nat} {x y : BitVec w}
+    (h : x.toNat + y.toNat < Nat.pow 2 w) : ¬ (x + y < x) := by
+  rw [bv_lt_iff_toNat_lt, bv_toNat_add_of_lt h]
+  exact Nat.not_lt_of_ge (Nat.le_add_right x.toNat y.toNat)
+
+/-! ## 7. Fixed-Width `UInt8`, `UInt16`, `UInt32`, and `UInt64` Lemmas -/
+
+theorem u8_eq_of_toNat_eq {x y : UInt8} (h : x.toNat = y.toNat) : x = y := by
+  cases x with
+  | ofBitVec bx =>
+    cases y with
+    | ofBitVec by_ =>
+      exact congrArg UInt8.ofBitVec (bitVec_eq_of_toNat_eq h)
+
+theorem u16_eq_of_toNat_eq {x y : UInt16} (h : x.toNat = y.toNat) : x = y := by
+  cases x with
+  | ofBitVec bx =>
+    cases y with
+    | ofBitVec by_ =>
+      exact congrArg UInt16.ofBitVec (bitVec_eq_of_toNat_eq h)
+
+theorem u32_eq_of_toNat_eq {x y : UInt32} (h : x.toNat = y.toNat) : x = y := by
+  cases x with
+  | ofBitVec bx =>
+    cases y with
+    | ofBitVec by_ =>
+      exact congrArg UInt32.ofBitVec (bitVec_eq_of_toNat_eq h)
+
+theorem u64_eq_of_toNat_eq {x y : UInt64} (h : x.toNat = y.toNat) : x = y := by
+  cases x with
+  | ofBitVec bx =>
+    cases y with
+    | ofBitVec by_ =>
+      exact congrArg UInt64.ofBitVec (bitVec_eq_of_toNat_eq h)
+
+theorem u8_toNat_lt (x : UInt8) : x.toNat < Nat.pow 2 8 :=
+  x.toBitVec.toFin.isLt
+
+theorem u16_toNat_lt (x : UInt16) : x.toNat < Nat.pow 2 16 :=
+  x.toBitVec.toFin.isLt
+
+theorem u32_toNat_lt (x : UInt32) : x.toNat < Nat.pow 2 32 :=
+  x.toBitVec.toFin.isLt
+
+theorem u64_toNat_lt (x : UInt64) : x.toNat < Nat.pow 2 64 :=
+  x.toBitVec.toFin.isLt
+
+theorem u8_toNat_ofNat (n : Nat) :
+    (UInt8.ofNat n).toNat = Nat.mod n (Nat.pow 2 8) := rfl
+
+theorem u16_toNat_ofNat (n : Nat) :
+    (UInt16.ofNat n).toNat = Nat.mod n (Nat.pow 2 16) := rfl
+
+theorem u32_toNat_ofNat (n : Nat) :
+    (UInt32.ofNat n).toNat = Nat.mod n (Nat.pow 2 32) := rfl
+
+theorem u64_toNat_ofNat (n : Nat) :
+    (UInt64.ofNat n).toNat = Nat.mod n (Nat.pow 2 64) := rfl
+
+theorem u8_toNat_ofNat_of_lt {n : Nat} (h : n < Nat.pow 2 8) :
+    (UInt8.ofNat n).toNat = n := Nat.mod_eq_of_lt h
+
+theorem u16_toNat_ofNat_of_lt {n : Nat} (h : n < Nat.pow 2 16) :
+    (UInt16.ofNat n).toNat = n := Nat.mod_eq_of_lt h
+
+theorem u32_toNat_ofNat_of_lt {n : Nat} (h : n < Nat.pow 2 32) :
+    (UInt32.ofNat n).toNat = n := Nat.mod_eq_of_lt h
+
+theorem u64_toNat_ofNat_of_lt {n : Nat} (h : n < Nat.pow 2 64) :
+    (UInt64.ofNat n).toNat = n := Nat.mod_eq_of_lt h
+
+theorem u8_ofNat_ne_zero {n : Nat} (hPos : 0 < n) (hLt : n < Nat.pow 2 8) :
+    UInt8.ofNat n ≠ 0 := by
+  intro hEq
+  have h1 : (UInt8.ofNat n).toNat = (0 : UInt8).toNat :=
+    congrArg UInt8.toNat hEq
+  rw [u8_toNat_ofNat_of_lt hLt] at h1
+  change n = 0 at h1
+  rw [h1] at hPos
+  exact Nat.lt_irrefl 0 hPos
+
+theorem u16_ofNat_ne_zero {n : Nat} (hPos : 0 < n) (hLt : n < Nat.pow 2 16) :
+    UInt16.ofNat n ≠ 0 := by
+  intro hEq
+  have h1 : (UInt16.ofNat n).toNat = (0 : UInt16).toNat :=
+    congrArg UInt16.toNat hEq
+  rw [u16_toNat_ofNat_of_lt hLt] at h1
+  change n = 0 at h1
+  rw [h1] at hPos
+  exact Nat.lt_irrefl 0 hPos
+
+theorem u32_ofNat_ne_zero {n : Nat} (hPos : 0 < n) (hLt : n < Nat.pow 2 32) :
+    UInt32.ofNat n ≠ 0 := by
+  intro hEq
+  have h1 : (UInt32.ofNat n).toNat = (0 : UInt32).toNat :=
+    congrArg UInt32.toNat hEq
+  rw [u32_toNat_ofNat_of_lt hLt] at h1
+  change n = 0 at h1
+  rw [h1] at hPos
+  exact Nat.lt_irrefl 0 hPos
+
+theorem u64_ofNat_ne_zero {n : Nat} (hPos : 0 < n) (hLt : n < Nat.pow 2 64) :
+    UInt64.ofNat n ≠ 0 := by
+  intro hEq
+  have h1 : (UInt64.ofNat n).toNat = (0 : UInt64).toNat :=
+    congrArg UInt64.toNat hEq
+  rw [u64_toNat_ofNat_of_lt hLt] at h1
+  change n = 0 at h1
+  rw [h1] at hPos
+  exact Nat.lt_irrefl 0 hPos
+
+/-! ## 8. Kernel-Checked Edge-Case Canaries -/
 
 /-- Canary exercising Section 1 `Bool` and `ite`/`dite` branch lemmas. -/
 theorem canary_bool_ite_edge :
@@ -755,5 +1133,74 @@ theorem canary_expanded_init_lemmas_edge (a b : Nat) :
    by rw [int_subNatNat_of_le (Nat.le_add_right a b), nat_add_sub_cancel_left],
    int_negSucc_lt_ofNat 3 0,
    (int_negSucc_lt_negSucc_iff 5 2).mpr (by decide)⟩
+
+/-- Canary exercising Section 3 power-of-two monotonicity and modular
+identities (power-of-two strict monotonicity, nested product modulus, squared
+prime-stride tail wraparound). -/
+theorem canary_nat_mod_edge (n : Nat) :
+    Nat.pow 2 0 < Nat.pow 2 3 ∧
+    Nat.mod (Nat.mod n (4 * 3)) 4 = Nat.mod n 4 ∧
+    Nat.mod (3 * 3 - (0 + 1)) 3 = 3 - (0 + 1) :=
+  ⟨nat_two_pow_lt_of_lt (by decide), nat_mod_mod_mul_left n 4 3,
+    nat_mod_sq_sub_succ 3 0 (by decide)⟩
+
+/-- Canary exercising Section 4 constructive `Int` order and `Int.ofNat`
+subtraction across negative, zero, and nonnegative boundaries. -/
+theorem canary_int_order_sub_edge :
+    Int.negSucc 2 ≤ Int.ofNat 1 ∧
+    Int.negSucc 2 ≤ Int.negSucc 0 ∧
+    ¬ (Int.ofNat 2 < Int.negSucc 0) ∧
+    Int.ofNat 5 - Int.ofNat 2 = Int.ofNat 3 ∧
+    Int.ofNat 2 - Int.ofNat 5 = Int.neg (Int.ofNat 5 - Int.ofNat 2) :=
+  ⟨int_le_trans (int_negSucc_le_ofNat 2 0) ((int_ofNat_le_iff 0 1).mpr
+      (by decide)),
+    (int_negSucc_le_negSucc_iff 2 0).mpr (by decide),
+    int_not_lt_of_ge (int_negSucc_le_ofNat 0 2),
+    int_ofNat_sub_of_le (by decide : 2 ≤ 5),
+    int_sub_ofNat_neg_swap 5 2⟩
+
+/-- Canary exercising Section 2 polymorphic `List.beq` equality reflection
+on empty lists, length mismatches, element mismatches, and matching lists. -/
+theorem canary_list_beq_edge :
+    List.beq ([] : List Nat) [] = true ∧
+    List.beq ([] : List Nat) [0] = false ∧
+    List.beq [1, 2] [1, 3] = false ∧
+    (List.beq [1, 2] [1, 2] = true ↔ [1, 2] = [1, 2]) :=
+  ⟨rfl, rfl, rfl, list_beq_iff [1, 2] [1, 2]⟩
+
+/-- Canary exercising Section 6 bounded `ofNat`/`toNat`, non-wrapping
+`BitVec` `+`, and `<`/`≤` bridges at width `8`. -/
+theorem canary_bv_arith_order_edge :
+    (BitVec.ofNat 8 200).toNat = 200 ∧
+    BitVec.ofNat 8 10 + BitVec.ofNat 8 20 = BitVec.ofNat 8 30 ∧
+    (BitVec.ofNat 8 100 + BitVec.ofNat 8 155).toNat = 255 ∧
+    ¬ (BitVec.ofNat 8 10 + BitVec.ofNat 8 20 < BitVec.ofNat 8 10) ∧
+    (BitVec.ofNat 8 10 ≤ BitVec.ofNat 8 20) :=
+  ⟨bv_toNat_ofNat_of_lt (by decide),
+    bv_add_ofNat_of_lt (by decide),
+    bv_toNat_add_of_lt (by decide),
+    bv_not_add_lt_left_of_lt (by decide),
+    (bv_le_iff_toNat_le (BitVec.ofNat 8 10) (BitVec.ofNat 8 20)).2
+      (by decide)⟩
+
+/-- Canary exercising Section 7 fixed-width `UInt8`..`UInt64` wraparound,
+extensionality, bounded `ofNat`, and symmetric nonzero lemmas. -/
+theorem canary_uint_edge :
+    UInt8.ofNat 256 = UInt8.ofNat 0 ∧
+    UInt16.ofNat 65536 = UInt16.ofNat 0 ∧
+    (UInt32.ofNat 7).toNat = 7 ∧
+    (UInt64.ofNat 9).toNat = 9 ∧
+    UInt8.ofNat 1 ≠ 0 ∧
+    UInt16.ofNat 1 ≠ 0 ∧
+    UInt32.ofNat 1 ≠ 0 ∧
+    UInt64.ofNat 1 ≠ 0 :=
+  ⟨u8_eq_of_toNat_eq rfl,
+    u16_eq_of_toNat_eq rfl,
+    u32_toNat_ofNat_of_lt (by decide),
+    u64_toNat_ofNat_of_lt (by decide),
+    u8_ofNat_ne_zero (by decide) (by decide),
+    u16_ofNat_ne_zero (by decide) (by decide),
+    u32_ofNat_ne_zero (by decide) (by decide),
+    u64_ofNat_ne_zero (by decide) (by decide)⟩
 
 end Anneal.InitLemmas

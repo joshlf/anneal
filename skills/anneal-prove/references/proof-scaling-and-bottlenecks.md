@@ -389,3 +389,22 @@ Follow a strict two-regime threshold heuristic:
    `lean_local_search` / `lean_hover` to locate existing `Anneal.*` lemmas
    instead of reading `trusted/lean/` source files or hand-writing intermediate
    `MachineState` records.
+
+---
+
+## 10. Multi-Variable Linear Arithmetic Certificates (`Anneal.LinearArith`)
+
+### Symptom
+Proving multi-variable linear `Nat`/`Int` inequalities or parity/alignment
+floor cuts inside Pass-1 (`prelude` + `Init.*`-only) proofs where `omega` is
+unavailable or kernel tactic reduction stalls on algebraic case splits.
+
+### Solution
+1. Reach for `Anneal.LinearArith` (`NatCutGoal`/`IntCutGoal` + `List CutStep`
+   verified via `checkNatCutGoal_sound` / `checkIntCutGoal_sound` with `rfl`)
+   for linear inequalities, `Anneal.BitVec`/`Anneal.BitTrieLrat` for
+   bitwise/SAT problems, and plain `rfl` for constant goals.
+2. Run `python3 ci/farkas_cert_gen.py --domain <nat|int>` with `--hyp` and
+   `--goal` flags (see `docs/farkas-cert-gen.md`) to synthesize a balanced
+   certificate within Lean's default `maxRecDepth` (`512`) and `--max-nodes`
+   search budget.

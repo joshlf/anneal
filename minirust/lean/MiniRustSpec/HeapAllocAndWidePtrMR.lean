@@ -1138,14 +1138,14 @@ theorem basicMemory_allocate_aligned {mem mem' : BasicMemory x86_64 ProvExtra Al
       | true => rfl
       | false => rw [hb] at hal; exact absurd rfl hal
 
-/-! ### `BasicMemory::deallocate` -/
+/-! ### `BasicMemory::deallocate` (`spec/mem/basic.md`) -/
 
 /-- The name `{:?}` prints for an `AllocationKind`. -/
 def allocKindName : AllocationKind → String
   | .Stack => "Stack" | .Heap => "Heap" | .Global => "Global"
   | .Function => "Function" | .VTable => "VTable"
 
-/-- The UB message of `BasicMemory::deallocate` for a kind mismatch:
+/-- The UB message of `BasicMemory::deallocate` (`spec/mem/basic.md`) for a kind mismatch:
 > "deallocating {:?} memory with {:?} deallocation operation" -/
 def deallocKindMismatchMsg (actual requested : AllocationKind) : String :=
   s!"deallocating {allocKindName actual} memory with {allocKindName requested} deallocation operation"
