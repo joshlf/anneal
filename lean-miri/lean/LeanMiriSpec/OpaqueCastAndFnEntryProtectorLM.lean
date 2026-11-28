@@ -48,7 +48,8 @@ The vendored LeanMiri (`lean-miri/vendor/`, unmodified) side of the frozen 22-ca
   `BorrowTree.releaseProtector`), plus universal laws on vendored `Miri.Interpreter.Call.initStackFrame`,
   `Call.passArgument`, `MachineHooks.withRetagMode`, `RetagPolicy.create`, and `RetagPipeline.retagPointerValue`.
 * `D3` (`16..21`): safe-pointer validity through vendored `Validity.checkScalar` (non-null valid
-  range of `pointerLayoutData true`), `checkPtrAccess` (dereferenceability), and `checkPtrAlign`,
+  range of `pointerLayoutData true`), then REAL `ValidityMachine.checkPointerAccess` /
+  `ValidityMachine.checkPointerAlign` executed on the harness allocations (`lmOcValChecks`),
   plus universal laws on vendored `ValidityMachine.{checkPointerAccess, checkPointerAlign, scalarMayBeNull}`.
 
 The memory harness (`lmAllocate`, `lmStore`, `lmLoad`, `lmRetag`, `lmEndCall`, `lmDeallocate`) is
@@ -789,8 +790,66 @@ def lmOcSafePtrValidity : LmOcM ScalarValidityLayout :=
   | .Scalar (.Initialized (validRange := vr) ..) => pure ⟨Size.ofBytes 8, vr⟩
   | _ => .error (.harness "pointer layout")
 
+/-- The vendored `ValidityMachine` state over the harness memory `mem` (integer alignment
+checking, deep validation, no borrow tracker / data-race detector in the validity scope). -/
+def ocValStateLm (mem : LmMem) : ValidityMachine.State MiriMemoryKind Unit :=
+  { stack := { frames := #[] }
+    machine := {
+      memory := mem
+      borrowTracker := none
+      dataRace := none
+      threads := Miri.Concurrency.ThreadManager.initial false
+      raceAllocations := #[]
+      allocationSpans := #[]
+      user := {
+        addresses := {
+          intToPtrMap := #[]
+          baseAddr := #[]
+          exposed := #[]
+          provenanceMode := .strict
+          addressMode := .managed
+          generation := none
+        }
+        payload := { payload := (), validation := .Deep, alignment := .Int }
+      }
+    } }
+
+/-- The vendored `ValidityMachine` access configuration of the harness: pointers resolve through
+`lmResolvePure` against the harness allocations (no shadow resolver). -/
+def ocValAccessLm : ValidityMachine.Access MiriMemoryKind Unit where
+  runtime := RuntimeTargetDataLayout.default
+  ghostMode := false
+  globalKind := none
+  globalHooks := {
+    synchronizeMemory := fun _ h => h
+    evaluateStaticInitializer := fun mem h _ => ⟨mem, h, .error "unused"⟩
+    beforeAccessGlobal := fun mem h _ _ _ _ => ⟨mem, h, .ok ()⟩
+    adjustGlobalAllocation := fun mem h _ _ => ⟨mem, h, .error "unused"⟩
+  }
+  dynamicLayout := fun mem h _ => ⟨mem, h, .ok none⟩
+  resolvePointer := fun _ ptr sz st => .ok (lmResolvePure ptr sz) st
+  beforeAllocationAccess := fun _ => pure ()
+  diagnostic := fun _ _ _ => pure ()
+  weakMemoryWrite := fun _ _ => pure ()
+  syncAccess := fun _ _ _ => pure ()
+  retainTouched := fun m _ => m
+  memoryError := fun _ => .unsupported "unused"
+
+/-- REAL vendored `ValidityMachine.checkPointerAccess` (dereferenceability) followed by REAL
+vendored `ValidityMachine.checkPointerAlign` (integer alignment) on the harness memory. -/
+def lmOcValChecks (st : LmState) (p : Pointer (Option Provenance)) (size : Nat) (align : Align) :
+    Except StepError Unit :=
+  match ValidityMachine.checkPointerAccess ocValAccessLm p (Size.ofBytes (UInt64.ofNat size))
+      (ocValStateLm st.mem) with
+  | .error e _ => .error e
+  | .ok () s' =>
+    match ValidityMachine.checkPointerAlign ocValAccessLm p align s' with
+    | .error e _ => .error e
+    | .ok () _ => .ok ()
+
 /-- Vendored safe-pointer validity of `p` at a pointee of `size` bytes and alignment `align`:
-`Validity.checkScalar` (non-null), `checkPtrAccess` (dereferenceable), `checkPtrAlign`. -/
+`Validity.checkScalar` (non-null valid range), then REAL `ValidityMachine.checkPointerAccess` and
+`ValidityMachine.checkPointerAlign` over the harness memory (`lmOcValChecks`). -/
 def lmOcPtrValidity (st : LmState) (p : Pointer (Option Provenance)) (size : Nat) (align : Align) :
     LmOcM LmOcFpObs := do
   let s ← (Scalar.fromMaybePointer lmLayout p).mapError (fun e => .mem (.scalar e))
@@ -799,9 +858,7 @@ def lmOcPtrValidity (st : LmState) (p : Pointer (Option Provenance)) (size : Nat
       (fun _ st => .error () st) () with
   | .error e _ => .error (.validity e)
   | .ok () _ =>
-    (checkPtrAccess lmPtrArith p (Size.ofBytes (UInt64.ofNat size)) (.dereferenceable "pointer")
-      lmResolvePure st.mem.getAllocInfo).mapError .access
-    (checkPtrAlign p align true lmResolvePure st.mem.getAllocInfo (fun _ _ _ _ _ => none)).mapError .access
+    (lmOcValChecks st p size align).mapError (fun e => .mem (.step e))
     pure .okPtrValid
 
 /-- A live `size`-byte allocation holding `bits`. -/
@@ -918,7 +975,16 @@ unroll_loops lmOcDeinitThenReadU := lmOcDeinitThenRead fuel 0
 unroll_loops lmOcProtectedDropU := lmOcProtectedDrop fuel 0
   with lmAllocateU, lmStoreU, lmRetagU, lmAccessTargetU, lmTreeAccessU
 unroll_loops lmOcD2U := lmOcD2 fuel 0 with lmAllocateU, lmStoreU, lmLoadU, lmRetagU, lmEndCallU
-unroll_loops lmOcPtrValidityU := lmOcPtrValidity fuel 0 with getAllocInfoU
+unroll_loops checkPointerAccessResultU := Miri.Interpreter.ValidityMachine.checkPointerAccessResult fuel 0
+  with getAllocInfoU
+unroll_loops checkPointerAccessU := Miri.Interpreter.ValidityMachine.checkPointerAccess fuel 0
+  with checkPointerAccessResultU
+unroll_loops checkPointerAlignResultU := Miri.Interpreter.ValidityMachine.checkPointerAlignResult fuel 0
+  with getAllocInfoU
+unroll_loops checkPointerAlignU := Miri.Interpreter.ValidityMachine.checkPointerAlign fuel 0
+  with checkPointerAlignResultU
+unroll_loops lmOcValChecksU := lmOcValChecks fuel 0 with checkPointerAccessU, checkPointerAlignU
+unroll_loops lmOcPtrValidityU := lmOcPtrValidity fuel 0 with lmOcValChecksU
 unroll_loops lmOcD3NullU := lmOcD3Null fuel 0 with lmOcPtrValidityU
 unroll_loops lmOcLiveU := lmOcLive fuel 0 with lmAllocateU, lmStoreU
 unroll_loops lmOcD3U := lmOcD3 fuel 0 with lmOcLiveU, lmOcPtrValidityU, lmDeallocateU
@@ -1893,6 +1959,8 @@ run_cmd do
   -- (traversing `LeanMiriSpec.*` adapters so wrappers cannot hide shadow evaluators).
   let bridgeReq : List (Lean.Name × Lean.Name) :=
     [ (ns ++ `lmOcObserve_table, `Miri.Interpreter.Step.step),
+      (ns ++ `lmOcObserve_table, `Miri.Interpreter.ValidityMachine.checkPointerAccess),
+      (ns ++ `lmOcObserve_table, `Miri.Interpreter.ValidityMachine.checkPointerAlign),
       (ns ++ `lm_d1_phase_boundary_table, `Miri.Interpreter.project),
       (ns ++ `lm_d1_phase_boundary_table, `Miri.Interpreter.PlaceDynamic.project),
       (ns ++ `lm_oc_setDiscriminant_payload_agreement, `Miri.Interpreter.Step.step),
@@ -1910,8 +1978,6 @@ run_cmd do
       (ns ++ `lmOcObserve_table, `Miri.Interpreter.writeAggregate),
       (ns ++ `lmOcObserve_table, `Miri.Memory.Allocation.writeUninit),
       (ns ++ `lmOcObserve_table, `Miri.Memory.Validity.checkScalar),
-      (ns ++ `lmOcObserve_table, `Miri.Memory.checkPtrAccess),
-      (ns ++ `lmOcObserve_table, `Miri.Memory.checkPtrAlign),
       (ns ++ `lmOcObserve_table, `Miri.TreeBorrows.RetagPipeline.retagPointerValue),
       (ns ++ `lmOcObserve_table, `Miri.TreeBorrows.BorrowTree.releaseProtector),
       (ns ++ `lmOcObserve_table, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
