@@ -214,9 +214,14 @@ def ocBody (name : String) (argCount : Nat) (decls : List Ty) (blocks : List Bas
 
 /-! #### `D1`: `ProjectionElem.opaqueCast` in every place context (`0..9`)
 
-Every `D1` fixture is argument-free: `_1` is made live and initialized in the body. The cast type
-of every chain equals the declared type of its local, so the cast-erased fixture
-(`ocEraseBody`) is well typed. -/
+Every `D1` fixture is argument-free: `_1` is made live and initialized in the body. In the
+canonical cases `0..9` and the companions `ocCase6PayloadMir`, `ocCase7ProtectedDropMir`, and
+`ocCase9DeadLocalMir`, the cast type of every chain equals the declared type of its local, so the
+cast-erased fixture (`ocEraseBody`) is well typed and is a faithful post-borrowck image. The ONE
+exception is `ocCase9InvalidBoolMir`, whose cast `(_1 as bool)` on `_1 : u8` is deliberately
+type-switching: its erasure is NOT a faithful image (it silently masks the invalid-`bool` UB; see
+the `type_switch_erasure_boundary` theorems), so that companion is checked against a
+memory-level type-switched read instead. -/
 
 @[reducible] def ocCastU32 : ProjectionElem := .opaqueCast ocU32Ty
 @[reducible] def ocInit7 : List StatementKind := [.storageLive 1, .assign (ocLoc 1) (.use (ocConstU32 7))]
@@ -1237,6 +1242,19 @@ theorem mr_oc_invalid_bool_ub_non_masking :
     runStopMsgTB ocMrProg9InvalidBool =
       some "load at type but the data in memory violates the language invariant" := by
   refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- **`D1.6` type-switching cast erasure boundary (kernel-checked)**: for the deliberately
+type-switching companion `ocCase9InvalidBoolMir` (`move (_1 as bool)`, `_1 : u8 = 2`), Trusted on
+the `.opaqueCast` fixture is `.ub` (validation at the cast type), whereas Trusted on its cast erasure
+`ocEraseBody` (`_0 = move _1`) returns the invalid byte `2` WITHOUT UB: cast erasure is faithful only
+for type-preserving casts (every other `D1` fixture), and erasing a type-switching cast would mask
+the UB. MiniRust therefore models the cast as the type-switched load `*(&raw const _1 as *const bool)`
+(`ocMrProg9InvalidBool`), which is `.ub` on `Mach` and `MachTB`, agreeing with the cast fixture. -/
+theorem mr_oc_type_switch_erasure_boundary :
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw ocCase9InvalidBoolMir []) = .ub ∧
+    mrOcTrustedObsOf .scalar (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []) = .okScalar 2 ∧
+    ocRun false [] ocMrProg9InvalidBool = .ub ∧ ocRun true [] ocMrProg9InvalidBool = .ub := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-- **`D2.3` reverse transmutation `fn(*mut u8, *mut u8) -> fn(&mut u8, *mut u8)` mode-sensitivity
 (kernel-checked)**: when the caller has NO `&mut` local and invokes a `fn(&mut u8, *mut u8)` callee
@@ -2629,6 +2647,7 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
     type_of% mr_oc_protected_drop_mode_sensitive ∧
     type_of% mr_oc_dead_local_ub_non_masking ∧
     type_of% mr_oc_invalid_bool_ub_non_masking ∧
+    type_of% mr_oc_type_switch_erasure_boundary ∧
     type_of% mr_oc_d2_rev_transmute_mode_sensitive ∧
     type_of% mr_oc_setDiscriminant_payload_agreement ∧
     type_of% mr_oc_d3_zst_dangling_and_null ∧
@@ -2655,6 +2674,7 @@ theorem ep1_minirust_opaquecast_fnentry_universal_capstone :
    @mr_checkValueM_ptr_eq_checkPtrM, mr_oc_exact_ub_diagnostics,
    mr_oc_minimize_lowering_contrasts, mr_oc_protected_drop_mode_sensitive,
    mr_oc_dead_local_ub_non_masking, mr_oc_invalid_bool_ub_non_masking,
+   mr_oc_type_switch_erasure_boundary,
    mr_oc_d2_rev_transmute_mode_sensitive,
    mr_oc_setDiscriminant_payload_agreement, mr_oc_d3_zst_dangling_and_null,
    mr_checkPtr_some_vs_none_contrast, mr_checkPtrM_tb_some_vs_none_contrast⟩
@@ -2683,6 +2703,8 @@ run_cmd do
       (ns ++ `mr_oc_dead_local_ub_non_masking, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_invalid_bool_ub_non_masking, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mr_oc_invalid_bool_ub_non_masking, `MiniRustSpec.Interp.stepM),
+      (ns ++ `mr_oc_type_switch_erasure_boundary, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `mr_oc_type_switch_erasure_boundary, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_d2_rev_transmute_mode_sensitive, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `mr_oc_d2_rev_transmute_mode_sensitive, `MiniRustSpec.Interp.stepM),
       (ns ++ `mr_oc_d3_zst_dangling_and_null, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),

@@ -215,9 +215,14 @@ def ocBody (name : String) (argCount : Nat) (decls : List Ty) (blocks : List Bas
 
 /-! #### `D1`: `ProjectionElem.opaqueCast` in every place context (`0..9`)
 
-Every `D1` fixture is argument-free: `_1` is made live and initialized in the body. The cast type
-of every chain equals the declared type of its local, so the cast-erased fixture
-(`ocEraseBody`) is well typed. -/
+Every `D1` fixture is argument-free: `_1` is made live and initialized in the body. In the
+canonical cases `0..9` and the companions `ocCase6PayloadMir`, `ocCase7ProtectedDropMir`, and
+`ocCase9DeadLocalMir`, the cast type of every chain equals the declared type of its local, so the
+cast-erased fixture (`ocEraseBody`) is well typed and is a faithful post-borrowck image. The ONE
+exception is `ocCase9InvalidBoolMir`, whose cast `(_1 as bool)` on `_1 : u8` is deliberately
+type-switching: its erasure is NOT a faithful image (it silently masks the invalid-`bool` UB; see
+the `type_switch_erasure_boundary` theorems), so that companion is checked against a
+memory-level type-switched read instead. -/
 
 @[reducible] def ocCastU32 : ProjectionElem := .opaqueCast ocU32Ty
 @[reducible] def ocInit7 : List StatementKind := [.storageLive 1, .assign (ocLoc 1) (.use (ocConstU32 7))]
@@ -1011,6 +1016,21 @@ def lmOcD3Diag (k : Nat) :
       some (lmOcAccessRes st q 4, lmOcAlignRes st .None q ⟨2⟩)
     | .error _ => none
 
+/-- `D1.6` (type-switching companion `ocCase9InvalidBoolMir`): a live 1-byte `u8` local holding
+`2`, read back at `bool` through the vendored memory harness (`Allocation.readScalar`) and validated
+by vendored `Validity.checkPrimitive .boolean` (`valid_range = 0..=1`). -/
+def lmOcInvalidBoolRead (tb : Bool) : LmOcM LmOcFpObs := do
+  let (p, st) ← lmOcMem (lmAllocate (lmInit tb) 1 1)
+  let st ← lmOcMem (lmStore st p 1 2)
+  let (v, _) ← lmOcMem (lmLoad st p 1)
+  let s ← (Scalar.fromUInt (Prov := Provenance) (BitVec.ofNat 128 v) (Size.ofBytes 1)).mapError
+    (fun e => .mem (.scalar e))
+  match Validity.checkPrimitive (MachineError := Unit) (HookState := Unit) .boolean
+      ⟨Size.ofBytes 1, { start := BitVec.ofNat 128 0, «end» := BitVec.ofNat 128 1 }⟩ s
+      (fun _ st => .error () st) () with
+  | .ok _ _ => pure (.okScalar v)
+  | .error e _ => .error (.validity e)
+
 /-! ### The observer -/
 
 /-- The LeanMiri run of case `idx` (`none` for `idx ≥ 22`).
@@ -1115,6 +1135,7 @@ unroll_loops lmOcLiveU := lmOcLive fuel 0 with lmAllocateU, lmStoreU
 unroll_loops lmOcD3U := lmOcD3 fuel 0 with lmOcLiveU, lmOcPtrValidityU, lmDeallocateU
 unroll_loops lmOcD3DiagU := lmOcD3Diag fuel 0
   with lmOcLiveU, lmDeallocateU, lmOcAccessResU, lmOcAlignResU
+unroll_loops lmOcInvalidBoolReadU := lmOcInvalidBoolRead fuel 0 with lmAllocateU, lmStoreU, lmLoadU
 unroll_loops lmOcCaseU := lmOcCase fuel 0
   with ocRunStepU, lmOcDeinitThenReadU, lmOcD2U, lmOcD3NullU, lmOcD3U
 unroll_loops lmOcObserveU := lmOcObserve fuel 0 with lmOcCaseU
@@ -1507,6 +1528,25 @@ theorem lm_oc_invalid_bool_ub_non_masking :
     lmOcBoolValidity 1 = .okScalar 1 ∧
     lmOcBoolValidity 2 = .ub := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- `D1.6` **type-switching cast erasure boundary (kernel-checked)**: for the deliberately
+type-switching companion `ocCase9InvalidBoolMir`, Trusted on the `.opaqueCast` fixture is `.ub`,
+whereas BOTH Trusted and vendored `Step.step` on its cast erasure (`_0 = move _1`, a `u8` byte moved
+into a `bool` local) return the invalid byte `2` without UB — erasing a type-switching cast masks
+the UB, so for this companion the faithful LeanMiri image is the memory-level type-switched read
+`lmOcInvalidBoolRead` (vendored `readScalar` + `Validity.checkPrimitive .boolean`), which is `.ub` in
+both modes, agreeing with the cast fixture. -/
+theorem lm_oc_type_switch_erasure_boundary :
+    lmOcTrustedObsOf 0 (ocRunTrustedRaw ocCase9InvalidBoolMir []) = .ub ∧
+    lmOcTrustedObsOf 0 (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []) = .okScalar 2 ∧
+    lmOcStepObs 1 (ocRunStep (ocEraseBody ocCase9InvalidBoolMir) ocBoolTy) = .okScalar 2 ∧
+    lmOcRun (lmOcInvalidBoolRead false) = .ub ∧ lmOcRun (lmOcInvalidBoolRead true) = .ub := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · decide +kernel
+  · decide +kernel
+  · rw [ocRunStepU.eq_src]; decide +kernel
+  · rw [lmOcInvalidBoolReadU.eq_src]; decide +kernel
+  · rw [lmOcInvalidBoolReadU.eq_src]; decide +kernel
 
 /-- `D2.3` **reverse transmutation `fn(*mut u8, *mut u8) -> fn(&mut u8, *mut u8)` mode-sensitivity
 (kernel-checked)**: Trusted on `ocCase13RevTransmuteMir` (caller holds NO `&mut` local) and
@@ -2170,6 +2210,7 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     type_of% lm_oc_protected_drop_mode_sensitive ∧
     type_of% lm_oc_dead_local_ub_non_masking ∧
     type_of% lm_oc_invalid_bool_ub_non_masking ∧
+    type_of% lm_oc_type_switch_erasure_boundary ∧
     type_of% lm_oc_d2_rev_transmute_mode_sensitive ∧
     type_of% lm_oc_d3_zst_dangling_and_null ∧
     type_of% lm_step_adapter_boundaries ∧
@@ -2197,7 +2238,7 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
    @lm_opaqueCast_phase_boundary, lm_d1_phase_boundary_table, @lm_ocErasePlace_cast_free,
    @lm_ocEraseBody_cast_free, lm_oc_setDiscriminant_payload_agreement,
    lm_oc_protected_drop_mode_sensitive, lm_oc_dead_local_ub_non_masking,
-   lm_oc_invalid_bool_ub_non_masking,
+   lm_oc_invalid_bool_ub_non_masking, lm_oc_type_switch_erasure_boundary,
    lm_oc_d2_rev_transmute_mode_sensitive, lm_oc_d3_zst_dangling_and_null, lm_step_adapter_boundaries,
    @lm_retagPolicy_protector, @lm_retagPolicy_none, lm_retagPolicy_fnEntry_witness,
    @lm_call_passArgument_copyAllowTransmute, @lm_call_initStackFrame_enters_fnEntry_mode,
@@ -2234,6 +2275,8 @@ run_cmd do
       (ns ++ `lm_oc_dead_local_ub_non_masking, `Miri.Interpreter.Step.step),
       (ns ++ `lm_oc_invalid_bool_ub_non_masking, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `lm_oc_invalid_bool_ub_non_masking, `Miri.Memory.Validity.checkScalar),
+      (ns ++ `lm_oc_type_switch_erasure_boundary, `Miri.Interpreter.Step.step),
+      (ns ++ `lm_oc_type_switch_erasure_boundary, `Miri.Memory.Validity.checkPrimitive),
       (ns ++ `lm_oc_d2_rev_transmute_mode_sensitive, `Miri.TreeBorrows.RetagPipeline.retagPointerValue),
       (ns ++ `lm_oc_d2_rev_transmute_mode_sensitive, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
       (ns ++ `lm_oc_d3_zst_dangling_and_null, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
@@ -2324,6 +2367,7 @@ run_cmd do
       ns ++ `lm_validityMachine_nonvacuity_witnesses,
       ns ++ `lm_d3_null_both_halves_ub,
       ns ++ `lm_scalarMayBeNull_int,
+      ns ++ `lm_oc_type_switch_erasure_boundary,
       ns ++ `ep1_lean_miri_opaquecast_fnentry_capstone ]
   let mut theorems : Nat := 0
   let mut badConstructive : Array Lean.Name := #[]
@@ -2349,7 +2393,7 @@ run_cmd do
     throwError "constructive theorems unexpectedly depend on Classical.choice: {badConstructive}"
   if !unexpectedChoice.isEmpty then
     throwError "theorems unexpectedly depend on Classical.choice (outside choiceAllowed): {unexpectedChoice}"
-  if choiceAllowed.length > 23 then
+  if choiceAllowed.length > 24 then
     throwError "choiceAllowed grew beyond audited cap: {choiceAllowed.length}"
   if theorems < 34 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
