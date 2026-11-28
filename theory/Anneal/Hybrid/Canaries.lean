@@ -563,34 +563,43 @@ def unsafeUnwindProducer (q : Nat × Nat)
   (q.1 ≠ 10 ∧ o = .faultUB)
 
 /-- Exercises `rung15_with_callerMemPreserved_sound` under `isUnsafe = true`,
-a nontrivial `safetyPre`, an unwinding producer, and non-vacuous strict effect
-weakening (`fEff := { true, false, true }` weakened to
-`outerEff := { true, false, false }`), while showing the same
-`.faultUB`-capable producer fails a safe (`isUnsafe = false`) contract even
-when `safetyPre := False`. -/
+a nontrivial `safetyPre`, and an unwinding producer. The statement itself
+pins the strict effect weakening (`fEff` guarantees `noAbort`, `outerEff`
+does not, and `maskLe` holds in one direction only) and the producer's own
+`fEff` contract, so the weakening cannot silently collapse to equal masks.
+Both composed paths are inhabited on `(mem, x) = (10, 5)`: the
+wrong candidate falls back to `15` with memory `10`, and the unwind
+propagates. The same `.faultUB`-capable producer fails a safe
+(`isUnsafe = false`) contract even when `safetyPre := False`. -/
 theorem canary_rung15_unsafe_and_effects :
+    let fEff : EffectMask :=
+      { terminates := true, noUnwind := false, noAbort := true }
     let outerEff : EffectMask :=
       { terminates := true, noUnwind := false, noAbort := false }
+    let run := rung15Run unsafeUnwindProducer sumCheck keepMem sumFb
+    maskLe outerEff fEff ∧ ¬ maskLe fEff outerEff ∧
+    ContractHolds
+        (rung15ProducerContract (Ret := Nat × Unit) (fun q => q.1 = 10)
+          (fun _ => True) fEff)
+        true unsafeUnwindProducer ∧
     ContractHolds
         (rung15OuterContract (fun q => q.1 = 10) (fun _ => True) sumPost
           outerEff)
-        true (rung15Run unsafeUnwindProducer sumCheck keepMem sumFb) ∧
+        true run ∧
+    run (10, 5) (.terminal (.returned 15 10)) ∧
+    run (10, 5) (.terminal (.unwound 10)) ∧
     ¬ ContractHolds
         (rung15OuterContract (fun _ => False) (fun _ => True) sumPost
           outerEff)
-        false (rung15Run unsafeUnwindProducer sumCheck keepMem sumFb) := by
-  let fEff : EffectMask :=
-    { terminates := true, noUnwind := false, noAbort := true }
-  let outerEff : EffectMask :=
-    { terminates := true, noUnwind := false, noAbort := false }
-  refine ⟨?_, ?_⟩
-  · refine rung15_with_callerMemPreserved_sound (fun q => q.1 = 10)
-      (fun _ => True) sumPost fEff outerEff true unsafeUnwindProducer sumCheck
-      keepMem sumFb
-      ⟨fun _ => rfl, fun h => Bool.noConfusion h,
-        fun h => Bool.noConfusion h⟩
-      ⟨?_, ?_⟩
-      (fun q y w _ h => sumCheck_sound q y w h) (fun q _ => sumFb_sound q)
+        false run := by
+  intro fEff outerEff run
+  have hMask : maskLe outerEff fEff :=
+    ⟨fun _ => rfl, fun h => Bool.noConfusion h, fun h => Bool.noConfusion h⟩
+  have hF : ContractHolds
+      (rung15ProducerContract (Ret := Nat × Unit) (fun q => q.1 = 10)
+        (fun _ => True) fEff)
+      true unsafeUnwindProducer := by
+    refine ⟨?_, ?_⟩
     · intro q hS hUb
       have h10 : q.1 = 10 := hS rfl
       cases hUb with
@@ -611,9 +620,16 @@ theorem canary_rung15_unsafe_and_effects :
         | inr hU =>
           rw [hU]
           exact ⟨rfl, rfl⟩
-  · intro hSafe
-    have hNoUb := hSafe.1 (0, 0) (fun h => Bool.noConfusion h)
-    exact hNoUb ⟨.faultUB, Or.inr ⟨by decide, rfl⟩, rfl⟩
+  refine ⟨hMask, fun h => Bool.noConfusion (h.2.2 rfl), hF,
+    rung15_with_callerMemPreserved_sound (fun q => q.1 = 10) (fun _ => True)
+      sumPost fEff outerEff true unsafeUnwindProducer sumCheck keepMem sumFb
+      hMask hF (fun q y w _ h => sumCheck_sound q y w h)
+      (fun q _ => sumFb_sound q),
+    ⟨.terminal (.returned (5 + 999, ()) 10), Or.inl ⟨rfl, Or.inl rfl⟩, rfl⟩,
+    ⟨.terminal (.unwound 10), Or.inl ⟨rfl, Or.inr rfl⟩, rfl⟩, ?_⟩
+  intro hSafe
+  exact hSafe.1 (0, 0) (fun h => Bool.noConfusion h)
+    ⟨.faultUB, Or.inr ⟨by decide, rfl⟩, rfl⟩
 
 /-! ## Anti-vacuity -/
 
