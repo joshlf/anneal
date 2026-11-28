@@ -12,6 +12,8 @@ import Lean
 import Trusted
 import Miri.Interpreter.Projection
 import Miri.Interpreter.PlaceDynamic
+import Miri.Interpreter.Call
+import Miri.Interpreter.MachineHooks
 import Miri.Interpreter.ValidityMachine
 import Miri.Memory.Validity
 import Miri.Memory.Access
@@ -32,23 +34,22 @@ The vendored LeanMiri (`lean-miri/vendor/`, unmodified) side of the frozen 22-ca
 * `D1` (`0..9`): vendored `Miri.Interpreter.project` and `Miri.Interpreter.PlaceDynamic.project`
   reject `ProjectionElem.OpaqueCast` at the phase boundary (`OpaqueCast after borrowck`, never a UB
   verdict; `lm_opaqueCast_phase_boundary`), because rustc's validator forbids `OpaqueCast` at
-  `MirPhase::Runtime`. The register-only cells (`0`–`3`, `9`) execute the cast-erased
-  (post-`PostAnalysisNormalize`) image `ocEraseBody` of the shared fixture directly through
-  vendored `Miri.Interpreter.Step.step` (`ocStepHooks`: the `annealStepHooksLM2_3` adapter with the
-  `wdStepHooks` raw-pointer overlay). The memory-backed cells run on the vendored memory harness:
-  `4` (field write into an uninitialized local), `6` (`SetDiscriminant` with the tag computed by
-  vendored `Discriminant.tagForVariant`), and `8` (`*(&raw const x)` through a vendored pointer
-  scalar round trip) — the adapter's local allocation runs vendored while-loop memory code that the
-  kernel cannot evaluate without loop-unrolling twins — and `5` / `7`, which have no pinned
-  `Step.step` path (`lm_step_adapter_boundaries`: `Deinit` was removed from pinned rustc MIR, and
-  the adapter rejects `"drop terminator"`), run vendored `Allocation.writeUninit` followed by
-  `Allocation.readScalar` — the `write_uninit` semantics of `Deinit` and Trusted's drop-as-deinit
-  model.
+  `MirPhase::Runtime`. Every `D1` case supported by pinned rustc MIR / the `Step.step` adapter
+  (`0`–`4`, `6`, `8`, `9`) executes the cast-erased (post-`PostAnalysisNormalize`) image
+  `ocEraseBody` of the shared fixture directly through unmodified vendored
+  `Miri.Interpreter.Step.step` (`ocStepHooks`: `annealStepHooksLM2_3` + `wdStepHooks`, including
+  real vendored `writeAggregate`, `Discriminant.writeDiscriminant`, and
+  `Discriminant.readDiscriminant` for `6`, with kernel-checked `reserveAllocIdU` unrolling for
+  memory-backed locals). Only `5` (`Deinit`, removed from pinned rustc MIR) and `7` (`Drop`,
+  adapter boundary pinned by `lm_step_adapter_boundaries`) use vendored `Allocation.writeUninit`
+  followed by `Allocation.readScalar`.
 * `D2` (`10..15`): callee-only `FnEntry` protectors through the vendored Tree Borrows retag
   pipeline (`RetagPipeline.retagPointerValue`, `MachineMemoryHooks.beforeMemoryWrite`,
-  `BorrowTree.releaseProtector`), with the universal `RetagPolicy.create` protector law.
+  `BorrowTree.releaseProtector`), plus universal laws on vendored `Miri.Interpreter.Call.initStackFrame`,
+  `Call.passArgument`, `MachineHooks.withRetagMode`, `RetagPolicy.create`, and `RetagPipeline.retagPointerValue`.
 * `D3` (`16..21`): safe-pointer validity through vendored `Validity.checkScalar` (non-null valid
-  range of `pointerLayoutData true`), `checkPtrAccess` (dereferenceability), and `checkPtrAlign`.
+  range of `pointerLayoutData true`), `checkPtrAccess` (dereferenceability), and `checkPtrAlign`,
+  plus universal laws on vendored `ValidityMachine.{checkPointerAccess, checkPointerAlign, scalarMayBeNull}`.
 
 The memory harness (`lmAllocate`, `lmStore`, `lmLoad`, `lmRetag`, `lmEndCall`, `lmDeallocate`) is
 the one of `LeanMiriSpec.HeapAllocAndWidePtrLM`: every state change is a vendored definition. The
@@ -318,16 +319,19 @@ def ocD2Main (name callee : String) (refRv : Rvalue) (refTy : Ty) (args : List O
      ocBb (post ++ [.assign (ocLoc 0) (.aggregate .tuple [.copy (ocLoc 4), .copy (ocLoc 1)])]) .return_]
 
 /-- Case 10 callee (`fn(*mut u8, *mut u8) -> u8`, the post-`#166253` callee-only view of a
-transmuted `fn(&mut u8)`): no `FnEntry` retag; foreign write `*_2 = 5` through the parent pointer. -/
+transmuted `fn(&mut u8, *mut u8)`): caller passes its `&mut u8` (`_3`) and parent `*mut u8` (`_2`),
+callee takes `*mut u8` with no `FnEntry` retag, and foreign write `*_2 = 5` disables unprotected
+`_3` without UB in either mode. -/
 def ocCase10Callee : CapturedMir :=
   ocBody "oc::case10_callee" 2 [ocU8Ty, ocRawMutU8Ty, ocRawMutU8Ty]
     [ocBb [.assign (ocLoc 2 [.deref]) (.use (ocConstU8 5)),
            .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
 def ocCase10Mir : CapturedMir :=
   ocD2Main "oc::case10_main" "oc::case10_callee" (.ref (.mut false) (ocLoc 2 [.deref])) ocMutRefU8Ty
-    [.copy (ocLoc 2), .copy (ocLoc 2)] []
-/-- Case 11 callee (pre-`#166253` caller-signature contrast): the SAME body as case `10`, but
-retagged on entry at the caller's `&mut u8` signature (`RetagKind.fnEntry` on `_1`). -/
+    [.copy (ocLoc 3), .copy (ocLoc 2)] []
+/-- Case 11 callee (pre-`#166253` caller-signature contrast): the SAME caller, arguments `(_3, _2)`,
+and body as case `10`, but retagged on entry at the caller's `&mut u8` signature (`RetagKind.fnEntry`
+on `_1`). -/
 def ocCase11Callee : CapturedMir :=
   ocBody "oc::case11_callee" 2 [ocU8Ty, ocMutRefU8Ty, ocRawMutU8Ty]
     [ocBb [.retag .fnEntry (ocLoc 1),
@@ -346,8 +350,9 @@ def ocCase12Callee : CapturedMir :=
 def ocCase12Mir : CapturedMir :=
   ocD2Main "oc::case12_main" "oc::case12_callee" (.ref (.mut false) (ocLoc 1)) ocMutRefU8Ty
     [.copy (ocLoc 3)] [.assign (ocLoc 1) (.use (ocConstU8 9))]
-/-- Case 13 callee (`fn(&mut u8, *mut u8)`): `FnEntry` retag, local write `*_1 = 4`, then the
-aliased foreign write `*_2 = 5` while the strong protector is active. -/
+/-- Case 13 callee (`fn(&mut u8, *mut u8)`, reverse transmutation: caller invokes through a
+`fn(*mut u8, *mut u8)` view passing `(_2, _2)`): callee's own `FnEntry` retag protects `_1`, local
+write `*_1 = 4` activates it, then aliased foreign write `*_2 = 5` violates the strong protector. -/
 def ocCase13Callee : CapturedMir :=
   ocBody "oc::case13_callee" 2 [ocU8Ty, ocMutRefU8Ty, ocRawMutU8Ty]
     [ocBb [.retag .fnEntry (ocLoc 1),
@@ -356,7 +361,7 @@ def ocCase13Callee : CapturedMir :=
            .assign (ocLoc 0) (.use (.copy (ocLoc 2 [.deref])))] .return_]
 def ocCase13Mir : CapturedMir :=
   ocD2Main "oc::case13_main" "oc::case13_callee" (.ref (.mut false) (ocLoc 2 [.deref])) ocMutRefU8Ty
-    [.copy (ocLoc 3), .copy (ocLoc 2)] []
+    [.copy (ocLoc 2), .copy (ocLoc 2)] []
 /-- Case 14 callee (`fn(&u8, *mut u8)`): `FnEntry` retag of the shared reference (`Frozen`),
 then the foreign write `*_2 = 5` while the protector is active. -/
 def ocCase14Callee : CapturedMir :=
@@ -636,52 +641,6 @@ def lmOcDeinitThenRead (tb : Bool) : LmOcM LmOcFpObs := do
   let (v, _) ← lmOcMem (lmLoad st p 4)
   pure (.okScalar v)
 
-/-- Case 4 (memory-backed): a fresh, UNINITIALIZED 8-byte `(u32, u32)` local; the field write
-`.1 = 9` stores at the field offset `4` (`ocPairLayout`), then the field is read back. -/
-def lmOcFieldWriteUninit (tb : Bool) : LmOcM LmOcFpObs := do
-  let (p, st) ← lmOcMem (lmAllocate (lmInit tb) 8 4)
-  let q := ⟨Size.ofBytes (p.offset.bytes + 4), p.provenance⟩
-  let st ← lmOcMem (lmStore st q 4 9)
-  let (v, _) ← lmOcMem (lmLoad st q 4)
-  pure (.okScalar v)
-
-/-- The direct tag that vendored `Discriminant.tagForVariant` (over the `annealDiscriminantHooksLM2_3`
-compiler queries) assigns to variant `variant` of the shared `TwoVar` layout. -/
-def lmOcTwoVarTag (variant : Nat) : LmOcM Nat :=
-  let st := wdMkStepState ocCase6Mir ocIsizeTy (ocStepLocals ocCase6Mir)
-  match Miri.Interpreter.Discriminant.tagForVariant
-      (annealDiscriminantHooksLM2_3 ocCase6Mir.localDecls ocCase6Mir.layouts) ()
-      (translateTy ocTwoVarTy ocLayouts) variant st with
-  | .ok (some (tag, _)) _ =>
-    match (Scalar.fromScalarInt (Prov := Provenance) tag).toBits (Size.ofBytes 1) with
-    | .ok b => pure b.toNat
-    | .error e => .error (.mem (.scalar e))
-  | .ok none _ => .error (.harness "untagged variant")
-  | .error e _ => .error (.mem (.step e))
-
-/-- Case 6 (memory-backed): `TwoVar::A(7)` (tag of variant `0` at offset `0`, payload at `4`),
-`SetDiscriminant(_, 1)` writes the vendored tag of variant `1`, and the discriminant is read back
-from the (direct-encoded) tag byte. -/
-def lmOcSetDiscriminant (tb : Bool) : LmOcM LmOcFpObs := do
-  let (p, st) ← lmOcMem (lmAllocate (lmInit tb) 8 4)
-  let t0 ← lmOcTwoVarTag 0
-  let st ← lmOcMem (lmStore st p 1 t0)
-  let st ← lmOcMem (lmStore st ⟨Size.ofBytes (p.offset.bytes + 4), p.provenance⟩ 4 7)
-  let t1 ← lmOcTwoVarTag 1
-  let st ← lmOcMem (lmStore st p 1 t1)
-  let (d, _) ← lmOcMem (lmLoad st p 1)
-  pure (.okScalar d)
-
-/-- Case 8 (memory-backed): `x = 5` in a live `u32` allocation, `&raw const x` materialized as a
-pointer scalar (vendored `Scalar.fromMaybePointer` / `Scalar.toPointer`), then `*p`. -/
-def lmOcRawDeref (tb : Bool) : LmOcM LmOcFpObs := do
-  let (p, st) ← lmOcMem (lmAllocate (lmInit tb) 4 4)
-  let st ← lmOcMem (lmStore st p 4 5)
-  let s ← (Scalar.fromMaybePointer lmLayout p).mapError (fun e => .mem (.scalar e))
-  let q ← (s.toPointer lmLayout).mapError (fun e => .mem (.scalar e))
-  let (v, _) ← lmOcMem (lmLoad st q 4)
-  pure (.okScalar v)
-
 /-! ### `D2`: callee-only `FnEntry` protectors (`x : u8 = 3` at `p`) -/
 
 /-- The callee body of a `D2` case after the caller set up `x = 3` at the parent pointer `p`;
@@ -755,14 +714,18 @@ def lmOcLive (tb : Bool) (size : Nat) (bits : Nat) : LmOcM (Pointer (Option Prov
 def lmOcAddr (p : Pointer (Option Provenance)) (k : Nat) : Pointer (Option Provenance) :=
   ⟨Size.ofBytes (p.offset.bytes + UInt64.ofNat k), p.provenance⟩
 
+/-- Case `18`: checks BOTH sized (`u32`, align `4`) AND ZST (`()`, align `1`) null safe pointers
+independently (combining via `ocCombine` AFTER `lmOcRun` so neither check can short-circuit the
+other). -/
+def lmOcD3Null (tb : Bool) : LmOcFpObs :=
+  ocCombine
+    (lmOcRun (lmOcPtrValidity (lmInit tb) ⟨Size.ofBytes 0, none⟩ 4 ⟨2⟩))
+    (lmOcRun (lmOcPtrValidity (lmInit tb) ⟨Size.ofBytes 0, none⟩ 0 ⟨0⟩))
+
 def lmOcD3 (tb : Bool) (k : Nat) : LmOcM LmOcFpObs := do
   match k with
   | 16 => let (p, st) ← lmOcLive tb 4 7; lmOcPtrValidity st p 4 ⟨2⟩
   | 17 => lmOcPtrValidity (lmInit tb) ⟨Size.ofBytes 4, none⟩ 0 ⟨0⟩
-  | 18 =>
-    let a ← lmOcPtrValidity (lmInit tb) ⟨Size.ofBytes 0, none⟩ 4 ⟨2⟩
-    let b ← lmOcPtrValidity (lmInit tb) ⟨Size.ofBytes 0, none⟩ 0 ⟨0⟩
-    pure (ocCombine a b)
   | 19 => let (p, st) ← lmOcLive tb 8 0; lmOcPtrValidity st (lmOcAddr p 2) 4 ⟨2⟩
   | 20 => let (p, st) ← lmOcLive tb 4 7; lmOcPtrValidity st (lmOcAddr p 4) 4 ⟨2⟩
   | _ =>
@@ -772,17 +735,23 @@ def lmOcD3 (tb : Bool) (k : Nat) : LmOcM LmOcFpObs := do
 
 /-! ### The observer -/
 
-/-- The LeanMiri run of case `idx` (`none` for `idx ≥ 22`). -/
+/-- The LeanMiri run of case `idx` (`none` for `idx ≥ 22`).
+Every `D1` case supported by pinned rustc MIR / the `Step.step` adapter (`0`–`4`, `6`, `8`, `9`)
+executes the cast-erased shared fixture `ocEraseBody` directly through unmodified vendored
+`Miri.Interpreter.Step.step` (including `writeAggregate`, `Discriminant.writeDiscriminant`, and
+`Discriminant.readDiscriminant` for `6`). Only `5` (`Deinit`, absent from pinned rustc MIR) and `7`
+(`Drop`, adapter boundary pinned by `lm_step_adapter_boundaries`) use vendored
+`Allocation.writeUninit` + `Allocation.readScalar`. -/
 def lmOcCase (tb : Bool) : Nat → Option LmOcFpObs
   | 0 => some (lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase0Mir) ocU32Ty))
   | 1 => some (lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase1Mir) ocU32Ty))
   | 2 => some (lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase2Mir) ocU32Ty))
   | 3 => some (lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase3Mir) ocU32Ty))
-  | 4 => some (lmOcRun (lmOcFieldWriteUninit tb))
+  | 4 => some (lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase4Mir) ocU32Ty))
   | 5 => some (lmOcRun (lmOcDeinitThenRead tb))
-  | 6 => some (lmOcRun (lmOcSetDiscriminant tb))
+  | 6 => some (lmOcStepObs 8 (ocRunStep (ocEraseBody ocCase6Mir) ocIsizeTy))
   | 7 => some (lmOcRun (lmOcDeinitThenRead tb))
-  | 8 => some (lmOcRun (lmOcRawDeref tb))
+  | 8 => some (lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase8Mir) ocU32Ty))
   | 9 => some (lmOcStepObs 4 (ocRunStep (ocEraseBody ocCase9Mir) ocU32Ty))
   | 10 => some (lmOcRun (lmOcD2 tb 10))
   | 11 => some (lmOcRun (lmOcD2 tb 11))
@@ -792,7 +761,7 @@ def lmOcCase (tb : Bool) : Nat → Option LmOcFpObs
   | 15 => some (lmOcRun (lmOcD2 tb 15))
   | 16 => some (lmOcRun (lmOcD3 tb 16))
   | 17 => some (lmOcRun (lmOcD3 tb 17))
-  | 18 => some (lmOcRun (lmOcD3 tb 18))
+  | 18 => some (lmOcD3Null tb)
   | 19 => some (lmOcRun (lmOcD3 tb 19))
   | 20 => some (lmOcRun (lmOcD3 tb 20))
   | 21 => some (lmOcRun (lmOcD3 tb 21))
@@ -806,22 +775,53 @@ def lmOcObserve (tb : Bool) (idx : Nat) : LmOcFpObs :=
 
 end Harness
 
-/-! ### Evaluable twins (while-loop unrolling of the vendored memory code) -/
+/-! ### Evaluable twins (while-loop and `KeyedArray` unrolling of vendored memory & `Step.step`) -/
 
 section Twins
-open LeanMiriSpec.HeapAllocAndWidePtrLM
+open LeanMiriSpec.HeapAllocAndWidePtrLM LeanMiriSpec.Correspondence
+open LeanMiriSpec.WideDstAndMaybeUninitLM
+
+unroll_loops annealPlaceHooksU := annealPlaceHooks fuel 0 with reserveAllocIdU
+unroll_loops annealMutablePlaceHooksU := annealMutablePlaceHooks fuel 0 with annealPlaceHooksU
+unroll_loops annealWriteProjectedLocalImmediateU := annealWriteProjectedLocalImmediate fuel 0
+  with annealMutablePlaceHooksU
+unroll_loops annealWriteImmediateLM2_2U := annealWriteImmediateLM2_2 fuel 0
+  with annealWriteProjectedLocalImmediateU
+unroll_loops annealCastHooksLM2_2U := annealCastHooksLM2_2 fuel 0 with annealWriteImmediateLM2_2U
+unroll_loops annealStructMemCopyOpU := annealStructMemCopyOp fuel 0
+  with annealWriteImmediateLM2_2U, annealMutablePlaceHooksU
+unroll_loops annealAggregateHooksLM2_2U := annealAggregateHooksLM2_2 fuel 0
+  with annealWriteImmediateLM2_2U, annealStructMemCopyOpU
+unroll_loops annealRvalueHooksLM2_2U := annealRvalueHooksLM2_2 fuel 0
+  with annealWriteImmediateLM2_2U, annealStructMemCopyOpU, annealAggregateHooksLM2_2U,
+    annealPlaceHooksU, annealCastHooksLM2_2U
+unroll_loops annealStepHooksLM2_2U := annealStepHooksLM2_2 fuel 0 with annealRvalueHooksLM2_2U
+unroll_loops annealForceEnumAllocationU := annealForceEnumAllocation fuel 0
+  with annealMutablePlaceHooksU
+unroll_loops annealDiscriminantHooksLM2_3U := annealDiscriminantHooksLM2_3 fuel 0
+  with annealForceEnumAllocationU, annealWriteImmediateLM2_2U
+unroll_loops annealAggregateHooksLM2_3U := annealAggregateHooksLM2_3 fuel 0
+  with annealAggregateHooksLM2_2U, annealForceEnumAllocationU, annealDiscriminantHooksLM2_3U
+unroll_loops annealRvalueHooksLM2_3U := annealRvalueHooksLM2_3 fuel 0
+  with annealRvalueHooksLM2_2U, annealAggregateHooksLM2_3U, annealDiscriminantHooksLM2_3U
+unroll_loops annealStepHooksLM2_3U := annealStepHooksLM2_3 fuel 0
+  with annealStepHooksLM2_2U, annealRvalueHooksLM2_3U, annealDiscriminantHooksLM2_3U
+unroll_loops wdCastHooksU := wdCastHooks fuel 0
+  with annealCastHooksLM2_2U, annealWriteImmediateLM2_2U
+unroll_loops wdStepHooksU := wdStepHooks fuel 0
+  with annealStepHooksLM2_2U, annealRvalueHooksLM2_2U, wdCastHooksU
+unroll_loops ocStepHooksU := ocStepHooks fuel 0 with annealStepHooksLM2_3U, wdStepHooksU
+unroll_loops ocRunStepU := ocRunStep fuel 0 with ocStepHooksU
 
 unroll_loops lmOcDeinitThenReadU := lmOcDeinitThenRead fuel 0
   with lmAllocateU, lmStoreU, lmAccessTargetU, lmTreeAccessU, lmLoadU
 unroll_loops lmOcD2U := lmOcD2 fuel 0 with lmAllocateU, lmStoreU, lmLoadU, lmRetagU, lmEndCallU
 unroll_loops lmOcPtrValidityU := lmOcPtrValidity fuel 0 with getAllocInfoU
+unroll_loops lmOcD3NullU := lmOcD3Null fuel 0 with lmOcPtrValidityU
 unroll_loops lmOcLiveU := lmOcLive fuel 0 with lmAllocateU, lmStoreU
 unroll_loops lmOcD3U := lmOcD3 fuel 0 with lmOcLiveU, lmOcPtrValidityU, lmDeallocateU
-unroll_loops lmOcFieldWriteUninitU := lmOcFieldWriteUninit fuel 0 with lmAllocateU, lmStoreU, lmLoadU
-unroll_loops lmOcSetDiscriminantU := lmOcSetDiscriminant fuel 0 with lmAllocateU, lmStoreU, lmLoadU
-unroll_loops lmOcRawDerefU := lmOcRawDeref fuel 0 with lmAllocateU, lmStoreU, lmLoadU
-unroll_loops lmOcCaseU := lmOcCase fuel 0 with lmOcDeinitThenReadU, lmOcFieldWriteUninitU,
-  lmOcSetDiscriminantU, lmOcRawDerefU, lmOcD2U, lmOcD3U
+unroll_loops lmOcCaseU := lmOcCase fuel 0
+  with ocRunStepU, lmOcDeinitThenReadU, lmOcD2U, lmOcD3NullU, lmOcD3U
 unroll_loops lmOcObserveU := lmOcObserve fuel 0 with lmOcCaseU
 
 end Twins
@@ -997,9 +997,9 @@ theorem lm_step_adapter_boundaries :
   · rw [lmOcObserveU.eq_src]; decide +kernel
   · rw [lmOcObserveU.eq_src]; decide +kernel
 
-/-- `D2` **vendored `RetagPolicy.create` protector law (universal)**: an `FnEntry` retag attaches
-a `StrongProtector` to references and a `WeakProtector` to `Box`; any other non-`None` mode
-attaches no protector. -/
+/-- `D2` **vendored `RetagPolicy.create` protector law (universal, constructive)**: an `FnEntry`
+retag attaches a `StrongProtector` to references and a `WeakProtector` to `Box`; any other
+non-`None` mode attaches no protector. -/
 theorem lm_retagPolicy_protector (facts : Miri.TreeBorrows.RetagPolicy.TypeFacts)
     (kind : Miri.TreeBorrows.RetagPolicy.ReferenceKind) (mode : Miri.TreeBorrows.RetagPolicy.RetagMode)
     (config : Miri.TreeBorrows.RetagPolicy.PolicyConfig) (p : Miri.TreeBorrows.RetagPolicy.NewPermission)
@@ -1014,7 +1014,7 @@ theorem lm_retagPolicy_protector (facts : Miri.TreeBorrows.RetagPolicy.TypeFacts
     · cases h
     · simp only [Option.some.injEq] at h
       subst h
-      by_cases hm : mode = .FnEntry <;> by_cases hk : kind = .Box <;> simp [hm, hk]
+      cases mode <;> cases kind <;> rfl
 
 /-- `D2` **callee-only retag mode `None` never creates a permission (vendored, universal)**: a
 parameter that the callee does not retag (`*mut u8`, `RetagMode.None`) gets no protector. -/
@@ -1023,16 +1023,286 @@ theorem lm_retagPolicy_none (facts : Miri.TreeBorrows.RetagPolicy.TypeFacts)
     Miri.TreeBorrows.RetagPolicy.create facts kind .None config = none :=
   Miri.TreeBorrows.RetagPolicy.none_mode_never_creates_permission facts kind config
 
-/-- `D2` non-vacuity: the `&mut u8` / `&u8` `FnEntry` policies of cases `11`–`15` carry strong
-protectors and the `Default` policy carries none. -/
+/-- `D2` non-vacuity: `&mut u8` / `&u8` `FnEntry` policies carry `StrongProtector`, `Box<u8>`
+`FnEntry` carries `WeakProtector`, and `Default` carries `none`. -/
 theorem lm_retagPolicy_fnEntry_witness :
     ((Miri.TreeBorrows.RetagPolicy.create lmFrozenFacts .Mutable .FnEntry ⟨true, false⟩).map
       (·.protector)) = some (some .StrongProtector) ∧
     ((Miri.TreeBorrows.RetagPolicy.create lmFrozenFacts .Shared .FnEntry ⟨true, false⟩).map
       (·.protector)) = some (some .StrongProtector) ∧
+    ((Miri.TreeBorrows.RetagPolicy.create lmFrozenFacts .Box .FnEntry ⟨true, false⟩).map
+      (·.protector)) = some (some .WeakProtector) ∧
     ((Miri.TreeBorrows.RetagPolicy.create lmFrozenFacts .Mutable .Default ⟨true, false⟩).map
       (·.protector)) = some none := by
-  refine ⟨?_, ?_, ?_⟩ <;> decide +kernel
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- `D2` **vendored `Call.passArgument` routes caller operand into callee's destination via
+`copyAllowTransmute` (universal)**: for any `.Copy op` argument whose layout matches `callerAbi`
+and is ABI-compatible with `calleeAbi`, `Call.passArgument` initializes the callee local and
+copies via `h.copyAllowTransmute` into the callee's destination place (keyed on `calleeTy`,
+not the caller's type). -/
+theorem lm_call_passArgument_copyAllowTransmute {P S C E Other Extern FnABI ArgABI : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C)
+    (op : OpTy P) (callerAbi calleeAbi : ArgABI) (calleeIndex : Nat) (localId : Miri.MIR.LocalId)
+    (st0 st1 st2 st3 : S) (destPlace : RuntimeStackPlace P)
+    (hLayout : (op.layout.layout == (h.argLayout callerAbi).layout) = true)
+    (hMeta : op.metadata.hasMeta = false)
+    (hCompat : h.checkArgumentCompat choice callerAbi calleeAbi st0 = .ok true st1)
+    (hLive : h.storageLiveDyn choice localId op.metadata st1 = .ok () st2)
+    (hEval : h.evalPlace choice ⟨localId, #[]⟩ false st2 = .ok destPlace st3) :
+    Call.passArgument h choice (.Copy op) callerAbi calleeAbi calleeIndex ⟨localId, #[]⟩
+      (h.argLayout calleeAbi).ty false st0 =
+      h.copyAllowTransmute choice op destPlace st3 := by
+  unfold Call.passArgument
+  have hProj : (#[] : Array Miri.MIR.ProjectionElem).isEmpty = true := rfl
+  simp only [FnArg.layout, FnArg.copyFnArg, beq_self_eq_true, hLayout, hMeta, hProj,
+    Bool.not_false, Bool.true_or]
+  change (EStateM.bind (h.checkArgumentCompat choice callerAbi calleeAbi) fun ok =>
+    if ok = true then
+      EStateM.bind (h.storageLiveDyn choice localId op.metadata) fun _ =>
+        EStateM.bind (h.evalPlace choice ⟨localId, #[]⟩ false) fun dest =>
+          EStateM.bind (h.copyAllowTransmute choice op dest) fun _ => EStateM.pure ()
+    else
+      EStateM.bind (throw (.undefinedBehavior s!"AbiMismatchArgument {calleeIndex}")) fun _ =>
+        EStateM.bind (h.storageLiveDyn choice localId op.metadata) fun _ =>
+          EStateM.bind (h.evalPlace choice ⟨localId, #[]⟩ false) fun dest =>
+            EStateM.bind (h.copyAllowTransmute choice op dest) fun _ => EStateM.pure ()) st0 = _
+  simp only [EStateM.bind, hCompat, hLive, hEval, ↓reduceIte]
+  cases h.copyAllowTransmute choice op destPlace st3 <;> rfl
+
+/-- `D2` **vendored `Call.initStackFrame` unconditionally enters `withRetagMode .FnEntry`
+(universal)**: for ANY `CallHooks` whose preamble succeeds (matching `#[track_caller]`, matching
+non-variadic calling convention, immediate return destination, unwinding preamble frame, and
+matching argument count), `Call.initStackFrame` invokes `h.withRetagMode choice .FnEntry` wrapping
+its argument-initialization loop (`passArgument` -> `copyAllowTransmute`). -/
+theorem lm_call_initStackFrame_enters_fnEntry_mode {P S C E Other Extern FnABI ArgABI : Type}
+    (h : CallHooks P S C E Other Extern FnABI ArgABI) (choice : C)
+    (fnInstance : CallInstance) (loadedBody : LoadedBody) (callerFnAbi calleeFnAbi : FnABI)
+    (args : Array (FnArg P)) (destination : RuntimeStackPlace P) (cont : ReturnContinuation)
+    (imm : Immediate P) (retLay : LocalLayout) (frame : Frame P LocalLayout E)
+    (span : Miri.MIR.SpanRef) (err : StepError)
+    (st0 st1 st2 st3 st4 st5 st6 st7 st8 stErr : S)
+    (hLoc : h.requiresCallerLocation fnInstance st0 = .ok false st1)
+    (hVarCaller : h.abiVariadic callerFnAbi = false)
+    (hCalleeAbi : h.fnAbiOfInstance choice fnInstance #[] st1 = .ok calleeFnAbi st2)
+    (hConv : h.sameConvention callerFnAbi calleeFnAbi = true)
+    (hVarCallee : h.abiVariadic calleeFnAbi = false)
+    (hFeat : h.checkTargetFeatures choice fnInstance st2 = .ok () st3)
+    (hDestOp : h.placeToOp choice destination st3 = .ok ⟨.immediate imm, retLay⟩ st4)
+    (hPush : h.pushRaw choice fnInstance loadedBody destination
+      (if h.abiCanUnwind calleeFnAbi = true then cont else match cont with
+        | .stop _ => cont
+        | .goto ret _ => .goto ret .Unreachable) st4 = .ok () st5)
+    (hGet : h.getFrame st5 = .ok frame st6)
+    (hPreamble : frame.location = .unwinding span)
+    (hSet : h.setFrame { frame with trackCallerArg := none } st6 = .ok () st7)
+    (hClosure : h.nonCapturingClosure choice fnInstance calleeFnAbi st7 = .ok false st8)
+    (hArity : (args.size + 0 == (h.abiArgs callerFnAbi).size) = true)
+    (hFnEntry : ∀ (act : CallM S (Nat × Nat)),
+      h.withRetagMode choice .FnEntry act st8 = .error err stErr) :
+    Call.initStackFrame h choice fnInstance loadedBody callerFnAbi args false destination cont st0 =
+      .error err stErr := by
+  unfold Call.initStackFrame
+  cases hU : h.abiCanUnwind calleeFnAbi <;> cases cont <;>
+  · simp only [hU, Bool.false_eq_true, ↓reduceIte] at hPush
+    simp only [hPreamble] at hSet
+    simp only [Bind.bind, EStateM.bind, Pure.pure, EStateM.pure,
+      hLoc, hVarCaller, hCalleeAbi, hConv, hVarCallee, hFeat, hDestOp, hU, hPush, hGet,
+      hPreamble, hSet, hClosure, hArity, bne_self_eq_false, beq_self_eq_true,
+      Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+    -- Reduce the private `require true` guard before `withRetagMode` by definitional equality.
+    have hStep :
+        ∀ (k : Nat × Nat → CallM S Unit) (act : CallM S (Nat × Nat)),
+          EStateM.bind (h.withRetagMode choice .FnEntry act) k st8 = .error err stErr := by
+      intro k act
+      simp only [EStateM.bind, hFnEntry]
+    exact hStep _ _
+
+/-- Minimal tracer state witnessing real `Call.initStackFrame` execution to completion on a
+transmuted `fn(&mut u8) -> fn(*mut u8)` call. -/
+structure OcCallTraceState where
+  modes : List Miri.TreeBorrows.RetagPolicy.RetagMode
+  copied : List (Miri.MIR.LocalId × Miri.MIR.TyId)
+  deriving DecidableEq, Repr
+
+/-- Minimal `CallHooks` tracing every `withRetagMode` mode and every `copyAllowTransmute`
+destination local/type during `Miri.Interpreter.Call.initStackFrame`. -/
+def ocCallTraceHooks (callerLay calleeLay : LocalLayout) :
+    CallHooks Unit OcCallTraceState Unit Unit Unit Unit (Array LocalLayout) LocalLayout where
+  debugAssertions := false
+  getFrame := pure {
+    body := {
+      phase := .Runtime .PostCleanup
+      argumentCount := 1
+      spreadArgument := none
+      locals := #[calleeLay.ty, calleeLay.ty]
+      basicBlocks := #[]
+    }
+    bodyIdentity := .ofCanonicalIndex 0
+    functionInstance := { kind := .Item 0, args := #[] }
+    extra := ()
+    returnContinuation := .stop false
+    returnPlace := .frameLocal 0 0 none callerLay (.ofAllocationToken 0)
+    localsIdentity := .ofAllocationToken 0
+    locals := #[]
+    vaList := #[]
+    trackCallerArg := none
+    location := .unwinding ⟨0⟩
+  }
+  setFrame := fun _ => pure ()
+  frameIndex := pure 0
+  evalOperand := fun _ _ => throw (.unsupported "unused")
+  evalPlace := fun _ p _ => pure (.frameLocal 0 p.localId none calleeLay (.ofAllocationToken 0))
+  placeToOp := fun _ p => pure ⟨.immediate .uninit, p.toRuntimePlace.layout⟩
+  forceAllocation := fun _ _ => throw (.unsupported "unused")
+  functionSignature := fun _ _ => pure (1, ())
+  functionKind := fun _ => pure .FnPtr
+  readPointer := fun _ _ => throw (.unsupported "unused")
+  getPtrFn := fun _ _ => throw (.unsupported "unused")
+  resolve := fun _ _ _ => pure { kind := .Item 0, args := #[] }
+  fnAbiOfFnPtr := fun _ _ _ => pure #[callerLay]
+  fnAbiOfInstance := fun _ _ _ => pure #[calleeLay]
+  requiresCallerLocation := fun _ => pure false
+  callerLocation := pure ⟨0⟩
+  abiCanUnwind := fun _ => false
+  abiVariadic := fun _ => false
+  abiFixedCount := fun a => a.size
+  abiArgs := fun a => a
+  abiReturn := fun _ => calleeLay
+  sameConvention := fun _ _ => true
+  isRustCall := fun _ => false
+  rustAbi := ()
+  argLayout := fun a => a
+  argIsIgnore := fun _ => false
+  isOneZst := fun _ => false
+  checkArgumentCompat := fun _ _ _ => pure true
+  checkTargetFeatures := fun _ _ => pure ()
+  tupleFields := fun _ => pure #[]
+  projectFnArg := fun _ a _ => pure a
+  localLayout := fun _ _ => pure calleeLay
+  localSpan := fun _ _ => pure ⟨0⟩
+  storageLiveDyn := fun _ _ _ => pure ()
+  copyAllowTransmute := fun _ _ dest =>
+    match dest with
+    | .frameLocal _ localId _ lay _ =>
+      modify fun s => { s with copied := s.copied ++ [(localId, lay.ty)] }
+    | .memory _ => pure ()
+  protectArgument := fun _ _ => pure ()
+  withRetagMode := fun _ mode act => do
+    modify fun s => { s with modes := s.modes ++ [mode] }
+    act
+  nonCapturingClosure := fun _ _ _ => pure false
+  allocateStack := fun _ _ => throw (.unsupported "unused")
+  copyToMemory := fun _ _ _ => pure ()
+  vaListPtr := fun _ _ => throw (.unsupported "unused")
+  writeZeroBytes := fun _ _ _ => pure ()
+  vaListKeyField := fun _ p => pure p
+  writePointerToMemory := fun _ _ _ => pure ()
+  pushRaw := fun _ _ _ _ _ => pure ()
+  pushDone := fun _ => pure ()
+  popRaw := fun _ => throw (.unsupported "unused")
+  cleanup := fun _ _ _ => throw (.unsupported "unused")
+  afterFrameInit := fun _ => pure ()
+  callExtra := fun _ _ _ _ _ _ _ => pure ()
+  callIntrinsic := fun _ _ _ _ _ _ => pure none
+  callLlvmIntrinsic := fun _ _ _ _ _ => pure ()
+  findMirOrEvalFn := fun _ _ _ _ _ _ _ => pure none
+  resolveVirtual := fun _ _ _ _ _ _ => throw (.unsupported "unused")
+  isDynamic := fun _ => pure false
+  unpackDynForDrop := fun _ p => pure p
+  resolveDropGlue := fun _ _ => throw (.unsupported "unused")
+  mplaceToMutRef := fun _ _ => throw (.unsupported "unused")
+  fakeUnitReturn := fun _ => throw (.unsupported "unused")
+
+/-- `D2` **non-vacuous end-to-end `Call.initStackFrame` witness**: executing real vendored
+`Miri.Interpreter.Call.initStackFrame` on a transmuted `&mut u8` (caller `TyId = 1001`) →
+`*mut u8` (callee `TyId = 1002`) argument succeeds, enters `withRetagMode .FnEntry`, and copies
+the argument into callee local `1` at the callee's `*mut u8` type (`1002`). -/
+theorem lm_call_initStackFrame_fnEntry_witness :
+    let callerLay : LocalLayout := ⟨1001, LeanMiriSpec.Correspondence.pointerLayoutData true⟩
+    let calleeLay : LocalLayout := ⟨1002, LeanMiriSpec.Correspondence.pointerLayoutData false⟩
+    let loadedBody : LoadedBody :=
+      { identity := .ofCanonicalIndex 0
+        body := {
+          phase := .Runtime .PostCleanup
+          argumentCount := 1
+          spreadArgument := none
+          locals := #[calleeLay.ty, calleeLay.ty]
+          basicBlocks := #[]
+        } }
+    let arg : FnArg Unit := .Copy ⟨.immediate .uninit, callerLay⟩
+    let retDest : RuntimeStackPlace Unit := .frameLocal 0 0 none calleeLay (.ofAllocationToken 0)
+    Call.initStackFrame (ocCallTraceHooks callerLay calleeLay) ()
+      { kind := .Item 0, args := #[] } loadedBody #[callerLay] #[arg] false retDest (.stop false)
+      ⟨[], []⟩ = .ok () ⟨[.FnEntry], [(1, 1002)]⟩ := by
+  kernel_rfl
+
+/-- `D2` **vendored `MachineHooks.withRetagMode` laws (universal, constructive)**:
+(a) when `borrowTracker = none` (no borrow tracker), `withRetagMode` is a transparent identity;
+(b) when `borrowTracker = some tr`, `withRetagMode .FnEntry` executes the body under
+`retagMode := .FnEntry` and restores `tr.retagMode` on both success and error. -/
+theorem lm_machineHooks_withRetagMode_laws {K User A : Type}
+    (mode : Miri.TreeBorrows.RetagPolicy.RetagMode) (action : MachineHooks.M K User A)
+    (st : MachineHooks.State K User) :
+    (st.machine.borrowTracker = none →
+      MachineHooks.withRetagMode mode action st = action st) ∧
+    (∀ tr v after trAfter,
+      st.machine.borrowTracker = some tr →
+      action { st with machine := { st.machine with
+        borrowTracker := some { tr with retagMode := mode } } } = .ok v after →
+      after.machine.borrowTracker = some trAfter →
+      MachineHooks.withRetagMode mode action st =
+        .ok v { after with machine := { after.machine with
+          borrowTracker := some { trAfter with retagMode := tr.retagMode } } }) ∧
+    (∀ tr err after trAfter,
+      st.machine.borrowTracker = some tr →
+      action { st with machine := { st.machine with
+        borrowTracker := some { tr with retagMode := mode } } } = .error err after →
+      after.machine.borrowTracker = some trAfter →
+      MachineHooks.withRetagMode mode action st =
+        .error err { after with machine := { after.machine with
+          borrowTracker := some { trAfter with retagMode := tr.retagMode } } }) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro hNone; unfold MachineHooks.withRetagMode; rw [hNone]
+  · intro tr v after trAfter hTr hAct hAfter
+    unfold MachineHooks.withRetagMode
+    rw [hTr]
+    dsimp only
+    rw [hAct]
+    dsimp only
+    rw [hAfter]
+  · intro tr err after trAfter hTr hAct hAfter
+    unfold MachineHooks.withRetagMode
+    rw [hTr]
+    dsimp only
+    rw [hAct]
+    dsimp only
+    rw [hAfter]
+
+/-- `D2` **vendored `RetagPipeline.retagPointerValue` raw-pointer law (universal)**:
+a raw-pointer parameter (`*mut u8`, `RetagTypeShape.rawPointer`) NEVER creates a borrow or
+registers a protector: in `.Raw` mode it finishes without retagging (unchanged state, zero events),
+and in `.FnEntry` mode it rejects with `.rawPointerWrongMode`. -/
+theorem lm_retagPipeline_rawPointer_no_protector {MachineKind : Type} [DecidableEq MachineKind]
+    (state : Miri.TreeBorrows.RetagPipeline.MachineState MachineKind)
+    (req : Miri.TreeBorrows.RetagPipeline.Request)
+    (hShape : req.typeShape = .rawPointer) :
+    (req.mode = .Raw →
+      Miri.TreeBorrows.RetagPipeline.retagPointerValue state req = ⟨state, .ok none, #[]⟩) ∧
+    (req.mode = .FnEntry →
+      Miri.TreeBorrows.RetagPipeline.retagPointerValue state req =
+        ⟨state, .error .rawPointerWrongMode, #[]⟩) := by
+  constructor
+  · intro hMode
+    unfold Miri.TreeBorrows.RetagPipeline.retagPointerValue
+    simp [hShape, Miri.TreeBorrows.RetagPipeline.RetagTypeShape.rawPointer,
+      Miri.TreeBorrows.RetagPipeline.RetagTypeShape.classify, hMode, Id.run]
+    rfl
+  · intro hMode
+    unfold Miri.TreeBorrows.RetagPipeline.retagPointerValue
+    simp [hShape, Miri.TreeBorrows.RetagPipeline.RetagTypeShape.rawPointer,
+      Miri.TreeBorrows.RetagPipeline.RetagTypeShape.classify, hMode, Id.run]
+    rfl
 
 /-- `D3` **zero-sized accesses are always dereferenceable (vendored, universal)**. -/
 theorem lm_checkPtrAccess_zero_size {Prov ProvExtra : Type} (t : PointerArithmetic)
@@ -1042,6 +1312,85 @@ theorem lm_checkPtrAccess_zero_size {Prov ProvExtra : Type} (t : PointerArithmet
   have hs : sizeAsI64 Size.ZERO = .ok 0 := by simp [sizeAsI64, Size.ZERO]
   simp only [checkPtrAccess, hs, bind, Except.bind, Miri.Memory.zero_sized_check_skips_resolution,
     pure, Except.pure]
+
+/-- `D3` **vendored `ValidityMachine.checkPointerAccess` laws (universal)**:
+(a) zero-sized accesses ALWAYS succeed with unchanged state (fast-path skips pointer resolution);
+(b) out-of-bounds, dangling-integer, and dead-allocation `AccessError`s from
+`checkPointerAccessResult` ALWAYS map to `StepError.undefinedBehavior` (never `.unsupported`). -/
+theorem lm_validityMachine_checkPointerAccess_laws {K User : Type}
+    (access : ValidityMachine.Access K User) (ptr : Pointer (Option Provenance))
+    (st : ValidityMachine.State K User) :
+    ValidityMachine.checkPointerAccess access ptr Size.ZERO st = .ok () st ∧
+    (∀ size st' id sz off inb msg,
+      ValidityMachine.checkPointerAccessResult access ptr size st =
+        .ok (.error (.pointerOutOfBounds id sz off inb msg)) st' →
+      ∃ ubMsg, ValidityMachine.checkPointerAccess access ptr size st =
+        .error (.undefinedBehavior ubMsg) st') ∧
+    (∀ size st' addr sz msg,
+      ValidityMachine.checkPointerAccessResult access ptr size st =
+        .ok (.error (.danglingIntegerPointer addr sz msg)) st' →
+      ∃ ubMsg, ValidityMachine.checkPointerAccess access ptr size st =
+        .error (.undefinedBehavior ubMsg) st') ∧
+    (∀ size st' id,
+      ValidityMachine.checkPointerAccessResult access ptr size st =
+        .ok (.error (.allocationLookup (.deadAllocation id))) st' →
+      ∃ ubMsg, ValidityMachine.checkPointerAccess access ptr size st =
+        .error (.undefinedBehavior ubMsg) st') := by
+  have hs : sizeAsI64 Size.ZERO = .ok 0 := by simp [sizeAsI64, Size.ZERO]
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · unfold ValidityMachine.checkPointerAccess ValidityMachine.checkPointerAccessResult
+    simp [hs, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure]
+  · intro size st' id sz off inb msg hRes
+    unfold ValidityMachine.checkPointerAccess
+    simp only [Bind.bind, EStateM.bind, hRes]
+    exact ⟨_, rfl⟩
+  · intro size st' addr sz msg hRes
+    unfold ValidityMachine.checkPointerAccess
+    simp only [Bind.bind, EStateM.bind, hRes]
+    exact ⟨_, rfl⟩
+  · intro size st' id hRes
+    unfold ValidityMachine.checkPointerAccess
+    simp only [Bind.bind, EStateM.bind, hRes]
+    exact ⟨_, rfl⟩
+
+/-- `D3` **vendored `ValidityMachine.checkPointerAlign` laws (universal)**:
+(a) align `1` (`pow2 = 0`) or disabled alignment checking (`.None`) succeeds with unchanged state;
+(b) malformed alignment (`required.pow2 > Align.MAX.pow2`) throws `.invalidProgram`;
+(c) any misalignment returned by `checkPointerAlignResult` throws `StepError.undefinedBehavior`. -/
+theorem lm_validityMachine_checkPointerAlign_laws {K User : Type}
+    (access : ValidityMachine.Access K User) (ptr : Pointer (Option Provenance))
+    (required : Align) (st : ValidityMachine.State K User) :
+    (required.pow2 = 0 →
+      ValidityMachine.checkPointerAlign access ptr required st = .ok () st) ∧
+    (required.pow2 > Align.MAX.pow2 →
+      ValidityMachine.checkPointerAlign access ptr required st =
+        .error (.invalidProgram "malformed validity alignment") st) ∧
+    (∀ st' mis,
+      ValidityMachine.checkPointerAlignResult access ptr required st = .ok (.error mis) st' →
+      ∃ ubMsg, ValidityMachine.checkPointerAlign access ptr required st =
+        .error (.undefinedBehavior ubMsg) st') := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro h0
+    unfold ValidityMachine.checkPointerAlign ValidityMachine.checkPointerAlignResult
+    simp [h0, Bind.bind, EStateM.bind, Pure.pure, EStateM.pure, get, getThe, MonadStateOf.get,
+      EStateM.get]
+  · intro hGt
+    unfold ValidityMachine.checkPointerAlign ValidityMachine.checkPointerAlignResult
+    simp [hGt, Bind.bind, EStateM.bind, throw, throwThe, MonadExceptOf.throw, EStateM.throw]
+  · intro st' mis hRes
+    unfold ValidityMachine.checkPointerAlign
+    simp only [Bind.bind, EStateM.bind, hRes]
+    exact ⟨_, rfl⟩
+
+/-- `D3` **case `18` non-short-circuiting witness**: BOTH the sized `&u32` null pointer AND the
+ZST `&()` null pointer independently fail `Validity.checkScalar` with UB (neither is skipped). -/
+theorem lm_d3_null_both_halves_ub :
+    lmOcRun (lmOcPtrValidity (lmInit false) ⟨Size.ofBytes 0, none⟩ 4 ⟨2⟩) = .ub ∧
+    lmOcRun (lmOcPtrValidity (lmInit false) ⟨Size.ofBytes 0, none⟩ 0 ⟨0⟩) = .ub ∧
+    lmOcRun (lmOcPtrValidity (lmInit true) ⟨Size.ofBytes 0, none⟩ 4 ⟨2⟩) = .ub ∧
+    lmOcRun (lmOcPtrValidity (lmInit true) ⟨Size.ofBytes 0, none⟩ 0 ⟨0⟩) = .ub := by
+  rw [lmOcPtrValidityU.eq_src]
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- `D3` **the safe-pointer valid range excludes exactly null (universal)**. -/
 theorem lm_safe_ptr_range_contains_iff (v : U128) :
@@ -1065,7 +1414,7 @@ end UniversalLaws
 
 /-- **Episode 1 LeanMiri capstone**: the 44-cell table, fail-closed range, exact mode sensitivity,
 the Trusted tables and cross-authority agreement outside the documented boundary `8`, the vendored
-phase-boundary law, and the `D2` / `D3` universal laws. -/
+phase-boundary law, and the `D2` / `D3` universal laws and witnesses. -/
 theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     ((List.range lmOcCaseCount).map (lmOcObserve false) = lmOcExpectedBasic ∧
       (List.range lmOcCaseCount).map (lmOcObserve true) = lmOcExpectedTb) ∧
@@ -1080,7 +1429,15 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
     type_of% @lm_retagPolicy_protector ∧
     type_of% @lm_retagPolicy_none ∧
     type_of% lm_retagPolicy_fnEntry_witness ∧
+    type_of% @lm_call_passArgument_copyAllowTransmute ∧
+    type_of% @lm_call_initStackFrame_enters_fnEntry_mode ∧
+    type_of% lm_call_initStackFrame_fnEntry_witness ∧
+    type_of% @lm_machineHooks_withRetagMode_laws ∧
+    type_of% @lm_retagPipeline_rawPointer_no_protector ∧
     type_of% @lm_checkPtrAccess_zero_size ∧
+    type_of% @lm_validityMachine_checkPointerAccess_laws ∧
+    type_of% @lm_validityMachine_checkPointerAlign_laws ∧
+    type_of% lm_d3_null_both_halves_ub ∧
     type_of% @lm_safe_ptr_range_contains_iff ∧
     type_of% lm_safe_ptr_validity_layout ∧
     type_of% @lm_scalarMayBeNull_int ∧
@@ -1089,7 +1446,11 @@ theorem ep1_lean_miri_opaquecast_fnentry_capstone :
    lmOc_trusted_agreement,
    @lm_opaqueCast_phase_boundary, lm_translated_cast_places_phase_boundary, lm_step_adapter_boundaries,
    @lm_retagPolicy_protector, @lm_retagPolicy_none, lm_retagPolicy_fnEntry_witness,
-   @lm_checkPtrAccess_zero_size, @lm_safe_ptr_range_contains_iff, lm_safe_ptr_validity_layout,
+   @lm_call_passArgument_copyAllowTransmute, @lm_call_initStackFrame_enters_fnEntry_mode,
+   lm_call_initStackFrame_fnEntry_witness, @lm_machineHooks_withRetagMode_laws,
+   @lm_retagPipeline_rawPointer_no_protector, @lm_checkPtrAccess_zero_size,
+   @lm_validityMachine_checkPointerAccess_laws, @lm_validityMachine_checkPointerAlign_laws,
+   lm_d3_null_both_halves_ub, @lm_safe_ptr_range_contains_iff, lm_safe_ptr_validity_layout,
    @lm_scalarMayBeNull_int, rfl⟩
 
 section AxiomAudit
@@ -1102,26 +1463,36 @@ run_cmd do
     if (`MiniRustSpec).isPrefixOf modName || (`Anneal).isPrefixOf modName then
       throwError "import-isolation violation: {modName} must not be imported by LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM"
   let ns := `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM
-  -- 2. Bridge-reality audit: our theorems transitively reach the real vendored Miri constants.
+  -- 2. Bridge-reality audit: our theorems transitively reach REAL vendored `Miri.*` constants
+  -- (traversing `LeanMiriSpec.*` adapters so wrappers cannot hide shadow evaluators).
   let bridgeReq : List (Lean.Name × Lean.Name) :=
     [ (ns ++ `lmOcObserve_table, `Miri.Interpreter.Step.step),
-      (ns ++ `lmOcObserve_table, `Miri.Interpreter.Discriminant.tagForVariant),
+      (ns ++ `lmOcObserve_table, `Miri.Interpreter.Discriminant.writeDiscriminant),
+      (ns ++ `lmOcObserve_table, `Miri.Interpreter.Discriminant.readDiscriminant),
+      (ns ++ `lmOcObserve_table, `Miri.Interpreter.writeAggregate),
       (ns ++ `lmOcObserve_table, `Miri.Memory.Allocation.writeUninit),
       (ns ++ `lmOcObserve_table, `Miri.Memory.Validity.checkScalar),
       (ns ++ `lmOcObserve_table, `Miri.Memory.checkPtrAccess),
       (ns ++ `lmOcObserve_table, `Miri.Memory.checkPtrAlign),
-      (ns ++ `lmOcObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmRetag),
-      (ns ++ `lmOcObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmEndCall),
-      (ns ++ `lmOcObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmStore),
-      (ns ++ `lmOcObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmLoad),
-      (ns ++ `lmOcObserve_table, `LeanMiriSpec.HeapAllocAndWidePtrLM.lmDeallocate),
+      (ns ++ `lmOcObserve_table, `Miri.TreeBorrows.RetagPipeline.retagPointerValue),
+      (ns ++ `lmOcObserve_table, `Miri.TreeBorrows.BorrowTree.releaseProtector),
+      (ns ++ `lmOcObserve_table, `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite),
+      (ns ++ `lmOcObserve_table, `Miri.Memory.MemoryLifecycle.allocatePtr),
+      (ns ++ `lmOcObserve_table, `Miri.Memory.MemoryLifecycle.deallocatePtrWith),
       (ns ++ `lmOcObserve_table, `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.ocEraseBody),
       (ns ++ `lmOcTrustedObserve_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `lm_opaqueCast_phase_boundary, `Miri.Interpreter.project),
       (ns ++ `lm_opaqueCast_phase_boundary, `Miri.Interpreter.PlaceDynamic.project),
       (ns ++ `lm_step_adapter_boundaries, `Miri.Interpreter.Step.step),
       (ns ++ `lm_retagPolicy_protector, `Miri.TreeBorrows.RetagPolicy.create),
+      (ns ++ `lm_call_passArgument_copyAllowTransmute, `Miri.Interpreter.Call.passArgument),
+      (ns ++ `lm_call_initStackFrame_enters_fnEntry_mode, `Miri.Interpreter.Call.initStackFrame),
+      (ns ++ `lm_call_initStackFrame_fnEntry_witness, `Miri.Interpreter.Call.initStackFrame),
+      (ns ++ `lm_machineHooks_withRetagMode_laws, `Miri.Interpreter.MachineHooks.withRetagMode),
+      (ns ++ `lm_retagPipeline_rawPointer_no_protector, `Miri.TreeBorrows.RetagPipeline.retagPointerValue),
       (ns ++ `lm_checkPtrAccess_zero_size, `Miri.Memory.checkPtrAccess),
+      (ns ++ `lm_validityMachine_checkPointerAccess_laws, `Miri.Interpreter.ValidityMachine.checkPointerAccess),
+      (ns ++ `lm_validityMachine_checkPointerAlign_laws, `Miri.Interpreter.ValidityMachine.checkPointerAlign),
       (ns ++ `lm_scalarMayBeNull_int, `Miri.Interpreter.ValidityMachine.scalarMayBeNull) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
@@ -1135,20 +1506,25 @@ run_cmd do
       if seen.contains n then continue
       seen := seen.insert n
       if n == req then break
-      if ns.isPrefixOf n then
+      if ns.isPrefixOf n || (`LeanMiriSpec).isPrefixOf n then
         if let some (.defnInfo v) := env.find? n then
           todo := todo ++ v.value.getUsedConstants
     unless seen.contains req do
       throwError "shadow-evaluator audit: {thm} does not reach real {req}"
-  -- 3. Standard-3-axiom purity, constructive purity of the Trusted tables and phase-boundary laws,
-  -- and a non-vacuous theorem count floor. (The vendored `ScalarInt` / loop-unrolling machinery
-  -- behind `lmOcObserve_table`, `lm_step_adapter_boundaries`, and `lm_scalarMayBeNull_int` uses
-  -- `Classical.choice` upstream, so those stay on the standard-3 allowlist.)
+  -- 3. Standard-3-axiom purity across the environment, constructive `[propext, Quot.sound]` purity
+  -- across every theorem that does not inherit upstream vendored `Classical.choice` (upstream
+  -- `Miri.Memory.{ScalarInt, MemoryState}` / `Miri.Interpreter.{Call, MachineHooks, ValidityMachine}` /
+  -- `RetagPipeline` / loop-unrolling twins use `Classical.choice` upstream), and a non-vacuous
+  -- theorem count floor.
   let constructive : List Lean.Name :=
-    [ ns ++ `lmOcTrustedObserve_table, ns ++ `lm_opaqueCast_phase_boundary,
-      ns ++ `lm_translated_cast_places_phase_boundary,
-      ns ++ `lm_retagPolicy_fnEntry_witness, ns ++ `lm_safe_ptr_validity_layout ]
+    [ ns ++ `lmOcTrustedObserve_table,
+      ns ++ `lm_opaqueCast_phase_boundary, ns ++ `lm_translated_cast_places_phase_boundary,
+      ns ++ `lm_retagPolicy_protector, ns ++ `lm_retagPolicy_none,
+      ns ++ `lm_retagPolicy_fnEntry_witness,
+      ns ++ `lm_checkPtrAccess_zero_size,
+      ns ++ `lm_safe_ptr_range_contains_iff, ns ++ `lm_safe_ptr_validity_layout ]
   let mut theorems : Nat := 0
+  let mut badConstructive : Array Lean.Name := #[]
   for (c, info) in env.constants.map₂.toList do
     for a in ← liftCoreM <| Lean.collectAxioms c do
       if a == ``sorryAx then throwError "{c} depends on sorryAx"
@@ -1157,10 +1533,12 @@ run_cmd do
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "{c} depends on non-standard axiom {a}"
       if constructive.contains c && a == ``Classical.choice then
-        throwError "{c} must be constructive but depends on Classical.choice"
+        badConstructive := badConstructive.push c
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 15 then
+  if !badConstructive.isEmpty then
+    throwError "constructive theorems unexpectedly depend on Classical.choice: {badConstructive}"
+  if theorems < 24 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
 
 end AxiomAudit
