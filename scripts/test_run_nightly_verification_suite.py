@@ -189,9 +189,12 @@ MIR_PROMOTED_VARIANT_THEOREMS: dict[str, dict[str, tuple[str, ...]]] = {
             "dual_exact_three_way_classification",
             "dual_d1_cast_erasure_and_boundary",
             "dual_d1_phase_boundary",
+            "dual_d1_companion_phase_boundary",
             "dual_type_switch_erasure_boundary",
             "dual_companion_three_way",
+            "lmCompanionCheckOf_sound",
             "ocRunner_copy_lock",
+            "steps_eq_runToStopM_bm_of",
             "ep2_opaquecast_fnentry_dual_authority_capstone",
             "ep2_opaquecast_fnentry_companion_phase_capstone",
         ),
@@ -907,13 +910,23 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "`ep2_opaquecast_fnentry_companion_phase_capstone",
             "`dual_companion_three_way",
             "`dual_d1_phase_boundary",
+            "`dual_d1_companion_phase_boundary",
+            "`lmCompanionCheckOf",
+            "`lmCompanionObserve_eq_unrolled",
+            "`lmPhaseCompanionCheckOf",
+            "`bm_driver_is_minirust_steps",
             "eqLockCount = 94",
             "sharedCount = 98",
             "twinCount = rejectedCount",
             "msg.startsWith",
         ):
             self.assertTrue(marker in bridge_code, marker)
-        for marker in ('msg.startsWith "(kernel)"', 'msg.splitOn "type mismatch"', "has no lock"):
+        for marker in (
+            'msg.startsWith "(kernel)"',
+            'msg.splitOn "type mismatch"',
+            "has no lock",
+            "reaches Trusted stepMirFn",
+        ):
             self.assertTrue(marker in bridge_text, marker)
 
         # `DualSpec` keeps strict import isolation: no `Miri.*` / `LeanMiriSpec.*` import.

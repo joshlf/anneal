@@ -1314,12 +1314,45 @@ theorem mrCompanion_table (tb : Bool) (c : OcFpCompanion) :
     mrCompanion tb c = ocCompanionExpected tb c := by
   cases tb <;> cases c <;> decide +kernel
 
+/-- All seven Episode 1 companion fixtures in constructor order. -/
+def allOcFpCompanions : List OcFpCompanion :=
+  [.payload, .protectedDrop, .deadLocal, .invalidBool, .revTransmute,
+   .zstDangling, .zstNull]
+
+theorem allOcFpCompanions_complete (c : OcFpCompanion) :
+    c ∈ allOcFpCompanions := by
+  cases c <;> decide
+
 /-- 14-cell certificate of a LeanMiri companion observer `obs` presented
 through the observation translation `f` (the cross-root bridge instantiates
 `f := lmToMr` and `obs` by the real vendored-Miri companion harnesses). -/
 def OcFpLmCompanionCells {Obs : Type} (f : Obs → MrOcFpObs)
     (obs : Bool → OcFpCompanion → Obs) : Prop :=
   ∀ tb c, f (obs tb c) = ocCompanionExpected tb c
+
+/-- Decidable 14-cell boolean certificate of a LeanMiri companion observer
+(mirroring `lmTableCheckOf`, kernel-evaluated on loop-unrolled twins in the
+cross-root bridge). -/
+def lmCompanionCheckOf {Obs : Type} (f : Obs → MrOcFpObs)
+    (obs : Bool → OcFpCompanion → Obs) : Bool :=
+  allTbModes.all fun tb => allOcFpCompanions.all fun c =>
+    decide (f (obs tb c) = ocCompanionExpected tb c)
+
+theorem lmCompanionCheckOf_sound {Obs : Type} (f : Obs → MrOcFpObs)
+    (obs : Bool → OcFpCompanion → Obs) (h : lmCompanionCheckOf f obs = true) :
+    OcFpLmCompanionCells f obs := by
+  intro tb c
+  have h₁ := List.all_eq_true.mp h tb (allTbModes_complete tb)
+  exact of_decide_eq_true
+    (List.all_eq_true.mp h₁ c (allOcFpCompanions_complete c))
+
+/-- Companion certificates transport along equal observers (used to move the
+kernel-evaluated certificate from loop-unrolled twins to real Miri harnesses). -/
+theorem lmCompanionCheckOf_of_eq {Obs : Type} (f : Obs → MrOcFpObs)
+    {obs obs' : Bool → OcFpCompanion → Obs} (h : obs = obs')
+    (h' : lmCompanionCheckOf f obs' = true) :
+    lmCompanionCheckOf f obs = true :=
+  h ▸ h'
 
 /-- **Exact 3-way raw-observer agreement on every companion cell.** A
 certified LeanMiri companion observer equals raw MiniRust on all 14 cells,
@@ -1384,21 +1417,36 @@ theorem dual_type_switch_erasure_boundary {Obs : Type} (f : Obs → MrOcFpObs)
 executes it value-transparently, whereas BOTH reference authorities reject
 every cast-bearing place statically and execute the cast-erased image. -/
 
-/-- **MiniRust static phase observer**: a fixture is rejected at the phase
-boundary when it addresses at least one cast-bearing place and EVERY such
-place fails closed in the real `MiniRustSpec.Correspondence.translatePlace`
-(upstream `minimize` has no `OpaqueCast` lowering). Mirrors LeanMiri's
-`lmOcPhaseObserve` (`.unsupported` when no place carries a cast). -/
+/-- **MiniRust static phase observer on one `CapturedMir` body**: a body is
+rejected at the phase boundary when it addresses at least one cast-bearing
+place and EVERY such place fails closed in real
+`MiniRustSpec.Correspondence.translatePlace` (upstream `minimize` has no
+`OpaqueCast` lowering). Mirrors LeanMiri's `lmOcPhaseObserveBody`. -/
+def mrOcPhaseObserveBody
+    (body : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) : MrOcFpObs :=
+  match (ocBodyPlaces body).filter ocPlaceHasCast with
+  | [] => .unsupported
+  | ps =>
+    if ps.all (fun p =>
+        (MiniRustSpec.Correspondence.translatePlace body.localDecls p).isNone)
+    then .phaseBoundary else .unsupported
+
+/-- **MiniRust static phase observer by canonical case index (`0..21`)**:
+`.unsupported` outside `0..21` or when no place carries a cast. -/
 def mrOcPhaseObserve (idx : Nat) : MrOcFpObs :=
   match ocCaseFixture? idx with
   | none => .unsupported
-  | some (body, _) =>
-    match (ocBodyPlaces body).filter ocPlaceHasCast with
-    | [] => .unsupported
-    | ps =>
-      if ps.all (fun p =>
-          (MiniRustSpec.Correspondence.translatePlace body.localDecls p).isNone)
-      then .phaseBoundary else .unsupported
+  | some (body, _) => mrOcPhaseObserveBody body
+
+/-- Out-of-range indices are fail-closed `.unsupported` for `mrOcPhaseObserve`. -/
+theorem mrOcPhaseObserve_out_of_range (idx : Nat) (h : mrOcCaseCount ≤ idx) :
+    mrOcPhaseObserve idx = .unsupported := by
+  unfold mrOcCaseCount at h
+  have hNone : ocCaseFixture? idx = none := by
+    unfold ocCaseFixture?
+    split <;> first | rfl | omega
+  unfold mrOcPhaseObserve
+  rw [hNone]
 
 /-- Frozen phase table: `phaseBoundary` on `D1` (`0..9`); the `D2` / `D3`
 fixtures carry no cast. -/
@@ -1414,6 +1462,77 @@ def ocPhaseExpected : List MrOcFpObs :=
 theorem mrOcPhaseObserve_table :
     (List.range mrOcCaseCount).map mrOcPhaseObserve = ocPhaseExpected := by
   decide +kernel
+
+/-- The shared `CapturedMir` body of each Episode 1 companion fixture. -/
+def ocCompanionBody : OcFpCompanion → Trusted.Rustc.V2026_06_01.MirAst.CapturedMir
+  | .payload => ocCase6PayloadMir
+  | .protectedDrop => ocCase7ProtectedDropMir
+  | .deadLocal => ocCase9DeadLocalMir
+  | .invalidBool => ocCase9InvalidBoolMir
+  | .revTransmute => ocCase13RevTransmuteMir
+  | .zstDangling => ocCase17DanglingZstMir
+  | .zstNull => ocCase18ZstNullMir
+
+/-- Whether a companion fixture belongs to `D1` (carries `.opaqueCast`). -/
+def ocCompanionIsD1 : OcFpCompanion → Bool
+  | .payload | .protectedDrop | .deadLocal | .invalidBool => true
+  | .revTransmute | .zstDangling | .zstNull => false
+
+/-- MiniRust static phase observer on all 7 companion fixtures. -/
+def mrOcPhaseCompanion (c : OcFpCompanion) : MrOcFpObs :=
+  mrOcPhaseObserveBody (ocCompanionBody c)
+
+/-- Frozen static phase classification of the 7 companions: `D1` companions are
+rejected at the phase boundary; `D2`/`D3` companions carry no cast. -/
+def ocPhaseCompanionExpected (c : OcFpCompanion) : MrOcFpObs :=
+  if ocCompanionIsD1 c then .phaseBoundary else .unsupported
+
+/-- Kernel-executed MiniRust static phase table on all 7 companion fixtures. -/
+theorem mrOcPhaseCompanion_table (c : OcFpCompanion) :
+    mrOcPhaseCompanion c = ocPhaseCompanionExpected c := by
+  cases c <;> decide +kernel
+
+/-- 7-cell static phase certificate for a LeanMiri companion phase observer
+(instantiated in the bridge by `lmOcPhaseObserveBody` on all 7 shared companion
+fixtures). -/
+def lmPhaseCompanionCheckOf {Obs : Type} (f : Obs → MrOcFpObs)
+    (phaseC : OcFpCompanion → Obs) : Bool :=
+  allOcFpCompanions.all fun c =>
+    decide (f (phaseC c) = ocPhaseCompanionExpected c)
+
+/-- **`D1` companion static phase boundary on MiniRust and LeanMiri vs runtime
+execution on all three authorities**: all 4 `D1` companions (`payload`,
+`protectedDrop`, `deadLocal`, `invalidBool`) are rejected at the static phase
+boundary by BOTH MiniRust (`translatePlace`) and LeanMiri
+(`Miri.Interpreter.project` + `PlaceDynamic.project`), while the 3 `D2`/`D3`
+companions carry no cast (`.unsupported`), and NO runtime companion observer
+ever reports `.phaseBoundary`. -/
+theorem dual_d1_companion_phase_boundary (A : OcFpLmAuthority)
+    (f : A.Obs → MrOcFpObs) (hf : ∀ o, A.toVerdict o = ocVerdictOf (f o))
+    (obs : Bool → OcFpCompanion → A.Obs) (hC : OcFpLmCompanionCells f obs)
+    (phaseC : OcFpCompanion → A.Obs)
+    (hPC : lmPhaseCompanionCheckOf f phaseC = true)
+    (tb : Bool) (c : OcFpCompanion) :
+    f (phaseC c) = mrOcPhaseCompanion c ∧
+    (mrOcPhaseCompanion c = .phaseBoundary ↔ ocCompanionIsD1 c = true) ∧
+    (A.toVerdict (phaseC c) = none ↔ ocCompanionIsD1 c = true) ∧
+    f (obs tb c) ≠ .phaseBoundary ∧
+    mrCompanion tb c ≠ .phaseBoundary ∧
+    trustedCompanion tb c ≠ .phaseBoundary := by
+  have hL : f (phaseC c) = ocPhaseCompanionExpected c :=
+    of_decide_eq_true
+      (List.all_eq_true.mp hPC c (allOcFpCompanions_complete c))
+  have hM : mrOcPhaseCompanion c = ocPhaseCompanionExpected c :=
+    mrOcPhaseCompanion_table c
+  have hObs := dual_companion_three_way f obs hC tb c
+  have hLmNe : f (obs tb c) ≠ .phaseBoundary := fun h =>
+    hObs.2.2.2.1 (congrArg ocVerdictOf h)
+  have hMrNe : mrCompanion tb c ≠ .phaseBoundary := hObs.1 ▸ hLmNe
+  have hTrNe : trustedCompanion tb c ≠ .phaseBoundary := fun h =>
+    hObs.2.2.2.2.2.1 (congrArg ocVerdictOf h)
+  refine ⟨hL.trans hM.symm, ?_, ?_, hLmNe, hMrNe, hTrNe⟩
+  · rw [hM]; cases c <;> decide
+  · rw [hf, hL]; cases c <;> decide
 
 /-- The frozen phase table is `phaseBoundary` (and hence verdict-less) exactly
 on the `D1` cases. -/
@@ -1684,10 +1803,25 @@ theorem rootBackedCompanion_cells :
   rw [mrCompanion_table tb c, trustedCompanion_table tb c]
   cases tb <;> cases c <;> decide
 
+theorem rootBackedCompanion_check :
+    lmCompanionCheckOf (fun o => o) rootBackedCompanion = true := by
+  unfold lmCompanionCheckOf
+  apply List.all_eq_true.mpr
+  intro tb _
+  apply List.all_eq_true.mpr
+  intro c _
+  exact decide_eq_true (rootBackedCompanion_cells tb c)
+
 /-- The REAL MiniRust phase observer passes the LeanMiri phase certificate
 (non-vacuity of `lmPhaseCheckOf`). -/
 theorem rootBackedPhase_check :
     lmPhaseCheckOf (fun o => o) mrOcPhaseObserve = true := by
+  decide +kernel
+
+/-- The REAL MiniRust companion phase observer passes `lmPhaseCompanionCheckOf`
+(non-vacuity of `lmPhaseCompanionCheckOf`). -/
+theorem rootBackedPhaseCompanion_check :
+    lmPhaseCompanionCheckOf (fun o => o) mrOcPhaseCompanion = true := by
   decide +kernel
 
 /-- Trusted `stepMirFn` on the cast-ERASED invalid-`bool` companion returns
@@ -1760,6 +1894,7 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone (A : OcFpLmAuthority)
     type_of% (dual_d3_dereferenceable_and_zst_boundary A hA) ∧
     type_of% dual_d2_machine_termination_contrast ∧
     type_of% @stepsM_eq_runToStopM ∧ type_of% stepsTB_eq_runToStopM ∧
+    type_of% steps_eq_runToStopM_bm_of ∧
     type_of% ep1_minirust_opaquecast_fnentry_capstone ∧
     type_of% ep1_minirust_opaquecast_fnentry_universal_capstone :=
   ⟨ocCodec_tight, ocValidRep_iff_decode_isSome, ocCodec_rejects_malformed,
@@ -1777,7 +1912,7 @@ theorem ep2_opaquecast_fnentry_dual_authority_capstone (A : OcFpLmAuthority)
    dual_d2_fnentry_protectors_and_transmute_boundary A hA,
    dual_d3_dereferenceable_and_zst_boundary A hA,
    dual_d2_machine_termination_contrast,
-   @stepsM_eq_runToStopM, stepsTB_eq_runToStopM,
+   @stepsM_eq_runToStopM, stepsTB_eq_runToStopM, steps_eq_runToStopM_bm_of,
    ep1_minirust_opaquecast_fnentry_capstone,
    ep1_minirust_opaquecast_fnentry_universal_capstone⟩
 
@@ -1807,16 +1942,23 @@ theorem ep2_opaquecast_fnentry_companion_phase_capstone (A : OcFpLmAuthority)
     (hf : ∀ o, A.toVerdict o = ocVerdictOf (f o))
     (obs : Bool → OcFpCompanion → A.Obs) (hC : OcFpLmCompanionCells f obs)
     (erased : A.Obs) (hE : f erased = .okScalar 2)
-    (phase : Nat → A.Obs) (hP : lmPhaseCheckOf f phase = true) :
+    (phase : Nat → A.Obs) (hP : lmPhaseCheckOf f phase = true)
+    (phaseC : OcFpCompanion → A.Obs)
+    (hPC : lmPhaseCompanionCheckOf f phaseC = true) :
     (∀ tb c, type_of% (dual_companion_three_way f obs hC tb c)) ∧
     (∀ c, type_of% (dual_companion_mode_sensitivity f obs hC c)) ∧
     (∀ tb, type_of% (dual_type_switch_erasure_boundary f obs hC erased hE tb)) ∧
     (∀ tb idx (hi : idx < mrOcCaseCount),
       type_of% (dual_d1_phase_boundary A hA f hf phase hP tb idx hi)) ∧
+    (∀ tb c,
+      type_of% (dual_d1_companion_phase_boundary A f hf obs hC phaseC hPC tb c)) ∧
+    (∀ idx, mrOcCaseCount ≤ idx → mrOcPhaseObserve idx = .unsupported) ∧
     type_of% @mr_translate_opaqueCast_fail_closed :=
   ⟨dual_companion_three_way f obs hC, dual_companion_mode_sensitivity f obs hC,
    dual_type_switch_erasure_boundary f obs hC erased hE,
    dual_d1_phase_boundary A hA f hf phase hP,
+   dual_d1_companion_phase_boundary A f hf obs hC phaseC hPC,
+   mrOcPhaseObserve_out_of_range,
    @mr_translate_opaqueCast_fail_closed⟩
 
 /-- The companion and phase-boundary capstone is non-vacuous: all of its
@@ -1827,13 +1969,15 @@ theorem ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous :
       (fun o => o) (fun _ => rfl) rootBackedCompanion rootBackedCompanion_cells
       (mrOcTrustedObsOf .scalar
         (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []))
-      rootBackedErased_eq mrOcPhaseObserve rootBackedPhase_check) :=
+      rootBackedErased_eq mrOcPhaseObserve rootBackedPhase_check
+      mrOcPhaseCompanion rootBackedPhaseCompanion_check) :=
   ep2_opaquecast_fnentry_companion_phase_capstone
     rootBackedLmAuthority rootBackedLmAuthority_tableCheck
     (fun o => o) (fun _ => rfl) rootBackedCompanion rootBackedCompanion_cells
     (mrOcTrustedObsOf .scalar
       (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []))
     rootBackedErased_eq mrOcPhaseObserve rootBackedPhase_check
+    mrOcPhaseCompanion rootBackedPhaseCompanion_check
 
 /-! ## §10. Import-Isolation, 100% Constructive Purity, Reachability & Audit -/
 
@@ -1894,19 +2038,29 @@ run_cmd do
       ns ++ `stepsTB_eq_runToStopM, ns ++ `steps_eq_runToStopM_bm_of,
       ns ++ `rootBackedLmAuthority, ns ++ `rootBackedLmAuthority_tableCheck,
       ns ++ `rootBackedLmAuthority_failClosed, ns ++ `rootBacked_observer_level,
+      ns ++ `allOcFpCompanions, ns ++ `allOcFpCompanions_complete,
       ns ++ `trustedCompanion, ns ++ `mrCompanion, ns ++ `ocCompanionExpected,
       ns ++ `ocCompanionTrustedExpected, ns ++ `trustedCompanion_table,
       ns ++ `mrCompanion_table, ns ++ `OcFpLmCompanionCells,
+      ns ++ `lmCompanionCheckOf, ns ++ `lmCompanionCheckOf_sound,
+      ns ++ `lmCompanionCheckOf_of_eq,
       ns ++ `dual_companion_three_way, ns ++ `dual_companion_mode_sensitivity,
       ns ++ `dual_type_switch_erasure_boundary,
-      ns ++ `mrOcPhaseObserve, ns ++ `ocPhaseExpected,
+      ns ++ `mrOcPhaseObserveBody, ns ++ `mrOcPhaseObserve,
+      ns ++ `mrOcPhaseObserve_out_of_range, ns ++ `ocPhaseExpected,
       ns ++ `mrOcPhaseObserve_table, ns ++ `ocPhaseExpected_cell,
+      ns ++ `ocCompanionBody, ns ++ `ocCompanionIsD1,
+      ns ++ `mrOcPhaseCompanion, ns ++ `ocPhaseCompanionExpected,
+      ns ++ `mrOcPhaseCompanion_table, ns ++ `lmPhaseCompanionCheckOf,
+      ns ++ `dual_d1_companion_phase_boundary,
       ns ++ `lmPhaseCheckOf, ns ++ `dual_d1_phase_boundary,
       ns ++ `ocStepG, ns ++ `ocTrustedStep_running_eq, ns ++ `ocStepG_natural,
       ns ++ `repeat_natural, ns ++ `ocRunner_copy_lock,
       ns ++ `ocCombine_copy_lock,
       ns ++ `rootBackedCompanion, ns ++ `rootBackedCompanion_cells,
-      ns ++ `rootBackedPhase_check, ns ++ `rootBackedErased_eq,
+      ns ++ `rootBackedCompanion_check,
+      ns ++ `rootBackedPhase_check, ns ++ `rootBackedPhaseCompanion_check,
+      ns ++ `rootBackedErased_eq,
       ns ++ `ep2_opaquecast_fnentry_dual_authority_capstone,
       ns ++ `ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous,
       ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone,
@@ -2009,6 +2163,12 @@ run_cmd do
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCaseFixture?,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocBodyPlaces,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocPlaceHasCast ]),
+      (ns ++ `mrOcPhaseCompanion,
+        [ `MiniRustSpec.Correspondence.translatePlace,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase6PayloadMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase7ProtectedDropMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase9DeadLocalMir,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocCase9InvalidBoolMir ]),
       (ns ++ `ocRunner_copy_lock,
         [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocTrustedStep,
@@ -2021,7 +2181,7 @@ run_cmd do
           `MiniRustSpec.Correspondence.translatePlace,
           `MiniRustSpec.Correspondence.translateStatement,
           ns ++ `trustedCompanion, ns ++ `mrCompanion,
-          ns ++ `mrOcPhaseObserve ]) ]
+          ns ++ `mrOcPhaseObserve, ns ++ `mrOcPhaseCompanion ]) ]
   for (root, rs) in reqs do
     let seen := reachFrom root
     for r in rs do

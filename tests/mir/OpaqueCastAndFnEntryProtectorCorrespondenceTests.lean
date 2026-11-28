@@ -216,7 +216,16 @@ theorem d1_phase_boundary_canaries :
     mrOcPhaseObserve 0 ≠ mrOcObserve false 0 ∧
     mrOcPhaseObserve 0 ≠ mrOcTrustedObserve false 0 ∧
     lmPhaseCheckOf (fun o => o) mrOcPhaseObserve = true ∧
-    lmPhaseCheckOf (fun o => o) (mrOcObserve false) = false := by
+    lmPhaseCheckOf (fun o => o) (mrOcObserve false) = false ∧
+    mrOcPhaseCompanion .payload = .phaseBoundary ∧
+    mrOcPhaseCompanion .protectedDrop = .phaseBoundary ∧
+    mrOcPhaseCompanion .deadLocal = .phaseBoundary ∧
+    mrOcPhaseCompanion .invalidBool = .phaseBoundary ∧
+    mrOcPhaseCompanion .revTransmute = .unsupported ∧
+    mrOcPhaseCompanion .zstDangling = .unsupported ∧
+    mrOcPhaseCompanion .zstNull = .unsupported ∧
+    lmPhaseCompanionCheckOf (fun o => o) mrOcPhaseCompanion = true ∧
+    lmPhaseCompanionCheckOf (fun o => o) (mrCompanion false) = false := by
   decide +kernel
 
 /-- `D2` (direct kernel execution): callee-only `rust#166253` (`10`) succeeds
@@ -378,13 +387,21 @@ theorem d3_some_vs_none_direct_canaries :
     ocCheckPtrMContrastTB ocMrProg16 (.Ref .Immutable u32Pointee) =
       some (.ok (),
         unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") ∧
+    ocCheckPtrMContrastTB ocMrProg17 (.Box ocMrUnitPointee) =
+      some (.ok (), .ok ()) ∧
+    ocCheckPtrMContrastTB ocMrProg18 (.Ref .Immutable ocMrUnitPointee) =
+      some (ub "Value::Ptr: null safe pointer",
+        ub "Value::Ptr: null safe pointer") ∧
+    ocCheckPtrMContrastTB ocMrProg19 (.Ref .Immutable u32Pointee) =
+      some (ub "Value::Ptr: unaligned safe pointer",
+        ub "Value::Ptr: unaligned safe pointer") ∧
     ocCheckPtrMContrastTB ocMrProg20 (.Ref .Immutable u32Pointee) =
       some (ub "Value::Ptr: non-dereferenceable safe pointer",
         unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") ∧
     ocCheckPtrMContrastTB ocMrProg21 (.Box u32Pointee) =
       some (ub "Value::Ptr: non-dereferenceable safe pointer",
         unsupported "check_ptr for a safe pointer (Memory::dereferenceable)") := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 end D3Direct
 
@@ -413,15 +430,19 @@ theorem root_capstone_instantiation :
     type_of% (projectFault rootBackedLmAuthority
       rootBackedLmAuthority_tableCheck) ∧
     type_of% ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous ∧
+    lmCompanionCheckOf (fun o => o) rootBackedCompanion = true ∧
     OcFpLmCompanionCells (fun o => o) rootBackedCompanion ∧
     lmPhaseCheckOf (fun o => o) mrOcPhaseObserve = true ∧
+    lmPhaseCompanionCheckOf (fun o => o) mrOcPhaseCompanion = true ∧
     type_of% ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous :=
   ⟨rootBackedLmAuthority_tableCheck,
    fun sel => lmCheckOf_of_table sel _ rootBackedLmAuthority_tableCheck,
    projectPositive _ rootBackedLmAuthority_tableCheck,
    projectFault _ rootBackedLmAuthority_tableCheck,
    ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous,
+   rootBackedCompanion_check,
    rootBackedCompanion_cells, rootBackedPhase_check,
+   rootBackedPhaseCompanion_check,
    ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous⟩
 
 /-! ## §2. Cross-Root 3-Way Kernel Closure (`MiniRustSpec` + `LeanMiriSpec` + `Anneal`) -/
@@ -1001,85 +1022,115 @@ run_cmd do
     unless sharedTopLevel = 98 && lockedShared.size = 98 do
       throwError "cross-root: expected 98 shared top-level MR/LM names (97 section Fixtures + ocCombine), got {sharedTopLevel} (locked {lockedShared.size})"
 
-    -- 4a. Companion fixtures and `D1` static phase boundary over the REAL
-    -- vendored-Miri harnesses. Every LeanMiri companion cell is read off the
-    -- statement of its kernel-checked Episode 1 theorem (the harness
-    -- expression on the left of each conjunct), assembled into the companion
-    -- observer `lmCompanionObserve`, and certified through `lmToMr`.
-    let conjuncts (thm : Name) : MetaM (Array (Expr × Expr)) := do
-      let mut out : Array (Expr × Expr) := #[]
-      let mut ty ← inferType (mkConst thm)
-      let mut pf := mkConst thm
-      let mut fuel : Nat := 64
-      while fuel > 0 do
-        fuel := fuel - 1
-        match ty.and? with
-        | some (a, b) =>
-          out := out.push (a, mkApp3 (mkConst ``And.left) a b pf)
-          pf := mkApp3 (mkConst ``And.right) a b pf
-          ty := b
-        | none =>
-          out := out.push (ty, pf)
-          fuel := 0
-      return out
+    -- 4a. Companion fixtures and `D1` static phase boundary DIRECTLY over the
+    -- REAL vendored-Miri companion harnesses (zero Episode 1 theorem index
+    -- scraping!): build `lmCompanionObserve` over the real harnesses and
+    -- `lmCompanionObserveU` over their 5 loop-unrolled twins, prove
+    -- `lmCompanionObserve = lmCompanionObserveU` from the 5 `.eq_src` theorems,
+    -- kernel-evaluate the 14-cell boolean certificate `lmCompanionCheckOf` on
+    -- the twin by `Eq.refl`, transport to the real observer, and audit
+    -- PER-CELL that every companion branch reaches its specific vendored Miri
+    -- entry point and NEVER reaches Trusted `stepMirFn`.
     let compNs := bNs ++ `OcFpCompanion
     let compTy := mkConst compNs
+    let lmStepObs := mkConst (lmNs ++ `lmOcStepObs)
+    let lmRun := mkConst (lmNs ++ `lmOcRun)
+    let lmInitC := mkConst `LeanMiriSpec.HeapAllocAndWidePtrLM.lmInit
+    let (pZst4, pZst0, align0) ← MetaM.run' do
+      let pvTy ← inferType (mkConst (lmNs ++ `lmOcPtrValidity))
+      -- `LmState → Pointer (Option Provenance) → Nat → Align → LmOcM LmOcFpObs`
+      let ptrTy := pvTy.bindingBody!.bindingDomain!
+      let provOptTy := ptrTy.appArg!
+      let provTy := provOptTy.appArg!
+      let noneProv := mkApp (mkConst ``Option.none [0]) provTy
+      let mkPtr (n : UInt64) : Expr :=
+        mkApp3 (mkConst `Miri.Memory.Pointer.mk [0]) provOptTy
+          (mkApp (mkConst `Miri.ABI.Size.ofBytes) (toExpr n)) noneProv
+      return (mkPtr 4, mkPtr 0, mkApp (mkConst `Miri.ABI.Align.mk) (mkNatLit 0))
+    let mkCompBranch (fStep fProt fInv fRev fPtr tbE : Expr) (c : Name) : Expr :=
+      match c with
+      | `payload =>
+        mkApp2 lmStepObs (toExpr (4 : UInt64))
+          (mkApp2 fStep
+            (mkApp (mkConst (lmNs ++ `ocEraseBody))
+              (mkConst (lmNs ++ `ocCase6PayloadMir)))
+            (mkConst (lmNs ++ `ocU32Ty)))
+      | `protectedDrop => mkApp lmRun (mkApp fProt tbE)
+      | `deadLocal =>
+        mkApp2 lmStepObs (toExpr (4 : UInt64))
+          (mkApp2 fStep
+            (mkApp (mkConst (lmNs ++ `ocEraseBody))
+              (mkConst (lmNs ++ `ocCase9DeadLocalMir)))
+            (mkConst (lmNs ++ `ocU32Ty)))
+      | `invalidBool => mkApp lmRun (mkApp fInv tbE)
+      | `revTransmute => mkApp lmRun (mkApp fRev tbE)
+      | `zstDangling =>
+        mkApp lmRun (mkApp4 fPtr (mkApp lmInitC tbE) pZst4 (mkNatLit 0) align0)
+      | _ =>
+        mkApp lmRun (mkApp4 fPtr (mkApp lmInitC tbE) pZst0 (mkNatLit 0) align0)
     let compCtors : List Name :=
       [`payload, `protectedDrop, `deadLocal, `invalidBool, `revTransmute,
        `zstDangling, `zstNull]
-    -- `(basic cell, Tree Borrows cell)` of each companion, in constructor
-    -- order, plus the erased-image cell of the invalid-`bool` companion.
-    let (cells, erasedCell) ← MetaM.run' do
-      let pay ← conjuncts (lmNs ++ `lm_oc_setDiscriminant_payload_agreement)
-      let pd ← conjuncts (lmNs ++ `lm_oc_protected_drop_mode_sensitive)
-      let dl ← conjuncts (lmNs ++ `lm_oc_dead_local_ub_non_masking)
-      let ts ← conjuncts (lmNs ++ `lm_oc_type_switch_erasure_boundary)
-      let rt ← conjuncts (lmNs ++ `lm_oc_d2_rev_transmute_mode_sensitive)
-      let z ← conjuncts (lmNs ++ `lm_oc_d3_zst_dangling_and_null)
-      unless pay.size = 2 && pd.size = 4 && dl.size = 2 && ts.size = 5 &&
-          rt.size = 4 && z.size = 6 do
-        throwError "cross-root: unexpected LeanMiri companion theorem shapes"
-      return (#[(pay[0]!, pay[0]!), (pd[0]!, pd[1]!), (dl[0]!, dl[0]!),
-                (ts[3]!, ts[4]!), (rt[2]!, rt[3]!), (z[1]!, z[2]!),
-                (z[4]!, z[5]!)], ts[2]!)
-    let lhsOf (p : Expr × Expr) : CoreM Expr := do
-      let some (_, l, _) := p.1.eq?
-        | throwError "cross-root: companion cell is not an equality: {p.1}"
-      return l
-    let mut obsMinors : Array Expr := #[]
-    for (cf, ct) in cells do
-      obsMinors := obsMinors.push <|
-        mkAppN (mkConst ``Bool.rec [1])
-          #[mkLambda `b .default boolTy lmObsTy, ← lhsOf cf, ← lhsOf ct, .bvar 1]
-    let compObsName := ns ++ `lmCompanionObserve
-    let _ ← addDef compObsName <|
+    let mkCompObs (fStep fProt fInv fRev fPtr : Expr) : Expr :=
+      let minors := compCtors.toArray.map (mkCompBranch fStep fProt fInv fRev fPtr (.bvar 1))
       mkLambda `tb .default boolTy <| mkLambda `c .default compTy <|
         mkAppN (mkConst (compNs ++ `rec) [1])
-          (#[mkLambda `x .default compTy lmObsTy] ++ obsMinors ++ #[.bvar 0])
-    added := added.push compObsName
+          (#[mkLambda `x .default compTy lmObsTy] ++ minors ++ #[.bvar 0])
+    let runStepC := mkConst (lmNs ++ `ocRunStep)
+    let runStepU := mkConst (lmNs ++ `ocRunStepU)
+    let protDropC := mkConst (lmNs ++ `lmOcProtectedDrop)
+    let protDropU := mkConst (lmNs ++ `lmOcProtectedDropU)
+    let invBoolC := mkConst (lmNs ++ `lmOcInvalidBoolRead)
+    let invBoolU := mkConst (lmNs ++ `lmOcInvalidBoolReadU)
+    let revTrC := mkConst (lmNs ++ `lmOcD2RevTransmute)
+    let revTrU := mkConst (lmNs ++ `lmOcD2RevTransmuteU)
+    let ptrValC := mkConst (lmNs ++ `lmOcPtrValidity)
+    let ptrValU := mkConst (lmNs ++ `lmOcPtrValidityU)
+    let compObsName := ns ++ `lmCompanionObserve
+    let _ ← addDef compObsName
+      (mkCompObs runStepC protDropC invBoolC revTrC ptrValC)
     let compObs := mkConst compObsName
-    let cellsPf ← MetaM.run' do
-      withLocalDeclD `tb boolTy fun tb => withLocalDeclD `c compTy fun c => do
-        let goal (tbE cE : Expr) : Expr :=
-          mkEq mrObsTy0 (mkApp lmToMr (mkApp2 compObs tbE cE))
-            (mkApp2 (mkConst (bNs ++ `ocCompanionExpected)) tbE cE)
-        let mut minors : Array Expr := #[]
-        for (ctor, (cf, ct)) in compCtors.zip cells.toList do
-          let cE := mkConst (compNs ++ ctor)
-          let motiveB ← withLocalDeclD `b boolTy fun b =>
-            mkLambdaFVars #[b] (goal b cE)
-          let pF ← mkAppM ``congrArg #[lmToMr, cf.2]
-          let pT ← mkAppM ``congrArg #[lmToMr, ct.2]
-          minors := minors.push
-            (mkAppN (mkConst ``Bool.rec [0]) #[motiveB, pF, pT, tb])
-        let motiveC ← withLocalDeclD `x compTy fun x =>
-          mkLambdaFVars #[x] (goal tb x)
-        mkLambdaFVars #[tb, c]
-          (mkAppN (mkConst (compNs ++ `rec) [0]) (#[motiveC] ++ minors ++ #[c]))
+    let compObsUName := ns ++ `lmCompanionObserveU
+    let _ ← addDef compObsUName
+      (mkCompObs runStepU protDropU invBoolU revTrU ptrValU)
+    let compObsU := mkConst compObsUName
+    added := added.push compObsName |>.push compObsUName
+    let compEqName := ns ++ `lmCompanionObserve_eq_unrolled
+    let compEqPf ← MetaM.run' do
+      let t1 ← inferType runStepC
+      let t2 ← inferType protDropC
+      let t3 ← inferType invBoolC
+      let t4 ← inferType revTrC
+      let t5 ← inferType ptrValC
+      let f ← withLocalDeclD `f1 t1 fun f1 =>
+        withLocalDeclD `f2 t2 fun f2 =>
+          withLocalDeclD `f3 t3 fun f3 =>
+            withLocalDeclD `f4 t4 fun f4 =>
+              withLocalDeclD `f5 t5 fun f5 =>
+                mkLambdaFVars #[f1, f2, f3, f4, f5]
+                  (mkCompObs f1 f2 f3 f4 f5)
+      let p1 ← mkCongrArg f (mkConst (lmNs ++ `ocRunStepU.eq_src))
+      let p2 ← mkCongr p1 (mkConst (lmNs ++ `lmOcProtectedDropU.eq_src))
+      let p3 ← mkCongr p2 (mkConst (lmNs ++ `lmOcInvalidBoolReadU.eq_src))
+      let p4 ← mkCongr p3 (mkConst (lmNs ++ `lmOcD2RevTransmuteU.eq_src))
+      mkCongr p4 (mkConst (lmNs ++ `lmOcPtrValidityU.eq_src))
+    addThmInfer compEqName compEqPf
+    added := added.push compEqName
+    let compCheck (obs : Expr) : Expr :=
+      mkApp3 (mkConst (bNs ++ `lmCompanionCheckOf)) lmObsTy lmToMr obs
+    let compCheckUName := ns ++ `lmCompanionU_check
+    addThm compCheckUName (eqTrue (compCheck compObsU)) reflTrue
+    added := added.push compCheckUName
+    let compCheckName := ns ++ `lmCompanion_check
+    addThm compCheckName (eqTrue (compCheck compObs))
+      (mkAppN (mkConst (bNs ++ `lmCompanionCheckOf_of_eq))
+        #[lmObsTy, lmToMr, compObs, compObsU, mkConst compEqName,
+          mkConst compCheckUName])
+    added := added.push compCheckName
     let compCellsName := ns ++ `lmCompanion_cells
-    addThm compCellsName
-      (mkApp3 (mkConst (bNs ++ `OcFpLmCompanionCells)) lmObsTy lmToMr compObs)
-      cellsPf
+    addThmInfer compCellsName
+      (mkApp4 (mkConst (bNs ++ `lmCompanionCheckOf_sound))
+        lmObsTy lmToMr compObs (mkConst compCheckName))
     added := added.push compCellsName
     let hC := mkConst compCellsName
     for thmName in [`dual_companion_three_way,
@@ -1087,32 +1138,96 @@ run_cmd do
       addThmInfer (ns ++ thmName)
         (mkApp4 (mkConst (bNs ++ thmName)) lmObsTy lmToMr compObs hC)
       added := added.push (ns ++ thmName)
-    let erasedLhs ← lhsOf erasedCell
-    let hErased ← MetaM.run' <| mkAppM ``congrArg #[lmToMr, erasedCell.2]
+    -- Direct twin-evaluated erased invalid-`bool` observation (zero scraping).
+    let mkErased (fStep : Expr) : Expr :=
+      mkApp2 lmStepObs (toExpr (1 : UInt64))
+        (mkApp2 fStep
+          (mkApp (mkConst (lmNs ++ `ocEraseBody))
+            (mkConst (lmNs ++ `ocCase9InvalidBoolMir)))
+          (mkConst (lmNs ++ `ocBoolTy)))
+    let erasedName := ns ++ `lmErasedInvalidBool
+    let _ ← addDef erasedName (mkErased runStepC)
+    let erasedUName := ns ++ `lmErasedInvalidBoolU
+    let _ ← addDef erasedUName (mkErased runStepU)
+    added := added.push erasedName |>.push erasedUName
+    let erasedLhs := mkConst erasedName
+    let erasedULhs := mkConst erasedUName
+    let erasedEqName := ns ++ `lmErasedInvalidBool_eq_unrolled
+    let erasedEqPf ← MetaM.run' do
+      let g ← withLocalDeclD `f (← inferType runStepC) fun f =>
+        mkLambdaFVars #[f] (mkErased f)
+      mkCongrArg g (mkConst (lmNs ++ `ocRunStepU.eq_src))
+    addThmInfer erasedEqName erasedEqPf
+    added := added.push erasedEqName
+    let mrSc2 := mkApp (mkConst (mrNs ++ `MrOcFpObs.okScalar)) (mkNatLit 2)
+    let erasedUOkName := ns ++ `lmErasedInvalidBoolU_eq
+    addThm erasedUOkName (mkEq mrObsTy0 (mkApp lmToMr erasedULhs) mrSc2)
+      (mkRefl mrObsTy0 mrSc2)
+    added := added.push erasedUOkName
+    let erasedOkName := ns ++ `lmErasedInvalidBool_eq
+    let erasedOkPf ← MetaM.run' do
+      let p1 ← mkCongrArg lmToMr (mkConst erasedEqName)
+      mkEqTrans p1 (mkConst erasedUOkName)
+    addThm erasedOkName (mkEq mrObsTy0 (mkApp lmToMr erasedLhs) mrSc2) erasedOkPf
+    added := added.push erasedOkName
+    let hErased := mkConst erasedOkName
     addThmInfer (ns ++ `dual_type_switch_erasure_boundary)
       (mkApp6 (mkConst (bNs ++ `dual_type_switch_erasure_boundary)) lmObsTy
         lmToMr compObs hC erasedLhs hErased)
     added := added.push (ns ++ `dual_type_switch_erasure_boundary)
     -- LeanMiri static phase observer (`Miri.Interpreter.project` AND
-    -- `PlaceDynamic.project` on every cast place): 22-cell certificate by
-    -- direct kernel evaluation.
+    -- `PlaceDynamic.project` on every cast place) for BOTH canonical cases
+    -- (`0..21`) AND all 7 companion fixtures (`lmPhaseCompanion`): direct
+    -- kernel evaluation by `Eq.refl`.
     let lmPhaseObs := mkConst (lmNs ++ `lmOcPhaseObserve)
     let phaseCheck (phase : Expr) : Expr :=
       mkApp3 (mkConst (bNs ++ `lmPhaseCheckOf)) lmObsTy lmToMr phase
     let phaseCheckName := ns ++ `lmPhase_check
     addThm phaseCheckName (eqTrue (phaseCheck lmPhaseObs)) reflTrue
     added := added.push phaseCheckName
+    let lmPhaseBody := mkConst (lmNs ++ `lmOcPhaseObserveBody)
+    let compBodies : List Name :=
+      [`ocCase6PayloadMir, `ocCase7ProtectedDropMir, `ocCase9DeadLocalMir,
+       `ocCase9InvalidBoolMir, `ocCase13RevTransmuteMir,
+       `ocCase17DanglingZstMir, `ocCase18ZstNullMir]
+    let phaseCompName := ns ++ `lmPhaseCompanion
+    let _ ← addDef phaseCompName <|
+      mkLambda `c .default compTy <|
+        mkAppN (mkConst (compNs ++ `rec) [1])
+          (#[mkLambda `x .default compTy lmObsTy] ++
+            (compBodies.toArray.map fun b =>
+              mkApp lmPhaseBody (mkConst (lmNs ++ b))) ++ #[.bvar 0])
+    added := added.push phaseCompName
+    let phaseCompObs := mkConst phaseCompName
+    let phaseCompCheck (pc : Expr) : Expr :=
+      mkApp3 (mkConst (bNs ++ `lmPhaseCompanionCheckOf)) lmObsTy lmToMr pc
+    let phaseCompCheckName := ns ++ `lmPhaseCompanion_check
+    addThm phaseCompCheckName (eqTrue (phaseCompCheck phaseCompObs)) reflTrue
+    added := added.push phaseCompCheckName
     let fidelityC := mkConst (ns ++ `translation_fidelity)
     addThmInfer (ns ++ `dual_d1_phase_boundary)
       (mkApp6 (mkConst (bNs ++ `dual_d1_phase_boundary)) authC hA lmToMr
         fidelityC lmPhaseObs (mkConst phaseCheckName))
     added := added.push (ns ++ `dual_d1_phase_boundary)
+    addThmInfer (ns ++ `dual_d1_companion_phase_boundary)
+      (mkAppN (mkConst (bNs ++ `dual_d1_companion_phase_boundary))
+        #[authC, lmToMr, fidelityC, compObs, hC, phaseCompObs,
+          mkConst phaseCompCheckName])
+    added := added.push (ns ++ `dual_d1_companion_phase_boundary)
     let compCapName := ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone
     addThmInfer compCapName <|
       mkAppN (mkConst (bNs ++ `ep2_opaquecast_fnentry_companion_phase_capstone))
         #[authC, hA, lmToMr, fidelityC, compObs, hC, erasedLhs, hErased,
-          lmPhaseObs, mkConst phaseCheckName]
+          lmPhaseObs, mkConst phaseCheckName,
+          phaseCompObs, mkConst phaseCompCheckName]
     added := added.push compCapName
+    -- Unconditional `Mach` driver identity inside `CrossRoot` (discharging
+    -- `steps_eq_runToStopM_bm_of` with `MiniRustSpec.Correspondence.stepM_bm_eq`).
+    let bmDriverName := ns ++ `bm_driver_is_minirust_steps
+    addThmInfer bmDriverName
+      (mkApp (mkConst (bNs ++ `steps_eq_runToStopM_bm_of))
+        (mkConst `MiniRustSpec.Correspondence.stepM_bm_eq))
+    added := added.push bmDriverName
 
     -- 4b. Observer-level 3-way agreement over raw `lmOcObserve` + unified
     -- cross-root 3-engine capstone.
@@ -1149,8 +1264,11 @@ run_cmd do
           mkConst (lmNs ++ `lmOcObserve_mode_sensitivity),
           mkConst (lmNs ++ `lmOc_trusted_agreement),
           mkConst compCapName,
+          mkConst compCheckName,
           mkConst compCellsName,
           mkConst phaseCheckName,
+          mkConst phaseCompCheckName,
+          mkConst bmDriverName,
           mkConst runnerUnivName ] ++
         (lockNames.toList.map mkConst)
       let rec conj : List Expr → MetaM Expr
@@ -1630,7 +1748,54 @@ run_cmd do
           thmD (ns ++ `forged.phaseFromRuntime)
             (eqTrue (phaseCheck (mkApp lmObserveU (toExpr false)))) reflTrue,
           thmD (ns ++ `honest.phaseFromRuntimeFalse)
-            (eqFalse (phaseCheck (mkApp lmObserveU (toExpr false)))) reflFalse) ] ++
+            (eqFalse (phaseCheck (mkApp lmObserveU (toExpr false)))) reflFalse),
+        ("forged negated LM 14-cell companion certificate",
+          thmD (ns ++ `forged.compCheckFalse) (eqFalse (compCheck compObsU)) reflFalse,
+          thmD (ns ++ `honest.compCheckTrue) (eqTrue (compCheck compObsU)) reflTrue),
+        ("forged mode-inverted LM 14-cell companion certificate",
+          thmD (ns ++ `forged.compCheckInverted)
+            (eqTrue (compCheck
+              (mkLambda `tb .default boolTy <| mkLambda `c .default compTy <|
+                mkApp2 compObsU (mkApp (mkConst ``Bool.not) (.bvar 1)) (.bvar 0))))
+            reflTrue,
+          thmD (ns ++ `honest.compCheckInvertedFalse)
+            (eqFalse (compCheck
+              (mkLambda `tb .default boolTy <| mkLambda `c .default compTy <|
+                mkApp2 compObsU (mkApp (mkConst ``Bool.not) (.bvar 1)) (.bvar 0))))
+            reflFalse),
+        eqCtl "forged companion twin: LM dead-local read returns okScalar 7"
+          `compLmDeadLocal mrObsTy0
+          (mkApp lmToMr (mkApp2 compObsU (toExpr false) (compC `deadLocal)))
+          (mrSc 7) (mrC `ub),
+        eqCtl "forged companion twin: LM dangling ZST rejected as UB"
+          `compLmZstDangling mrObsTy0
+          (mkApp lmToMr (mkApp2 compObsU (toExpr false) (compC `zstDangling)))
+          (mrC `ub) (mrC `okPtrValid),
+        eqCtl "forged companion twin: LM null ZST accepted as okPtrValid"
+          `compLmZstNull mrObsTy0
+          (mkApp lmToMr (mkApp2 compObsU (toExpr true) (compC `zstNull)))
+          (mrC `okPtrValid) (mrC `ub),
+        eqCtl "forged companion twin: LM erased invalid-bool is UB instead of masking byte 2"
+          `compLmErasedUb mrObsTy0 (mkApp lmToMr erasedULhs)
+          (mrC `ub) (mrSc 2),
+        ("forged negated LM 7-companion phase certificate",
+          thmD (ns ++ `forged.phaseCompFalse)
+            (eqFalse (phaseCompCheck phaseCompObs)) reflFalse,
+          thmD (ns ++ `honest.phaseCompTrue)
+            (eqTrue (phaseCompCheck phaseCompObs)) reflTrue),
+        ("forged LM companion phase certificate from RUNTIME companion observer",
+          thmD (ns ++ `forged.phaseCompFromRuntime)
+            (eqTrue (phaseCompCheck (mkApp compObsU (toExpr false)))) reflTrue,
+          thmD (ns ++ `honest.phaseCompFromRuntimeFalse)
+            (eqFalse (phaseCompCheck (mkApp compObsU (toExpr false)))) reflFalse),
+        eqCtl "forged MR companion phase: cast-free revTransmute is phaseBoundary"
+          `phaseCompRevTr mrObsTy0
+          (mkApp (mkConst (bNs ++ `mrOcPhaseCompanion)) (compC `revTransmute))
+          (mrC `phaseBoundary) (mrC `unsupported),
+        eqCtl "forged MR companion phase: D1 invalidBool is unsupported"
+          `phaseCompInvBool mrObsTy0
+          (mkApp (mkConst (bNs ++ `mrOcPhaseCompanion)) (compC `invalidBool))
+          (mrC `unsupported) (mrC `phaseBoundary) ] ++
       ([18, 19, 20, 21].map fun i =>
         eqCtl s!"forged D3 case {i}: Trusted accepts the invalid safe pointer"
           (Name.mkSimple s!"d3TrAccepts{i}") mrObsTy (trObs false i)
@@ -1791,7 +1956,8 @@ run_cmd do
         `MiniRustSpec.Correspondence.translatePlace,
         `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.trustedCompanion,
         `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.mrCompanion,
-        `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.mrOcPhaseObserve ]
+        `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.mrOcPhaseObserve,
+        `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.mrOcPhaseCompanion ]
     -- Universal runner lock: both copies of the shared Trusted runner.
     let runnerReach : List Name :=
       [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
@@ -1808,6 +1974,7 @@ run_cmd do
         `MiniRustSpec.Interp.CM.dereferenceable,
         `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable,
         `MiniRustSpec.Correspondence.translatePlace,
+        `MiniRustSpec.Correspondence.stepM_bm_eq,
         `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.ep1_lean_miri_opaquecast_fnentry_capstone ]
     let twinU : List Name :=
       [ `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserveU ]
@@ -1819,7 +1986,15 @@ run_cmd do
         (ns ++ `domainBundle ++ `d3, bundleCore),
         (compObsName, companionReach),
         (phaseCheckName, phaseReach),
+        (phaseCompCheckName,
+          [ `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcPhaseObserveBody,
+            `Miri.Interpreter.project,
+            `Miri.Interpreter.PlaceDynamic.project ]),
         (compCapName, compCapReach),
+        (bmDriverName,
+          [ `MiniRustSpec.Interp.steps,
+            `MiniRustSpec.Interp.stepM,
+            `MiniRustSpec.Correspondence.stepM_bm_eq ]),
         (runnerUnivName, runnerReach),
         (crossName, crossReach) ]
     let mut reachChecked : Nat := 0
@@ -1831,6 +2006,63 @@ run_cmd do
         unless seen.contains r do
           throwError "cross-root reachability failure: {root} does not reach {r}"
         reachChecked := reachChecked + 1
+    -- Per-cell companion reachability + anti-Trusted audit: EVERY ONE of the 7
+    -- companion branches plus `lmErasedInvalidBool` MUST reach its specific
+    -- vendored Miri entry point AND MUST NOT reach Trusted `stepMirFn`.
+    let reachFromExpr (e : Expr) : NameSet := Id.run do
+      let mut seen : NameSet := {}
+      let mut todo : Array Name := e.getUsedConstants
+      while !todo.isEmpty do
+        let n := todo.back!
+        todo := todo.pop
+        if seen.contains n then continue
+        seen := seen.insert n
+        if let some ci := env.find? n then
+          for d in ci.getUsedConstantsAsSet do
+            if !seen.contains d then todo := todo.push d
+      return seen
+    let stepMirFnName := `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn
+    let perCellReqs : List (Name × Expr × List Name) :=
+      [ (`payload,
+          mkCompBranch runStepC protDropC invBoolC revTrC ptrValC (toExpr false) `payload,
+          [`Miri.Interpreter.Step.step]),
+        (`protectedDrop,
+          mkCompBranch runStepC protDropC invBoolC revTrC ptrValC (toExpr true) `protectedDrop,
+          [`Miri.TreeBorrows.RetagPipeline.retagPointerValue,
+           `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite]),
+        (`deadLocal,
+          mkCompBranch runStepC protDropC invBoolC revTrC ptrValC (toExpr false) `deadLocal,
+          [`Miri.Interpreter.Step.step]),
+        (`invalidBool,
+          mkCompBranch runStepC protDropC invBoolC revTrC ptrValC (toExpr false) `invalidBool,
+          [`Miri.Memory.Validity.checkPrimitive]),
+        (`revTransmute,
+          mkCompBranch runStepC protDropC invBoolC revTrC ptrValC (toExpr true) `revTransmute,
+          [`Miri.TreeBorrows.RetagPipeline.retagPointerValue,
+           `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryWrite]),
+        (`zstDangling,
+          mkCompBranch runStepC protDropC invBoolC revTrC ptrValC (toExpr false) `zstDangling,
+          [`Miri.Memory.Validity.checkScalar,
+           `Miri.Interpreter.ValidityMachine.checkPointerAccess,
+           `Miri.Interpreter.ValidityMachine.checkPointerAlign]),
+        (`zstNull,
+          mkCompBranch runStepC protDropC invBoolC revTrC ptrValC (toExpr false) `zstNull,
+          [`Miri.Memory.Validity.checkScalar,
+           `Miri.Interpreter.ValidityMachine.checkPointerAccess,
+           `Miri.Interpreter.ValidityMachine.checkPointerAlign]),
+        (`erasedInvalidBool, mkErased runStepC,
+          [`Miri.Interpreter.Step.step]) ]
+    for (cellTag, expr, reqsC) in perCellReqs do
+      let seen := reachFromExpr expr
+      if seen.contains stepMirFnName then
+        throwError "per-cell companion audit FAILED: LM cell {cellTag} reaches Trusted stepMirFn"
+      for r in reqsC do
+        unless seen.contains r do
+          throwError "per-cell companion audit FAILED: LM cell {cellTag} does not reach {r}"
+        reachChecked := reachChecked + 1
+    -- Self-test: the anti-Trusted detector catches Trusted `mrOcTrustedObserve`.
+    unless (reachFromExpr (mkConst (mrNs ++ `mrOcTrustedObserve))).contains stepMirFnName do
+      throwError "per-cell anti-Trusted self-test failed: mrOcTrustedObserve not caught"
     -- The vendored projection engines live in the modules named by the
     -- Episode 2 brief (`Miri.Interpreter.Projection` / `.PlaceDynamic`).
     for (c, m) in [(`Miri.Interpreter.project, `Miri.Interpreter.Projection),
@@ -1853,9 +2085,9 @@ run_cmd do
   let ((addedCount, bundleCount, eqLockCount, sharedCount,
         rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 186 && bundleCount = 4 && eqLockCount = 94 &&
-      sharedCount = 98 && rejectedCount ≥ 77 &&
-      twinCount = rejectedCount && reachCount ≥ 152 do
+  unless addedCount ≥ 196 && bundleCount = 4 && eqLockCount = 94 &&
+      sharedCount = 98 && rejectedCount ≥ 87 &&
+      twinCount = rejectedCount && reachCount ≥ 172 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, shared={sharedCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles; {eqLockCount} Eq.refl + 2 bijection + 2 universal runner + 1 ocCombine locks covering {sharedCount}/98 shared MR/LM declarations), kernel-rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
 
@@ -1888,15 +2120,24 @@ run_cmd do
       `rootBackedLmAuthority_failClosed, `rootBacked_observer_level,
       `stepsM_eq_runToStopM, `stepsTB_eq_runToStopM,
       `steps_eq_runToStopM_bm_of,
+      `allOcFpCompanions, `allOcFpCompanions_complete,
       `trustedCompanion, `mrCompanion, `trustedCompanion_table,
-      `mrCompanion_table, `OcFpLmCompanionCells, `dual_companion_three_way,
+      `mrCompanion_table, `OcFpLmCompanionCells,
+      `lmCompanionCheckOf, `lmCompanionCheckOf_sound, `lmCompanionCheckOf_of_eq,
+      `dual_companion_three_way,
       `dual_companion_mode_sensitivity, `dual_type_switch_erasure_boundary,
-      `mrOcPhaseObserve, `mrOcPhaseObserve_table, `ocPhaseExpected_cell,
+      `mrOcPhaseObserveBody, `mrOcPhaseObserve, `mrOcPhaseObserve_out_of_range,
+      `mrOcPhaseObserve_table, `ocPhaseExpected_cell,
+      `ocCompanionBody, `ocCompanionIsD1, `mrOcPhaseCompanion,
+      `mrOcPhaseCompanion_table, `lmPhaseCompanionCheckOf,
+      `dual_d1_companion_phase_boundary,
       `lmPhaseCheckOf, `dual_d1_phase_boundary,
       `ocStepG, `ocTrustedStep_running_eq, `ocStepG_natural, `repeat_natural,
       `ocRunner_copy_lock, `ocCombine_copy_lock,
       `rootBackedCompanion, `rootBackedCompanion_cells,
-      `rootBackedPhase_check, `rootBackedErased_eq,
+      `rootBackedCompanion_check,
+      `rootBackedPhase_check, `rootBackedPhaseCompanion_check,
+      `rootBackedErased_eq,
       `ep2_opaquecast_fnentry_dual_authority_capstone,
       `ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous,
       `ep2_opaquecast_fnentry_companion_phase_capstone,
