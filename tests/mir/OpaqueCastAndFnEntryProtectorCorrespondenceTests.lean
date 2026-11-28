@@ -38,9 +38,9 @@ import MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
    44-cell certificate on the loop-unrolled twin `lmOcObserveU` and transports
    along `lmOcObserveU.eq_src`, discharges fail-closedness from
    `lmOcObserve_out_of_range`, closes the unified + 3 per-domain (`D1`–`D3`)
-   bundles plus the unified and `D1` POST-BORROWCK bundles (6 bundles; the
-   post-borrowck gate admits every case, closing case `8`), all lifted
-   theorems, observer-level (raw `MrOcFpObs`) 3-way
+   bundles plus ALL FOUR post-borrowck bundles (`unified`, `D1`–`D3`, 8 bundles
+   total; the post-borrowck gate admits every case, closing case `8`), all
+   lifted theorems, observer-level (raw `MrOcFpObs`) 3-way
    agreement, 3-engine companion & UB root-cause alignment, and the Episode 2
    cross-root capstone. It also:
    - locks ALL 97 shared `section Fixtures` declarations: 93 identically-typed
@@ -261,6 +261,36 @@ theorem post_borrowck_canaries :
     trustedPostBorrowckObserve true 22 = .unsupported ∧
     trustedPostBorrowckVerdict false 8 = some (.returns (.scalar 5)) ∧
     trustedVerdict false 8 = some .unsupported := by
+  decide +kernel
+
+/-- **Uniform cast erasure and cast-free fixture identity (direct kernel
+execution)**: `trustedUniformErasedObserve` (zero `if idx < 10` case split)
+agrees with `mrOcObserve` on all 44 cells and fails closed out of range; every
+`D1` fixture (`0..9`) and `D1` companion carries a `.opaqueCast` place erased
+to none by `ocEraseBody`, while every `D2`/`D3` fixture (`10..21`) and
+`D2`/`D3` companion carries zero `.opaqueCast` places. -/
+theorem uniform_erased_and_cast_free_canaries :
+    (List.range 22).map (trustedUniformErasedObserve false) =
+      (List.range 22).map (mrOcObserve false) ∧
+    (List.range 22).map (trustedUniformErasedObserve true) =
+      (List.range 22).map (mrOcObserve true) ∧
+    trustedUniformErasedObserve false 8 = .okScalar 5 ∧
+    trustedUniformErasedObserve true 22 = .unsupported ∧
+    (List.range 10).all (fun i =>
+      match ocCaseFixture? i with
+      | some (b, []) =>
+        (ocBodyPlaces b).any ocPlaceHasCast &&
+        !((ocBodyPlaces (ocEraseBody b)).any ocPlaceHasCast)
+      | _ => false) = true ∧
+    (List.range 12).all (fun k =>
+      match ocCaseFixture? (k + 10) with
+      | some (b, cs) =>
+        !((ocBodyPlaces b).any ocPlaceHasCast) &&
+        cs.all (fun c => !((ocBodyPlaces c).any ocPlaceHasCast))
+      | _ => false) = true ∧
+    allOcFpCompanions.all (fun c =>
+      (ocBodyPlaces (ocCompanionBody c)).any ocPlaceHasCast ==
+        ocCompanionIsD1 c) = true := by
   decide +kernel
 
 /-- **Case `17` fixture divergence (direct kernel execution)**: MiniRust's
@@ -1267,13 +1297,6 @@ run_cmd do
         #[authC, lmToMr, fidelityC, compObs, hC, phaseCompObs,
           mkConst phaseCompCheckName])
     added := added.push (ns ++ `dual_d1_companion_phase_boundary)
-    let compCapName := ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone
-    addThmInfer compCapName <|
-      mkAppN (mkConst (bNs ++ `ep2_opaquecast_fnentry_companion_phase_capstone))
-        #[authC, hA, lmToMr, fidelityC, compObs, hC, erasedLhs, hErased,
-          lmPhaseObs, mkConst phaseCheckName,
-          phaseCompObs, mkConst phaseCompCheckName]
-    added := added.push compCapName
     -- Unconditional `Mach` driver identity inside `CrossRoot` (discharging
     -- `steps_eq_runToStopM_bm_of` with `MiniRustSpec.Correspondence.stepM_bm_eq`).
     let bmDriverName := ns ++ `bm_driver_is_minirust_steps
@@ -1317,53 +1340,67 @@ run_cmd do
       (mkApp5 (mkConst (bNs ++ `dual_d1_phase_boundary_all_nat)) lmObsTy lmToMr
         lmPhaseObs (mkConst phaseCheckName) (mkConst phaseOobName))
     added := added.push (ns ++ `dual_d1_phase_boundary_all_nat)
+    let compCapName := ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone
+    addThmInfer compCapName <|
+      mkAppN (mkConst (bNs ++ `ep2_opaquecast_fnentry_companion_phase_capstone))
+        #[authC, hA, lmToMr, fidelityC, compObs, hC, erasedLhs, hErased,
+          lmPhaseObs, mkConst phaseCheckName, mkConst phaseOobName,
+          phaseCompObs, mkConst phaseCompCheckName]
+    added := added.push compCapName
 
     -- 4a'. Post-borrowck image. On the cast-erased MIR, Trusted `stepMirFn`
-    -- agrees with MiniRust and LeanMiri on ALL 44 cells, so the unified and
-    -- `D1` post-borrowck bundles gate EVERY case (case `8` closed). Each LM
-    -- side certificate is kernel-evaluated on the twin, transported onto
-    -- `lmAuthority`, and its direct bundle is locked by `Eq.refl` to the
-    -- table-derived bundle.
+    -- agrees with MiniRust and LeanMiri on ALL 44 cells, so ALL FOUR
+    -- post-borrowck bundles (`unified`, `d1`, `d2`, `d3`) gate EVERY case
+    -- (case `8` closed). Each LM side certificate is kernel-evaluated on the
+    -- twin, transported onto `lmAuthority`, and its direct bundle is locked by
+    -- `Eq.refl` to the table-derived bundle.
     let pbCheck (sel a : Expr) : Expr :=
       mkApp2 (mkConst (bNs ++ `lmPostBorrowckCheckOf)) sel a
     let pbUnifiedName := ns ++ `postBorrowckBundle ++ `unified
     let pbD1Name := ns ++ `postBorrowckBundle ++ `d1
+    let pbD2Name := ns ++ `postBorrowckBundle ++ `d2
+    let pbD3Name := ns ++ `postBorrowckBundle ++ `d3
     for (tag, sel) in sels do
-      if tag == `unified || tag == `d1 then
-        let chkU := ns ++ `lmPostBorrowckSideCheckU ++ tag
-        addThm chkU (eqTrue (pbCheck sel authUC)) reflTrue
-        added := added.push chkU
-        let chkDirect := ns ++ `lmPostBorrowckSideCheck_direct ++ tag
-        let pFn ← MetaM.run' <|
-          withLocalDeclD `a (mkConst (bNs ++ `OcFpLmAuthority)) fun a =>
-            mkLambdaFVars #[a] (pbCheck sel a)
-        addThm chkDirect (eqTrue (pbCheck sel authC))
-          (mkAppN (mkConst (bNs ++ `cert_transport))
-            #[authC, authUC, mkConst eqName, pFn, mkConst chkU])
-        added := added.push chkDirect
-        let bName := ns ++ `postBorrowckBundle ++ tag
-        let bVal :=
-          if tag == `unified then
-            mkApp2 (mkConst (bNs ++ `postBorrowckBundleOf)) authC hA
-          else
-            mkApp3 (mkConst (bNs ++ `postBorrowckDomainBundleOf))
-              (mkConst (domNs ++ `d1)) authC hA
-        let bTy ← addDef bName bVal
-        added := added.push bName
-        bundleCount := bundleCount + 1
-        let dName := ns ++ `postBorrowckBundle_direct ++ tag
-        let _ ← addDef dName
-          (mkApp3 (mkConst (bNs ++ `postBorrowckBundleOfSel)) sel authC
-            (mkConst chkDirect))
-        added := added.push dName
-        let eqBName := ns ++ `postBorrowckBundle_eq ++ tag
-        addThm eqBName (mkEq bTy (mkConst dName) (mkConst bName))
-          (mkRefl bTy (mkConst dName))
-        added := added.push eqBName
+      let chkU := ns ++ `lmPostBorrowckSideCheckU ++ tag
+      addThm chkU (eqTrue (pbCheck sel authUC)) reflTrue
+      added := added.push chkU
+      let chkDirect := ns ++ `lmPostBorrowckSideCheck_direct ++ tag
+      let pFn ← MetaM.run' <|
+        withLocalDeclD `a (mkConst (bNs ++ `OcFpLmAuthority)) fun a =>
+          mkLambdaFVars #[a] (pbCheck sel a)
+      addThm chkDirect (eqTrue (pbCheck sel authC))
+        (mkAppN (mkConst (bNs ++ `cert_transport))
+          #[authC, authUC, mkConst eqName, pFn, mkConst chkU])
+      added := added.push chkDirect
+      let bName := ns ++ `postBorrowckBundle ++ tag
+      let bVal :=
+        if tag == `unified then
+          mkApp2 (mkConst (bNs ++ `postBorrowckBundleOf)) authC hA
+        else
+          mkApp3 (mkConst (bNs ++ `postBorrowckDomainBundleOf))
+            (mkConst (domNs ++ tag)) authC hA
+      let bTy ← addDef bName bVal
+      added := added.push bName
+      bundleCount := bundleCount + 1
+      let dName := ns ++ `postBorrowckBundle_direct ++ tag
+      let _ ← addDef dName
+        (mkApp3 (mkConst (bNs ++ `postBorrowckBundleOfSel)) sel authC
+          (mkConst chkDirect))
+      added := added.push dName
+      let eqBName := ns ++ `postBorrowckBundle_eq ++ tag
+      addThm eqBName (mkEq bTy (mkConst dName) (mkConst bName))
+        (mkRefl bTy (mkConst dName))
+      added := added.push eqBName
     for thmName in [`post_borrowck_bundle_closes_case8,
+                    `postBorrowck_modeSensitivity_present,
                     `dual_post_borrowck_case8] do
       addThmInfer (ns ++ thmName) (mkApp2 (mkConst (bNs ++ thmName)) authC hA)
       added := added.push (ns ++ thmName)
+    addThmInfer (ns ++ `postBorrowckDomain_bundle_claims)
+      (mkLambda `d .default (mkConst domNs)
+        (mkApp3 (mkConst (bNs ++ `postBorrowckDomain_bundle_claims))
+          (.bvar 0) authC hA))
+    added := added.push (ns ++ `postBorrowckDomain_bundle_claims)
     addThmInfer (ns ++ `dual_post_borrowck_exact_all_nat)
       (mkApp5 (mkConst (bNs ++ `dual_post_borrowck_exact_all_nat)) authC hA hOob
         lmToMr fidelityC)
@@ -1435,6 +1472,10 @@ run_cmd do
           mkConst (ns ++ `dual_d1_phase_boundary_all_nat),
           mkConst (ns ++ `postBorrowckBundle_eq ++ `unified),
           mkConst (ns ++ `postBorrowckBundle_eq ++ `d1),
+          mkConst (ns ++ `postBorrowckBundle_eq ++ `d2),
+          mkConst (ns ++ `postBorrowckBundle_eq ++ `d3),
+          mkConst (ns ++ `postBorrowckDomain_bundle_claims),
+          mkConst (ns ++ `postBorrowck_modeSensitivity_present),
           mkConst zstLockName,
           mkConst (ns ++ `dual_d3_zst_fixture_divergence),
           mkConst runnerUnivName ] ++
@@ -1844,6 +1885,14 @@ run_cmd do
     let checkOnPbModel := pbChkInfo.value.bindingBody!.bindingBody!.appFn!
     let pbSideMr := mkApp3 (mkConst (bNs ++ `sideOf)) noneSel
       (mkConst (bNs ++ `postBorrowckGate)) (mkConst (bNs ++ `mrVerdictFn))
+    let fin8 : Expr :=
+      mkApp3 (mkConst ``Fin.mk) (mkNatLit 22) (mkNatLit 8)
+        (mkApp2 (mkConst ``Nat.le_add_left) (mkNatLit 9) (mkNatLit 13))
+    let bodyHasCast (mirConst : Expr) : Expr :=
+      mkApp3 (mkConst ``List.any [0])
+        (mkConst `Trusted.Rustc.V2026_06_01.MirAst.Place)
+        (mkApp (mkConst (mrNs ++ `ocBodyPlaces)) mirConst)
+        (mkConst (mrNs ++ `ocPlaceHasCast))
     let eqCtl (what : String) (tag : Name) (ty lhs bad good : Expr) :
         String × Declaration × Declaration :=
       (what, thmD (ns ++ `forged ++ tag) (mkEq ty lhs bad) (mkRefl ty lhs),
@@ -2004,7 +2053,40 @@ run_cmd do
           thmD (ns ++ `forged.pbModeInverted)
             (eqTrue (pbCheck noneSel invAuth)) reflTrue,
           thmD (ns ++ `honest.pbFromUnrolled)
-            (eqTrue (pbCheck noneSel authUC)) reflTrue) ]
+            (eqTrue (pbCheck noneSel authUC)) reflTrue),
+        ("forged D2 post-borrowck LM side certificate from mode-inverted authority",
+          thmD (ns ++ `forged.pbD2ModeInverted)
+            (eqTrue (pbCheck (mkApp2 (mkConst ``Option.some [0]) (mkConst domNs)
+              (mkConst (domNs ++ `d2))) invAuth)) reflTrue,
+          -- `D1` post-borrowck is mode-insensitive, so the SAME inversion passes there.
+          thmD (ns ++ `honest.pbD1ModeInverted)
+            (eqTrue (pbCheck (mkApp2 (mkConst ``Option.some [0]) (mkConst domNs)
+              (mkConst (domNs ++ `d1))) invAuth)) reflTrue),
+        eqCtl "forged uniform erased observer at case 8: stays unsupported"
+          `pbUniformCase8Uns mrObsTy0
+          (mkApp2 (mkConst (bNs ++ `trustedUniformErasedObserve))
+            (toExpr false) (mkNatLit 8))
+          (mrC `unsupported) (mrSc 5),
+        eqCtl "forged uniform erased observer out of range (idx 22): returns scalar 5"
+          `pbUniformOob22Ok mrObsTy0
+          (mkApp2 (mkConst (bNs ++ `trustedUniformErasedObserve))
+            (toExpr true) (mkNatLit 22))
+          (mrSc 5) (mrC `unsupported),
+        eqCtl "forged D1 post-borrowck gate excludes case 8"
+          `pbD1Gate8 boolTy
+          (mkApp2 (mkConst (bNs ++ `postBorrowckGate))
+            (mkApp2 (mkConst ``Option.some [0]) (mkConst domNs)
+              (mkConst (domNs ++ `d1)))
+            fin8)
+          (toExpr false) (toExpr true),
+        eqCtl "forged D1 case 8 carries no opaqueCast place"
+          `d1Case8NoCast boolTy
+          (bodyHasCast (mkConst (mrNs ++ `ocCase8Mir)))
+          (toExpr false) (toExpr true),
+        eqCtl "forged D2 case 10 carries an opaqueCast place"
+          `d2Case10HasCast boolTy
+          (bodyHasCast (mkConst (mrNs ++ `ocCase10Mir)))
+          (toExpr true) (toExpr false) ]
     let mut rejected : Nat := 0
     let mut twins : Nat := 0
     for (what, d, h) in forged ++ forgedMore do
@@ -2199,8 +2281,11 @@ run_cmd do
         (compCapName, compCapReach),
         (pbUnifiedName, bundleCore ++ erasedReach),
         (pbD1Name, bundleCore ++ erasedReach),
+        (pbD2Name, bundleCore ++ erasedReach),
+        (pbD3Name, bundleCore ++ erasedReach),
         (pbCapName, trustedCore ++ erasedReach ++
-          [ `MiniRustSpec.Interp.stepM,
+          [ `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.trustedUniformErasedObserve,
+            `MiniRustSpec.Interp.stepM,
             `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserve,
             `Miri.Interpreter.Step.step ]),
         (bmDriverName,
@@ -2234,6 +2319,23 @@ run_cmd do
             if !seen.contains d then todo := todo.push d
       return seen
     let stepMirFnName := `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn
+    let mrStepMName := `MiniRustSpec.Interp.stepM
+    -- Mutual 3-way authority independence: NONE of Authority 2 (LeanMiri)'s
+    -- canonical, companion, or phase observers reach Authority 0 (Trusted
+    -- `stepMirFn`) OR Authority 1 (MiniRust `stepM`).
+    for (lmTag, lmExpr) in
+        [ (`lmOcObserve, lmObserve),
+          (`lmCompanionObserve, compObs),
+          (`lmOcPhaseObserve, lmPhaseObs),
+          (`lmPhaseCompanion, phaseCompObs) ] do
+      let seen := reachFromExpr lmExpr
+      if seen.contains stepMirFnName then
+        throwError "authority-independence audit FAILED: LM {lmTag} reaches Trusted stepMirFn"
+      if seen.contains mrStepMName then
+        throwError "authority-independence audit FAILED: LM {lmTag} reaches MiniRust stepM"
+    -- Positive self-test: MiniRust `mrOcObserve` IS caught by the anti-MiniRust detector.
+    unless (reachFromExpr (mkConst (mrNs ++ `mrOcObserve))).contains mrStepMName do
+      throwError "anti-MiniRust self-test failed: mrOcObserve not caught"
     let perCellReqs : List (Name × Expr × List Name) :=
       [ (`payload,
           mkCompBranch runStepC protDropC invBoolC revTrC ptrValC (toExpr false) `payload,
@@ -2268,6 +2370,8 @@ run_cmd do
       let seen := reachFromExpr expr
       if seen.contains stepMirFnName then
         throwError "per-cell companion audit FAILED: LM cell {cellTag} reaches Trusted stepMirFn"
+      if seen.contains mrStepMName then
+        throwError "per-cell companion audit FAILED: LM cell {cellTag} reaches MiniRust stepM"
       for r in reqsC do
         unless seen.contains r do
           throwError "per-cell companion audit FAILED: LM cell {cellTag} does not reach {r}"
@@ -2297,9 +2401,9 @@ run_cmd do
   let ((addedCount, bundleCount, eqLockCount, sharedCount,
         rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 217 && bundleCount = 6 && eqLockCount = 94 &&
-      sharedCount = 98 && rejectedCount ≥ 93 &&
-      twinCount = rejectedCount && reachCount ≥ 226 do
+  unless addedCount ≥ 229 && bundleCount = 8 && eqLockCount = 94 &&
+      sharedCount = 98 && rejectedCount ≥ 99 &&
+      twinCount = rejectedCount && reachCount ≥ 268 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, shared={sharedCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles; {eqLockCount} Eq.refl + 2 bijection + 2 universal runner + 1 ocCombine locks covering {sharedCount}/98 shared MR/LM declarations), kernel-rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
 
@@ -2364,6 +2468,10 @@ run_cmd do
       `postBorrowckBundleOf, `postBorrowckDomainBundleOf,
       `post_borrowck_bundle_closes_case8, `dual_post_borrowck_case8,
       `dual_post_borrowck_exact_all_nat,
+      `trustedUniformErasedObserve, `ocEraseBody_ne_of_hasCast,
+      `ocEraseBody_fixture_fixed_iff, `ocEraseBody_companion_fixed_iff,
+      `trustedPostBorrowckObserve_eq_uniform_erased,
+      `postBorrowckDomain_bundle_claims, `postBorrowck_modeSensitivity_present,
       `ep2_opaquecast_fnentry_post_borrowck_capstone,
       `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   let isChoiceFree (axs : Array Name) : Bool :=

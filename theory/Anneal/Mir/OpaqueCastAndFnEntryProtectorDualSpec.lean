@@ -1569,12 +1569,13 @@ theorem dual_d1_companion_phase_boundary (A : OcFpLmAuthority)
   · rw [hf, hL]; cases c <;> decide
 
 /-- The frozen phase table is `phaseBoundary` (and hence verdict-less) exactly
-on the `D1` cases. -/
+on the `D1` cases, and `.unsupported` on `10 ≤ idx`. -/
 theorem ocPhaseExpected_cell (idx : Nat) (hi : idx < mrOcCaseCount) :
     (ocPhaseExpected.getD idx .unsupported = .phaseBoundary ↔
       ocDomainOf idx = .d1) ∧
     (ocVerdictOf (ocPhaseExpected.getD idx .unsupported) = none ↔
-      ocDomainOf idx = .d1) := by
+      ocDomainOf idx = .d1) ∧
+    (ocPhaseExpected.getD idx .unsupported = .unsupported ↔ 10 ≤ idx) := by
   revert hi
   revert idx
   decide +kernel
@@ -1618,7 +1619,7 @@ theorem dual_d1_phase_boundary (A : OcFpLmAuthority)
     hNoPanic.1 (congrArg ocVerdictOf h)
   refine ⟨hL.trans hM.symm, ?_, ?_, hObs.1 ▸ hMrNe, hMrNe, hTrNe⟩
   · rw [hM]; exact hCell.1
-  · rw [hf, hL]; exact hCell.2
+  · rw [hf, hL]; exact hCell.2.1
 
 /-- The shared fixture table is empty outside the canonical range. -/
 theorem ocCaseFixture?_out_of_range (idx : Nat) (h : mrOcCaseCount ≤ idx) :
@@ -1659,26 +1660,34 @@ theorem phase_fail_closed_of_fixture {Obs : Type} (f : Obs → MrOcFpObs)
 
 /-- **All-`Nat` static phase agreement.** For EVERY `idx : Nat` (canonical
 `0..21` and fail-closed `≥ 22`) a certified, fail-closed LeanMiri phase
-observer equals the MiniRust phase observer, and the phase boundary is hit
-exactly on the `D1` indices `idx < 10`. -/
+observer equals the MiniRust phase observer; the phase boundary (verdict-less)
+is hit iff `idx < 10`, and `.unsupported` holds iff `10 ≤ idx`. -/
 theorem dual_d1_phase_boundary_all_nat {Obs : Type} (f : Obs → MrOcFpObs)
     (phase : Nat → Obs) (hP : lmPhaseCheckOf f phase = true)
     (hPOob : ∀ idx, mrOcCaseCount ≤ idx → f (phase idx) = .unsupported)
     (idx : Nat) :
     f (phase idx) = mrOcPhaseObserve idx ∧
-    (mrOcPhaseObserve idx = .phaseBoundary ↔ idx < 10) := by
+    (mrOcPhaseObserve idx = .phaseBoundary ↔ idx < 10) ∧
+    (ocVerdictOf (f (phase idx)) = none ↔ idx < 10) ∧
+    (f (phase idx) = .unsupported ↔ 10 ≤ idx) := by
   by_cases hi : idx < mrOcCaseCount
   · have hL : f (phase idx) = ocPhaseExpected.getD idx .unsupported :=
       of_decide_eq_true (List.all_eq_true.mp hP idx (List.mem_range.mpr hi))
     have hM : mrOcPhaseObserve idx = ocPhaseExpected.getD idx .unsupported := by
       rw [← mrOcPhaseObserve_table, range_map_getD hi]
-    refine ⟨hL.trans hM.symm, ?_⟩
-    rw [hM]
-    exact (ocPhaseExpected_cell idx hi).1.trans (ocDomainOf_d1_iff idx)
+    have hCell := ocPhaseExpected_cell idx hi
+    refine ⟨hL.trans hM.symm, ?_, ?_, ?_⟩
+    · rw [hM]; exact hCell.1.trans (ocDomainOf_d1_iff idx)
+    · rw [hL]; exact hCell.2.1.trans (ocDomainOf_d1_iff idx)
+    · rw [hL]; exact hCell.2.2
   · have hge : mrOcCaseCount ≤ idx := Nat.le_of_not_lt hi
     have h10 : ¬ idx < 10 := by unfold mrOcCaseCount at hge; omega
+    have hGe10 : 10 ≤ idx := by unfold mrOcCaseCount at hge; omega
     rw [hPOob idx hge, mrOcPhaseObserve_out_of_range idx hge]
-    exact ⟨rfl, (fun e => nomatch e), fun e => absurd e h10⟩
+    exact ⟨rfl,
+      ⟨(fun e => nomatch e), (fun e => absurd e h10)⟩,
+      ⟨(fun e => nomatch e), (fun e => absurd e h10)⟩,
+      ⟨(fun _ => hGe10), (fun _ => rfl)⟩⟩
 
 /-! ## §7d. The Post-Borrowck (Cast-Erased) Image: Closing Case `8`
 
@@ -1878,6 +1887,175 @@ theorem dual_post_borrowck_exact_all_nat (A : OcFpLmAuthority)
     exact hAll.2.2.mp ⟨h.trans hPB, hAll.1.symm⟩
   · intro h8
     exact (hAll.2.2.mpr h8).1.trans hPB.symm
+
+/-- **Uniform post-borrowck Trusted observer**: applies `ocEraseBody`
+unconditionally to EVERY fixture body and its callees (with `ocEraseRetags` in
+`tb = false`, mirroring `mrOcTrustedObserve`), with ZERO `if idx < 10` case
+split. -/
+def trustedUniformErasedObserve (tb : Bool) (idx : Nat) : MrOcFpObs :=
+  match ocCaseFixture? idx with
+  | none => .unsupported
+  | some (body, callees) =>
+    let cs := (if tb then callees else callees.map ocEraseRetags).map ocEraseBody
+    mrOcTrustedObsOf (ocRetKindOf idx) (ocRunTrustedRaw (ocEraseBody body) cs)
+
+/-- Any body carrying a `.opaqueCast` place whose erased image has none is
+strictly transformed by `ocEraseBody`. -/
+theorem ocEraseBody_ne_of_hasCast
+    (b : Trusted.Rustc.V2026_06_01.MirAst.CapturedMir)
+    (hHas : (ocBodyPlaces b).any ocPlaceHasCast = true)
+    (hErased : (ocBodyPlaces (ocEraseBody b)).any ocPlaceHasCast = false) :
+    ocEraseBody b ≠ b := by
+  intro h
+  have : false = true :=
+    hErased ▸ (congrArg (fun x => (ocBodyPlaces x).any ocPlaceHasCast) h).trans hHas
+  exact Bool.noConfusion this
+
+/-- **Exact cast-erasure fixed-point characterization on all 22 canonical
+fixtures**: `ocEraseBody` is the syntactic identity on a fixture body iff
+`10 ≤ idx` (`D2`/`D3`), strictly changes every `D1` body (`0..9`, which carry
+no callees), and leaves every `D2`/`D3` callee (both raw and `ocEraseRetags`)
+syntactically fixed. -/
+theorem ocEraseBody_fixture_fixed_iff (idx : Nat) (hi : idx < mrOcCaseCount) :
+    match ocCaseFixture? idx with
+    | none => False
+    | some (body, callees) =>
+      (ocEraseBody body = body ↔ 10 ≤ idx) ∧
+      callees.map ocEraseBody = callees ∧
+      (callees.map ocEraseRetags).map ocEraseBody = callees.map ocEraseRetags ∧
+      (idx < 10 → callees = []) := by
+  match idx, hi with
+  | 0, _ | 1, _ | 2, _ | 3, _ | 4, _ | 5, _ | 6, _ | 7, _ | 8, _ | 9, _ =>
+    exact ⟨⟨fun h => absurd h (ocEraseBody_ne_of_hasCast _
+        (by decide +kernel) (by decide +kernel)),
+      fun h => absurd h (by decide)⟩, rfl, rfl, fun _ => rfl⟩
+  | 10, _ | 11, _ | 12, _ | 13, _ | 14, _ | 15, _ | 16, _ | 17, _ | 18, _
+  | 19, _ | 20, _ | 21, _ =>
+    exact ⟨⟨fun _ => by decide, fun _ => rfl⟩, rfl, rfl,
+      fun h => absurd h (by decide)⟩
+  | n + 22, hi =>
+    exact False.elim (Nat.not_lt.mpr (Nat.le_add_left 22 n) hi)
+
+/-- **Exact cast-erasure fixed-point characterization on all 7 companions**:
+`ocEraseBody` fixes a companion body iff it is cast-free (`D2`/`D3`). -/
+theorem ocEraseBody_companion_fixed_iff (c : OcFpCompanion) :
+    ocEraseBody (ocCompanionBody c) = ocCompanionBody c ↔
+      ocCompanionIsD1 c = false := by
+  cases c with
+  | payload | protectedDrop | deadLocal | invalidBool =>
+    exact ⟨fun h => absurd h (ocEraseBody_ne_of_hasCast _
+        (by decide +kernel) (by decide +kernel)),
+      fun h => Bool.noConfusion h⟩
+  | revTransmute | zstDangling | zstNull =>
+    exact ⟨fun _ => rfl, fun _ => rfl⟩
+
+/-- **Piecewise = Uniform cast erasure for EVERY `tb` and EVERY `idx : Nat`.**
+Because `ocEraseBody` fixes every cast-free `D2`/`D3` fixture and callee
+syntactically, `trustedPostBorrowckObserve` equals the unconditional
+`trustedUniformErasedObserve` everywhere. -/
+theorem trustedPostBorrowckObserve_eq_uniform_erased (tb : Bool) (idx : Nat) :
+    trustedPostBorrowckObserve tb idx = trustedUniformErasedObserve tb idx := by
+  by_cases hi : idx < mrOcCaseCount
+  · have hF := ocEraseBody_fixture_fixed_iff idx hi
+    unfold trustedPostBorrowckObserve trustedUniformErasedObserve
+      mrOcTrustedErasedObserve mrOcTrustedObserve
+    cases hEq : ocCaseFixture? idx with
+    | none => rw [hEq] at hF; exact False.elim hF
+    | some bc =>
+      rcases bc with ⟨body, callees⟩
+      rw [hEq] at hF
+      by_cases h10 : idx < 10
+      · rw [ite_eq_left h10]
+        have hNil : callees = [] := hF.2.2.2 h10
+        subst hNil
+        cases tb <;> rfl
+      · have hGe10 : 10 ≤ idx := Nat.le_of_not_lt h10
+        rw [ite_eq_right h10]
+        have hBody : ocEraseBody body = body := hF.1.mpr hGe10
+        cases tb with
+        | true => dsimp only; rw [ite_eq_left rfl, hBody, hF.2.1]
+        | false => dsimp only; rw [ite_eq_right Bool.false_ne_true, hBody, hF.2.2.1]
+  · have hGe : mrOcCaseCount ≤ idx := Nat.le_of_not_lt hi
+    have h10 : ¬ idx < 10 := by unfold mrOcCaseCount at hGe; omega
+    unfold trustedPostBorrowckObserve trustedUniformErasedObserve
+      mrOcTrustedObserve
+    rw [ite_eq_right h10, ocCaseFixture?_out_of_range idx hGe]
+
+/-- **Per-domain post-borrowck bundle claims (`D1`–`D3`)**: every per-domain
+post-borrowck bundle carries correspondence, fault-equivalence, genuine
+`.undefined` UB witnesses, and `ExactBehaviorEq` on ALL cases of its domain
+(including all 10 `D1` cases `0..9` with case `8` closed); `D1` strictly
+expands support over the cast-image bundle at case `8`, while `D2` and `D3`
+gates match identically. -/
+theorem postBorrowckDomain_bundle_claims (d : OcFpDomain) (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) :
+    let B := postBorrowckDomainBundleOf d A hA
+    CorrespondenceClaim B.mrRel ∧ FaultEquivClaim B.mrRel ∧
+    CorrespondenceClaim B.lmRel ∧ FaultEquivClaim B.lmRel ∧
+    B.mrPositive.p = okCaseOf (some d) ∧ B.lmPositive.p = okCaseOf (some d) ∧
+    B.mrFault.p = faultCaseOf (some d) ∧ B.lmFault.p = faultCaseOf (some d) ∧
+    B.mrFault.kind = .undefined ∧ B.lmFault.kind = .undefined ∧
+    B.mrFlip.kind = .undefined ∧ B.lmFlip.kind = .undefined ∧
+    (∀ (i : OcFpCase), ocDomainOf i.val = d →
+      postBorrowckGate (some d) i = true ∧
+      ∀ mMR mLM : Bool,
+        ExactBehaviorEq B.mrRel mMR i () ∧
+        ExactBehaviorEq B.lmRel mLM i ()) ∧
+    (d = .d1 → postBorrowckGate (some .d1) 8 = true ∧ mrGate (some .d1) 8 = false) ∧
+    (d ≠ .d1 → ∀ i : OcFpCase, postBorrowckGate (some d) i = mrGate (some d) i) := by
+  have hKind : ∀ d' : OcFpDomain,
+      Corpus.faultKindOf
+        (trustedPostBorrowckVerdict (OcFpMode.ofTb (wModeOf (some d'))).toTb
+          (faultCaseOf (some d')).val) = .undefined := by
+    intro d'
+    rw [trustedPostBorrowckVerdict_cell _ _ (faultCaseOf (some d')).isLt]
+    cases d' <;> rfl
+  refine ⟨(postBorrowckDomainBundleOf d A hA).mrSim.correspondenceClaim,
+    (postBorrowckDomainBundleOf d A hA).mrSim.faultEquivClaim,
+    (postBorrowckDomainBundleOf d A hA).lmSim.correspondenceClaim,
+    (postBorrowckDomainBundleOf d A hA).lmSim.faultEquivClaim,
+    rfl, rfl, rfl, rfl,
+    hKind d, hKind d, hKind d, hKind d, ?_, ?_, ?_⟩
+  · intro i hd
+    have hGate : postBorrowckGate (some d) i = true := by
+      unfold postBorrowckGate domainSel
+      exact decide_eq_true hd
+    refine ⟨hGate, fun _ _ =>
+      ⟨(postBorrowckDomainBundleOf d A hA).mrSim.exactBehaviorEq_of_reverseTotal
+          ((mrPostBorrowckSide (some d)).reverseTotal ocPostBorrowckModel
+            (Bool.and_eq_true _ _ ▸ mrPostBorrowckSide_check (some d)).1) hGate,
+       (postBorrowckDomainBundleOf d A hA).lmSim.exactBehaviorEq_of_reverseTotal
+          ((lmPostBorrowckSideOf (some d) A).reverseTotal ocPostBorrowckModel
+            (Bool.and_eq_true _ _ ▸
+              lmPostBorrowckCheckOf_of_table (some d) A hA).1) hGate⟩⟩
+  · intro _; exact ⟨rfl, rfl⟩
+  · intro hNe i
+    cases d with
+    | d1 => exact absurd rfl hNe
+    | d2 => revert i; decide +kernel
+    | d3 => revert i; decide +kernel
+
+/-- Non-vacuous Tree Borrows mode sensitivity (case `11`) is preserved on the
+unified and `D2` post-borrowck bundles on BOTH authorities (`D1`/`D3` `none`). -/
+theorem postBorrowck_modeSensitivity_present (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) :
+    (∃ w, (postBorrowckBundleOf A hA).mrFlip.modeSensitivity? = some w ∧
+      w.m₁ = false ∧ w.m₂ = true ∧ w.p = 11) ∧
+    (∃ w, (postBorrowckBundleOf A hA).lmFlip.modeSensitivity? = some w ∧
+      w.m₁ = false ∧ w.m₂ = true ∧ w.p = 11) ∧
+    (∃ w, (postBorrowckDomainBundleOf .d2 A hA).mrFlip.modeSensitivity? = some w ∧
+      w.m₁ = false ∧ w.m₂ = true ∧ w.p = 11) ∧
+    (∃ w, (postBorrowckDomainBundleOf .d2 A hA).lmFlip.modeSensitivity? = some w ∧
+      w.m₁ = false ∧ w.m₂ = true ∧ w.p = 11) ∧
+    (postBorrowckDomainBundleOf .d1 A hA).mrFlip.modeSensitivity? = none ∧
+    (postBorrowckDomainBundleOf .d1 A hA).lmFlip.modeSensitivity? = none ∧
+    (postBorrowckDomainBundleOf .d3 A hA).mrFlip.modeSensitivity? = none ∧
+    (postBorrowckDomainBundleOf .d3 A hA).lmFlip.modeSensitivity? = none := by
+  refine ⟨?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl⟩
+  · exact ⟨_, rfl, rfl, rfl, rfl⟩
 
 /-! ## §7e. Verbatim-Copy Locks for the Shared Trusted Runner
 
@@ -2236,20 +2414,25 @@ theorem ep2_opaquecast_fnentry_companion_phase_capstone (A : OcFpLmAuthority)
     (obs : Bool → OcFpCompanion → A.Obs) (hC : OcFpLmCompanionCells f obs)
     (erased : A.Obs) (hE : f erased = .okScalar 2)
     (phase : Nat → A.Obs) (hP : lmPhaseCheckOf f phase = true)
+    (hPOob : ∀ idx, mrOcCaseCount ≤ idx → f (phase idx) = .unsupported)
     (phaseC : OcFpCompanion → A.Obs)
     (hPC : lmPhaseCompanionCheckOf f phaseC = true) :
     (∀ tb c, type_of% (dual_companion_three_way f obs hC tb c)) ∧
     (∀ c, type_of% (dual_companion_mode_sensitivity f obs hC c)) ∧
+    (∀ tb, type_of% (dual_d3_zst_fixture_divergence f obs hC tb)) ∧
     (∀ tb, type_of% (dual_type_switch_erasure_boundary f obs hC erased hE tb)) ∧
     (∀ tb idx (hi : idx < mrOcCaseCount),
       type_of% (dual_d1_phase_boundary A hA f hf phase hP tb idx hi)) ∧
+    (∀ idx, type_of% (dual_d1_phase_boundary_all_nat f phase hP hPOob idx)) ∧
     (∀ tb c,
       type_of% (dual_d1_companion_phase_boundary A f hf obs hC phaseC hPC tb c)) ∧
     (∀ idx, mrOcCaseCount ≤ idx → mrOcPhaseObserve idx = .unsupported) ∧
     type_of% @mr_translate_opaqueCast_fail_closed :=
   ⟨dual_companion_three_way f obs hC, dual_companion_mode_sensitivity f obs hC,
+   dual_d3_zst_fixture_divergence f obs hC,
    dual_type_switch_erasure_boundary f obs hC erased hE,
    dual_d1_phase_boundary A hA f hf phase hP,
+   dual_d1_phase_boundary_all_nat f phase hP hPOob,
    dual_d1_companion_phase_boundary A f hf obs hC phaseC hPC,
    mrOcPhaseObserve_out_of_range,
    @mr_translate_opaqueCast_fail_closed⟩
@@ -2263,6 +2446,7 @@ theorem ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous :
       (mrOcTrustedObsOf .scalar
         (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []))
       rootBackedErased_eq mrOcPhaseObserve rootBackedPhase_check
+      mrOcPhaseObserve_out_of_range
       mrOcPhaseCompanion rootBackedPhaseCompanion_check) :=
   ep2_opaquecast_fnentry_companion_phase_capstone
     rootBackedLmAuthority rootBackedLmAuthority_tableCheck
@@ -2270,6 +2454,7 @@ theorem ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous :
     (mrOcTrustedObsOf .scalar
       (ocRunTrustedRaw (ocEraseBody ocCase9InvalidBoolMir) []))
     rootBackedErased_eq mrOcPhaseObserve rootBackedPhase_check
+    mrOcPhaseObserve_out_of_range
     mrOcPhaseCompanion rootBackedPhaseCompanion_check
 
 /-- **Episode 2 post-borrowck capstone (100% constructive)**: for EVERY
@@ -2278,25 +2463,41 @@ certified fail-closed LeanMiri authority `A` whose translation factors through
 1. the MiniRust and LeanMiri post-borrowck side certificates hold for the
    unified and all three per-domain selections;
 2. the unified post-borrowck bundle gates ALL 22 cases with exact behavioral
-   equivalence on both authorities (case `8` closed);
+   equivalence on both authorities (case `8` closed), and every per-domain
+   post-borrowck bundle (`D1`–`D3`) carries full claims & mode sensitivity;
 3. case `8` is `.unsupported` on Trusted's cast fixture yet `5` on its
    post-borrowck image, as on MiniRust and LeanMiri;
 4. for all `tb` and all `idx : Nat`, Trusted on the post-borrowck image equals
-   raw MiniRust and raw LeanMiri, and cast erasure is faithful on Trusted iff
-   `idx ≠ 8`. -/
+   the unconditional uniform cast-erased runner `trustedUniformErasedObserve`,
+   raw MiniRust, and raw LeanMiri, `ocEraseBody` fixes all cast-free `D2`/`D3`
+   fixtures, callees, and companions syntactically, and cast erasure is
+   faithful on Trusted iff `idx ≠ 8`. -/
 theorem ep2_opaquecast_fnentry_post_borrowck_capstone (A : OcFpLmAuthority)
     (hA : lmTableCheckOf A = true) (hOob : OcFpLmFailClosed A)
     (f : A.Obs → MrOcFpObs) (hf : ∀ o, A.toVerdict o = ocVerdictOf (f o)) :
     (∀ sel, (mrPostBorrowckSide sel).check ocPostBorrowckModel = true) ∧
     (∀ sel, lmPostBorrowckCheckOf sel A = true) ∧
     type_of% (post_borrowck_bundle_closes_case8 A hA) ∧
+    (∀ d, type_of% (postBorrowckDomain_bundle_claims d A hA)) ∧
+    type_of% (postBorrowck_modeSensitivity_present A hA) ∧
     (∀ tb, type_of% (dual_post_borrowck_case8 A hA tb)) ∧
     (∀ tb idx,
-      type_of% (dual_post_borrowck_exact_all_nat A hA hOob f hf tb idx)) :=
+      type_of% (dual_post_borrowck_exact_all_nat A hA hOob f hf tb idx)) ∧
+    (∀ idx (hi : idx < mrOcCaseCount),
+      type_of% (ocEraseBody_fixture_fixed_iff idx hi)) ∧
+    (∀ c, type_of% (ocEraseBody_companion_fixed_iff c)) ∧
+    (∀ tb idx,
+      type_of% (trustedPostBorrowckObserve_eq_uniform_erased tb idx)) :=
   ⟨mrPostBorrowckSide_check,
    fun sel => lmPostBorrowckCheckOf_of_table sel A hA,
-   post_borrowck_bundle_closes_case8 A hA, dual_post_borrowck_case8 A hA,
-   dual_post_borrowck_exact_all_nat A hA hOob f hf⟩
+   post_borrowck_bundle_closes_case8 A hA,
+   fun d => postBorrowckDomain_bundle_claims d A hA,
+   postBorrowck_modeSensitivity_present A hA,
+   dual_post_borrowck_case8 A hA,
+   dual_post_borrowck_exact_all_nat A hA hOob f hf,
+   ocEraseBody_fixture_fixed_iff,
+   ocEraseBody_companion_fixed_iff,
+   trustedPostBorrowckObserve_eq_uniform_erased⟩
 
 /-- The post-borrowck capstone is non-vacuous (root-backed authority). -/
 theorem ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous :
@@ -2409,6 +2610,12 @@ run_cmd do
       ns ++ `postBorrowckDomainBundleOf,
       ns ++ `post_borrowck_bundle_closes_case8, ns ++ `dual_post_borrowck_case8,
       ns ++ `dual_post_borrowck_exact_all_nat,
+      ns ++ `trustedUniformErasedObserve, ns ++ `ocEraseBody_ne_of_hasCast,
+      ns ++ `ocEraseBody_fixture_fixed_iff,
+      ns ++ `ocEraseBody_companion_fixed_iff,
+      ns ++ `trustedPostBorrowckObserve_eq_uniform_erased,
+      ns ++ `postBorrowckDomain_bundle_claims,
+      ns ++ `postBorrowck_modeSensitivity_present,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
       ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   for c in spotlightDecls do
@@ -2543,17 +2750,37 @@ run_cmd do
         [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve ]),
+      (ns ++ `trustedUniformErasedObserve,
+        [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocEraseBody,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocEraseRetags,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocRunTrustedRaw ]),
       (ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
         [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve,
           `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocEraseBody,
           `MiniRustSpec.Interp.stepM,
-          ns ++ `trustedPostBorrowckObserve, ns ++ `postBorrowckBundleOf ]) ]
+          ns ++ `trustedPostBorrowckObserve, ns ++ `trustedUniformErasedObserve,
+          ns ++ `postBorrowckBundleOf, ns ++ `postBorrowckDomainBundleOf ]) ]
   for (root, rs) in reqs do
     let seen := reachFrom root
     for r in rs do
       unless seen.contains r do
         throwError "shadow-evaluator audit: {root} does not reach the real {r}"
+  -- Mutual authority independence (anti-contamination): Trusted observers never
+  -- reach MiniRust `stepM`, and MiniRust observers never reach Trusted `stepMirFn`.
+  for trObs in [ `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedObserve,
+                 ns ++ `trustedPostBorrowckObserve,
+                 ns ++ `trustedUniformErasedObserve,
+                 ns ++ `trustedCompanion ] do
+    if (reachFrom trObs).contains `MiniRustSpec.Interp.stepM then
+      throwError "authority-independence audit failed: Trusted {trObs} reaches MiniRust stepM"
+  for mrObs in [ `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve,
+                 ns ++ `mrCompanion,
+                 ns ++ `mrOcPhaseObserve,
+                 ns ++ `mrOcPhaseCompanion ] do
+    if (reachFrom mrObs).contains `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn then
+      throwError "authority-independence audit failed: MiniRust {mrObs} reaches Trusted stepMirFn"
   -- Reachability self-tests: the detector is not vacuously true (the pure
   -- codec reaches no interpreter, and the cast-image bundle never touches the
   -- cast-erased Trusted observer).
