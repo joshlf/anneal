@@ -11,6 +11,9 @@ import Lean.Replay
 import Lean.Compiler.ExportAttr
 import Lean.Compiler.IR.Basic
 import Lean.Compiler.ImplementedByAttr
+import Lean.Compiler.CSimpAttr
+import Lean.Compiler.LCNF.PassManager
+import Lean.Compiler.LCNF.Simp.ConstantFold
 import Anneal.NatBitwise
 
 /-!
@@ -1696,21 +1699,70 @@ def validateKernelQuery (lctx : LocalContext) (exprs : Array Expr) (fuel : Nat :
             s!"query references fvar {id.name} not declared in the LocalContext"
   return { violations := st.violations, stats := st.stats }
 
-/-- Validate a single `ConstantInfo` in-memory (V-Q1, V-M2, V-U3, V-F4). -/
+/-- Collect every `Level.param` occurring in `e` (fuel-bounded, DAG-memoized by
+`StrictExprKey` and `StrictLevelKey`) to enforce universe-parameter scoping. -/
+def collectLevelParamsBounded (e : Expr) (fuel : Nat := 2000000) : Option NameSet := Id.run do
+  let mut seenE : Std.HashSet StrictExprKey := {}
+  let mut seenL : Std.HashSet StrictLevelKey := {}
+  let mut out : NameSet := {}
+  let mut workE : List Expr := [e]
+  let mut workL : List Level := []
+  for _ in [0:fuel] do
+    match workL with
+    | l :: restL =>
+      workL := restL
+      if seenL.contains ⟨l⟩ then continue
+      seenL := seenL.insert ⟨l⟩
+      match l with
+      | .param n => out := out.insert n
+      | .succ u => workL := u :: workL
+      | .max u v | .imax u v => workL := u :: v :: workL
+      | .zero | .mvar _ => pure ()
+    | [] =>
+      match workE with
+      | [] => return some out
+      | x :: restE =>
+        workE := restE
+        if seenE.contains ⟨x⟩ then continue
+        seenE := seenE.insert ⟨x⟩
+        match x with
+        | .sort l => workL := l :: workL
+        | .const _ ls => workL := ls ++ workL
+        | .app f a => workE := f :: a :: workE
+        | .lam _ t b _ | .forallE _ t b _ => workE := t :: b :: workE
+        | .letE _ t v b _ => workE := t :: v :: b :: workE
+        | .mdata _ b | .proj _ _ b => workE := b :: workE
+        | _ => pure ()
+  return none
+
+/-- Validate a single `ConstantInfo` in-memory (V-Q1, V-M2, V-U3, V-F4), including
+`levelParams` uniqueness and universe-parameter scoping (A3 hardening). -/
 def validateConstantInfo (ci : ConstantInfo) (originMod : Option Name)
     (st0 : MemValidatorState) (fuel : Nat := 2000000) : MemValidatorState := Id.run do
   let decl := ci.name
   let mut st := { st0 with stats := { st0.stats with declsChecked := st0.stats.declsChecked + 1 } }
   let (st1, _) := validateNameDag decl decl st fuel
   st := st1
+  let mut lpSet : NameSet := {}
   for lp in ci.levelParams do
     let (st2, _) := validateNameDag decl lp st fuel
     st := st2
-  let (st3, _) := validateExprDag decl ci.type st (requireClosed := true) fuel
-  st := st3
+    if lpSet.contains lp then
+      st := st.record "forgedLevelMData" decl s!"duplicate universe parameter {lp} in levelParams"
+    lpSet := lpSet.insert lp
+  let checkScopedLps (s : MemValidatorState) (e : Expr) (rootData : UInt64) : MemValidatorState :=
+    if !exprDataHasLevelParam rootData then s
+    else match collectLevelParamsBounded e fuel with
+      | none => s.record "auditFuelExhausted" decl "collectLevelParamsBounded exhausted fuel"
+      | some ps =>
+        ps.foldl (fun acc p =>
+          if lpSet.contains p then acc
+          else acc.record "forgedLevelMData" decl s!"unbound universe parameter Level.param {p}") s
+  let (st3, tyData) := validateExprDag decl ci.type st (requireClosed := true) fuel
+  st := checkScopedLps st3 ci.type tyData
   if let some v := ci.value? (allowOpaque := true) then
-    let (st4, _) := validateExprDag decl v st (requireClosed := true) fuel
-    st := st4
+    let (st4, valData) := validateExprDag decl v st (requireClosed := true) fuel
+    st := checkScopedLps st4 v valData
   match ci with
   | .quotInfo qv =>
     for v in validateQuotVal qv originMod do
@@ -1740,8 +1792,8 @@ def validateConstantInfo (ci : ConstantInfo) (originMod : Option Name)
       st := st'
     for r in v.rules do
       let (st', _) := validateNameDag decl r.ctor st fuel
-      let (st'', _) := validateExprDag decl r.rhs st' (requireClosed := true) fuel
-      st := st''
+      let (st'', rhsData) := validateExprDag decl r.rhs st' (requireClosed := true) fuel
+      st := checkScopedLps st'' r.rhs rhsData
   | .axiomInfo _ => pure ()
   return st
 
@@ -1787,16 +1839,59 @@ def auditExportSurface (env : Environment) (modIdx : Nat) (modName : Name)
   for (declName, _) in builtinInitAttr.ext.getModuleIREntries env modIdx do
     st := st.record "forbiddenExportAttr" declName
       s!"@[builtin_init] hook in module {modName} (.ir entries)"
+  -- A3 hardening: audit compiler-override extensions (`CSimp`, `passManagerExt`, `folderExt`)
+  -- across BOTH `.olean` and `.ir` tables (closes `.ir` blind spot in `OleanEnvAuditor.lean`).
+  for e in Compiler.CSimp.ext.ext.getModuleEntries env modIdx do
+    let ent := match e with | .global a => a | .scoped _ a => a
+    st := st.record "forbiddenExportAttr" ent.fromDeclName
+      s!"@[csimp] override {ent.fromDeclName} ↦ {ent.toDeclName} in module {modName} (.olean entries)"
+  for e in Compiler.CSimp.ext.ext.getModuleIREntries env modIdx do
+    let ent := match e with | .global a => a | .scoped _ a => a
+    st := st.record "forbiddenExportAttr" ent.fromDeclName
+      s!"@[csimp] override {ent.fromDeclName} ↦ {ent.toDeclName} in module {modName} (.ir entries)"
+  for installer in Compiler.LCNF.passManagerExt.getModuleEntries env modIdx do
+    st := st.record "forbiddenExportAttr" installer
+      s!"cpass installer {installer} in module {modName} (.olean entries)"
+  for installer in Compiler.LCNF.passManagerExt.getModuleIREntries env modIdx do
+    st := st.record "forbiddenExportAttr" installer
+      s!"cpass installer {installer} in module {modName} (.ir entries)"
+  for fe in Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env modIdx do
+    st := st.record "forbiddenExportAttr" fe.declName
+      s!"constant_fold folder {fe.folderDeclName} in module {modName} (.olean entries)"
+  for fe in Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleIREntries env modIdx do
+    st := st.record "forbiddenExportAttr" fe.declName
+      s!"constant_fold folder {fe.folderDeclName} in module {modName} (.ir entries)"
   let isMod := (env.header.moduleData[modIdx]?).map (·.isModule) |>.getD false
+  let ownedDecls : NameSet := match env.header.moduleData[modIdx]? with
+    | some data => (data.constNames ++ data.extraConstNames).foldl (·.insert ·) {}
+    | none => {}
   let mut irFdeclNames : NameSet := {}
+  let mut seenIRTable : NameSet := {}
   for irDecl in IR.declMapExt.getModuleIREntries env modIdx do
+    let f := irDecl.name
+    if seenIRTable.contains f then
+      st := st.record "forgedIrDecl" f
+        s!"duplicate IR.Decl entry for {f} in module {modName} (.ir IR.declMapExt)"
+    seenIRTable := seenIRTable.insert f
+    if !ownedDecls.contains f then
+      st := st.record "forgedIrDecl" f
+        s!"foreign IR.Decl {f} not owned by module {modName} (.ir IR.declMapExt)"
     match irDecl with
     | .extern f _ _ _ =>
       st := st.record "forbiddenExportAttr" f
         s!"IR.Decl.extern C-symbol stub in module {modName} (.ir IR.declMapExt)"
     | .fdecl f .. =>
       irFdeclNames := irFdeclNames.insert f
+  let mut seenModIRTable : NameSet := {}
   for irDecl in IR.declMapExt.getModuleEntries env modIdx do
+    let f := irDecl.name
+    if seenModIRTable.contains f then
+      st := st.record "forgedIrDecl" f
+        s!"duplicate IR.Decl entry for {f} in module {modName} (.olean IR.declMapExt)"
+    seenModIRTable := seenModIRTable.insert f
+    if !ownedDecls.contains f then
+      st := st.record "forgedIrDecl" f
+        s!"foreign IR.Decl {f} not owned by module {modName} (.olean IR.declMapExt)"
     match irDecl with
     | .extern f _ _ info =>
       let pureOpaque := match info.entries with | [.opaque] => true | _ => false
@@ -3119,10 +3214,77 @@ def binExprMatchesCanonical (parts : Array OleanPart) (ptr : UInt64) (expected :
           | _, _, _, _ => false
         | _ => false
 
+/-- Verify every `Level.param` reachable from a binary `Expr` pointer is declared in `allowedLps`
+(only called when `exprDataHasLevelParam rootData == true`, so zero overhead on monomorphic terms). -/
+def checkBinExprLevelParams (parts : Array OleanPart) (decl : Name) (rootWord : UInt64)
+    (allowedLps : NameSet) (st0 : BinValidatorState) (fuel : Nat := 2000000) :
+    BinValidatorState := Id.run do
+  let mut st := st0
+  let mut seenE : Std.HashSet UInt64 := {}
+  let mut seenL : Std.HashSet UInt64 := {}
+  let mut workE : List UInt64 := [rootWord]
+  let mut workL : List UInt64 := []
+  let mut completed := false
+  for _ in [0:fuel] do
+    match workL with
+    | lw :: restL =>
+      workL := restL
+      if isScalarWord lw || seenL.contains lw then continue
+      seenL := seenL.insert lw
+      if let .ok lh := readObjHeader parts lw then
+        match lh.tag with
+        | 1 =>
+          if let .ok u := readFieldPtr parts lh 0 then workL := u :: workL
+        | 2 | 3 =>
+          if let .ok u := readFieldPtr parts lh 0 then workL := u :: workL
+          if let .ok v := readFieldPtr parts lh 1 then workL := v :: workL
+        | 4 =>
+          if let .ok np := readFieldPtr parts lh 0 then
+            let (st1, nInfo) := validateBinName parts decl np st fuel
+            st := st1
+            if !allowedLps.contains nInfo.name then
+              st := st.record "forgedLevelMData" decl
+                s!"binary Expr references unbound universe parameter Level.param {nInfo.name}"
+        | _ => pure ()
+    | [] =>
+      match workE with
+      | [] => completed := true; break
+      | ew :: restE =>
+        workE := restE
+        if isScalarWord ew || seenE.contains ew then continue
+        seenE := seenE.insert ew
+        if let .ok eh := readObjHeader parts ew then
+          match eh.tag with
+          | 3 =>
+            if let .ok lp := readFieldPtr parts eh 0 then workL := lp :: workL
+          | 4 =>
+            if let .ok usp := readFieldPtr parts eh 1 then
+              if let .ok lws := readBinList parts usp fuel then
+                workL := lws.toList ++ workL
+          | 5 =>
+            if let .ok fp := readFieldPtr parts eh 0 then workE := fp :: workE
+            if let .ok ap := readFieldPtr parts eh 1 then workE := ap :: workE
+          | 6 | 7 =>
+            if let .ok tp := readFieldPtr parts eh 1 then workE := tp :: workE
+            if let .ok bp := readFieldPtr parts eh 2 then workE := bp :: workE
+          | 8 =>
+            if let .ok tp := readFieldPtr parts eh 1 then workE := tp :: workE
+            if let .ok vp := readFieldPtr parts eh 2 then workE := vp :: workE
+            if let .ok bp := readFieldPtr parts eh 3 then workE := bp :: workE
+          | 10 =>
+            if let .ok bp := readFieldPtr parts eh 1 then workE := bp :: workE
+          | 11 =>
+            if let .ok bp := readFieldPtr parts eh 2 then workE := bp :: workE
+          | _ => pure ()
+  if !completed then
+    st := st.record "auditFuelExhausted" decl "checkBinExprLevelParams exhausted fuel"
+  return st
+
 /-- Validate `ConstantVal` (tag 0, 3 objs: `name`, `levelParams`, `type`) and return
-`(st, declName, levelParams, typePtr)`. -/
+`(st, declName, levelParams, lpSet, typePtr)`. -/
 def validateBinConstantVal (parts : Array OleanPart) (cvPtr : UInt64)
-    (st0 : BinValidatorState) (fuel : Nat) : BinValidatorState × Option (Name × List Name × UInt64) := Id.run do
+    (st0 : BinValidatorState) (fuel : Nat) :
+    BinValidatorState × Option (Name × List Name × NameSet × UInt64) := Id.run do
   let mut st := st0
   match readObjHeader parts cvPtr with
   | .error e =>
@@ -3136,6 +3298,7 @@ def validateBinConstantVal (parts : Array OleanPart) (cvPtr : UInt64)
       st := st1
       let decl := nInfo.name
       let mut lps : List Name := []
+      let mut lpSet : NameSet := {}
       match readBinList parts lparamsPtr fuel with
       | .error e =>
         st := st.record "malformedOleanRegion" decl s!"levelParams list error: {e}"
@@ -3143,10 +3306,16 @@ def validateBinConstantVal (parts : Array OleanPart) (cvPtr : UInt64)
         for lpw in lpWords do
           let (st2, lpInfo) := validateBinName parts decl lpw st fuel
           st := st2
+          if lpSet.contains lpInfo.name then
+            st := st.record "forgedLevelMData" decl
+              s!"duplicate universe parameter {lpInfo.name} in binary levelParams"
+          lpSet := lpSet.insert lpInfo.name
           lps := lps ++ [lpInfo.name]
-      let (st3, _) := validateBinExpr parts decl typePtr st (requireClosed := true) fuel
+      let (st3, tyData) := validateBinExpr parts decl typePtr st (requireClosed := true) fuel
       st := st3
-      return (st, some (decl, lps, typePtr))
+      if exprDataHasLevelParam tyData then
+        st := checkBinExprLevelParams parts decl typePtr lpSet st fuel
+      return (st, some (decl, lps, lpSet, typePtr))
     | _, _, _ =>
       return (st.record "malformedOleanRegion" .anonymous s!"ConstantVal field read error at {cvPtr}", none)
 
@@ -3200,7 +3369,11 @@ def validateBinConstantInfo (parts : Array OleanPart) (ciPtr : UInt64)
         | .ok cvPtr =>
           let (st1, cvOpt) := validateBinConstantVal parts cvPtr st fuel
           st := st1
-          let some (decl, lps, typePtr) := cvOpt | return st
+          let some (decl, lps, lpSet, typePtr) := cvOpt | return st
+          let checkValExpr (vPtr : UInt64) (s : BinValidatorState) : BinValidatorState :=
+            let (s1, vData) := validateBinExpr parts decl vPtr s (requireClosed := true) fuel
+            if exprDataHasLevelParam vData then checkBinExprLevelParams parts decl vPtr lpSet s1 fuel
+            else s1
           let checkNameList (listPtr : UInt64) (s : BinValidatorState) : BinValidatorState := Id.run do
             let mut s' := s
             match readBinList parts listPtr fuel with
@@ -3219,8 +3392,7 @@ def validateBinConstantInfo (parts : Array OleanPart) (ciPtr : UInt64)
               st := st.record "malformedOleanRegion" decl "DefinitionVal bad m_other"
             else
               if let .ok vPtr := readFieldPtr parts vh 1 then
-                let (st', _) := validateBinExpr parts decl vPtr st (requireClosed := true) fuel
-                st := st'
+                st := checkValExpr vPtr st
               if let .ok allPtr := readFieldPtr parts vh 3 then
                 st := checkNameList allPtr st
           | 2 => -- thmInfo (cv, value, all)
@@ -3228,8 +3400,7 @@ def validateBinConstantInfo (parts : Array OleanPart) (ciPtr : UInt64)
               st := st.record "malformedOleanRegion" decl "TheoremVal bad m_other"
             else
               if let .ok vPtr := readFieldPtr parts vh 1 then
-                let (st', _) := validateBinExpr parts decl vPtr st (requireClosed := true) fuel
-                st := st'
+                st := checkValExpr vPtr st
               if let .ok allPtr := readFieldPtr parts vh 2 then
                 st := checkNameList allPtr st
           | 3 => -- opaqueInfo (cv, value, all; isUnsafe)
@@ -3237,8 +3408,7 @@ def validateBinConstantInfo (parts : Array OleanPart) (ciPtr : UInt64)
               st := st.record "malformedOleanRegion" decl "OpaqueVal bad m_other"
             else
               if let .ok vPtr := readFieldPtr parts vh 1 then
-                let (st', _) := validateBinExpr parts decl vPtr st (requireClosed := true) fuel
-                st := st'
+                st := checkValExpr vPtr st
               if let .ok allPtr := readFieldPtr parts vh 2 then
                 st := checkNameList allPtr st
           | 4 => -- quotInfo (cv; kind) -> V-Q1!
@@ -3306,8 +3476,7 @@ def validateBinConstantInfo (parts : Array OleanPart) (ciPtr : UInt64)
                           let (st', _) := validateBinName parts decl cPtr st fuel
                           st := st'
                         if let .ok rhsPtr := readFieldPtr parts rh 2 then
-                          let (st', _) := validateBinExpr parts decl rhsPtr st (requireClosed := true) fuel
-                          st := st'
+                          st := checkValExpr rhsPtr st
                         st := binCheckNatField parts decl rh 1 "RecursorRule.nfields" st
           | _ => pure ()
           -- B1 hardening: scalar discriminants and `Nat` fields. A0 never read them, so e.g.
@@ -3464,13 +3633,14 @@ def binExternAttrDataIsPureOpaque (parts : Array OleanPart) (externDataWord : UI
   `m_rc != 0` / cycles / `LeanClosure` objects cannot hide in any extension payload. -/
 def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entriesArrPtr : UInt64)
     (st0 : BinValidatorState) (fuel : Nat) (allowOpaqueIrStubs : Bool := false) :
-    BinValidatorState × NameSet × NameSet := Id.run do
+    BinValidatorState × NameSet × NameSet × NameSet := Id.run do
   let mut st := st0
   let mut opaqueStubs : NameSet := {}
   let mut fdecls : NameSet := {}
+  let mut allIrNames : NameSet := {}
   match readArrayElems parts entriesArrPtr with
   | .error e =>
-    return (st.record "malformedOleanRegion" modName s!"entries array error: {e}", opaqueStubs, fdecls)
+    return (st.record "malformedOleanRegion" modName s!"entries array error: {e}", opaqueStubs, fdecls, allIrNames)
   | .ok pairs =>
     for pairPtr in pairs do
       match readObjHeader parts pairPtr with
@@ -3511,7 +3681,10 @@ def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entries
             else if extInfo.name == `Lean.externAttr ||
                     extInfo.name == `Lean.Compiler.implementedByAttr ||
                     extInfo.name == `Lean.regularInitAttr ||
-                    extInfo.name == `Lean.builtinInitAttr then
+                    extInfo.name == `Lean.builtinInitAttr ||
+                    extInfo.name == `Lean.Compiler.CSimp.ext ||
+                    extInfo.name == `Lean.Compiler.LCNF.passManagerExt ||
+                    extInfo.name == `Lean.Compiler.LCNF.Simp.ConstantFold.folderExt then
               match readArrayElems parts arrPtr with
               | .error e =>
                 st := st.record "forbiddenExportAttr" modName
@@ -3533,6 +3706,7 @@ def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entries
                 st := st.record "malformedOleanRegion" modName
                   s!"malformed Lean.IR.declMapExt array in {modName}: {e}"
               | .ok irDecls =>
+                let mut seenInExt : NameSet := {}
                 for dp in irDecls do
                   match readObjHeader parts dp with
                   | .error e =>
@@ -3543,7 +3717,12 @@ def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entries
                         if let .ok fPtr := readFieldPtr parts dh 0 then
                           let (st2, fInfo) := validateBinName parts modName fPtr st fuel
                           st := st2
+                          if seenInExt.contains fInfo.name then
+                            st := st.record "forgedIrDecl" fInfo.name
+                              s!"duplicate binary IR.Decl {fInfo.name} in {modName}"
+                          seenInExt := seenInExt.insert fInfo.name
                           fdecls := fdecls.insert fInfo.name
+                          allIrNames := allIrNames.insert fInfo.name
                     else if dh.tag == 1 then
                       -- `IR.Decl.extern (f : FunId) (xs : Array Param) (type : IRType) (info : ExternAttrData)`
                       let mut fName := modName
@@ -3552,6 +3731,11 @@ def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entries
                           let (st2, fInfo) := validateBinName parts modName fPtr st fuel
                           st := st2
                           fName := fInfo.name
+                      if seenInExt.contains fName then
+                        st := st.record "forgedIrDecl" fName
+                          s!"duplicate binary IR.Decl {fName} in {modName}"
+                      seenInExt := seenInExt.insert fName
+                      allIrNames := allIrNames.insert fName
                       let pureOpaque :=
                         if dh.other == 4 then
                           match readFieldPtr parts dh 3 with
@@ -3568,26 +3752,32 @@ def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entries
                         s!"unknown IR.Decl tag {dh.tag} at ptr {dp}"
           | _, _ => st := st.record "malformedOleanRegion" modName s!"entries pair field error"
     st := sweepBinRegionGraph parts modName entriesArrPtr st (min fuel 2000000)
-    return (st, opaqueStubs, fdecls)
+    return (st, opaqueStubs, fdecls, allIrNames)
 
 def validateOleanPartsEx (rawParts : Array ByteArray) (modName : Name)
     (forbidMainExport : Bool := true) (fuel : Nat := 20000000)
-    (isIrGroup : Bool := false) : AuditReport × NameSet × NameSet := Id.run do
+    (isIrGroup : Bool := false) : AuditReport × NameSet × NameSet × NameSet × NameSet := Id.run do
   match parseOleanParts rawParts with
   | .error err =>
-    return ({ violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := err }] }, {}, {})
+    return ({ violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := err }] }, {}, {}, {}, {})
   | .ok parts =>
     let mut st : BinValidatorState := {}
     let mut opaqueStubs : NameSet := {}
     let mut fdecls : NameSet := {}
+    let mut allIrNames : NameSet := {}
+    let mut ownedNames : NameSet := {}
     for pIdx in [0:parts.size] do
+      -- A3 hardening: multi-part compacted regions may ONLY point into earlier or current parts
+      -- (`0..pIdx`); forward pointers from `.olean` into `.olean.server`/`.olean.private` crash
+      -- `importModules (level := .exported)` and are rejected via `visParts`.
+      let visParts := parts.extract 0 (pIdx + 1)
       let rootPtr := parts[pIdx]!.rootPtr
       if isScalarWord rootPtr then
         -- Empty delta layer root (if any) must be valid scalar 0 (`PUnit` / empty).
         if unboxScalar rootPtr != 0 then
           st := st.record "malformedOleanRegion" modName s!"part {pIdx} invalid scalar root {rootPtr}"
         continue
-      match readObjHeader parts rootPtr with
+      match readObjHeader visParts rootPtr with
       | .error e =>
         st := st.record "malformedOleanRegion" modName s!"part {pIdx} ModuleData root error: {e}"
       | .ok rh =>
@@ -3597,37 +3787,38 @@ def validateOleanPartsEx (rawParts : Array ByteArray) (modName : Name)
         else
           -- B1 hardening: `ModuleData.isModule` byte and `imports` (A0 skipped field 0, so a
           -- forged import `Name.hash` / invalid UTF-8 / `_kernel_fresh` import name passed).
-          st := binCheckByte parts modName rh 0 1 "ModuleData.isModule" st
-          let partIsModule := match readScalarU8 parts rh 0 with | .ok 1 => true | _ => false
-          match readFieldPtr parts rh 0 with
+          st := binCheckByte visParts modName rh 0 1 "ModuleData.isModule" st
+          let partIsModule := match readScalarU8 visParts rh 0 with | .ok 1 => true | _ => false
+          match readFieldPtr visParts rh 0 with
           | .error e => st := st.record "malformedOleanRegion" modName s!"imports field error: {e}"
           | .ok importsPtr =>
-            match readArrayElems parts importsPtr with
+            match readArrayElems visParts importsPtr with
             | .error e => st := st.record "malformedOleanRegion" modName s!"imports error: {e}"
             | .ok impPtrs =>
               for ip in impPtrs do
-                match readObjHeader parts ip with
+                match readObjHeader visParts ip with
                 | .error e => st := st.record "malformedOleanRegion" modName s!"Import header error: {e}"
                 | .ok ih =>
                   if ih.tag != 0 || ih.other != 1 then
                     st := st.record "malformedOleanRegion" modName s!"Import bad ctor at {ip}"
                   else
                     for (o, what) in [(0, "importAll"), (1, "isExported"), (2, "isMeta")] do
-                      st := binCheckByte parts modName ih o 1 s!"Import.{what}" st
-                    if let .ok nPtr := readFieldPtr parts ih 0 then
-                      st := (validateBinName parts modName nPtr st fuel).1
-          match readFieldPtr parts rh 1, readFieldPtr parts rh 2,
-                readFieldPtr parts rh 3, readFieldPtr parts rh 4 with
+                      st := binCheckByte visParts modName ih o 1 s!"Import.{what}" st
+                    if let .ok nPtr := readFieldPtr visParts ih 0 then
+                      st := (validateBinName visParts modName nPtr st fuel).1
+          match readFieldPtr visParts rh 1, readFieldPtr visParts rh 2,
+                readFieldPtr visParts rh 3, readFieldPtr visParts rh 4 with
           | .ok constNamesPtr, .ok constsPtr, .ok extraNamesPtr, .ok entriesPtr =>
             let mut cnInfos : Array BinNameInfo := #[]
             let mut partSeenConstNames : NameSet := {}
-            match readArrayElems parts constNamesPtr with
+            match readArrayElems visParts constNamesPtr with
             | .error e => st := st.record "malformedOleanRegion" modName s!"constNames error: {e}"
             | .ok cnPtrs =>
               for cnp in cnPtrs do
-                let (st1, nInfo) := validateBinName parts modName cnp st fuel
+                let (st1, nInfo) := validateBinName visParts modName cnp st fuel
                 st := st1
                 cnInfos := cnInfos.push nInfo
+                ownedNames := ownedNames.insert nInfo.name
                 if partSeenConstNames.contains nInfo.name then
                   st := st.record "shadowedConstant" nInfo.name
                     s!"duplicate constName {nInfo.name} in part {pIdx} of module {modName}"
@@ -3635,13 +3826,14 @@ def validateOleanPartsEx (rawParts : Array ByteArray) (modName : Name)
                 if forbidMainExport && nInfo.name == `main then
                   st := st.record "forbiddenExportAttr" `main
                     s!"unannotated `main` C-symbol entry point in binary module {modName}"
-            match readArrayElems parts extraNamesPtr with
+            match readArrayElems visParts extraNamesPtr with
             | .error e => st := st.record "malformedOleanRegion" modName s!"extraConstNames error: {e}"
             | .ok enPtrs =>
               for enp in enPtrs do
-                let (st1, _) := validateBinName parts modName enp st fuel
+                let (st1, eInfo) := validateBinName visParts modName enp st fuel
                 st := st1
-            match readArrayElems parts constsPtr with
+                ownedNames := ownedNames.insert eInfo.name
+            match readArrayElems visParts constsPtr with
             | .error e => st := st.record "malformedOleanRegion" modName s!"constants error: {e}"
             | .ok ciPtrs =>
               -- B1 hardening: `importModules` binds `constNames[i] ↦ constants[i]`; reject
@@ -3651,24 +3843,25 @@ def validateOleanPartsEx (rawParts : Array ByteArray) (modName : Name)
                   s!"constNames.size={cnInfos.size} != constants.size={ciPtrs.size} (importModules silently drops the excess)"
               for h : i in [0:ciPtrs.size] do
                 let cip := ciPtrs[i]
-                st := validateBinConstantInfo parts cip modName st fuel
+                st := validateBinConstantInfo visParts cip modName st fuel
                 if let some cnInfo := cnInfos[i]? then
-                  match binConstantNamePtr parts cip with
+                  match binConstantNamePtr visParts cip with
                   | .error e => st := st.record "malformedOleanRegion" modName s!"ConstantInfo name read: {e}"
                   | .ok np =>
-                    let (st1, ciName) := validateBinName parts modName np st fuel
+                    let (st1, ciName) := validateBinName visParts modName np st fuel
                     st := st1
                     if !(cnInfo.name == ciName.name && cnInfo.hashVal == ciName.hashVal) then
                       st := st.record "constNameAliasMismatch" cnInfo.name
                         s!"constNames entry {cnInfo.name} binds a ConstantInfo named {ciName.name}"
-            let (stE, pStubs, pFdecls) := validateBinModuleEntries parts modName entriesPtr st fuel
+            let (stE, pStubs, pFdecls, pIrNames) := validateBinModuleEntries visParts modName entriesPtr st fuel
               (allowOpaqueIrStubs := !isIrGroup && partIsModule)
             st := stE
             opaqueStubs := pStubs.foldl (·.insert ·) opaqueStubs
             fdecls := pFdecls.foldl (·.insert ·) fdecls
+            allIrNames := pIrNames.foldl (·.insert ·) allIrNames
           | _, _, _, _ =>
             st := st.record "malformedOleanRegion" modName s!"part {pIdx} ModuleData fields unreadable"
-    return ({ violations := st.violations, stats := st.stats }, opaqueStubs, fdecls)
+    return ({ violations := st.violations, stats := st.stats }, opaqueStubs, fdecls, allIrNames, ownedNames)
 
 def mergeAuditStats (a b : AuditStats) : AuditStats := {
   declsChecked := a.declsChecked + b.declsChecked
@@ -3682,18 +3875,22 @@ def mergeAuditStats (a b : AuditStats) : AuditStats := {
 }
 
 /-- Validate a module's `.olean*` compacted-region group and its independent `.ir*`
-compacted-region group separately (A1 hardening: `.ir.sig`/`.ir` have an independent base
-address space from `.olean`/`.olean.server`/`.olean.private`, and every `module` `.olean`
-pure-`.opaque` IR signature stub must be backed by an `IR.Decl.fdecl` in `.ir`). -/
+compacted-region group separately (A1/A3 hardening):
+- `.ir.sig`/`.ir` have an independent base address space from `.olean*`.
+- Every `module` `.olean` pure-`.opaque` IR stub must be backed by an `IR.Decl.fdecl` in `.ir`.
+- Every `IR.Decl` in `.olean*` or `.ir*` must be owned by `modName` (`∈ constNames ∪ extraConstNames`)
+  whenever `oleanParts` declares module constants (blocking foreign `IR.Decl.fdecl` hijacking). -/
 def validateModuleArtifactParts (oleanParts irParts : Array ByteArray) (modName : Name)
     (forbidMainExport : Bool := true) (fuel : Nat := 20000000) : AuditReport := Id.run do
-  let (r1, oStubs, oFdecls) := validateOleanPartsEx oleanParts modName forbidMainExport fuel (isIrGroup := false)
-  let (r2, irFdecls) :=
-    if irParts.isEmpty then ({}, ({} : NameSet))
+  let (r1, oStubs, oFdecls, oIrNames, oOwned) :=
+    validateOleanPartsEx oleanParts modName forbidMainExport fuel (isIrGroup := false)
+  let (r2, irFdecls, irIrNames) :=
+    if irParts.isEmpty then ({}, ({} : NameSet), ({} : NameSet))
     else
-      let (rep, _, fds) := validateOleanPartsEx irParts modName forbidMainExport fuel (isIrGroup := true)
-      (rep, fds)
+      let (rep, _, fds, irNs, _) := validateOleanPartsEx irParts modName forbidMainExport fuel (isIrGroup := true)
+      (rep, fds, irNs)
   let allFdecls := irFdecls.foldl (·.insert ·) oFdecls
+  let allIr := irIrNames.foldl (·.insert ·) oIrNames
   let mut vs := r1.violations ++ r2.violations
   for stub in oStubs do
     if !allFdecls.contains stub then
@@ -3702,6 +3899,14 @@ def validateModuleArtifactParts (oleanParts irParts : Array ByteArray) (modName 
         decl := stub
         detail := s!"unresolved module IR.Decl.extern opaque stub {stub} in {modName} without backing .ir fdecl"
       }
+  if !oOwned.isEmpty then
+    for f in allIr do
+      if !oOwned.contains f then
+        vs := vs.push {
+          tag := "forgedIrDecl"
+          decl := f
+          detail := s!"binary IR.Decl {f} is not owned by module {modName} (constNames ∪ extraConstNames)"
+        }
   return { violations := vs, stats := mergeAuditStats r1.stats r2.stats }
 
 /-- Full pure-Lean binary `.olean`/`.ir` compacted-region pointer-DAG validation over
@@ -3952,41 +4157,63 @@ def independentAxiomClosures (env : Environment) (roots : Array Name) (fuel : Na
 
 def exportedAxiomsExtName : String := "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt"
 
-/-- Decode the per-declaration axiom arrays stored in a module's binary `exportedAxiomsExt`
-entries (A2 hardening: checks `ph`/`eh` ctor shapes `(tag=0, other=2)` and fails closed on
-any `validateBinName` violation instead of discarding name-hash/UTF-8 errors). -/
-def binExportedAxiomClaims (rawParts : Array ByteArray) :
-    Except String (Array (Name × Array Name)) := do
+structure BinAxiomPartInfo where
+  isModule   : Bool
+  constNames : Array Name
+  claims     : Array (Name × Array Name)
+  deriving Inhabited
+
+/-- Decode per-part `exportedAxiomsExt` entries, enforcing forward-pointer isolation (`visParts`),
+strict ctor `(tag=0, other=2)` shapes, and clean `validateBinName` checks. -/
+def binExportedAxiomClaimsPerPart (rawParts : Array ByteArray) :
+    Except String (Array BinAxiomPartInfo) := do
   let parts ← parseOleanParts rawParts
-  let mut out : Array (Name × Array Name) := #[]
-  let readCleanName (ptr : UInt64) (what : String) : Except String Name :=
-    let (st, info) := validateBinName parts .anonymous ptr {}
-    if !st.violations.isEmpty then
-      .error s!"{what} name invalid: {(st.violations.map Violation.render)}"
-    else
-      .ok info.name
-  for p in parts do
-    if isScalarWord p.rootPtr then continue
-    let rh ← readObjHeader parts p.rootPtr
-    for pairPtr in ← readArrayElems parts (← readFieldPtr parts rh 4) do
-      let ph ← readObjHeader parts pairPtr
+  let mut out : Array BinAxiomPartInfo := #[]
+  for pIdx in [0:parts.size] do
+    let visParts := parts.extract 0 (pIdx + 1)
+    let readCleanName (ptr : UInt64) (what : String) : Except String Name :=
+      let (st, info) := validateBinName visParts .anonymous ptr {}
+      if !st.violations.isEmpty then
+        .error s!"{what} name invalid: {(st.violations.map Violation.render)}"
+      else
+        .ok info.name
+    let p := parts[pIdx]!
+    if isScalarWord p.rootPtr then
+      out := out.push { isModule := false, constNames := #[], claims := #[] }
+      continue
+    let rh ← readObjHeader visParts p.rootPtr
+    let isMod := match readScalarU8 visParts rh 0 with | .ok 1 => true | _ => false
+    let mut cns : Array Name := #[]
+    for cnp in ← readArrayElems visParts (← readFieldPtr visParts rh 1) do
+      cns := cns.push (← readCleanName cnp "part constName")
+    let mut pClaims : Array (Name × Array Name) := #[]
+    for pairPtr in ← readArrayElems visParts (← readFieldPtr visParts rh 4) do
+      let ph ← readObjHeader visParts pairPtr
       if ph.tag != 0 || ph.other != 2 then
         throw s!"entries pair bad ctor (tag={ph.tag}, other={ph.other})"
-      let extName ← readCleanName (← readFieldPtr parts ph 0) "entries extension"
+      let extName ← readCleanName (← readFieldPtr visParts ph 0) "entries extension"
       if extName.toString == exportedAxiomsExtName then
-        for e in ← readArrayElems parts (← readFieldPtr parts ph 1) do
-          let eh ← readObjHeader parts e
+        for e in ← readArrayElems visParts (← readFieldPtr visParts ph 1) do
+          let eh ← readObjHeader visParts e
           if eh.tag != 0 || eh.other != 2 then
             throw s!"exportedAxiomsExt entry bad ctor (tag={eh.tag}, other={eh.other})"
-          let declName ← readCleanName (← readFieldPtr parts eh 0) "exportedAxiomsExt decl"
+          let declName ← readCleanName (← readFieldPtr visParts eh 0) "exportedAxiomsExt decl"
           let mut axs : Array Name := #[]
-          for a in ← readArrayElems parts (← readFieldPtr parts eh 1) do
+          for a in ← readArrayElems visParts (← readFieldPtr visParts eh 1) do
             axs := axs.push (← readCleanName a "exportedAxiomsExt axiom")
-          out := out.push (declName, axs)
+          pClaims := pClaims.push (declName, axs)
+    out := out.push { isModule := isMod, constNames := cns, claims := pClaims }
   return out
 
+/-- Decode the per-declaration axiom arrays stored in a module's binary `exportedAxiomsExt`
+entries (flattened across parts). -/
+def binExportedAxiomClaims (rawParts : Array ByteArray) :
+    Except String (Array (Name × Array Name)) := do
+  let perPart ← binExportedAxiomClaimsPerPart rawParts
+  return perPart.foldl (fun acc p => acc ++ p.claims) #[]
+
 /-- Reject module-owned declarations whose cached (`exportedAxiomsExt`) axiom array omits an
-axiom of the independently recomputed SCC-exact closure, plus duplicate claims or claims
+axiom of the independently recomputed SCC-exact closure, plus conflicting duplicates or claims
 targeting declarations owned by OTHER modules (`forgedExportedAxioms`). -/
 def validateExportedAxiomCache (env : Environment) (modName : Name)
     (claims : Array (Name × Array Name)) : AuditReport := Id.run do
@@ -3994,9 +4221,8 @@ def validateExportedAxiomCache (env : Environment) (modName : Name)
     | return { violations := #[{ tag := "missingModule", decl := modName, detail := "module not loaded in environment" }] }
   let mut vs : Array Violation := #[]
   -- B3: a `module` file legitimately stores the SAME (`.uniform`) cache in `.olean`,
-  -- `.olean.server` and `.olean.private`, so A2's "any duplicate" rule rejected every honest
-  -- module-system file. Only CONFLICTING duplicates are flagged; every copy is still checked
-  -- against the independent closure below.
+  -- `.olean.server` and `.olean.private`, so identical cross-part duplicates are accepted.
+  -- Conflicting duplicates and foreign-owned claims are rejected.
   let mut seenClaims : NameMap (Array Name) := {}
   let mut owned : Array (Name × Array Name) := #[]
   for (c, cached) in claims do
@@ -4049,20 +4275,80 @@ def validateExportedAxiomCache (env : Environment) (modName : Name)
             }
     return { violations := vs }
 
-/-- In-memory module validation plus the exported axiom-cache cross-check (decodes claims from
-BOTH `.olean*` and optional `.ir*` bytes so no extension code runs on import and `.ir` cannot
-smuggle forged `exportedAxiomsExt` entries). -/
+/-- Per-part `exportedAxiomsExt` validation (A3 hardening):
+1. Rejects ANY intra-part duplicate claim within a single `.olean*` part.
+2. Enforces completeness on `module` part 0 (`.olean` public interface): deleting
+   `exportedAxiomsExt` from `.olean` caused downstream `module` `#print axioms useEvil` to report
+   `[useEvil]` instead of `[evilAx]` while B3 returned `ok=true`! Every public part-0
+   declaration whose true Tarjan closure is non-empty MUST have an entry in part 0's cache.
+3. Also enforces completeness on non-`module` `.olean`s for every non-private, non-`.ctorInfo`
+   declaration with non-empty true closure (blocks deleting `exportedAxiomsExt` outright). -/
+def validateExportedAxiomCachePerPart (env : Environment) (modName : Name)
+    (partInfos : Array BinAxiomPartInfo) (checkCompleteness : Bool := true) : AuditReport := Id.run do
+  let some modIdx := env.getModuleIdx? modName
+    | return { violations := #[{ tag := "missingModule", decl := modName, detail := "module not loaded in environment" }] }
+  let mut vs : Array Violation := #[]
+  let mut flatClaims : Array (Name × Array Name) := #[]
+  for pIdx in [0:partInfos.size] do
+    let pi := partInfos[pIdx]!
+    let mut partSeen : NameSet := {}
+    for (c, cached) in pi.claims do
+      if partSeen.contains c then
+        vs := vs.push {
+          tag := "forgedExportedAxioms"
+          decl := c
+          detail := s!"intra-part duplicate exportedAxiomsExt entry for {c} in part {pIdx} of {modName}"
+        }
+      partSeen := partSeen.insert c
+      flatClaims := flatClaims.push (c, cached)
+  let baseRep := validateExportedAxiomCache env modName flatClaims
+  vs := vs ++ baseRep.violations
+  if checkCompleteness then
+    if let some p0 := partInfos[0]? then
+      let p0ClaimSet : NameSet := p0.claims.foldl (fun s (c, _) => s.insert c) {}
+      let candidates : Array Name :=
+        if p0.isModule then
+          p0.constNames.filter (fun c => env.getModuleIdxFor? c == some modIdx && !p0ClaimSet.contains c)
+        else
+          p0.constNames.filter (fun c =>
+            env.getModuleIdxFor? c == some modIdx && !p0ClaimSet.contains c &&
+            !isPrivateName c && !(match env.find? c with | some (.ctorInfo _) => true | _ => false))
+      if !candidates.isEmpty then
+        match independentAxiomClosures env candidates with
+        | .error v => vs := vs.push v
+        | .ok closures =>
+          for c in candidates do
+            let truth := (closures.find? c).getD #[]
+            if !truth.isEmpty then
+              let effNonEmpty :=
+                match env.find? c with
+                | some (.ctorInfo cv) =>
+                  match independentAxiomClosures env #[c] (skipInductCtorsFor := some cv.induct) with
+                  | .ok m => !((m.find? c).getD #[]).isEmpty
+                  | .error _ => true
+                | _ => true
+              if effNonEmpty then
+                vs := vs.push {
+                  tag := "forgedExportedAxioms"
+                  decl := c
+                  detail := s!"exportedAxiomsExt in part 0 of {modName} omits {c} despite non-empty true axiom closure {truth}"
+                }
+  return { violations := vs }
+
+/-- In-memory module validation plus per-part exported axiom-cache cross-check (decodes claims
+from BOTH `.olean*` and optional `.ir*` bytes so no extension code runs on import, `.ir` cannot
+smuggle forged entries, and deleting `exportedAxiomsExt` from `.olean` is rejected). -/
 def validateEnvModuleFull (env : Environment) (modName : Name) (oleanParts : Array ByteArray)
     (fuel : Nat := 20000000) (checkLiveExportState : Bool := true)
     (irParts : Array ByteArray := #[]) : AuditReport :=
   let r1 := validateEnvModule env modName fuel checkLiveExportState
-  let decodeGroup (ps : Array ByteArray) (label : String) : AuditReport :=
+  let decodeGroup (ps : Array ByteArray) (label : String) (checkComp : Bool) : AuditReport :=
     if ps.isEmpty then {}
-    else match binExportedAxiomClaims ps with
-      | .ok claims => validateExportedAxiomCache env modName claims
+    else match binExportedAxiomClaimsPerPart ps with
+      | .ok perPart => validateExportedAxiomCachePerPart env modName perPart (checkCompleteness := checkComp)
       | .error e => { violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := s!"{label} exportedAxiomsExt decode: {e}" }] }
-  let r2 := decodeGroup oleanParts "olean"
-  let r3 := decodeGroup irParts "ir"
+  let r2 := decodeGroup oleanParts "olean" true
+  let r3 := decodeGroup irParts "ir" false
   { violations := r1.violations ++ r2.violations ++ r3.violations, stats := r1.stats }
 
 /-! ## Section 10: Process Memory (`VmHWM` / `VmRSS`) & Benchmark Harness -/
@@ -5198,6 +5484,112 @@ B3 V-N6 conflicting duplicate claim: tags=#[forgedExportedAxioms]
     IO.println s!"B3 V-N6 honest 5-file module (uniform cache in 3 olean parts): claims={nClaims} Full ok={(validateEnvModuleFull env `B3Mod olPs (irParts := irPs)).ok}"
     let conflict := validateExportedAxiomCache env `B3Mod #[(`b3Use, #[`b3Ax]), (`b3Use, #[`b3Ax, `propext])]
     IO.println s!"B3 V-N6 conflicting duplicate claim: tags={conflict.tags}"
+  finally
+    try IO.FS.removeDirAll dir catch _ => pure ()
+
+/-! ## Section 11g: Round-A3 Adversarial Regressions
+
+Pins every bypass reproduced LIVE against B3 (`f606dba4`):
+1. Module-system deleted `exportedAxiomsExt` in part 0 (`.olean`) hides `evilAx` behind
+   `[useEvil]` in downstream `module` `#print axioms` while B3 returned `ok=true`!
+2. Multi-part compacted-region forward pointer (part 0 `.olean` pointing into part 1).
+3. V-S5 foreign `IR.Decl.fdecl` hijacking `Nat.add` (zero `exportAttr`/`extern`) + `.ir`
+   `Lean.Compiler.CSimp.ext` compiler-override extension.
+4. V-M2 duplicate `levelParams` (`[`u, `u]`) and unbound `Level.param `v`. -/
+
+/--
+info: A3 V-N6 module deleted exportedAxiomsExt in part0: Full=#[forgedExportedAxioms]
+A3 binary multi-part forward ptr (part0 -> part1): tags=#[malformedOleanRegion]
+A3 V-S5 foreign IR.Decl.fdecl hijacking Nat.add: binary=#[forgedIrDecl] memory=#[forgedIrDecl]
+A3 V-M2 duplicate levelParams: binary=#[forgedLevelMData] memory=#[forgedLevelMData]
+A3 V-M2 unbound Level.param: binary=#[forgedLevelMData] memory=#[forgedLevelMData]
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  let pid ← IO.Process.getPID
+  let dir : System.FilePath := ⟨s!"/tmp/anneal-proto-a3-{pid}"⟩
+  IO.FS.createDirAll dir
+  try
+    let libDir ← b1LibDir
+    let appDir ← IO.appDir
+    let leanBin : System.FilePath :=
+      match ← IO.getEnv "LEAN_BIN" with
+      | some p => ⟨p⟩
+      | none => ⟨appDir.toString ++ "/lean"⟩
+    let leanExe := if ← leanBin.pathExists then leanBin else ⟨"lean"⟩
+    -- (1) Module-system deleted `exportedAxiomsExt` in part 0 (`.olean`) while server/private keep it!
+    IO.FS.writeFile (dir / "A3ModDel.lean")
+      "module\npublic axiom a3EvilAx : False\npublic theorem a3UseEvil : False := a3EvilAx\n"
+    IO.FS.writeFile (dir / "A3ModDel.setup.json")
+      "{\"name\":\"A3ModDel\",\"isModule\":true,\"imports\":[{\"module\":\"Init\",\"importAll\":false,\"isExported\":true,\"isMeta\":false}],\"importArts\":{},\"dynlibs\":[],\"plugins\":[],\"options\":{}}"
+    let cOut ← IO.Process.output {
+      cmd := leanExe.toString
+      args := #["-j1", "--setup", (dir / "A3ModDel.setup.json").toString, "-o", (dir / "A3ModDel.olean").toString, (dir / "A3ModDel.lean").toString]
+      cwd := some dir }
+    if cOut.exitCode != 0 then throw (IO.userError s!"compile A3ModDel failed: {cOut.stderr}")
+    let (olPs0, irPs0) ← loadModulePartsFromDisk (dir / "A3ModDel")
+    -- Zero `m_size` on `exportedAxiomsExt`'s outer array in part 0 (`.olean`) ONLY!
+    let mut b0 := olPs0[0]!
+    let p0Parsed ← IO.ofExcept (parseOleanParts #[b0])
+    let rh0 ← IO.ofExcept (readObjHeader p0Parsed p0Parsed[0]!.rootPtr)
+    for pairPtr in ← IO.ofExcept (readArrayElems p0Parsed (← IO.ofExcept (readFieldPtr p0Parsed rh0 4))) do
+      let ph ← IO.ofExcept (readObjHeader p0Parsed pairPtr)
+      let (_, extInfo) := validateBinName p0Parsed `A3ModDel (← IO.ofExcept (readFieldPtr p0Parsed ph 0)) {}
+      if extInfo.name.toString == exportedAxiomsExtName then
+        let ah ← IO.ofExcept (readObjHeader p0Parsed (← IO.ofExcept (readFieldPtr p0Parsed ph 1)))
+        b0 := b1PutU64 b0 (ah.off + 8) 0
+    let olPsMut := olPs0.set! 0 b0
+    IO.FS.writeBinFile (dir / "A3ModDelMut.olean") b0
+    let olPaths : Array System.FilePath := #[dir / "A3ModDelMut.olean", dir / "A3ModDel.olean.server", dir / "A3ModDel.olean.private"]
+    let irPaths : Array System.FilePath := #[dir / "A3ModDel.ir.sig", dir / "A3ModDel.ir"]
+    searchPathRef.set [libDir]
+    let mArts : NameMap ImportArtifacts := ({} : NameMap ImportArtifacts).insert `A3ModDel (.ofArrays #[olPaths, irPaths])
+    let envDel ← importModules #[{ module := `A3ModDel }] {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private) (arts := mArts)
+    let repDel := validateEnvModuleFull envDel `A3ModDel olPsMut (irParts := irPs0)
+    IO.println s!"A3 V-N6 module deleted exportedAxiomsExt in part0: Full={repDel.tags}"
+    -- (2) Multi-part forward pointer: part 0 root_ptr points into part 1 address space!
+    let mkHdr (base root : UInt64) (sz : Nat) : ByteArray := Id.run do
+      let mut b := ByteArray.mk (Array.replicate sz (0 : UInt8))
+      b := b.set! 0 0x6f |>.set! 1 0x6c |>.set! 2 0x65 |>.set! 3 0x61 |>.set! 4 0x6e |>.set! 5 2
+      b := b1PutU64 b 80 base
+      b := b1PutU64 b 88 root
+      return b
+    let fwdPart0 := mkHdr 0x100000 (0x140000 + 96) 128
+    let fwdPart1 := mkHdr 0x140000 1 128
+    IO.println s!"A3 binary multi-part forward ptr (part0 -> part1): tags={(validateOleanParts #[fwdPart0, fwdPart1] `A3Fwd).tags}"
+    -- (3) Foreign `IR.Decl.fdecl` hijacking `Nat.add` (zero exportAttr/extern)!
+    let foreignDecl : IR.Decl := .fdecl `Nat.add #[] .object (.ret (.var ⟨0⟩)) {}
+    let fDonorEnv := IR.declMapExt.addEntry (← mkEmptyEnvironment) foreignDecl
+    let pFDonor := dir / "A3IrDonor.olean"
+    writeModule fDonorEnv pFDonor (writeIR := false)
+    let (fDonorMd, _) ← readModuleData pFDonor
+    let fIrEntries := fDonorMd.entries.filter (·.1 == `Lean.IR.declMapExt)
+    let pForIr := dir / "A3ForeignIr.olean"
+    saveModuleData pForIr `A3ForeignIr {
+      isModule := false
+      imports := #[{ module := `Init.Core, importAll := false, isExported := true, isMeta := false }]
+      constNames := #[`a3OwnFn]
+      constants := #[.defnInfo {
+        name := `a3OwnFn, levelParams := [], type := mkConst ``Nat, value := mkNatLit 0
+        hints := .abbrev, safety := .safe, all := [`a3OwnFn] }]
+      extraConstNames := #[]
+      entries := fIrEntries }
+    let bForIr ← IO.FS.readBinFile pForIr
+    let envForIr ← b1Import libDir [(`A3ForeignIr, pForIr)] `A3ForeignIr
+    IO.println s!"A3 V-S5 foreign IR.Decl.fdecl hijacking Nat.add: binary={(validateOleanParts #[bForIr] `A3ForeignIr).tags} memory={(validateEnvModule envForIr `A3ForeignIr).tags}"
+    -- (4) Duplicate `levelParams` & unbound `Level.param`.
+    let dupLpCi : ConstantInfo := .defnInfo {
+      name := `a3DupLp, levelParams := [`u, `u], type := Expr.sort (Level.param `u)
+      value := Expr.const ``Nat [], hints := .abbrev, safety := .safe, all := [`a3DupLp] }
+    let pDupLp ← b1Save dir `A3DupLp #[`Init.Core] #[`a3DupLp] #[dupLpCi]
+    let envDupLp ← b1Import libDir [(`A3DupLp, pDupLp)] `A3DupLp
+    IO.println s!"A3 V-M2 duplicate levelParams: binary={(validateOleanParts #[← IO.FS.readBinFile pDupLp] `A3DupLp).tags} memory={(validateEnvModule envDupLp `A3DupLp).tags}"
+    let unbLpCi : ConstantInfo := .defnInfo {
+      name := `a3UnbLp, levelParams := [`u], type := Expr.sort (Level.param `v)
+      value := Expr.const ``Nat [], hints := .abbrev, safety := .safe, all := [`a3UnbLp] }
+    let pUnbLp ← b1Save dir `A3UnbLp #[`Init.Core] #[`a3UnbLp] #[unbLpCi]
+    let envUnbLp ← b1Import libDir [(`A3UnbLp, pUnbLp)] `A3UnbLp
+    IO.println s!"A3 V-M2 unbound Level.param: binary={(validateOleanParts #[← IO.FS.readBinFile pUnbLp] `A3UnbLp).tags} memory={(validateEnvModule envUnbLp `A3UnbLp).tags}"
   finally
     try IO.FS.removeDirAll dir catch _ => pure ()
 

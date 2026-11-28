@@ -126,6 +126,27 @@ against Round B2:
   budget the bounded equality now returns `true`, which is sound because any `Syntax` that
   large already fails validation closed (`auditFuelExhausted`).
 
+## Adversarial Hardening Regressions (Round A3)
+
+`tests/mir/OleanQuotMdataUtf8ProtoTests.lean` Section 11g pins bypasses reproduced live
+against Round B3:
+
+- **V-N6 / module deleted `exportedAxiomsExt`**: deleting `exportedAxiomsExt` from part 0
+  (`.olean`) of a `module` causes downstream `module` `#print axioms useEvil` to hide
+  `evilAx` behind `[useEvil]` while B3 returned `ok=true` (because `.olean.server`/`.private`
+  still had claims, or all-empty claims yielded 0 iterations). Closed by per-part decoding
+  (`binExportedAxiomClaimsPerPart` / `validateExportedAxiomCachePerPart`) enforcing part-0
+  completeness for non-empty axiom closures and zero intra-part duplicates.
+- **Multi-part forward pointers**: `validateOleanPartsEx` and `binExportedAxiomClaimsPerPart`
+  now restrict part `pIdx` pointer resolution to `parts[0..pIdx]`, rejecting dangling forward
+  pointers from `.olean` into `.olean.server`/`.olean.private` (`malformedOleanRegion`).
+- **V-S5 / foreign `IR.Decl` hijacking & compiler overrides**: rejects `IR.Decl` entries whose
+  `FunId` is not owned by `modName` (`constNames ∪ extraConstNames`) or duplicated within a
+  table (`forgedIrDecl`), and audits `CSimp.ext` / `passManagerExt` / `folderExt` across both
+  `.olean` and `.ir` (`forbiddenExportAttr`).
+- **V-M2 / universe-parameter scoping**: rejects duplicate `levelParams` and unbound
+  `Level.param` references in both binary and in-memory validators (`forgedLevelMData`).
+
 ## Running the Suite
 
 ```bash
