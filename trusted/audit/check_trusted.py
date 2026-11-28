@@ -15,7 +15,6 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
-import struct
 import subprocess
 import sys
 import tempfile
@@ -739,28 +738,30 @@ def _validate_olean_parts(module: str, olean_parts: list[str], phase: str, ir_pa
 
 def _walk_region(data: bytes, base: int, root: int, parents) -> set:
     """Validate every own-region object reachable from `root` (m_rc 0, known kind, bounds, MPZ/String/ScalarArray)."""
-    size, seen, stack = len(data), {root}, [root]
+    size, seen, stack, mv = len(data), {root}, [root], memoryview(data)
+    u64 = lambda p: int.from_bytes(mv[p:p + 8], "little")
     while stack:
         o = stack.pop() - base
-        rc, cs, oth, tag = struct.unpack_from("<iHBB", data, o)
-        msz, cap = struct.unpack_from("<QQ", data, o + 8) if o + 24 <= size else (1, 0)
+        cs, oth, tag = data[o + 4] | (data[o + 5] << 8), data[o + 6], data[o + 7]
+        msz, cap = (u64(o + 8), u64(o + 16)) if o + 24 <= size else (1, 0)
         if tag <= 243 and (cs == 0 or cs >= 8 + 8 * oth):
             end, n, at = o + max(cs, 8 + 8 * oth), oth, o + 8
         elif tag == 246 and msz <= cap:
             end, n, at = o + 24 + 8 * cap, msz, o + 24
         elif tag == 248 and oth > 0 and msz <= cap:
             end, n, at = o + 24 + oth * cap, 0, o + 24
-        elif tag == 249 and 1 <= msz <= cap and o + 32 + cap <= size and data[o + 32 + msz - 1] == 0 and struct.unpack_from("<Q", data, o + 24)[0] < msz:
+        elif tag == 249 and 1 <= msz <= cap and o + 32 + cap <= size and data[o + 32 + msz - 1] == 0 and u64(o + 24) < msz:
             end, n, at = o + 32 + cap, 0, o + 24
         elif tag == 250 and o + 24 <= size and (cs == 0 or cs >= 24):
-            alloc, msz_i, dptr = struct.unpack_from("<iiQ", data, o + 8)
+            alloc, msz_i, dptr = int.from_bytes(mv[o + 8:o + 12], "little", signed=True), int.from_bytes(mv[o + 12:o + 16], "little", signed=True), u64(o + 16)
             ok = alloc >= 0 and abs(msz_i) <= alloc and (alloc == 0 or ((dptr & 7) == 0 and base + 96 <= dptr and dptr + 8 * alloc <= base + size))
             end, n, at = (o + max(cs, 24) if ok else size + 1), 0, o
         else:
             end, n, at = size + 1, 0, o
-        if rc != 0 or end > size:
+        if mv[o:o + 4] != b"\x00\x00\x00\x00" or end > size:
             raise ValueError(f"invalid object (tag {tag}) at offset {o}")
-        for c in struct.unpack_from(f"<{n}Q", data, at):
+        for p in range(at, at + 8 * n, 8):
+            c = u64(p)
             if c & 7 == 0 and base + 96 <= c < base + o:  # Compaction is post-order: own fields point strictly down.
                 if c not in seen:
                     seen.add(c)
@@ -788,7 +789,7 @@ def _validate_layer_chain(module: str, chain, phase: str, disjoint=()) -> list[t
             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid header magic/version/flags in {p}")
         if data[7:40] != _OLEAN_LEAN_VER or data[40:80] != _OLEAN_GITHASH:
             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: unpinned Lean version/githash in {p}")
-        base_addr, root_ptr = struct.unpack_from("<QQ", data, 80)
+        base_addr, root_ptr = int.from_bytes(data[80:88], "little"), int.from_bytes(data[88:96], "little")
         if base_addr == 0 or (base_addr & 7) != 0 or base_addr + size >= (1 << 64):
             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid/overflowing baseAddr in {p}")
         if any(not (base_addr + size <= pb or pb + ps <= base_addr) for pb, ps, *_ in (*parents, *disjoint)):
@@ -798,16 +799,16 @@ def _validate_layer_chain(module: str, chain, phase: str, disjoint=()) -> list[t
         if base_addr + 96 <= root_ptr <= base_addr + size - 8:
             off = root_ptr - base_addr
             # Pinned roots are `ModuleData`-shaped: tag 0, 5 object fields, 56 bytes.
-            if (root_ptr & 7) != 0 or off + 56 > size or struct.unpack_from("<iHBB", data, off) != (0, 56, 5, 0):
+            if (root_ptr & 7) != 0 or off + 56 > size or data[off:off + 8] != b"\x00\x00\x00\x00\x38\x00\x05\x00":
                 raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root object header in {p}")
-            kids = struct.unpack_from("<5Q", data, off + 8)
+            kids = tuple(int.from_bytes(data[off + 8 + 8 * k:off + 16 + 8 * k], "little") for k in range(5))
             for k, child in enumerate(kids):  # Own-region `Array` fields (bounds: `_walk_region`) or a parent's same slot.
                 own = (child & 7) == 0 and base_addr + 96 <= child <= base_addr + size - 8
                 if not (data[child - base_addr + 7] == 246 if own else any(len(pl[3]) == 5 and pl[3][k] == child for pl in parents)):
                     raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid or out-of-bounds root child ptr in {p}")
             try:  # Every reachable object, not just the root's first hops (`importModules` maps them all).
                 seen = _walk_region(data, base_addr, root_ptr, [pl[4] for pl in parents])
-            except (ValueError, struct.error) as error:
+            except ValueError as error:
                 raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: {error} in {p}") from error
         elif not parents or size != 96 or not any(root_ptr == pr for _, _, pr, *_ in parents):
             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid out-of-region rootPtr in {p}")
