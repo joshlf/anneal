@@ -266,7 +266,11 @@ example : checkIRAtSpecModel v1Env ["M"]
       (by decide))
 example : checkIRAtSpecModel v1Env ["M"]
     (mkPrivateName ["Init", "Prelude"] ["Array", "fold"] ++
-      [.str "_at_"] ++ mkPrivateName ["Other"] ["site", "spec_0"]) = false := by decide
+      [.str "_at_"] ++ mkPrivateName ["Other"] ["site", "spec_0"]) = false :=
+  checkIRAtSpec_rejects_foreign_private_last_site v1Env ["M"] _
+    (mkPrivateName ["Init", "Prelude"] ["Array", "fold"]) []
+    (mkPrivateName ["Other"] ["site", "spec_0"]) (mkPrivateName ["Other"] ["site"])
+    ⟨["Other"], ["site"]⟩ 1 (by decide) (by decide) (by decide) (by decide)
 example : checkIRAtSpecModel v1Env ["M"]
     (mkPrivateName ["Init", "Prelude"] ["Array", "fold"] ++
       [.str "_at_", .str "M", .str "noSpec"]) = false := by decide
@@ -375,6 +379,9 @@ example : "_native.ax_0" ∈ (wholeModuleAxiomSweep true localSorryAndNativeInve
   wholeModuleAxiomSweep_rejects_native_in_local_mod true localSorryAndNativeInventory
     { kind := .axiomDecl, name := "_native.ax_0", declaringMod := "T", originMod := "T",
       isLocalAxiomMod := true, isNative := true } (by decide) rfl rfl
+example : "Classical.choice" ∈ (wholeModuleAxiomSweep false adversarialInventory).violations :=
+  wholeModuleAxiomSweep_rejects_classical_in_constructive adversarialInventory
+    (toolchainAxiom "Classical.choice" true) (by decide) rfl rfl rfl
 
 /-- Positive control: toolchain foundational axioms, a file-local test axiom, and an
 `Assumptions.*` axiom inside an `Assumptions.*` test module. -/
@@ -913,6 +920,8 @@ example : letBoundArgOnly.scrutineesTheoremFree = true := by decide
 example : cleanUse.flagged = false := by decide
 example : cleanUse.scrutineesTheoremFree = true := by decide
 example : cleanUse.flagged = false := readinessScanner_clean_zero_flags cleanUse (by decide)
+example : cleanUse.scrutineesTheoremFree = true :=
+  (readinessScanner_flagged_iff_not_clean cleanUse).mp (by decide)
 -- A theorem under a binder inside a scrutinee is a function body, not a carried proof.
 example : (ReadinessExpr.proj (.lam (.const "thm" true))).flagged = false := by decide
 
@@ -1455,5 +1464,26 @@ never `Classical.choice`, `sorryAx`, or a native-evaluation axiom.
 /-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_clean_zero_flags_at' does not depend on any axioms -/
 #guard_msgs in
 #print axioms readinessScanner_clean_zero_flags_at
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.checkIRAtSiteModel_none_of_foreign_private_last' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms checkIRAtSiteModel_none_of_foreign_private_last
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.checkIRAtSpec_rejects_foreign_private_last_site' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms checkIRAtSpec_rejects_foreign_private_last_site
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.wholeModuleAxiomSweep_rejects_classical_in_constructive' depends on axioms: [propext,
+ Quot.sound] -/
+#guard_msgs in
+#print axioms wholeModuleAxiomSweep_rejects_classical_in_constructive
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_flaggedAt_eq_not_cleanAt' does not depend on any axioms -/
+#guard_msgs in
+#print axioms readinessScanner_flaggedAt_eq_not_cleanAt
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_flagged_iff_not_clean' does not depend on any axioms -/
+#guard_msgs in
+#print axioms readinessScanner_flagged_iff_not_clean
 
 end Anneal.OleanShadowAndOverrideAuditTests

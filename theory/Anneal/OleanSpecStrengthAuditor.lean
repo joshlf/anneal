@@ -2068,6 +2068,81 @@ theorem checkIRAtSpec_rejects_forged_site (env : PrivateAuditEnv) (declaringMod 
     rw [hnone']
     exact Bool.and_false _
 
+theorem checkIRAtSiteModel_none_of_foreign_private_last (env : PrivateAuditEnv)
+    (declaringMod : List String) (seg site : AuditName) (r : PrivateParseResult) (sp : Nat)
+    (hstrip : stripSpecTailModel seg = some (site, sp))
+    (hparse : parseStrictPrivateName site = some r)
+    (hforeign : (r.moduleSegs == declaringMod) = false) :
+    checkIRAtSiteModel env declaringMod true seg = none := by
+  have hm := parseStrictPrivate_some_mentions site r hparse
+  unfold checkIRAtSiteModel
+  rw [hstrip]
+  show (if (true && sp == 0) = true then none
+    else if hasPrivateMentionModel site = true then
+      match parseStrictPrivateName site with
+      | some r' =>
+        if env.loadedModules.contains r'.moduleSegs &&
+            !privateUserForbiddenModel env r'.moduleSegs r'.userComps &&
+            (!true || r'.moduleSegs == declaringMod) then some sp
+        else none
+      | none => none
+    else
+      match allStrComps site with
+      | some us =>
+        if !isShareCommonNameModel us && (!true || !privateUserForbiddenModel env declaringMod us) then
+          some sp
+        else none
+      | none => none) = none
+  cases hsp : (sp == 0) with
+  | true => rfl
+  | false =>
+    rw [hm, hparse]
+    show (if (env.loadedModules.contains r.moduleSegs &&
+        !privateUserForbiddenModel env r.moduleSegs r.userComps &&
+        (!true || r.moduleSegs == declaringMod)) = true then some sp else none) = none
+    rw [hforeign]
+    have hfalse : (env.loadedModules.contains r.moduleSegs &&
+        !privateUserForbiddenModel env r.moduleSegs r.userComps && (!true || false)) = false :=
+      Bool.and_false _
+    rw [hfalse]
+    rfl
+
+/-- **V1 non-evasion (foreign private `_at_` final site).** Any `_at_` specialization name whose
+final site is a private name claiming a module other than `declaringMod` is rejected. -/
+theorem checkIRAtSpec_rejects_foreign_private_last_site (env : PrivateAuditEnv)
+    (declaringMod : List String) (n head : AuditName) (mid : List AuditName)
+    (last site : AuditName) (r : PrivateParseResult) (sp : Nat)
+    (hsplit : splitOnAt n = head :: (mid ++ [last]))
+    (hstrip : stripSpecTailModel last = some (site, sp))
+    (hparse : parseStrictPrivateName site = some r)
+    (hforeign : (r.moduleSegs == declaringMod) = false) :
+    checkIRAtSpecModel env declaringMod n = false := by
+  have hnone : checkIRAtTailsModel env declaringMod (mid ++ [last]) = none :=
+    checkIRAtTailsModel_none_of_last env declaringMod mid last
+      (checkIRAtSiteModel_none_of_foreign_private_last env declaringMod last site r sp hstrip
+        hparse hforeign)
+  unfold checkIRAtSpecModel
+  rw [hsplit]
+  cases hm : mid with
+  | nil =>
+    rw [hm] at hnone
+    have hnone' : checkIRAtTailsModel env declaringMod [last] = none := hnone
+    show (checkIRAtHeadModel env head &&
+      (match checkIRAtTailsModel env declaringMod [last] with
+       | some tot => tot == ([last]).length
+       | none => false)) = false
+    rw [hnone']
+    exact Bool.and_false _
+  | cons seg rest =>
+    rw [hm] at hnone
+    have hnone' : checkIRAtTailsModel env declaringMod (seg :: (rest ++ [last])) = none := hnone
+    show (checkIRAtHeadModel env head &&
+      (match checkIRAtTailsModel env declaringMod (seg :: (rest ++ [last])) with
+       | some tot => tot == (seg :: (rest ++ [last])).length
+       | none => false)) = false
+    rw [hnone']
+    exact Bool.and_false _
+
 /-! ## 9. V2 — Whole-Module Unreferenced Top-Level Axiom Sweep (`leanprover/lean4#16781`)
 
 Reachability-only axiom auditing (`#print axioms`-style closure from the claims) cannot see a
@@ -2332,6 +2407,17 @@ theorem wholeModuleAxiomSweep_rejects_masked_redecl (allowClassical : Bool)
     (hax : e.kind = .axiomDecl) (hne : e.originMod ≠ e.declaringMod) :
     e.name ∈ (wholeModuleAxiomSweep allowClassical inv).violations :=
   wholeModuleAxiomSweep_complete allowClassical inv e hmem hax fun h => hne h.1
+
+/-- **V2 (g).** Under constructive policy (`allowClassical = false`), `Classical.choice` is always
+rejected even when declared by a pinned toolchain module as a foundational axiom. -/
+theorem wholeModuleAxiomSweep_rejects_classical_in_constructive (inv : ModuleInventoryModel)
+    (e : DeclEntryModel) (hmem : e ∈ inv.allEntries) (hax : e.kind = .axiomDecl)
+    (hc : e.isClassicalChoice = true) (hf : e.isFoundational = true) :
+    e.name ∈ (wholeModuleAxiomSweep false inv).violations :=
+  wholeModuleAxiomSweep_complete false inv e hmem hax fun h => by
+    rcases h.2.2.2 with ⟨_, _, hallow⟩ | ⟨_, hnf, _⟩
+    · cases hallow hc
+    · rw [hf] at hnf; cases hnf
 
 /-! ## 10. V3 — Artifact Root Containment & Acyclic Compacted-Region Bounds (`leanprover/lean4#16737`)
 
@@ -3376,6 +3462,52 @@ flagged, however many theorems it uses elsewhere. -/
 theorem readinessScanner_clean_zero_flags (e : ReadinessExpr)
     (h : e.scrutineesTheoremFree = true) : e.flagged = false :=
   readinessScanner_clean_zero_flags_at e [] h
+
+/-- Exact Boolean duality: `flaggedAt bm` is literally `!scrutineesTheoremFreeAt bm` (zero slack
+between the scanner and the clean-scrutinee predicate). -/
+theorem readinessScanner_flaggedAt_eq_not_cleanAt (e : ReadinessExpr) :
+    ∀ (bm : List Bool), e.flaggedAt bm = !e.scrutineesTheoremFreeAt bm := by
+  induction e with
+  | const _ _ => intro _; rfl
+  | bvar _ => intro _; rfl
+  | app f a ihf iha =>
+    intro bm
+    show (f.flaggedAt bm || a.flaggedAt bm) =
+      !(f.scrutineesTheoremFreeAt bm && a.scrutineesTheoremFreeAt bm)
+    rw [ihf bm, iha bm]
+    cases f.scrutineesTheoremFreeAt bm <;> cases a.scrutineesTheoremFreeAt bm <;> rfl
+  | lam b ih => intro bm; exact ih (false :: bm)
+  | letE v b ihv ihb =>
+    intro bm
+    show (v.flaggedAt bm || b.flaggedAt (v.carriesTheoremAt bm :: bm)) =
+      !(v.scrutineesTheoremFreeAt bm && b.scrutineesTheoremFreeAt (v.carriesTheoremAt bm :: bm))
+    rw [ihv bm, ihb (v.carriesTheoremAt bm :: bm)]
+    cases v.scrutineesTheoremFreeAt bm <;>
+      cases b.scrutineesTheoremFreeAt (v.carriesTheoremAt bm :: bm) <;> rfl
+  | proj s ih =>
+    intro bm
+    show (s.carriesTheoremAt bm || s.flaggedAt bm) =
+      !(!s.carriesTheoremAt bm && s.scrutineesTheoremFreeAt bm)
+    rw [ih bm]
+    cases s.carriesTheoremAt bm <;> cases s.scrutineesTheoremFreeAt bm <;> rfl
+  | recursorApp minors major ihm ihM =>
+    intro bm
+    show (major.carriesTheoremAt bm || minors.flaggedAt bm || major.flaggedAt bm) =
+      !(!major.carriesTheoremAt bm && minors.scrutineesTheoremFreeAt bm &&
+        major.scrutineesTheoremFreeAt bm)
+    rw [ihm bm, ihM bm]
+    cases major.carriesTheoremAt bm <;> cases minors.scrutineesTheoremFreeAt bm <;>
+      cases major.scrutineesTheoremFreeAt bm <;> rfl
+
+/-- **V4 readiness exact characterization.** A closed expression has `flagged = false` if and only
+if every scrutinee position is theorem-free (`scrutineesTheoremFree = true`). -/
+theorem readinessScanner_flagged_iff_not_clean (e : ReadinessExpr) :
+    e.flagged = false ↔ e.scrutineesTheoremFree = true := by
+  show e.flaggedAt [] = false ↔ e.scrutineesTheoremFreeAt [] = true
+  rw [readinessScanner_flaggedAt_eq_not_cleanAt e []]
+  cases e.scrutineesTheoremFreeAt [] with
+  | false => exact ⟨fun h => (by cases h), fun h => (by cases h)⟩
+  | true => exact ⟨fun _ => rfl, fun _ => rfl⟩
 
 /-- Filtering with a predicate that is `false` on every element yields `[]`. -/
 theorem filter_nil_of_all_false {α : Type} (p : α → Bool) :

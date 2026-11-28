@@ -2361,16 +2361,17 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "def pubFn (xs : List Nat) : Nat := (mapped xs).length + (GoodBox.mk 1).ctorIdx\n"
             "def fib : Nat → Nat\n  | 0 => 0\n  | 1 => 1\n  | n + 2 => fib n + fib (n + 1)\n"), ["Init"])
         g31_base = olean_accept(ol3, ["OlG31Base"])
-        assert g31_base["replay"] is True and g31_base["privateNamesAudited"] >= 2, g31_base
+        assert g31_base["replay"] is True and g31_base["privateNamesAudited"] >= 4, g31_base
         assert g31_base["oleanFilesValidated"] >= 1 and g31_base["opaqueTheoremReadinessFlags"] == 0, g31_base
 
-        def ir_has_private_at(module):
-            """The compiled artifacts (IR lives in `.olean` for non-module files, in `.ir` for module
-            files) really carry an `_at_` specialization of a private helper."""
-            data = b"".join(Path(p).read_bytes() for group in ol3.artifacts[module] for p in group)
-            return b"_at_" in data and b"_private" in data and b"spec_" in data
+        def ir_has_private_at(module, helper_tok, site_tok, *, ir_only=False):
+            """Verify compiled IR (in `.olean` for non-module files, strictly in `.ir` for module
+            files) genuinely carries a private `_at_` specialization referencing the private helper."""
+            paths = [ol3.artifacts[module][1][1]] if ir_only else [p for g in ol3.artifacts[module] for p in g]
+            data = b"".join(Path(p).read_bytes() for p in paths)
+            return all(tok in data for tok in (b"_at_", b"_private", b"spec_", helper_tok, site_tok))
 
-        assert ir_has_private_at("OlG31Base"), "positive control lost its private `_at_` specialization"
+        assert ir_has_private_at("OlG31Base", b"helper", b"mapped"), "positive control lost its private `_at_` specialization"
         olean_module(ol3, "OlG31ModPos", (
             "module\nprelude\npublic import Init\n"
             "public structure ModBox where\n  x : Nat\n"
@@ -2379,9 +2380,10 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "public def modPubFn (xs : List Nat) : Nat := (modMapped xs).length + (ModBox.mk 1).ctorIdx\n"),
             ["Init"], module_file=True)
         g31_mod = olean_accept(ol3, ["OlG31ModPos"])
-        assert g31_mod["replay"] is True and g31_mod["privateNamesAudited"] >= 2, g31_mod
+        assert g31_mod["replay"] is True and g31_mod["privateNamesAudited"] >= 4, g31_mod
         assert g31_mod["oleanFilesValidated"] >= 5 and g31_mod["opaqueTheoremReadinessFlags"] == 0, g31_mod
-        assert ir_has_private_at("OlG31ModPos"), "module-file positive control lost its private `_at_` specialization"
+        assert ir_has_private_at("OlG31ModPos", b"modHelper", b"modMapped", ir_only=True), (
+            "module-file `.ir` lost its private `_at_` specialization")
         # V1 attacks without metaprogramming: reserved-root user suffixes in an ordinary module.
         olean_module(ol3, "OlG31V1Src", prelude_init + (
             "namespace Trusted\nprivate def spoof : Nat := 1\nend Trusted\n"
@@ -2429,9 +2431,22 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "  modifyEnv fun env => IR.declMapExt.addEntry env\n"
             "    (.fdecl atName #[] .object (.vdecl ⟨0⟩ .object (.lit (.num 0)) (.ret (.var ⟨0⟩))) {})\n"
             "def trOnly (n : Nat) : Nat := n\n"
+            "def zeroSrc : Nat := 0\n"
             "run_meta do\n"
             "  let stx := Syntax.node .none `Lean.Parser.Attr.simple #[mkIdent `tagged_return]\n"
-            "  Attribute.add ``trOnly `tagged_return stx .global\n")
+            "  Attribute.add ``trOnly `tagged_return stx .global\n"
+            "  addDecl (.defnDecl {\n"
+            "    name := `retMismatch, levelParams := [], type := mkConst ``Nat,\n"
+            "    value := mkNatLit 1, hints := .opaque, safety := .safe })\n"
+            "  let env ← getEnv\n"
+            "  let some bd := Compiler.LCNF.getDeclCore? env Compiler.LCNF.baseExt ``zeroSrc | throwError \"no base\"\n"
+            "  let some md := Compiler.LCNF.getDeclCore? env Compiler.LCNF.monoExt ``zeroSrc | throwError \"no mono\"\n"
+            "  let some ir := IR.findEnvDecl env ``zeroSrc | throwError \"no ir\"\n"
+            "  let ir' := match ir with | .fdecl _ ps ty b i => IR.Decl.fdecl `retMismatch ps ty b i | other => other\n"
+            "  modifyEnv fun e =>\n"
+            "    let e := Compiler.LCNF.baseExt.addEntry e { bd with name := `retMismatch }\n"
+            "    let e := Compiler.LCNF.monoExt.addEntry e { md with name := `retMismatch }\n"
+            "    IR.declMapExt.addEntry e ir'\n")
         olean_module(ol3, "OlG31V1Meta", v1_meta, ["Lean", "Init.Data.Array.Basic", "OlG31Base"])
         v1_msg = olean_reject(ol3, ["OlG31Base", "OlG31V1Meta"], "[privateNamespaceSpoofed]",
                               "_private.Init.Prelude.0.fake", "_private.OlG31V1Meta.0.Trusted.foo",
@@ -2443,7 +2458,9 @@ def self_test(checkout: Path, lean: Path | None) -> int:
                               "_private.GhostMod.0.fake", "is not a loaded module",
                               "_private.OlG31Base.0.helper.eq_999", "_at_.Trusted.forged_site",
                               "malformed _private name shape", "outside verified realized-aux set",
-                              "[compilerOverrideAttribute] trOnly (OlG31V1Meta)", "tagged_return", **lean_roots)
+                              "[compilerOverrideAttribute] trOnly (OlG31V1Meta)", "tagged_return",
+                              "[compilerOverrideAttribute] retMismatch (OlG31V1Meta)", "lcnf_ir_mismatch",
+                              **lean_roots)
         assert "privateNamespaceSpoofed=13" in v1_msg, v1_msg
 
         # V2: an unreferenced top-level axiom nothing refers to; a foreign `Assumptions.*` axiom
