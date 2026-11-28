@@ -2734,11 +2734,26 @@ def self_test(checkout: Path, lean: Path | None) -> int:
             "theorem thmUsesIdInRec : Eq.rec (motive := fun _ _ => Nat) 8 (id myEq) = 8 := rfl\n"
             "def usesWrapThmInRec : Nat := Eq.rec (motive := fun _ _ => Nat) 9 (wrapEq myEq)\n"
             "def usesLetThmInRec : Nat := let h := myEq; Eq.rec (motive := fun _ _ => Nat) 10 (wrapEq h)\n"
-            "def usesThmAsArg : Nat := (fun (_ : (1 : Nat) = 1) => 3) myEq\n"), ["Init"])
+            "def usesThmAsArg : Nat := (fun (_ : (1 : Nat) = 1) => 3) myEq\n"
+            # `Acc.rec` reached only after unfolding a definition (directly, and through the
+            # `WellFounded.fix` of a well-founded definition): counted.
+            "theorem accZero : Acc (fun (a b : Nat) => a < b) 0 := Acc.intro 0 (fun _ h => absurd h (Nat.not_lt_zero _))\n"
+            "def accWrap (h : Acc (fun (a b : Nat) => a < b) 0) : Nat :=\n"
+            "  Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 16) h\n"
+            "def usesAccWrap : Nat := accWrap accZero\n"
+            "def wfHalf (n : Nat) : Nat := if h : n = 0 then 0 else wfHalf (n / 2)\n"
+            "termination_by n\ndecreasing_by exact Nat.div_lt_self (Nat.pos_of_ne_zero h) (by decide)\n"
+            # Structure eta and K-like reduction survive opaque theorems: `And.casesOn`, a `match`
+            # on a proof, and `cast` on an equality theorem still reduce, so they are not counted.
+            "theorem myAnd : True ∧ True := ⟨trivial, trivial⟩\n"
+            "theorem natEq : Nat = Nat := rfl\n"
+            "def usesCasesOn : Nat := And.casesOn (motive := fun _ => Nat) myAnd (fun _ _ => 14)\n"
+            "def usesMatch : Nat := match myAnd with | ⟨_, _⟩ => 15\n"
+            "def usesCast : Nat := cast natEq 17\n"), ["Init"])
         ready_off = olean_accept(ol3, ["OlG31Ready"])
         assert ready_off["opaqueTheoremReadinessFlags"] == 0, ready_off
         ready_on = olean_accept(ol3, ["OlG31Ready"], checkOpaqueTheoremReadiness=True)
-        assert ready_on["replay"] is True and ready_on["opaqueTheoremReadinessFlags"] == 5, ready_on
+        assert ready_on["replay"] is True and ready_on["opaqueTheoremReadinessFlags"] == 7, ready_on
         olean_module(ol3, "OlG31ReadyProj", (
             "prelude\nimport Lean\nopen Lean\n"
             "set_option linter.defProp false\n"

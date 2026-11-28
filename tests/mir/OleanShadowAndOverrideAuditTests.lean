@@ -944,6 +944,33 @@ example : (scanModuleOpaqueTheoremReadiness true
     [{ name := "cleanDef", type := .const "Nat" false, value := some cleanUse }]).flagCount = 0 := by
   decide
 
+/-- `accWrap accZero` with `accWrap h := Acc.rec f h`: the surface value applies a definition to a
+theorem argument, so no recursor is visible; its head-normal form is `Acc.rec f accZero`, a theorem
+in a major premise. -/
+def accWrapDecl : ReadinessDecl :=
+  { name := "usesAccWrap", type := .const "Nat" false,
+    value := some (.app (.const "accWrap" false) (.const "accZero" true)),
+    unfolded := [.recursorApp (.const "f" false) (.const "accZero" true)] }
+
+-- The surface value alone is clean; the unfolded form flags the declaration.
+example : (accWrapDecl.value.map ReadinessExpr.flagged) = some false := by decide
+example : scanDeclOpaqueTheoremReadiness accWrapDecl = true := by decide
+example : scanDeclOpaqueTheoremReadiness accWrapDecl = true :=
+  readinessScanner_flags_delta_wrapped_recursor accWrapDecl (.const "f" false) (.const "accZero" true)
+    (by decide) rfl
+-- A definition whose unfolding scrutinizes plain data stays clean.
+example : scanDeclOpaqueTheoremReadiness
+    { accWrapDecl with unfolded := [.recursorApp (.const "f" false) (.const "pair" false)] } =
+    false := by decide
+example : (scanModuleOpaqueTheoremReadiness true (accWrapDecl :: readinessModule)).flagCount = 3 := by
+  decide
+example : (scanModuleOpaqueTheoremReadiness true (accWrapDecl :: readinessModule)).isBlocking =
+    false := rfl
+
+/-- info: 'Anneal.OleanSpecStrengthAuditor.readinessScanner_flags_delta_wrapped_recursor' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms readinessScanner_flags_delta_wrapped_recursor
+
 /-! ## 5. Axiom pins
 
 Every theorem of §8–§11 and the decidable checkers they are about: at most `[propext, Quot.sound]`,

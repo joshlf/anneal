@@ -3833,8 +3833,8 @@ def exprUsesOpaqueTheorem (env : Environment) (e : Expr) (fuel : Nat := 100000) 
       match x with
       | .proj _ _ s => if scrutineeHasThm s bm then return true else stack := (s, bm) :: stack
       | .app f a =>
-        if let .const c _ := x.getAppFn then
-          let args := x.getAppArgs
+        for z in [x, (headNormalizeBudget env x 64 false).expr] do if let .const c _ := z.getAppFn then
+          let args := z.getAppArgs
           let mi := match env.find? c with | some (.recInfo rv) => rv.getMajorIdx | some (.quotInfo qv) => (match qv.kind with | .lift => 5 | .ind => 4 | _ => args.size) | _ => args.size
           if h : mi < args.size then if scrutineeHasThm args[mi] bm then return true
         stack := (f, bm) :: (a, bm) :: stack

@@ -3178,11 +3178,15 @@ structure ReadinessDecl where
   name : String
   type : ReadinessExpr
   value : Option ReadinessExpr := none
+  /-- Head-normal forms (δ/β/ζ, theorems never unfolded) of application subterms whose head is a
+  definition: `T.casesOn`, matchers, and other wrappers that unfold to a recursor. -/
+  unfolded : List ReadinessExpr := []
   deriving DecidableEq, Repr
 
-/-- Scan one declaration's type and value. -/
+/-- Scan one declaration's type, value, and the head-normal forms of its applications. -/
 def scanDeclOpaqueTheoremReadiness (d : ReadinessDecl) : Bool :=
-  d.type.flagged || (match d.value with | some v => v.flagged | none => false)
+  d.type.flagged || (match d.value with | some v => v.flagged | none => false) ||
+    d.unfolded.any ReadinessExpr.flagged
 
 /-- Readiness report (mirrors the `opaqueTheoremReadinessFlags` diagnostic). It is advisory:
 `blocking` is `false` in every report the scanner produces. -/
@@ -3368,6 +3372,15 @@ theorem filter_nil_of_all_false {α : Type} (p : α → Bool) :
     show (match p x with | true => x :: xs.filter p | false => xs.filter p) = []
     rw [hx]
     exact filter_nil_of_all_false p xs (fun y hy => h y (List.mem_cons.mpr (Or.inr hy)))
+
+/-- **V4 readiness (δ-wrapped recursors).** A recursor reached only after unfolding a definition
+(`And.casesOn thm f`, a `match` on a theorem) is flagged even when the surface type and value put no
+theorem in any scrutinee position. -/
+theorem readinessScanner_flags_delta_wrapped_recursor (d : ReadinessDecl) (minors major : ReadinessExpr)
+    (hmem : ReadinessExpr.recursorApp minors major ∈ d.unfolded) (h : major.carriesTheorem = true) :
+    scanDeclOpaqueTheoremReadiness d = true :=
+  bor_intro_right (List.any_eq_true.mpr
+    ⟨_, hmem, readinessScanner_flags_major_premise_theorem minors major h⟩)
 
 /-- **V4 readiness (c′).** A module whose declarations are all clean produces `0` flags. -/
 theorem readinessScanner_clean_module_zero_flags (enabled : Bool) (ds : List ReadinessDecl)
