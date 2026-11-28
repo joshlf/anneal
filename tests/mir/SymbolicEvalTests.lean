@@ -2761,7 +2761,8 @@ def ubTransmuteInvalidEnumTagB7C29Body : CapturedMir :=
     layouts := ubTransmuteInvalidEnumTagB7C29Layouts
     allocations := [] }
 
-/-- Both confirmations below, proved in one kernel evaluation so the second
+/-- Both `by rfl` confirmations below (the tactic generated
+`MiriOracleConfirm` modules use), proved in one declaration so that the second
 run of the same 64-step body reuses the first one's reductions. -/
 private theorem confirm_tag_and_probe_ub_transmute_invalid_enum_tag__b7_c29 :
     evalMirDiffTagBounded 64 ubTransmuteInvalidEnumTagB7C29Body
@@ -2772,8 +2773,8 @@ private theorem confirm_tag_and_probe_ub_transmute_invalid_enum_tag__b7_c29 :
         (.running
           (initMachineStateWithMemory
             ubTransmuteInvalidEnumTagB7C29Body [] emptyMemory)) =
-      (MirDiffTag.normalScalar 1 1, "none") := by
-  decide +kernel
+      (MirDiffTag.normalScalar 1 1, "none") :=
+  ⟨by rfl, by rfl⟩
 
 /--
 Kernel-checked `by rfl` confirmation that `evalMirDiffTagBounded` classifies
@@ -2835,8 +2836,8 @@ theorem confirm_ub_transmute_invalid_enum_tag_out_of_range :
       (.running
         (initMachineStateWithMemory
           ubTransmuteInvalidEnumTagOutOfRangeBody [] emptyMemory)) =
-      (MirDiffTag.ub, "src/lib.rs:5006:32: 5006:46") := by
-  decide +kernel
+      (MirDiffTag.ub, "src/lib.rs:5006:32: 5006:46") :=
+  ⟨by rfl, by rfl⟩
 
 /--
 Adversarial edge-case bodies for scalar-represented enum return classification:
@@ -3028,8 +3029,8 @@ theorem scalar_enum_return_edge_cases_confirmed :
     probeMirDiffBounded 16 nicheOptionBoolNoneBody
       (initMachineStateWithMemory
         nicheOptionBoolNoneBody [] emptyMemory) =
-      (MirDiffTag.normalOther, "none") := by
-  decide +kernel
+      (MirDiffTag.normalOther, "none") :=
+  ⟨by rfl, by rfl, by rfl, by rfl, by rfl⟩
 
 /--
 Kernel-checked `TotalVerificationResult` certification for
@@ -3363,8 +3364,8 @@ theorem scalar_enum_return_b1_hardening_confirmed :
     probeMirDiffBounded 16 outOfWidthRangeScalarEnumBody
       (initMachineStateWithMemory
         outOfWidthRangeScalarEnumBody [] emptyMemory) =
-      (MirDiffTag.normalOther, "none") := by
-  decide +kernel
+      (MirDiffTag.normalOther, "none") :=
+  ⟨by rfl, by rfl, by rfl, by rfl, by rfl, by rfl, by rfl, by rfl, by rfl⟩
 
 /-! ## 13. Safe Panics Across Uninterpreted External Calls (`verifyModularSafePanicMirBounded`) -/
 
@@ -4197,7 +4198,7 @@ private theorem v26FfiReadReg_checks :
       (.some v26FfiReadRegReqMir) [⟨10, 4⟩] = true ∧
     checkOptMirRequiresPinsScalarsDirect 64 (.some v26FfiReadRegReqMir)
       [⟨10, 4⟩] = false ∧
-    checkMirBoolBounded 64 v26FfiReadRegReqMir
+    checkMirBoolBounded 128 v26FfiReadRegReqMir
       [.aggregate 0 [.scalar { bits := 10, sizeBytes := 4 }]] = true := by
   decide +kernel
 
@@ -4241,7 +4242,6 @@ theorem v26FfiReadRegPinnedAuto_verified : VerificationResult v26FfiReadRegClaim
 theorem v26FfiReadRegEqU32_verified : VerificationResult v26FfiReadRegClaim :=
   dischargeRustEqU32FuelFree
     v26FfiReadRegClaim v26FfiReadRegReqMir v26FfiReadRegEnsMir 10
-    (h_pre := fun _ h => ⟨h.1, optArgsTyped_of_typed (Or.inl h.2)⟩)
     (h_check := by
       unfold checkMirRustEqScalar1SpecWithCallees
       rw [strictScalarInt_eq]
@@ -4282,7 +4282,7 @@ theorem v26FfiReadRegUntypedClaim_refuted :
       v26FfiReadRegUntypedClaim
       16
       [.aggregate 0 [.scalar { bits := 10, sizeBytes := 4 }]]
-      ⟨rfl, mirBoolPredicateHolds_of_checkBounded 64 v26FfiReadRegReqMir _
+      ⟨rfl, mirBoolPredicateHolds_of_wp_fuelFree v26FfiReadRegReqMir _
         v26FfiReadReg_checks.2.2.2.2⟩⟩
 
 def v26ClampAddOneMir : CapturedMir := mkV26AddConstU32Mir "sym_test::clamp_add_one" 1
@@ -4501,7 +4501,7 @@ private theorem v26ModularAndCanary_checks :
       (.some v26ReadAndOffsetReqMir) (.some v26ReadAndOffsetEnsMir)
       "sym_test::ffi_read_reg" 1 (.some v26FfiReadRegReqMir)
       v26FfiReadRegEnsMir [] = true ∧
-    checkMirBoolBounded 64 v26FfiReadRegEnsMir
+    checkMirBoolBounded 128 v26FfiReadRegEnsMir
       ([.scalar ⟨10, 4⟩] ++ [.aggregate 0 [.scalar ⟨42, 4⟩]]) = true ∧
     checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir
       (.some v26FfiReadRegReqMir) [⟨11, 4⟩] = false ∧
@@ -4555,7 +4555,7 @@ the callee contract's `retMatchesCalleeReturnTy` typing (`OptRetIsScalarOfWidth`
 theorem v26FfiReadRegEnsUntypedRet_accepted :
     MirBoolPredicateHolds v26FfiReadRegEnsMir
       ([.scalar ⟨10, 4⟩] ++ [.aggregate 0 [.scalar ⟨42, 4⟩]]) :=
-  mirBoolPredicateHolds_of_checkBounded 64 v26FfiReadRegEnsMir _
+  mirBoolPredicateHolds_of_wp_fuelFree v26FfiReadRegEnsMir _
     v26ModularAndCanary_checks.2.2.2.1
 
 /-- The closure-deref checkers are exact: a wrong pinned value, a pin or return width that
@@ -4937,7 +4937,6 @@ theorem v26AddTwoRegsPinnedAuto_verified :
 theorem v26AddTwoRegsEq2U32_verified : VerificationResult v26AddTwoRegsClaim :=
   dischargeRustEq2U32FuelFree
     v26AddTwoRegsClaim v26AddTwoRegsReqMir v26AddTwoRegsEnsMir 10 20
-    (h_pre := fun _ h => ⟨h.1, optArgsTyped_of_typed (Or.inl h.2)⟩)
     (h_pins := v26AddTwoRegs_checks.2.1)
     (h_check := v26AddTwoRegs_subjSpecEns16)
 
