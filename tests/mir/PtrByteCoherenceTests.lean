@@ -4104,6 +4104,33 @@ theorem a3_lockstep_parity :
     v06 = [some (.scalar 0x1000 8), some .none, some .none, some .none, some .none, some .none, some (.scalar 0x1000 8)] := by
   exact ⟨rfl, rfl⟩
 
+/-! ## §4g. `[adv ep1-B4]` `evalCopyMemory` Reference / `fn()` / ADT Read-Time Regressions -/
+
+/-- B4 (A3 `evalCopyMemory` paths, both dialects): an untyped `copy` of `2u8` into
+`Unaligned<bool>` succeeds and faults on the typed read, while `1u8` reads back; provenance-free
+`0x1000u64` bytes copied into `&u8` or `fn()` fault on read (no `allocId = 0` forgery); an intact
+pointer copied into `fn()` or `*const u8` keeps provenance; `V2026_06_01 == V2026_08_01`. -/
+theorem b4_evalCopyMemory_ref_fnptr_adt_read_time_v06_v08 :
+    a2Copy1Read_06 tyU8_06 tyUnalignedBool_06 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1 = some .none ∧
+    a2Copy1Read_06 tyU8_06 tyUnalignedBool_06 (.init (.scalar ⟨1, 1⟩)) .uninit 0 0 1 =
+      some (.agg 0 [.scalar 1 1]) ∧
+    a2Copy1Read_06 tyU64_06 tyRefU8_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 = some .none ∧
+    a2Copy1Read_06 tyU64_06 tyFnPtr_06 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 = some .none ∧
+    a2Copy1Read_06 tyRawPtrU8_06 tyFnPtr_06 (.init (.ptr ptr64_06 8)) .uninit 0 0 8 =
+      some (.ptr 7 0x10 8) ∧
+    a2Copy1Read_06 tyRawPtrU8_06 tyRawPtrU8_06 (.init (.ptr ptr64_06 8)) .uninit 0 0 8 =
+      some (.ptr 7 0x10 8) ∧
+    a2Copy1Read_08 tyU8_08 tyUnalignedBool_08 (.init (.scalar ⟨2, 1⟩)) .uninit 0 0 1 = some .none ∧
+    a2Copy1Read_08 tyU8_08 tyUnalignedBool_08 (.init (.scalar ⟨1, 1⟩)) .uninit 0 0 1 =
+      some (.agg 0 [.scalar 1 1]) ∧
+    a2Copy1Read_08 tyU64_08 tyRefU8_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 = some .none ∧
+    a2Copy1Read_08 tyU64_08 tyFnPtr_08 (.init (.scalar ⟨0x1000, 8⟩)) .uninit 0 0 8 = some .none ∧
+    a2Copy1Read_08 tyRawPtrU8_08 tyFnPtr_08 (.init (.ptr ptr64_08 8)) .uninit 0 0 8 =
+      some (.ptr 7 0x10 8) ∧
+    a2Copy1Read_08 tyRawPtrU8_08 tyRawPtrU8_08 (.init (.ptr ptr64_08 8)) .uninit 0 0 8 =
+      some (.ptr 7 0x10 8) := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 /-! ## §5. Mechanical Local Axiom, Reachability, & Non-Triviality Audit -/
 
 open Lean Elab Command in
