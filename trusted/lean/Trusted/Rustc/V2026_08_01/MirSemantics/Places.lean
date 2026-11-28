@@ -9772,6 +9772,171 @@ def wrapFullWidthInitChain?
   | _, _, _ => .none
 
 /--
+Test whether predicate `p` holds on every `Value` in `vs`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+-/
+@[reducible]
+def allValuesSatisfy (p : Value → Bool) : List Value → Bool
+  | .nil => true
+  | v :: vs =>
+    match p v with
+    | true => allValuesSatisfy p vs
+    | false => false
+
+/--
+Test whether binary predicate `p` holds pairwise on tuple field kinds `ks` and
+runtime field values `vs` (returning `true` on mismatched lengths so structural
+fallbacks remain unaffected).
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+-/
+@[reducible]
+def allTupleFieldsSatisfy (p : RigidTy → Value → Bool) : List RigidTy → List Value → Bool
+  | .nil, .nil => true
+  | k :: ks, v :: vs =>
+    match p k v with
+    | true => allTupleFieldsSatisfy p ks vs
+    | false => false
+  | _, _ => true
+
+/--
+Test whether predicate `p` holds on at least one `RigidTy` in `ks`.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "- A `struct`, tuple, and array requires all fields/elements to be valid at their respective type."
+-/
+@[reducible]
+def anyRigidTySatisfies (p : RigidTy → Bool) : List RigidTy → Bool
+  | .nil => false
+  | k :: ks =>
+    match p k with
+    | true => true
+    | false => anyRigidTySatisfies p ks
+
+/--
+Fuel-bounded check for whether `RigidTy` `k` is or structurally contains (via
+`.array` or `.tuple`) a `.ref` or `.fnPtr` type requiring coherent pointer
+provenance on union field reads.
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Reading a union field reads the bits of the union at the field's type. ...
+> Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def rigidTyMentionsRefOrFnPtr : Nat → RigidTy → Bool
+  | .zero, _ => true
+  | .succ fuel', k =>
+    match k with
+    | .ref _ _ => true
+    | .fnPtr _ _ _ _ => true
+    | .array ek _ => rigidTyMentionsRefOrFnPtr fuel' ek
+    | .tuple ks => anyRigidTySatisfies (rigidTyMentionsRefOrFnPtr fuel') ks
+    | _ => false
+
+/--
+Test whether a trailing projection chain `rest` below a union `.field` step
+projects through or to a `.ref` or `.fnPtr` type (so a cached `.scalar`-bearing
+aggregate union slot such as `RefWrap(&T)` decoded solely from `ScalarLayout`
+must be re-decoded from the union's storage bytes at the projected leaf type).
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Reading a union field reads the bits of the union at the field's type. ...
+> Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def projChainMentionsRefOrFnPtr : List ProjectionElem → Bool
+  | .nil => false
+  | .field _ fTy :: rest =>
+    match rigidTyMentionsRefOrFnPtr defaultCodecFuel fTy.kind with
+    | true => true
+    | false => projChainMentionsRefOrFnPtr rest
+  | .opaqueCast cTy :: rest =>
+    match rigidTyMentionsRefOrFnPtr defaultCodecFuel cTy.kind with
+    | true => true
+    | false => projChainMentionsRefOrFnPtr rest
+  | .unwrapUnsafeBinder iTy :: rest =>
+    match rigidTyMentionsRefOrFnPtr defaultCodecFuel iTy.kind with
+    | true => true
+    | false => projChainMentionsRefOrFnPtr rest
+  | _ :: rest => projChainMentionsRefOrFnPtr rest
+
+/--
+Fuel-bounded check for whether runtime `Value` `v` contains a `Value.scalar`
+leaf (used when a sub-projection below a union field targets a `.ref` or
+`.fnPtr` leaf).
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def valueHasScalarLeaf : Nat → Value → Bool
+  | .zero, _ => true
+  | .succ _, .scalar _ => true
+  | .succ fuel', .aggregate _ fs =>
+    Bool.not (allValuesSatisfy (fun v => Bool.not (valueHasScalarLeaf fuel' v)) fs)
+  | .succ _, _ => false
+
+/--
+Fuel-bounded recursive helper for `unionDirectSlotValidForFieldTy`, checking
+`.ref`, `.fnPtr`, `.array` elements, and `.tuple` fields so provenance-free or
+byte-permuted `.scalar` slots inside compound union fields (`[&T; N]`,
+`(&T, U)`) fall through to `decodeTypedValueFromBytes`.
+
+Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
+<https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
+
+> "Reading a union field reads the bits of the union at the field's type. ...
+> Every field read must produce a valid value of the field's type; otherwise,
+> the behavior is undefined."
+-/
+@[reducible]
+def unionDirectSlotValidForFieldTyAux : Nat → RigidTy → Value → Bool
+  | .zero, _, _ => false
+  | .succ fuel', rFieldKind, fv =>
+    match fv with
+    | .scalar _ =>
+      match rFieldKind with
+      | .ref _ _ => false
+      | .fnPtr _ _ _ _ => false
+      | _ => true
+    | .aggregate 0 elems =>
+      match rFieldKind with
+      | .ref _ (.dynamic _) =>
+        match elems with
+        | .ptr _ _ :: .ptr _ _ :: .nil => true
+        | _ => false
+      | .ref _ (.slice _) | .ref _ .str =>
+        match elems with
+        | .ptr _ _ :: .scalar _ :: .nil => true
+        | .scalar addrSc :: .scalar lenSc :: .nil =>
+          Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq addrSc.bits 0))
+        | _ => false
+      | .array elemKind _ =>
+        allValuesSatisfy (unionDirectSlotValidForFieldTyAux fuel' elemKind) elems
+      | .tuple ks =>
+        allTupleFieldsSatisfy (unionDirectSlotValidForFieldTyAux fuel') ks elems
+      | _ => true
+    | _ => true
+
+/--
 Check whether a cached runtime slot value `fv` in a `FieldsShape.union`
 aggregate may be returned directly when reading the union field at static type
 `rFieldKind`, or must be re-decoded from the union's storage bytes at the full
@@ -9779,12 +9944,12 @@ aggregate may be returned directly when reading the union field at static type
 - `TypeLayout.fieldLayouts` decodes union slots without `RigidTy` (distinguishing
   only `ScalarLayout`, which `NonNull<T>` shares with `&T` and `fn()`), so a
   provenance-free or byte-permuted pointer image (`UCG#558`) can populate a
-  union slot with `Value.scalar`.
-- Reading a `.ref` or `.fnPtr` union field requires coherent pointer provenance
-  (except non-null zero-length slice/`str` references `&[]` / `""`), so any
-  cached `.scalar` (or `.scalar`-backed wide `&dyn` / non-empty `&[T]`) slot is
-  not trusted directly and falls through to `decodeTypedValueFromBytes` at
-  `rFieldTy`.
+  union slot (or `.array`/`.tuple` union slot) with `Value.scalar`.
+- Reading a `.ref` or `.fnPtr` union field (or `.array`/`.tuple` thereof)
+  requires coherent pointer provenance (except non-null zero-length slice/`str`
+  references `&[]` / `""`), so any cached `.scalar` (or `.scalar`-backed wide
+  `&dyn` / non-empty `&[T]`) slot is not trusted directly and falls through to
+  `decodeTypedValueFromBytes` at `rFieldTy`.
 
 Reference (The Rust Reference 1.98.0, "Union types — Reading and writing union fields"):
 <https://doc.rust-lang.org/1.98.0/reference/items/unions.html#reading-and-writing-union-fields>
@@ -9801,20 +9966,7 @@ def unionDirectSlotValidForFieldTy (rFieldKind : RigidTy) (fv : Value) : Bool :=
     | .ref _ _ => false
     | .fnPtr _ _ _ _ => false
     | _ => true
-  | .aggregate 0 (dVal :: mVal :: .nil) =>
-    match rFieldKind with
-    | .ref _ (.dynamic _) =>
-      match dVal, mVal with
-      | .ptr _ _, .ptr _ _ => true
-      | _, _ => false
-    | .ref _ (.slice _) | .ref _ .str =>
-      match dVal, mVal with
-      | .ptr _ _, .scalar _ => true
-      | .scalar addrSc, .scalar lenSc =>
-        Bool.and (Nat.beq lenSc.bits 0) (Bool.not (Nat.beq addrSc.bits 0))
-      | _, _ => false
-    | _ => true
-  | _ => true
+  | _ => unionDirectSlotValidForFieldTyAux defaultCodecFuel rFieldKind fv
 
 /--
 Read a deref-free projection chain `proj` on `v` of static type `baseTy` with
@@ -9902,8 +10054,14 @@ def readProjectedValueUnionAware
             | _ => .none
           | .some fv =>
             match unionDirectSlotValidForFieldTy rFieldTy.kind fv with
-            | true => .some fv
             | false => .none
+            | true =>
+              match projChainMentionsRefOrFnPtr rest with
+              | false => .some fv
+              | true =>
+                match valueHasScalarLeaf defaultCodecFuel fv with
+                | true => .none
+                | false => .some fv
           | .none => .none
         -- A union value whose slots (or raw-byte overlay) disagree on some
         -- initialized byte does not determine a storage image (e.g. after a

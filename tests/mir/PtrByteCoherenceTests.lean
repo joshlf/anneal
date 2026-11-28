@@ -4131,6 +4131,220 @@ theorem b4_evalCopyMemory_ref_fnptr_adt_read_time_v06_v08 :
       some (.ptr 7 0x10 8) := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-! ## §4h. `[adv ep1-A4]` Compound Union `.ref` / `.fnPtr` Punning Regressions
+
+### `lean-miri` Correspondence Gap Note (`mir-correspondence-postmortem`)
+In Pass A3, `unionDirectSlotValidForFieldTy` checked top-level `.ref` and `.fnPtr` union fields,
+but did not recurse into compound `.array` / `.tuple` union fields (`[&T; N]`, `(&T, U)`) or guard
+nested field sub-projections (`u.wrap.0` on `RefWrap(&T)`) when `fv` held a `.scalar` leaf decoded
+from `TypeLayout.fieldLayouts` (`ScalarLayout.initialized (.pointer 0) ⟨1, MAX⟩`). `SimLM2_4`
+models scalar-only union punning and did not exercise compound reference-bearing union fields.
+Pass A4 extends `unionDirectSlotValidForFieldTy` (`unionDirectSlotValidForFieldTyAux`) recursively
+over `.array` and `.tuple` fields and guards `readProjectedValueUnionAware` via
+`projChainMentionsRefOrFnPtr` + `valueHasScalarLeaf`. -/
+
+section A4Fixtures06
+
+open V06
+
+/-- `[u64; 1]` at idx 20 (`fieldLayouts = [4]`). -/
+def a4Arr1U64L_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .array ⟨8⟩ 1, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [4] }
+
+/-- `[&'static u8; 1]` at idx 21 (`fieldLayouts = [6]`). -/
+def a4Arr1RefL_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .array ⟨8⟩ 1, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [6] }
+
+/-- `union IntArrOrRefArr { i: [u64; 1], r: [&'static u8; 1] }` at idx 22 (`fieldLayouts = [20, 21]`). -/
+def a4UnionArrRefL_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [20, 21] }
+
+/-- `(&'static u8, u64)` at idx 23 (`fieldLayouts = [6, 4]`). -/
+def a4TupRefU64L_06 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩,
+    backendRepr := .scalarPair
+      (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩)
+      (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [6, 4] }
+
+/-- `(u64, u64)` at idx 24 (`fieldLayouts = [4, 4]`). -/
+def a4TupU64U64L_06 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩,
+    backendRepr := .scalarPair
+      (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩)
+      (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [4, 4] }
+
+/-- `union TupOrRefTup { i: (u64, u64), t: (&'static u8, u64) }` at idx 25 (`fieldLayouts = [24, 23]`). -/
+def a4UnionTupRefL_06 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [24, 23] }
+
+/-- `struct RefWrap(&'static u8)` at idx 26 (`fieldLayouts = [6]`). -/
+def a4RefWrapL_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [6] }
+
+/-- `union IntOrRefWrap { i: u64, w: RefWrap(&'static u8) }` at idx 27 (`fieldLayouts = [4, 26]`). -/
+def a4UnionRefWrapL_06 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [4, 26] }
+
+def a4Layouts64_06 : LayoutTable :=
+  { a3Layouts64_06 with
+    entries := a3Layouts64_06.entries ++
+      [a4Arr1U64L_06, a4Arr1RefL_06, a4UnionArrRefL_06,
+       a4TupRefU64L_06, a4TupU64U64L_06, a4UnionTupRefL_06,
+       a4RefWrapL_06, a4UnionRefWrapL_06] }
+
+def a4TyArr1Ref_06 : Ty := { kind := .array (tyRefU8_06.kind) 1, layoutIdx := 21 }
+def a4TyUnionArrRef_06 : Ty := { kind := .adt "IntArrOrRefArr" [], layoutIdx := 22 }
+def a4TyTupRefU64_06 : Ty := { kind := .tuple [tyRefU8_06.kind, .uint .u64], layoutIdx := 23 }
+def a4TyUnionTupRef_06 : Ty := { kind := .adt "TupOrRefTup" [], layoutIdx := 25 }
+def a4TyRefWrap_06 : Ty := { kind := .adt "RefWrap" [tyRefU8_06.kind], layoutIdx := 26 }
+def a4TyUnionRefWrap_06 : Ty := { kind := .adt "IntOrRefWrap" [], layoutIdx := 27 }
+
+end A4Fixtures06
+
+section A4Fixtures08
+
+open V08
+
+def a4Arr1U64L_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .array ⟨8⟩ 1, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [4] }
+
+def a4Arr1RefL_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .array ⟨8⟩ 1, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [6] }
+
+def a4UnionArrRefL_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [20, 21] }
+
+def a4TupRefU64L_08 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩,
+    backendRepr := .scalarPair
+      (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩)
+      (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [6, 4] }
+
+def a4TupU64U64L_08 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩,
+    backendRepr := .scalarPair
+      (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩)
+      (.initialized (.int 64 false) ⟨0, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [4, 4] }
+
+def a4UnionTupRefL_08 : TypeLayout :=
+  { size := ⟨16⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [24, 23] }
+
+def a4RefWrapL_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩,
+    backendRepr := .scalar (.initialized (.pointer 0) ⟨1, 0xFFFFFFFFFFFFFFFF⟩),
+    fields := .arbitrary [⟨0⟩] [0], variants := .single 0, isUninhabited := false,
+    fieldLayouts := [6] }
+
+def a4UnionRefWrapL_08 : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨8⟩, backendRepr := .memory,
+    fields := .union 2, variants := .single 0, isUninhabited := false,
+    fieldLayouts := [4, 26] }
+
+def a4Layouts64_08 : LayoutTable :=
+  { a3Layouts64_08 with
+    entries := a3Layouts64_08.entries ++
+      [a4Arr1U64L_08, a4Arr1RefL_08, a4UnionArrRefL_08,
+       a4TupRefU64L_08, a4TupU64U64L_08, a4UnionTupRefL_08,
+       a4RefWrapL_08, a4UnionRefWrapL_08] }
+
+def a4TyArr1Ref_08 : Ty := { kind := .array (tyRefU8_08.kind) 1, layoutIdx := 21 }
+def a4TyUnionArrRef_08 : Ty := { kind := .adt "IntArrOrRefArr" [], layoutIdx := 22 }
+def a4TyTupRefU64_08 : Ty := { kind := .tuple [tyRefU8_08.kind, .uint .u64], layoutIdx := 23 }
+def a4TyUnionTupRef_08 : Ty := { kind := .adt "TupOrRefTup" [], layoutIdx := 25 }
+def a4TyRefWrap_08 : Ty := { kind := .adt "RefWrap" [tyRefU8_08.kind], layoutIdx := 26 }
+def a4TyUnionRefWrap_08 : Ty := { kind := .adt "IntOrRefWrap" [], layoutIdx := 27 }
+
+end A4Fixtures08
+
+/-- A4 (`[&'static u8; 1]`, `(&'static u8, u64)`, and `RefWrap(&'static u8)` union punning,
+`V2026_06_01` & `V2026_08_01`): provenance-free (`0x1000`) and byte-swapped (`swap01 ptr64Bytes`)
+images inside compound union fields fault `.ub` on whole-field reads (`u.r`, `u.t`) and leaf
+sub-reads (`u.r[0]`, `u.t.0`, `u.w.0`), while intact `ptr64Bytes` union images succeed with
+`.ptr ptr64 8`, in strict `V2026_06_01 == V2026_08_01` lockstep. -/
+theorem a4_compound_union_ref_punning_reject_and_parity :
+    -- V2026_06_01
+    let plain8_06 := V06.encodeLittleEndianBytes 0x1000 8 none
+    let plain16_06 := plain8_06 ++ V06.encodeLittleEndianBytes 42 8 none
+    let ok16_06 := ptr64Bytes_06 ++ V06.encodeLittleEndianBytes 42 8 none
+    let plain8_08 := V08.encodeLittleEndianBytes 0x1000 8 none
+    let plain16_08 := plain8_08 ++ V08.encodeLittleEndianBytes 42 8 none
+    let ok16_08 := ptr64Bytes_08 ++ V08.encodeLittleEndianBytes 42 8 none
+    let pr06 : Trusted.Rustc.V2026_06_01.MirSemantics.ProjReadResult → ValSummary
+      | .ok v => valSummaryVal06 v
+      | _ => .none
+    let pr08 : Trusted.Rustc.V2026_08_01.MirSemantics.ProjReadResult → ValSummary
+      | .ok v => valSummaryVal08 v
+      | _ => .none
+    (match V06.decodeUntypedStorageBytes V06.defaultCodecFuel a4Layouts64_06 a4TyUnionArrRef_06 (swap01_06 ptr64Bytes_06) .strictUcg630Ub true,
+           V06.decodeUntypedStorageBytes V06.defaultCodecFuel a4Layouts64_06 a4TyUnionArrRef_06 ptr64Bytes_06 .strictUcg630Ub true,
+           V06.decodeUntypedStorageBytes V06.defaultCodecFuel a4Layouts64_06 a4TyUnionTupRef_06 plain16_06 .strictUcg630Ub true,
+           V06.decodeUntypedStorageBytes V06.defaultCodecFuel a4Layouts64_06 a4TyUnionTupRef_06 ok16_06 .strictUcg630Ub true,
+           V06.decodeUntypedStorageBytes V06.defaultCodecFuel a4Layouts64_06 a4TyUnionRefWrap_06 plain8_06 .strictUcg630Ub true,
+           V06.decodeUntypedStorageBytes V06.defaultCodecFuel a4Layouts64_06 a4TyUnionRefWrap_06 ptr64Bytes_06 .strictUcg630Ub true,
+           V08.decodeUntypedStorageBytes V08.defaultCodecFuel a4Layouts64_08 a4TyUnionArrRef_08 (swap01_08 ptr64Bytes_08) .strictUcg630Ub true,
+           V08.decodeUntypedStorageBytes V08.defaultCodecFuel a4Layouts64_08 a4TyUnionArrRef_08 ptr64Bytes_08 .strictUcg630Ub true,
+           V08.decodeUntypedStorageBytes V08.defaultCodecFuel a4Layouts64_08 a4TyUnionTupRef_08 plain16_08 .strictUcg630Ub true,
+           V08.decodeUntypedStorageBytes V08.defaultCodecFuel a4Layouts64_08 a4TyUnionTupRef_08 ok16_08 .strictUcg630Ub true,
+           V08.decodeUntypedStorageBytes V08.defaultCodecFuel a4Layouts64_08 a4TyUnionRefWrap_08 plain8_08 .strictUcg630Ub true,
+           V08.decodeUntypedStorageBytes V08.defaultCodecFuel a4Layouts64_08 a4TyUnionRefWrap_08 ptr64Bytes_08 .strictUcg630Ub true with
+     | some uArrBad06, some uArrOk06, some uTupBad06, some uTupOk06, some uWrapBad06, some uWrapOk06,
+       some uArrBad08, some uArrOk08, some uTupBad08, some uTupOk08, some uWrapBad08, some uWrapOk08 =>
+       let v06 : List ValSummary := [
+         pr06 (V06.readProjectedValueUnionAware [] [] a4Layouts64_06 uArrBad06 a4TyUnionArrRef_06 [.field 1 a4TyArr1Ref_06]),
+         pr06 (V06.readProjectedValueUnionAware [.init (.scalar ⟨0, 8⟩)] [] a4Layouts64_06 uArrBad06 a4TyUnionArrRef_06 [.field 1 a4TyArr1Ref_06, .index 0]),
+         pr06 (V06.readProjectedValueUnionAware [] [] a4Layouts64_06 uArrOk06 a4TyUnionArrRef_06 [.field 1 a4TyArr1Ref_06]),
+         pr06 (V06.readProjectedValueUnionAware [] [] a4Layouts64_06 uTupBad06 a4TyUnionTupRef_06 [.field 1 a4TyTupRefU64_06]),
+         pr06 (V06.readProjectedValueUnionAware [] [] a4Layouts64_06 uTupBad06 a4TyUnionTupRef_06 [.field 1 a4TyTupRefU64_06, .field 0 tyRefU8_06]),
+         pr06 (V06.readProjectedValueUnionAware [] [] a4Layouts64_06 uTupOk06 a4TyUnionTupRef_06 [.field 1 a4TyTupRefU64_06, .field 0 tyRefU8_06]),
+         pr06 (V06.readProjectedValueUnionAware [] [] a4Layouts64_06 uWrapBad06 a4TyUnionRefWrap_06 [.field 1 a4TyRefWrap_06, .field 0 tyRefU8_06]),
+         pr06 (V06.readProjectedValueUnionAware [] [] a4Layouts64_06 uWrapOk06 a4TyUnionRefWrap_06 [.field 1 a4TyRefWrap_06, .field 0 tyRefU8_06])
+       ]
+       let v08 : List ValSummary := [
+         pr08 (V08.readProjectedValueUnionAware [] [] a4Layouts64_08 uArrBad08 a4TyUnionArrRef_08 [.field 1 a4TyArr1Ref_08]),
+         pr08 (V08.readProjectedValueUnionAware [.init (.scalar ⟨0, 8⟩)] [] a4Layouts64_08 uArrBad08 a4TyUnionArrRef_08 [.field 1 a4TyArr1Ref_08, .index 0]),
+         pr08 (V08.readProjectedValueUnionAware [] [] a4Layouts64_08 uArrOk08 a4TyUnionArrRef_08 [.field 1 a4TyArr1Ref_08]),
+         pr08 (V08.readProjectedValueUnionAware [] [] a4Layouts64_08 uTupBad08 a4TyUnionTupRef_08 [.field 1 a4TyTupRefU64_08]),
+         pr08 (V08.readProjectedValueUnionAware [] [] a4Layouts64_08 uTupBad08 a4TyUnionTupRef_08 [.field 1 a4TyTupRefU64_08, .field 0 tyRefU8_08]),
+         pr08 (V08.readProjectedValueUnionAware [] [] a4Layouts64_08 uTupOk08 a4TyUnionTupRef_08 [.field 1 a4TyTupRefU64_08, .field 0 tyRefU8_08]),
+         pr08 (V08.readProjectedValueUnionAware [] [] a4Layouts64_08 uWrapBad08 a4TyUnionRefWrap_08 [.field 1 a4TyRefWrap_08, .field 0 tyRefU8_08]),
+         pr08 (V08.readProjectedValueUnionAware [] [] a4Layouts64_08 uWrapOk08 a4TyUnionRefWrap_08 [.field 1 a4TyRefWrap_08, .field 0 tyRefU8_08])
+       ]
+       v06 = v08 ∧
+       v06 = [.none, .none, .agg 0 [.ptr 7 0x10 8], .none, .none, .ptr 7 0x10 8, .none, .ptr 7 0x10 8] ∧
+       Trusted.Rustc.V2026_06_01.MirSemantics.projChainMentionsRefOrFnPtr [.field 0 tyRefU8_06] = true ∧
+       Trusted.Rustc.V2026_08_01.MirSemantics.projChainMentionsRefOrFnPtr [.field 0 tyRefU8_08] = true
+     | _, _, _, _, _, _, _, _, _, _, _, _ => False) := by
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
 /-! ## §5. Mechanical Local Axiom, Reachability, & Non-Triviality Audit -/
 
 open Lean Elab Command in
@@ -4207,6 +4421,7 @@ run_cmd do
     ``Trusted.Rustc.V2026_06_01.MirSemantics.isPtrCopyKind,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.materializeReadPtrValue,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.unionDirectSlotValidForFieldTy,
+    ``Trusted.Rustc.V2026_06_01.MirSemantics.projChainMentionsRefOrFnPtr,
     ``Trusted.Rustc.V2026_06_01.MirSemantics.readProjectedValueUnionAware,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.PtrByteFrag,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.abstractBytesCoherentPtrProv?,
@@ -4232,6 +4447,7 @@ run_cmd do
     ``Trusted.Rustc.V2026_08_01.MirSemantics.isPtrCopyKind,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.materializeReadPtrValue,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.unionDirectSlotValidForFieldTy,
+    ``Trusted.Rustc.V2026_08_01.MirSemantics.projChainMentionsRefOrFnPtr,
     ``Trusted.Rustc.V2026_08_01.MirSemantics.readProjectedValueUnionAware
   ]
   for req in requiredConsts do
