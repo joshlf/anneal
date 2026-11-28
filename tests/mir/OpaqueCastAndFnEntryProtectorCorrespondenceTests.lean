@@ -26,7 +26,9 @@ import MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
    type-switch erasure boundary), `D2` mode-sensitivity (`{11, 13, 14}`) and
    `rust#166253` callee-only (`10`) vs pre-`#166253` (`11`) + reverse-transmute
    + indirect fn-ptr boundary, `D3` `some mach` vs `none` `CM.dereferenceable`
-   separation + ZST dangling/null companions, out-of-range fail-closed guards
+   separation + ZST dangling/null companions, the post-borrowck image (Trusted
+   on the cast-erased MIR agrees with MiniRust on all 44 cells, case `8`
+   included), the case-`17` fixture divergence, out-of-range fail-closed guards
    (`22`, `1000`), and root-side non-vacuous capstone instantiation.
 2. **§2 Cross-root 3-way kernel closure (`run_cmd`)**: loads
    `.lake/build/lib/lean` (root) AND `examples/.lake/build/lib/lean`
@@ -36,7 +38,9 @@ import MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
    44-cell certificate on the loop-unrolled twin `lmOcObserveU` and transports
    along `lmOcObserveU.eq_src`, discharges fail-closedness from
    `lmOcObserve_out_of_range`, closes the unified + 3 per-domain (`D1`–`D3`)
-   bundles, all lifted theorems, observer-level (raw `MrOcFpObs`) 3-way
+   bundles plus the unified and `D1` POST-BORROWCK bundles (6 bundles; the
+   post-borrowck gate admits every case, closing case `8`), all lifted
+   theorems, observer-level (raw `MrOcFpObs`) 3-way
    agreement, 3-engine companion & UB root-cause alignment, and the Episode 2
    cross-root capstone. It also:
    - locks ALL 97 shared `section Fixtures` declarations: 93 identically-typed
@@ -50,7 +54,14 @@ import MiniRustSpec.OpaqueCastAndFnEntryProtectorMR
    - closes exact 3-way raw-observer agreement on all 14 companion cells
      (`dual_companion_three_way`), the type-switch erasure boundary, and the
      `D1` static phase boundary (`dual_d1_phase_boundary`) over the REAL
-     vendored-Miri companion harnesses and `lmOcPhaseObserve`;
+     vendored-Miri companion harnesses and `lmOcPhaseObserve`, extended to
+     EVERY `idx : Nat` (`dual_d1_phase_boundary_all_nat`: LeanMiri's phase
+     observer is fail-closed because it factors through the `Eq.refl`-locked
+     fixture table);
+   - locks LeanMiri's canonical cell `17` to its dangling-ZST companion
+     harness for every mode (`lmCompanion_zstDangling_is_canonical17`) and
+     closes `dual_d3_zst_fixture_divergence` (Trusted's canonical case `17` is
+     a live `&()`; on the identical dangling program Trusted is `.ub`);
    - proves translation fidelity (`lmOcToVerdict = ocVerdictOf ∘ lmToMr`,
      `lmToMr`/`mrToLm` 7-constructor bijection) and locks `ocLmExpected*` to
      `lmOcExpected*.map lmToMr` by `Eq.refl`;
@@ -226,6 +237,43 @@ theorem d1_phase_boundary_canaries :
     mrOcPhaseCompanion .zstNull = .unsupported ∧
     lmPhaseCompanionCheckOf (fun o => o) mrOcPhaseCompanion = true ∧
     lmPhaseCompanionCheckOf (fun o => o) (mrCompanion false) = false := by
+  decide +kernel
+
+/-- **Post-borrowck image (direct kernel execution)**: Trusted `stepMirFn` on
+the cast-erased image agrees with MiniRust on ALL 44 cells; case `8` reads `5`
+there while the cast fixture stays honestly `.unsupported`; case `8` is the
+ONLY in-range case where cast erasure changes Trusted's observation; the
+post-borrowck gate admits case `8` while the cast-image gate excludes it; and
+out-of-range indices fail closed. -/
+theorem post_borrowck_canaries :
+    trustedPostBorrowckObserve false 8 = .okScalar 5 ∧
+    trustedPostBorrowckObserve true 8 = .okScalar 5 ∧
+    mrOcTrustedObserve false 8 = .unsupported ∧
+    mrOcObserve false 8 = .okScalar 5 ∧
+    (List.range 22).map (trustedPostBorrowckObserve false) =
+      (List.range 22).map (mrOcObserve false) ∧
+    (List.range 22).map (trustedPostBorrowckObserve true) =
+      (List.range 22).map (mrOcObserve true) ∧
+    (List.range 22).filter (fun i =>
+      decide (mrOcTrustedObserve false i ≠ trustedPostBorrowckObserve false i)) =
+      [8] ∧
+    postBorrowckGate none 8 = true ∧ mrGate none 8 = false ∧
+    trustedPostBorrowckObserve true 22 = .unsupported ∧
+    trustedPostBorrowckVerdict false 8 = some (.returns (.scalar 5)) ∧
+    trustedVerdict false 8 = some .unsupported := by
+  decide +kernel
+
+/-- **Case `17` fixture divergence (direct kernel execution)**: MiniRust's
+canonical cell `17` IS its dangling-ZST companion, Trusted's canonical cell
+`17` (a live `&()`) is `okPtrValid`, and Trusted on the identical dangling
+program is conservatively `.ub`. -/
+theorem d3_case17_fixture_divergence_canaries :
+    mrCompanion false .zstDangling = mrOcObserve false 17 ∧
+    mrCompanion true .zstDangling = mrOcObserve true 17 ∧
+    mrOcObserve false 17 = .okPtrValid ∧
+    mrOcTrustedObserve false 17 = .okPtrValid ∧
+    trustedCompanion false .zstDangling = .ub ∧
+    trustedCompanion true .zstDangling ≠ mrOcTrustedObserve true 17 := by
   decide +kernel
 
 /-- `D2` (direct kernel execution): callee-only `rust#166253` (`10`) succeeds
@@ -434,7 +482,9 @@ theorem root_capstone_instantiation :
     OcFpLmCompanionCells (fun o => o) rootBackedCompanion ∧
     lmPhaseCheckOf (fun o => o) mrOcPhaseObserve = true ∧
     lmPhaseCompanionCheckOf (fun o => o) mrOcPhaseCompanion = true ∧
-    type_of% ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous :=
+    type_of% ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous ∧
+    (∀ sel, lmPostBorrowckCheckOf sel rootBackedLmAuthority = true) ∧
+    type_of% ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous :=
   ⟨rootBackedLmAuthority_tableCheck,
    fun sel => lmCheckOf_of_table sel _ rootBackedLmAuthority_tableCheck,
    projectPositive _ rootBackedLmAuthority_tableCheck,
@@ -443,7 +493,10 @@ theorem root_capstone_instantiation :
    rootBackedCompanion_check,
    rootBackedCompanion_cells, rootBackedPhase_check,
    rootBackedPhaseCompanion_check,
-   ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous⟩
+   ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous,
+   fun sel =>
+     lmPostBorrowckCheckOf_of_table sel _ rootBackedLmAuthority_tableCheck,
+   ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous⟩
 
 /-! ## §2. Cross-Root 3-Way Kernel Closure (`MiniRustSpec` + `LeanMiriSpec` + `Anneal`) -/
 
@@ -1229,6 +1282,114 @@ run_cmd do
         (mkConst `MiniRustSpec.Correspondence.stepM_bm_eq))
     added := added.push bmDriverName
 
+    -- All-`Nat` phase agreement: LeanMiri's `lmOcPhaseObserve` factors through
+    -- its copy of the shared fixture table (locked to `ocCaseFixture?` by
+    -- `Eq.refl` above), so it is fail-closed for EVERY `idx ≥ 22`; the
+    -- factorization hypothesis is discharged by `Eq.refl`.
+    let fixOptTy ← MetaM.run' do
+      let t ← inferType (mkConst (lmNs ++ `ocCaseFixture?))
+      return t.bindingBody!
+    let fixPairTy := fixOptTy.appArg!
+    let listCapTy := mkApp (mkConst ``List [0]) capMirTy0
+    let kPhase : Expr :=
+      mkLambda `o .default fixOptTy <|
+        mkAppN (mkConst ``Option.rec [1, 0])
+          #[fixPairTy, mkLambda `x .default fixOptTy lmObsTy,
+            lmObsC `unsupported,
+            mkLambda `p .default fixPairTy <|
+              mkAppN (mkConst ``Prod.rec [1, 0, 0])
+                #[capMirTy0, listCapTy, mkLambda `x .default fixPairTy lmObsTy,
+                  mkLambda `body .default capMirTy0 <|
+                    mkLambda `cs .default listCapTy (mkApp lmPhaseBody (.bvar 1)),
+                  .bvar 0],
+            .bvar 0]
+    let mrUnsupported := mkConst (mrNs ++ `MrOcFpObs.unsupported)
+    let phaseOobName := ns ++ `lmPhase_failClosed
+    addThmInfer phaseOobName <|
+      mkAppN (mkConst (bNs ++ `phase_fail_closed_of_fixture))
+        #[lmObsTy, lmToMr, mkConst (lmNs ++ `ocCaseFixture?),
+          mkConst (ns ++ `fixtureLock ++ `ocCaseFixture?), kPhase,
+          mkRefl mrObsTy0 mrUnsupported, lmPhaseObs,
+          mkLambda `idx .default natTy
+            (mkRefl lmObsTy (mkApp lmPhaseObs (.bvar 0)))]
+    added := added.push phaseOobName
+    addThmInfer (ns ++ `dual_d1_phase_boundary_all_nat)
+      (mkApp5 (mkConst (bNs ++ `dual_d1_phase_boundary_all_nat)) lmObsTy lmToMr
+        lmPhaseObs (mkConst phaseCheckName) (mkConst phaseOobName))
+    added := added.push (ns ++ `dual_d1_phase_boundary_all_nat)
+
+    -- 4a'. Post-borrowck image. On the cast-erased MIR, Trusted `stepMirFn`
+    -- agrees with MiniRust and LeanMiri on ALL 44 cells, so the unified and
+    -- `D1` post-borrowck bundles gate EVERY case (case `8` closed). Each LM
+    -- side certificate is kernel-evaluated on the twin, transported onto
+    -- `lmAuthority`, and its direct bundle is locked by `Eq.refl` to the
+    -- table-derived bundle.
+    let pbCheck (sel a : Expr) : Expr :=
+      mkApp2 (mkConst (bNs ++ `lmPostBorrowckCheckOf)) sel a
+    let pbUnifiedName := ns ++ `postBorrowckBundle ++ `unified
+    let pbD1Name := ns ++ `postBorrowckBundle ++ `d1
+    for (tag, sel) in sels do
+      if tag == `unified || tag == `d1 then
+        let chkU := ns ++ `lmPostBorrowckSideCheckU ++ tag
+        addThm chkU (eqTrue (pbCheck sel authUC)) reflTrue
+        added := added.push chkU
+        let chkDirect := ns ++ `lmPostBorrowckSideCheck_direct ++ tag
+        let pFn ← MetaM.run' <|
+          withLocalDeclD `a (mkConst (bNs ++ `OcFpLmAuthority)) fun a =>
+            mkLambdaFVars #[a] (pbCheck sel a)
+        addThm chkDirect (eqTrue (pbCheck sel authC))
+          (mkAppN (mkConst (bNs ++ `cert_transport))
+            #[authC, authUC, mkConst eqName, pFn, mkConst chkU])
+        added := added.push chkDirect
+        let bName := ns ++ `postBorrowckBundle ++ tag
+        let bVal :=
+          if tag == `unified then
+            mkApp2 (mkConst (bNs ++ `postBorrowckBundleOf)) authC hA
+          else
+            mkApp3 (mkConst (bNs ++ `postBorrowckDomainBundleOf))
+              (mkConst (domNs ++ `d1)) authC hA
+        let bTy ← addDef bName bVal
+        added := added.push bName
+        bundleCount := bundleCount + 1
+        let dName := ns ++ `postBorrowckBundle_direct ++ tag
+        let _ ← addDef dName
+          (mkApp3 (mkConst (bNs ++ `postBorrowckBundleOfSel)) sel authC
+            (mkConst chkDirect))
+        added := added.push dName
+        let eqBName := ns ++ `postBorrowckBundle_eq ++ tag
+        addThm eqBName (mkEq bTy (mkConst dName) (mkConst bName))
+          (mkRefl bTy (mkConst dName))
+        added := added.push eqBName
+    for thmName in [`post_borrowck_bundle_closes_case8,
+                    `dual_post_borrowck_case8] do
+      addThmInfer (ns ++ thmName) (mkApp2 (mkConst (bNs ++ thmName)) authC hA)
+      added := added.push (ns ++ thmName)
+    addThmInfer (ns ++ `dual_post_borrowck_exact_all_nat)
+      (mkApp5 (mkConst (bNs ++ `dual_post_borrowck_exact_all_nat)) authC hA hOob
+        lmToMr fidelityC)
+    added := added.push (ns ++ `dual_post_borrowck_exact_all_nat)
+    let pbCapName := ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone
+    addThmInfer pbCapName
+      (mkApp5 (mkConst (bNs ++ `ep2_opaquecast_fnentry_post_borrowck_capstone))
+        authC hA hOob lmToMr fidelityC)
+    added := added.push pbCapName
+    -- Case `17` fixture divergence: LeanMiri's canonical cell `17` IS its
+    -- dangling-ZST companion harness (definitional lock for every `tb`),
+    -- while Trusted's canonical fixture is a live `&()`.
+    let zstLockName := ns ++ `lmCompanion_zstDangling_is_canonical17
+    let zstDanglingC := mkConst (compNs ++ `zstDangling)
+    addThm zstLockName
+      (mkForall `tb .default boolTy <|
+        mkEq lmObsTy (mkApp2 compObs (.bvar 0) zstDanglingC)
+          (mkApp2 lmObserve (.bvar 0) (mkNatLit 17)))
+      (mkLambda `tb .default boolTy <|
+        mkRefl lmObsTy (mkApp2 compObs (.bvar 0) zstDanglingC))
+    added := added.push zstLockName
+    addThmInfer (ns ++ `dual_d3_zst_fixture_divergence)
+      (mkApp4 (mkConst (bNs ++ `dual_d3_zst_fixture_divergence)) lmObsTy lmToMr
+        compObs hC)
+    added := added.push (ns ++ `dual_d3_zst_fixture_divergence)
+
     -- 4b. Observer-level 3-way agreement over raw `lmOcObserve` + unified
     -- cross-root 3-engine capstone.
     let olName := ns ++ `observer_level_three_way
@@ -1269,6 +1430,13 @@ run_cmd do
           mkConst phaseCheckName,
           mkConst phaseCompCheckName,
           mkConst bmDriverName,
+          mkConst pbCapName,
+          mkConst phaseOobName,
+          mkConst (ns ++ `dual_d1_phase_boundary_all_nat),
+          mkConst (ns ++ `postBorrowckBundle_eq ++ `unified),
+          mkConst (ns ++ `postBorrowckBundle_eq ++ `d1),
+          mkConst zstLockName,
+          mkConst (ns ++ `dual_d3_zst_fixture_divergence),
           mkConst runnerUnivName ] ++
         (lockNames.toList.map mkConst)
       let rec conj : List Expr → MetaM Expr
@@ -1667,6 +1835,15 @@ run_cmd do
     let forgedRunnerTy ← MetaM.run' <| inferType forgedRunnerPf
     let lmCombine12 := mkApp lmToMr
       (mkApp2 (mkConst (lmNs ++ `ocCombine)) (lmSc 1) (lmSc 2))
+    let pbObs (tb : Bool) (i : Nat) : Expr :=
+      mkApp2 (mkConst (bNs ++ `trustedPostBorrowckObserve)) (toExpr tb)
+        (mkNatLit i)
+    let some (.defnInfo pbChkInfo) :=
+        (← getEnv).find? (bNs ++ `lmPostBorrowckCheckOf)
+      | throwError "cross-root: lmPostBorrowckCheckOf definition missing"
+    let checkOnPbModel := pbChkInfo.value.bindingBody!.bindingBody!.appFn!
+    let pbSideMr := mkApp3 (mkConst (bNs ++ `sideOf)) noneSel
+      (mkConst (bNs ++ `postBorrowckGate)) (mkConst (bNs ++ `mrVerdictFn))
     let eqCtl (what : String) (tag : Name) (ty lhs bad good : Expr) :
         String × Declaration × Declaration :=
       (what, thmD (ns ++ `forged ++ tag) (mkEq ty lhs bad) (mkRefl ty lhs),
@@ -1803,7 +1980,31 @@ run_cmd do
       ([18, 19, 20, 21].map fun i =>
         eqCtl s!"forged D3 case {i}: MiniRust accepts the invalid safe pointer"
           (Name.mkSimple s!"d3MrAccepts{i}") mrObsTy (mrObs true i)
-          (mrC `okPtrValid) (mrC `ub))
+          (mrC `okPtrValid) (mrC `ub)) ++
+      -- Post-borrowck image and out-of-range phase controls.
+      [ eqCtl "forged LM phase observer out of range: idx 22 rejected at the phase boundary"
+          `phaseOob22 mrObsTy0
+          (mkApp lmToMr (mkApp lmPhaseObs (mkNatLit 22)))
+          (mrC `phaseBoundary) (mrC `unsupported),
+        eqCtl "forged MR phase observer out of range: idx 1000 rejected at the phase boundary"
+          `phaseOob1000 mrObsTy0 (mrPhase 1000)
+          (mrC `phaseBoundary) (mrC `unsupported),
+        eqCtl "forged post-borrowck case 8: Trusted on the erased image stays unsupported"
+          `pbCase8 mrObsTy0 (pbObs false 8) (mrC `unsupported) (mrSc 5),
+        eqCtl "forged cast-erasure faithfulness at case 8 (cast fixture = erased image)"
+          `pbCase8Faithful mrObsTy0 (trObs false 8) (pbObs false 8)
+          (mrC `unsupported),
+        ("forged all-case MR gate on the CAST model (case 8 breaks Side.check)",
+          thmD (ns ++ `forged.pbGateOnCastModel)
+            (eqTrue (mkApp checkOnOcModel pbSideMr)) reflTrue,
+          -- Same side, same gate: only the post-borrowck model accepts it.
+          thmD (ns ++ `honest.pbGateOnPostBorrowckModel)
+            (eqTrue (mkApp checkOnPbModel pbSideMr)) reflTrue),
+        ("forged post-borrowck LM side certificate from the mode-inverted LM authority",
+          thmD (ns ++ `forged.pbModeInverted)
+            (eqTrue (pbCheck noneSel invAuth)) reflTrue,
+          thmD (ns ++ `honest.pbFromUnrolled)
+            (eqTrue (pbCheck noneSel authUC)) reflTrue) ]
     let mut rejected : Nat := 0
     let mut twins : Nat := 0
     for (what, d, h) in forged ++ forgedMore do
@@ -1976,6 +2177,11 @@ run_cmd do
         `MiniRustSpec.Correspondence.translatePlace,
         `MiniRustSpec.Correspondence.stepM_bm_eq,
         `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.ep1_lean_miri_opaquecast_fnentry_capstone ]
+    -- Post-borrowck bundles: Trusted on the cast-erased image.
+    let erasedReach : List Name :=
+      [ `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve,
+        `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocEraseBody,
+        `Anneal.Mir.OpaqueCastAndFnEntryProtectorDualSpec.trustedPostBorrowckObserve ]
     let twinU : List Name :=
       [ `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserveU ]
     let reqs : List (Name × List Name) :=
@@ -1991,6 +2197,12 @@ run_cmd do
             `Miri.Interpreter.project,
             `Miri.Interpreter.PlaceDynamic.project ]),
         (compCapName, compCapReach),
+        (pbUnifiedName, bundleCore ++ erasedReach),
+        (pbD1Name, bundleCore ++ erasedReach),
+        (pbCapName, trustedCore ++ erasedReach ++
+          [ `MiniRustSpec.Interp.stepM,
+            `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM.lmOcObserve,
+            `Miri.Interpreter.Step.step ]),
         (bmDriverName,
           [ `MiniRustSpec.Interp.steps,
             `MiniRustSpec.Interp.stepM,
@@ -2085,9 +2297,9 @@ run_cmd do
   let ((addedCount, bundleCount, eqLockCount, sharedCount,
         rejectedCount, twinCount, reachCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 196 && bundleCount = 4 && eqLockCount = 94 &&
-      sharedCount = 98 && rejectedCount ≥ 87 &&
-      twinCount = rejectedCount && reachCount ≥ 172 do
+  unless addedCount ≥ 217 && bundleCount = 6 && eqLockCount = 94 &&
+      sharedCount = 98 && rejectedCount ≥ 93 &&
+      twinCount = rejectedCount && reachCount ≥ 226 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, eqLocks={eqLockCount}, shared={sharedCount}, rejected={rejectedCount}, twins={twinCount}, reach={reachCount})"
   logInfo m!"oc/fp cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles; {eqLockCount} Eq.refl + 2 bijection + 2 universal runner + 1 ocCombine locks covering {sharedCount}/98 shared MR/LM declarations), kernel-rejected {rejectedCount} forged controls ({twinCount}/{rejectedCount} honest twins accepted), {reachCount} reachability edges across Trusted+MiniRust+Miri, axioms {crAxioms}"
 
@@ -2141,7 +2353,19 @@ run_cmd do
       `ep2_opaquecast_fnentry_dual_authority_capstone,
       `ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous,
       `ep2_opaquecast_fnentry_companion_phase_capstone,
-      `ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous ]
+      `ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous,
+      `dual_d3_zst_fixture_divergence,
+      `ocCaseFixture?_out_of_range, `ocDomainOf_d1_iff,
+      `phase_fail_closed_of_fixture, `dual_d1_phase_boundary_all_nat,
+      `trustedPostBorrowckObserve, `trustedPostBorrowckObserve_table,
+      `trustedPostBorrowckVerdict_cell, `ocPostBorrowckModel,
+      `postBorrowckGate, `mrPostBorrowckSide_check,
+      `lmPostBorrowckCheckOf_of_table, `postBorrowckBundleOfSel,
+      `postBorrowckBundleOf, `postBorrowckDomainBundleOf,
+      `post_borrowck_bundle_closes_case8, `dual_post_borrowck_case8,
+      `dual_post_borrowck_exact_all_nat,
+      `ep2_opaquecast_fnentry_post_borrowck_capstone,
+      `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   let isChoiceFree (axs : Array Name) : Bool :=
     axs.all fun a => a == ``propext || a == ``Quot.sound
   for d in constructiveDecls do
@@ -2160,7 +2384,7 @@ run_cmd do
       unless isChoiceFree axs do
         throwError "exhaustive constructive audit failure: {c} uses non-constructive axiom ({axs})"
       exhaustiveChoiceFree := exhaustiveChoiceFree + 1
-  unless exhaustiveChoiceFree ≥ 400 do
+  unless exhaustiveChoiceFree ≥ 500 do
     throwError "exhaustive constructive audit vacuous: only {exhaustiveChoiceFree} decls checked"
   -- Self-tests: constructive check rejects `Classical.choice`; standard-axiom
   -- check rejects `sorryAx` and `Lean.ofReduceBool`; trivial-prop detector

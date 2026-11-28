@@ -229,7 +229,10 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             # `OpaqueCast after borrowck` phase-boundary rejection (`Projection.lean` `.invariant`
             # / `PlaceDynamic.lean` `.invalidProgram`) plus `Step.step` execution on the
             # post-borrowck cast-erased image (`dual_d1_phase_boundary`); cast erasure is faithful
-            # only for type-preserving casts (`dual_type_switch_erasure_boundary`).
+            # only for type-preserving casts (`dual_type_switch_erasure_boundary`). On that
+            # post-borrowck image Trusted `stepMirFn` agrees with both authorities on ALL 44 cells,
+            # so the post-borrowck bundles gate every case, case `8` included
+            # (`post_borrowck_bundle_closes_case8`, `dual_post_borrowck_exact_all_nat`).
             ("opaqueCast", "proved_corresponding"),
             # UnwindSetDiscrAndFnPtr{MR,LM} (`C9`) and NullaryAndPtrCoercion{MR,LM,Bundle}.
             ("unwrapUnsafeBinder", "proved_corresponding"),

@@ -52,8 +52,16 @@ witnesses over unmodified `Trusted.Rustc.V2026_06_01.MirSemantics`.
   `zstDangling`, plus the type-switch erasure boundary.
 * §7c pins the `D1` static phase boundary on MiniRust (real `translatePlace`)
   and LeanMiri (parameterized phase observer) against runtime execution.
-* §7d exports the universal copy laws through which the cross-root bridge
+* §7d closes case `8` on the post-borrowck (cast-erased) image: Trusted
+  `stepMirFn` on `ocEraseBody` agrees with MiniRust and LeanMiri on ALL 44
+  cells, packaged as bundles whose support gate has no boundary.
+* §7e exports the universal copy laws through which the cross-root bridge
   locks the shared Trusted runner of `section Fixtures` for EVERY body.
+
+**Honest fixture note for case `17`**: Trusted's canonical fixture builds a
+live `&()`, whereas MiniRust and LeanMiri check a dangling provenance-less ZST
+pointer; on the identical dangling program Trusted is conservatively `.ub`
+(`dual_d3_zst_fixture_divergence`).
 
 **100% Constructive purity (`[propext, Quot.sound]`)**: every single declaration
 in this module — codecs, corpus combinators, bundle witnesses, lifted domain
@@ -1391,6 +1399,32 @@ theorem dual_companion_mode_sensitivity {Obs : Type} (f : Obs → MrOcFpObs)
     trustedCompanion_table false c, trustedCompanion_table true c]
   cases c <;> decide
 
+/-- **Honest fixture divergence at `D3` case `17`.** On MiniRust the
+`zstDangling` companion is not an independent program: it IS canonical cell
+`17` (`ocMrProg17` checks the provenance-less pointer `4` at `&()` / `Box<()>`),
+and a certified LeanMiri companion observes the same value. Trusted's canonical
+case `17` instead builds a LIVE `&()` (`okPtrValid`), because on the identical
+dangling program (`ocCase17DanglingZstMir`) Trusted conservatively rejects the
+provenance-less reference transmute with `.ub`. So the 3-way agreement of
+canonical cell `17` relates Trusted on a live ZST reference to MiniRust and
+LeanMiri on a dangling one. -/
+theorem dual_d3_zst_fixture_divergence {Obs : Type} (f : Obs → MrOcFpObs)
+    (obs : Bool → OcFpCompanion → Obs) (hC : OcFpLmCompanionCells f obs)
+    (tb : Bool) :
+    mrCompanion tb .zstDangling = mrOcObserve tb 17 ∧
+    f (obs tb .zstDangling) = mrOcObserve tb 17 ∧
+    mrOcTrustedObserve tb 17 = .okPtrValid ∧
+    trustedCompanion tb .zstDangling = .ub ∧
+    trustedCompanion tb .zstDangling ≠ mrOcTrustedObserve tb 17 := by
+  have hT : mrOcTrustedObserve tb 17 = .okPtrValid := by
+    cases tb <;> decide +kernel
+  have hC17 : trustedCompanion tb .zstDangling = .ub := by
+    rw [trustedCompanion_table tb .zstDangling]; rfl
+  refine ⟨rfl, (hC tb .zstDangling).trans
+    (mrCompanion_table tb .zstDangling).symm, hT, hC17, ?_⟩
+  rw [hT, hC17]
+  decide
+
 /-- **Type-switch erasure boundary on all three authorities**
 (`ocCase9InvalidBoolMir`, `move (_1 as bool)` with `_1 : u8 = 2`). The cast
 fixture is `.ub` on Trusted, MiniRust, and LeanMiri, whereas the cast-ERASED
@@ -1586,7 +1620,266 @@ theorem dual_d1_phase_boundary (A : OcFpLmAuthority)
   · rw [hM]; exact hCell.1
   · rw [hf, hL]; exact hCell.2
 
-/-! ## §7d. Verbatim-Copy Locks for the Shared Trusted Runner
+/-- The shared fixture table is empty outside the canonical range. -/
+theorem ocCaseFixture?_out_of_range (idx : Nat) (h : mrOcCaseCount ≤ idx) :
+    ocCaseFixture? idx = none := by
+  unfold mrOcCaseCount at h
+  unfold ocCaseFixture?
+  split <;> first | rfl | omega
+
+theorem ocDomainOf_d1_iff (idx : Nat) : ocDomainOf idx = .d1 ↔ idx < 10 := by
+  unfold ocDomainOf
+  by_cases h : idx < 10
+  · rw [ite_eq_left h]; exact ⟨fun _ => h, fun _ => rfl⟩
+  · rw [ite_eq_right h]
+    by_cases h2 : idx < 16
+    · rw [ite_eq_left h2]; exact ⟨(fun e => nomatch e), fun e => absurd e h⟩
+    · rw [ite_eq_right h2]; exact ⟨(fun e => nomatch e), fun e => absurd e h⟩
+
+/-- **Fail-closedness of a fixture-indexed phase observer.** Any phase
+observer that factors as `k ∘ fixture'` through a copy `fixture'` of the shared
+fixture table (locked to `ocCaseFixture?` by `Eq.refl` in the cross-root
+bridge), with `k none` translating to `.unsupported`, is fail-closed outside
+the canonical range. The bridge instantiates it with LeanMiri's
+`lmOcPhaseObserve`, discharging `hphase` by `Eq.refl`. -/
+theorem phase_fail_closed_of_fixture {Obs : Type} (f : Obs → MrOcFpObs)
+    (fixture' : Nat → Option
+      (Trusted.Rustc.V2026_06_01.MirAst.CapturedMir ×
+        List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir))
+    (hfix : ocCaseFixture? = fixture')
+    (k : Option
+      (Trusted.Rustc.V2026_06_01.MirAst.CapturedMir ×
+        List Trusted.Rustc.V2026_06_01.MirAst.CapturedMir) → Obs)
+    (hk : f (k none) = .unsupported)
+    (phase : Nat → Obs) (hphase : ∀ idx, phase idx = k (fixture' idx))
+    (idx : Nat) (h : mrOcCaseCount ≤ idx) :
+    f (phase idx) = .unsupported := by
+  rw [hphase idx, ← hfix, ocCaseFixture?_out_of_range idx h]
+  exact hk
+
+/-- **All-`Nat` static phase agreement.** For EVERY `idx : Nat` (canonical
+`0..21` and fail-closed `≥ 22`) a certified, fail-closed LeanMiri phase
+observer equals the MiniRust phase observer, and the phase boundary is hit
+exactly on the `D1` indices `idx < 10`. -/
+theorem dual_d1_phase_boundary_all_nat {Obs : Type} (f : Obs → MrOcFpObs)
+    (phase : Nat → Obs) (hP : lmPhaseCheckOf f phase = true)
+    (hPOob : ∀ idx, mrOcCaseCount ≤ idx → f (phase idx) = .unsupported)
+    (idx : Nat) :
+    f (phase idx) = mrOcPhaseObserve idx ∧
+    (mrOcPhaseObserve idx = .phaseBoundary ↔ idx < 10) := by
+  by_cases hi : idx < mrOcCaseCount
+  · have hL : f (phase idx) = ocPhaseExpected.getD idx .unsupported :=
+      of_decide_eq_true (List.all_eq_true.mp hP idx (List.mem_range.mpr hi))
+    have hM : mrOcPhaseObserve idx = ocPhaseExpected.getD idx .unsupported := by
+      rw [← mrOcPhaseObserve_table, range_map_getD hi]
+    refine ⟨hL.trans hM.symm, ?_⟩
+    rw [hM]
+    exact (ocPhaseExpected_cell idx hi).1.trans (ocDomainOf_d1_iff idx)
+  · have hge : mrOcCaseCount ≤ idx := Nat.le_of_not_lt hi
+    have h10 : ¬ idx < 10 := by unfold mrOcCaseCount at hge; omega
+    rw [hPOob idx hge, mrOcPhaseObserve_out_of_range idx hge]
+    exact ⟨rfl, (fun e => nomatch e), fun e => absurd e h10⟩
+
+/-! ## §7d. The Post-Borrowck (Cast-Erased) Image: Closing Case `8`
+
+The `castDerefBoundary` class is a limitation of Trusted's dispatch of a
+dereference directly below a leading cast chain, not a semantic disagreement:
+on the post-borrowck image (the MIR that exists at `MirPhase::Runtime`, where
+`ProjectionElem.opaqueCast` has been erased) Trusted `stepMirFn` agrees with
+MiniRust and LeanMiri on ALL 44 cells, case `8` included. This section packages
+that fact as a second family of genuine `DualCorrespondenceBundle` witnesses
+whose support gate has NO boundary. -/
+
+/-- **Trusted observer on the post-borrowck image**: unmodified `stepMirFn` on
+the cast-erased image `ocEraseBody` of every `D1` fixture (`idx < 10`,
+`mrOcTrustedErasedObserve`), and on the cast-free `D2` / `D3` fixtures
+unchanged. -/
+def trustedPostBorrowckObserve (tb : Bool) (idx : Nat) : MrOcFpObs :=
+  if idx < 10 then mrOcTrustedErasedObserve idx else mrOcTrustedObserve tb idx
+
+/-- **Kernel-executed 44-cell table**: on the post-borrowck image Trusted
+`stepMirFn` coincides with the frozen MiniRust table on EVERY cell (the
+deref-below-cast case `8` reads `okScalar 5`). -/
+theorem trustedPostBorrowckObserve_table (tb : Bool) :
+    (List.range mrOcCaseCount).map (trustedPostBorrowckObserve tb) =
+      mrTable tb := by
+  cases tb <;> decide +kernel
+
+theorem trustedPostBorrowckObserve_out_of_range (tb : Bool) (idx : Nat)
+    (h : mrOcCaseCount ≤ idx) :
+    trustedPostBorrowckObserve tb idx = .unsupported := by
+  have h10 : ¬ idx < 10 := by unfold mrOcCaseCount at h; omega
+  unfold trustedPostBorrowckObserve
+  rw [ite_eq_right h10]
+  exact mrOcTrustedObserve_out_of_range tb idx h
+
+/-- Authority 0 on the post-borrowck image. -/
+def trustedPostBorrowckVerdict (tb : Bool) (idx : Nat) :
+    Option (Corpus.Verdict OcFpObs) :=
+  ocVerdictOf (trustedPostBorrowckObserve tb idx)
+
+theorem trustedPostBorrowckVerdict_cell (tb : Bool) (idx : Nat)
+    (hi : idx < mrOcCaseCount) :
+    trustedPostBorrowckVerdict tb idx = cellOf (mrTable tb) idx := by
+  unfold trustedPostBorrowckVerdict cellOf
+  rw [← trustedPostBorrowckObserve_table tb, range_map_getD hi]
+
+/-- Trusted Anneal execution on the post-borrowck image of every key. -/
+def ocPostBorrowckAnnealEval (m : OcFpMode) (i : OcFpCase) (_q : Unit)
+    (_c : Unit) : Option (Corpus.Verdict OcFpObs) :=
+  trustedPostBorrowckVerdict m.toTb i.val
+
+def ocPostBorrowckExpectedEval (m : OcFpMode) (i : OcFpCase) (_q : Unit)
+    (_c : Unit) : Option (Corpus.Verdict OcFpObs) :=
+  cellOf (mrTable m.toTb) i.val
+
+theorem ocPostBorrowckAnnealEval_funext :
+    ocPostBorrowckAnnealEval = ocPostBorrowckExpectedEval :=
+  funext fun m => funext fun i => funext fun _ => funext fun _ =>
+    trustedPostBorrowckVerdict_cell m.toTb i.val i.isLt
+
+/-- The Anneal corpus model evaluated by Trusted `stepMirFn` on the
+post-borrowck image. -/
+def ocPostBorrowckModel :
+    Corpus.Model OcFpMode OcFpCase Unit Unit OcFpObs OcFpObsRep :=
+  ocModelOf ocPostBorrowckAnnealEval
+
+/-- Support gate on the post-borrowck image: EVERY case of the selected
+sub-domain (no `castDerefBoundary` exclusion). -/
+def postBorrowckGate (sel : Option OcFpDomain) (i : OcFpCase) : Bool :=
+  domainSel sel i
+
+/-- MiniRust side on the post-borrowck image (same `mrOcObserve` verdicts). -/
+def mrPostBorrowckSide (sel : Option OcFpDomain) :
+    Corpus.Side OcFpMode Bool OcFpCase Unit Unit OcFpObs OcFpObsRep :=
+  sideOf sel postBorrowckGate mrVerdictFn
+
+theorem mrPostBorrowckSide_check (sel : Option OcFpDomain) :
+    (mrPostBorrowckSide sel).check ocPostBorrowckModel = true := by
+  show (sideOf sel postBorrowckGate mrVerdictFn).check
+    (ocModelOf ocPostBorrowckAnnealEval) = true
+  rw [ocPostBorrowckAnnealEval_funext, mrVerdictFn_funext]
+  cases sel with
+  | none => decide +kernel
+  | some d => cases d <;> decide +kernel
+
+/-- LeanMiri side on the post-borrowck image over an arbitrary authority. -/
+def lmPostBorrowckSideOf (sel : Option OcFpDomain) (A : OcFpLmAuthority) :
+    Corpus.Side OcFpMode Bool OcFpCase Unit Unit OcFpObs OcFpObsRep :=
+  sideOf sel postBorrowckGate (lmVerdictFn A)
+
+def lmPostBorrowckCheckOf (sel : Option OcFpDomain) (A : OcFpLmAuthority) :
+    Bool :=
+  (lmPostBorrowckSideOf sel A).check ocPostBorrowckModel
+
+theorem lmPostBorrowckCheckOf_of_table (sel : Option OcFpDomain)
+    (A : OcFpLmAuthority) (hA : lmTableCheckOf A = true) :
+    lmPostBorrowckCheckOf sel A = true := by
+  show (sideOf sel postBorrowckGate (lmVerdictFn A)).check
+    (ocModelOf ocPostBorrowckAnnealEval) = true
+  rw [ocPostBorrowckAnnealEval_funext, lmVerdictFn_funext A hA]
+  cases sel with
+  | none => decide +kernel
+  | some d => cases d <;> decide +kernel
+
+/-- Post-borrowck bundle of selection `sel` from a side certificate. -/
+def postBorrowckBundleOfSel (sel : Option OcFpDomain) (A : OcFpLmAuthority)
+    (hLM : lmPostBorrowckCheckOf sel A = true) : OcFpBundle :=
+  Corpus.bundle ocPostBorrowckModel (mrPostBorrowckSide sel)
+    (lmPostBorrowckSideOf sel A) (mrPostBorrowckSide_check sel) hLM
+
+/-- **Unified post-borrowck bundle**: MiniRust and LeanMiri gated on ALL 22
+cases × 2 modes against Trusted on the cast-erased image. -/
+def postBorrowckBundleOf (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) : OcFpBundle :=
+  postBorrowckBundleOfSel none A (lmPostBorrowckCheckOf_of_table none A hA)
+
+/-- **Per-domain post-borrowck bundle** (`D1` gates all ten cases `0..9`). -/
+def postBorrowckDomainBundleOf (d : OcFpDomain) (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) : OcFpBundle :=
+  postBorrowckBundleOfSel (some d) A
+    (lmPostBorrowckCheckOf_of_table (some d) A hA)
+
+/-- **The post-borrowck bundle has no boundary.** Case `8` is excluded from
+the cast-image gates (`mrGate` / `lmGate`) but admitted by `postBorrowckGate`;
+EVERY case is gated, carries exact behavioral equivalence (reverse totality)
+on BOTH authorities, and the bundle makes genuine correspondence and
+fault-equivalence claims with a real UB fault witness. -/
+theorem post_borrowck_bundle_closes_case8 (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) :
+    postBorrowckGate none 8 = true ∧ mrGate none 8 = false ∧
+    lmGate none 8 = false ∧ postBorrowckGate (some .d1) 8 = true ∧
+    (∀ i : OcFpCase, postBorrowckGate none i = true) ∧
+    (∀ (i : OcFpCase) (mMR mLM : Bool),
+      ExactBehaviorEq (postBorrowckBundleOf A hA).mrRel mMR i () ∧
+      ExactBehaviorEq (postBorrowckBundleOf A hA).lmRel mLM i ()) ∧
+    CorrespondenceClaim (postBorrowckBundleOf A hA).mrRel ∧
+    FaultEquivClaim (postBorrowckBundleOf A hA).mrRel ∧
+    CorrespondenceClaim (postBorrowckBundleOf A hA).lmRel ∧
+    FaultEquivClaim (postBorrowckBundleOf A hA).lmRel ∧
+    (postBorrowckBundleOf A hA).mrFault.p = 2 ∧
+    (postBorrowckBundleOf A hA).lmFault.p = 2 :=
+  ⟨rfl, rfl, rfl, rfl, fun _ => rfl,
+   fun i _ _ =>
+    ⟨(postBorrowckBundleOf A hA).mrSim.exactBehaviorEq_of_reverseTotal
+        ((mrPostBorrowckSide none).reverseTotal ocPostBorrowckModel
+          (Bool.and_eq_true _ _ ▸ mrPostBorrowckSide_check none).1)
+        (rfl : postBorrowckGate none i = true),
+     (postBorrowckBundleOf A hA).lmSim.exactBehaviorEq_of_reverseTotal
+        ((lmPostBorrowckSideOf none A).reverseTotal ocPostBorrowckModel
+          (Bool.and_eq_true _ _ ▸
+            lmPostBorrowckCheckOf_of_table none A hA).1)
+        (rfl : postBorrowckGate none i = true)⟩,
+   (postBorrowckBundleOf A hA).mrSim.correspondenceClaim,
+   (postBorrowckBundleOf A hA).mrSim.faultEquivClaim,
+   (postBorrowckBundleOf A hA).lmSim.correspondenceClaim,
+   (postBorrowckBundleOf A hA).lmSim.faultEquivClaim, rfl, rfl⟩
+
+/-- **Case `8` on both images (verdict level)**: Trusted is honestly
+`.unsupported` on the cast fixture, yet returns `5` on its post-borrowck
+image, exactly as MiniRust and LeanMiri do. -/
+theorem dual_post_borrowck_case8 (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) (tb : Bool) :
+    trustedVerdict tb 8 = some .unsupported ∧
+    trustedPostBorrowckVerdict tb 8 = some (.returns (.scalar 5)) ∧
+    mrVerdict tb 8 = some (.returns (.scalar 5)) ∧
+    A.verdict tb 8 = some (.returns (.scalar 5)) := by
+  rw [trustedVerdict_cell tb 8 (by decide),
+    trustedPostBorrowckVerdict_cell tb 8 (by decide),
+    mrVerdict_cell tb 8 (by decide), lmTableCheckOf_sound A hA tb 8 (by decide)]
+  cases tb <;> exact ⟨rfl, rfl, rfl, rfl⟩
+
+/-- **Exact post-borrowck agreement for EVERY `tb` and EVERY `idx : Nat`
+(raw observers).** Trusted on the post-borrowck image equals raw MiniRust and
+the raw (translated) LeanMiri observation unconditionally, and cast erasure is
+faithful on Trusted (cast fixture = post-borrowck image) iff `idx ≠ 8`. -/
+theorem dual_post_borrowck_exact_all_nat (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) (hOob : OcFpLmFailClosed A)
+    (f : A.Obs → MrOcFpObs) (hf : ∀ o, A.toVerdict o = ocVerdictOf (f o))
+    (tb : Bool) (idx : Nat) :
+    trustedPostBorrowckObserve tb idx = mrOcObserve tb idx ∧
+    trustedPostBorrowckObserve tb idx = f (A.observe tb idx) ∧
+    (mrOcTrustedObserve tb idx = trustedPostBorrowckObserve tb idx ↔
+      idx ≠ 8) := by
+  have hAll := observer_level_exact_all_nat A hA hOob f hf tb idx
+  have hPB : trustedPostBorrowckObserve tb idx = mrOcObserve tb idx := by
+    by_cases hi : idx < mrOcCaseCount
+    · have h1 : trustedPostBorrowckObserve tb idx =
+          (mrTable tb).getD idx .unsupported := by
+        rw [← trustedPostBorrowckObserve_table tb, range_map_getD hi]
+      have h2 : mrOcObserve tb idx = (mrTable tb).getD idx .unsupported := by
+        rw [← mrTable_eq tb, range_map_getD hi]
+      exact h1.trans h2.symm
+    · have hge : mrOcCaseCount ≤ idx := Nat.le_of_not_lt hi
+      rw [trustedPostBorrowckObserve_out_of_range tb idx hge,
+        mrOcObserve_out_of_range tb idx hge]
+  refine ⟨hPB, hPB.trans hAll.1.symm, ?_, ?_⟩
+  · intro h
+    exact hAll.2.2.mp ⟨h.trans hPB, hAll.1.symm⟩
+  · intro h8
+    exact (hAll.2.2.mpr h8).1.trans hPB.symm
+
+/-! ## §7e. Verbatim-Copy Locks for the Shared Trusted Runner
 
 `section Fixtures` of `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR` is shared
 verbatim with `LeanMiriSpec.OpaqueCastAndFnEntryProtectorLM`. Its 93 plain
@@ -1979,6 +2272,41 @@ theorem ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous :
     rootBackedErased_eq mrOcPhaseObserve rootBackedPhase_check
     mrOcPhaseCompanion rootBackedPhaseCompanion_check
 
+/-- **Episode 2 post-borrowck capstone (100% constructive)**: for EVERY
+certified fail-closed LeanMiri authority `A` whose translation factors through
+`f`:
+1. the MiniRust and LeanMiri post-borrowck side certificates hold for the
+   unified and all three per-domain selections;
+2. the unified post-borrowck bundle gates ALL 22 cases with exact behavioral
+   equivalence on both authorities (case `8` closed);
+3. case `8` is `.unsupported` on Trusted's cast fixture yet `5` on its
+   post-borrowck image, as on MiniRust and LeanMiri;
+4. for all `tb` and all `idx : Nat`, Trusted on the post-borrowck image equals
+   raw MiniRust and raw LeanMiri, and cast erasure is faithful on Trusted iff
+   `idx ≠ 8`. -/
+theorem ep2_opaquecast_fnentry_post_borrowck_capstone (A : OcFpLmAuthority)
+    (hA : lmTableCheckOf A = true) (hOob : OcFpLmFailClosed A)
+    (f : A.Obs → MrOcFpObs) (hf : ∀ o, A.toVerdict o = ocVerdictOf (f o)) :
+    (∀ sel, (mrPostBorrowckSide sel).check ocPostBorrowckModel = true) ∧
+    (∀ sel, lmPostBorrowckCheckOf sel A = true) ∧
+    type_of% (post_borrowck_bundle_closes_case8 A hA) ∧
+    (∀ tb, type_of% (dual_post_borrowck_case8 A hA tb)) ∧
+    (∀ tb idx,
+      type_of% (dual_post_borrowck_exact_all_nat A hA hOob f hf tb idx)) :=
+  ⟨mrPostBorrowckSide_check,
+   fun sel => lmPostBorrowckCheckOf_of_table sel A hA,
+   post_borrowck_bundle_closes_case8 A hA, dual_post_borrowck_case8 A hA,
+   dual_post_borrowck_exact_all_nat A hA hOob f hf⟩
+
+/-- The post-borrowck capstone is non-vacuous (root-backed authority). -/
+theorem ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous :
+    type_of% (ep2_opaquecast_fnentry_post_borrowck_capstone
+      rootBackedLmAuthority rootBackedLmAuthority_tableCheck
+      rootBackedLmAuthority_failClosed (fun o => o) (fun _ => rfl)) :=
+  ep2_opaquecast_fnentry_post_borrowck_capstone
+    rootBackedLmAuthority rootBackedLmAuthority_tableCheck
+    rootBackedLmAuthority_failClosed (fun o => o) (fun _ => rfl)
+
 /-! ## §10. Import-Isolation, 100% Constructive Purity, Reachability & Audit -/
 
 section AxiomAudit
@@ -2064,7 +2392,25 @@ run_cmd do
       ns ++ `ep2_opaquecast_fnentry_dual_authority_capstone,
       ns ++ `ep2_opaquecast_fnentry_dual_authority_capstone_nonvacuous,
       ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone,
-      ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous ]
+      ns ++ `ep2_opaquecast_fnentry_companion_phase_capstone_nonvacuous,
+      ns ++ `dual_d3_zst_fixture_divergence,
+      ns ++ `ocCaseFixture?_out_of_range, ns ++ `ocDomainOf_d1_iff,
+      ns ++ `phase_fail_closed_of_fixture,
+      ns ++ `dual_d1_phase_boundary_all_nat,
+      ns ++ `trustedPostBorrowckObserve,
+      ns ++ `trustedPostBorrowckObserve_table,
+      ns ++ `trustedPostBorrowckObserve_out_of_range,
+      ns ++ `trustedPostBorrowckVerdict, ns ++ `trustedPostBorrowckVerdict_cell,
+      ns ++ `ocPostBorrowckAnnealEval_funext, ns ++ `ocPostBorrowckModel,
+      ns ++ `postBorrowckGate, ns ++ `mrPostBorrowckSide,
+      ns ++ `mrPostBorrowckSide_check, ns ++ `lmPostBorrowckSideOf,
+      ns ++ `lmPostBorrowckCheckOf, ns ++ `lmPostBorrowckCheckOf_of_table,
+      ns ++ `postBorrowckBundleOfSel, ns ++ `postBorrowckBundleOf,
+      ns ++ `postBorrowckDomainBundleOf,
+      ns ++ `post_borrowck_bundle_closes_case8, ns ++ `dual_post_borrowck_case8,
+      ns ++ `dual_post_borrowck_exact_all_nat,
+      ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
+      ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone_nonvacuous ]
   for c in spotlightDecls do
     unless env.contains c do throwError "constructive audit: {c} missing"
     for a in ← liftCoreM <| Lean.collectAxioms c do
@@ -2077,7 +2423,7 @@ run_cmd do
         unless a == ``propext || a == ``Quot.sound do
           throwError "exhaustive constructive audit failure: {c} depends on {a}"
       exhaustiveChoiceFree := exhaustiveChoiceFree + 1
-  if exhaustiveChoiceFree < 400 then
+  if exhaustiveChoiceFree < 500 then
     throwError "exhaustive constructive audit vacuous: only {exhaustiveChoiceFree} decls checked"
   -- Auditor self-tests: Classical.em, sorryAx, and Lean.ofReduceBool are caught.
   if (← liftCoreM <| Lean.collectAxioms ``Classical.em).all
@@ -2181,12 +2527,42 @@ run_cmd do
           `MiniRustSpec.Correspondence.translatePlace,
           `MiniRustSpec.Correspondence.translateStatement,
           ns ++ `trustedCompanion, ns ++ `mrCompanion,
-          ns ++ `mrOcPhaseObserve, ns ++ `mrOcPhaseCompanion ]) ]
+          ns ++ `mrOcPhaseObserve, ns ++ `mrOcPhaseCompanion ]),
+      -- Post-borrowck bundles: Trusted `stepMirFn` on the cast-erased image.
+      (ns ++ `postBorrowckBundleOf,
+        [ `Anneal.DualCorrespondenceBundle.DualCorrespondenceBundle,
+          `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocEraseBody,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedObserve,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve,
+          `MiniRustSpec.Interp.stepM,
+          `MiniRustSpec.Interp.checkPtrM,
+          `MiniRustSpec.Interp.ConcurrentMemory.dereferenceable ]),
+      (ns ++ `postBorrowckDomainBundleOf,
+        [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcObserve ]),
+      (ns ++ `ep2_opaquecast_fnentry_post_borrowck_capstone,
+        [ `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve,
+          `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.ocEraseBody,
+          `MiniRustSpec.Interp.stepM,
+          ns ++ `trustedPostBorrowckObserve, ns ++ `postBorrowckBundleOf ]) ]
   for (root, rs) in reqs do
     let seen := reachFrom root
     for r in rs do
       unless seen.contains r do
         throwError "shadow-evaluator audit: {root} does not reach the real {r}"
+  -- Reachability self-tests: the detector is not vacuously true (the pure
+  -- codec reaches no interpreter, and the cast-image bundle never touches the
+  -- cast-erased Trusted observer).
+  if (reachFrom (ns ++ `ocCodec)).contains
+      `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn then
+    throwError "shadow-evaluator audit self-test failed: ocCodec reaches stepMirFn"
+  if (reachFrom (ns ++ `bundleOf)).contains
+      `MiniRustSpec.OpaqueCastAndFnEntryProtectorMR.mrOcTrustedErasedObserve then
+    throwError "shadow-evaluator audit self-test failed: bundleOf reaches the erased observer"
   -- 5. Standard-3-axiom purity & non-vacuous authored theorem floor.
   let mut theorems : Nat := 0
   for (c, info) in env.constants.map₂.toList do
@@ -2198,7 +2574,7 @@ run_cmd do
         throwError "{c} depends on non-standard axiom {a}"
     if ns.isPrefixOf c && !c.isInternal then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 100 then
+  if theorems < 120 then
     throwError "axiom audit vacuous: only {theorems} theorems seen"
   logInfo m!"oc/fp DualSpec audit: {exhaustiveChoiceFree} decls ({theorems} theorems) 100% constructive in [propext, Quot.sound], zero Classical.choice"
 
