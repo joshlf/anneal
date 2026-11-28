@@ -264,6 +264,7 @@ def run_quorum(
     extra_lean_paths: list[str],
     neg_files: list[pathlib.Path],
     permitted_axioms: list[str],
+    mutant_ndjsons: list[pathlib.Path] | None = None,
     tc_435_arg: str | None = None,
     tc_434_arg: str | None = None,
     anneal_kc_arg: str | None = None,
@@ -542,6 +543,58 @@ def run_quorum(
                     "negative_mutations": neg_results,
                 }
 
+        mutant_ndjson_results: list[dict[str, Any]] = []
+        for mf in mutant_ndjsons or []:
+            mf_res = mf.resolve()
+            mut_cfg = tmp_path / f"nanoda_mut_{mf_res.stem}.json"
+            mut_cfg.write_text(
+                json.dumps(
+                    {
+                        "use_stdin": False,
+                        "export_file_path": str(mf_res),
+                        "permitted_axioms": permitted_axioms,
+                        "unpermitted_axiom_hard_error": True,
+                        "num_threads": jobs,
+                        "nat_extension": True,
+                        "string_extension": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mut_kernels: dict[str, dict[str, Any]] = {
+                "nanoda_bin": run_timed([str(nanoda_bin), str(mut_cfg)], env=exp_env),
+            }
+            if con_ron_bin.is_file():
+                mut_kernels["con-ron"] = run_timed(
+                    [str(con_ron_bin), "--verified", f"--jobs={jobs}", str(mf_res)], env=exp_env
+                )
+            if anneal_kc_bin is not None:
+                mut_kernels["anneal-kc"] = run_timed(
+                    [str(anneal_kc_bin), "--anneal-policy", str(mf_res)], env=exp_env
+                )
+            if palladium_bin is not None:
+                mut_kernels["palladium"] = run_timed(
+                    [str(palladium_bin), "--strict-axioms", "-j", str(jobs), str(mf_res)],
+                    env=exp_env,
+                )
+            accepted_mut = [k for k, r in mut_kernels.items() if r["rc"] == 0]
+            mutant_ndjson_results.append(
+                {
+                    "file": mf_res.name,
+                    "kernels": mut_kernels,
+                    "rejected_by_all": len(accepted_mut) == 0,
+                }
+            )
+            if accepted_mut:
+                return 1, {
+                    "passed": False,
+                    "stage": "mutant_ndjson_rejection",
+                    "module": mod,
+                    "mutant_file": str(mf_res),
+                    "accepted_unexpectedly": accepted_mut,
+                    "mutant_ndjsons": mutant_ndjson_results,
+                }
+
         nd_summary = {k: v for k, v in nd_info.items() if k != "decl_names"}
         return 0, {
             "passed": True,
@@ -553,6 +606,7 @@ def run_quorum(
             "kernels": kernels,
             "tamper_forged_axiom": tamper_results,
             "negative_mutations": neg_results,
+            "mutant_ndjsons": mutant_ndjson_results,
         }
 
 
@@ -584,6 +638,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Negative mutation `.lean` canary that must fail compilation (`rc != 0`).",
+    )
+    ap.add_argument(
+        "--require-mutant-reject",
+        action="append",
+        default=[],
+        dest="mutant_ndjsons",
+        help="Mutated or corrupted NDJSON export that every external kernel must reject (`rc != 0`).",
     )
     ap.add_argument(
         "--permitted-axiom",
@@ -634,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
         extra_lean_paths=list(args.lean_path),
         neg_files=[pathlib.Path(p) for p in args.neg_file],
         permitted_axioms=axioms,
+        mutant_ndjsons=[pathlib.Path(p) for p in args.mutant_ndjsons],
         tc_435_arg=args.tc_435,
         tc_434_arg=args.tc_434,
         anneal_kc_arg=args.anneal_kc,

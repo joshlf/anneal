@@ -2358,6 +2358,25 @@
       ]
     },
     {
+      "name": "diff_oracle_runner",
+      "path": "scripts/diff_oracle_runner.py",
+      "badge": "host_script",
+      "summary": "Language-agnostic JSONL differential-oracle runner with IEEE-754 F64Bits and mutant checks.",
+      "cli_flags": [
+        "--cases-jsonl",
+        "--exact-nan-bits",
+        "--json",
+        "--min-cases",
+        "--model-cmd",
+        "--model-jsonl",
+        "--mutant-model-cmd",
+        "--mutant-model-jsonl",
+        "--oracle-cmd",
+        "--oracle-jsonl",
+        "--out-json"
+      ]
+    },
+    {
       "name": "farkas_cert_gen",
       "path": "scripts/farkas_cert_gen.py",
       "badge": "host_script",
@@ -2479,6 +2498,7 @@
         "--out-json",
         "--palladium",
         "--permitted-axiom",
+        "--require-mutant-reject",
         "--root-dir",
         "--skip-tamper-check",
         "--skip-v434",

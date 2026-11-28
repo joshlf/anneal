@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import audit_lean_hygiene  # noqa: E402
 import build_lean_dag  # noqa: E402
+import diff_oracle_runner  # noqa: E402
 import farkas_cert_gen  # noqa: E402
 import olean_profiler  # noqa: E402
 import preflight_syntax_check  # noqa: E402
@@ -361,6 +362,94 @@ class VerifyQuorumTests(unittest.TestCase):
             self.assertEqual(rep_land["stage"], "nat_land_guard")
             self.assertIn("Anneal.NatBitwise", rep_land["error"])
             self.assertIn("4444", rep_land["error"])
+
+            mut_nd = td / "corrupted_mutant.ndjson"
+            mut_nd.write_text('{"in":1,"str":{"pre":0,"str":"bad"}}\n{"thm":{"name":1}}\n', encoding="utf-8")
+            rc_mut, rep_mut = verify_quorum.run_quorum(
+                lean_file=clean_src,
+                dep_files=[],
+                root_dir=td,
+                module_name="QuorumClean",
+                export_roots=["pack8_div"],
+                extra_lean_paths=[],
+                neg_files=[],
+                permitted_axioms=list(verify_quorum.DEFAULT_PERMITTED_AXIOMS),
+                mutant_ndjsons=[mut_nd],
+            )
+            self.assertEqual(rc_mut, 0, rep_mut)
+            self.assertTrue(rep_mut["mutant_ndjsons"][0]["rejected_by_all"])
+
+
+class DiffOracleRunnerTests(unittest.TestCase):
+    def test_f64_signed_zero_nan_outcomes_and_mutant_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            td = pathlib.Path(tmp)
+            model_p = td / "model.jsonl"
+            oracle_p = td / "oracle.jsonl"
+            mut_bad_zero = td / "mut_zero.jsonl"
+            mut_ident = td / "mut_ident.jsonl"
+
+            rows_model = [
+                '{"id":"neg_zero","outcome":"returned","f64_bits":"0x8000000000000000"}',
+                '{"id":"qnan_a","outcome":"returned","f64_bits":"0x7ff8000000000001"}',
+                '{"id":"throw_case","outcome":"unwound","error_tag":"RangeError"}',
+                '{"id":"bytes_case","outcome":"returned","bytes_hex":"0102ff"}',
+            ]
+            rows_oracle = [
+                '{"id":"neg_zero","outcome":"returned","f64_bits":"0x8000000000000000"}',
+                '{"id":"qnan_a","outcome":"returned","f64_bits":"0xfff8000000000000"}',
+                '{"id":"throw_case","outcome":"unwound","error_tag":"RangeError"}',
+                '{"id":"bytes_case","outcome":"returned","bytes_hex":"0102ff"}',
+            ]
+            rows_mut_zero = [
+                '{"id":"neg_zero","outcome":"returned","f64_bits":"0x0000000000000000"}',
+                *rows_model[1:],
+            ]
+            model_p.write_text("\n".join(rows_model) + "\n", encoding="utf-8")
+            oracle_p.write_text("\n".join(rows_oracle) + "\n", encoding="utf-8")
+            mut_bad_zero.write_text("\n".join(rows_mut_zero) + "\n", encoding="utf-8")
+            mut_ident.write_text("\n".join(rows_model) + "\n", encoding="utf-8")
+
+            rc_ok, rep_ok = diff_oracle_runner.run_differential_suite(
+                cases_jsonl=None,
+                model_jsonl=model_p,
+                oracle_jsonl=oracle_p,
+                model_cmd=None,
+                oracle_cmd=None,
+                mutant_model_jsonls=[mut_bad_zero],
+                mutant_model_cmds=[],
+                exact_nan_bits=False,
+                min_cases=4,
+            )
+            self.assertEqual(rc_ok, 0, rep_ok)
+            self.assertEqual(rep_ok["primary"]["matched_cases"], 4)
+            self.assertTrue(rep_ok["mutants"][0]["killed_as_expected"])
+
+            # Exact NaN payload mode flags differing NaN bit patterns.
+            rc_exact, _ = diff_oracle_runner.run_differential_suite(
+                cases_jsonl=None,
+                model_jsonl=model_p,
+                oracle_jsonl=oracle_p,
+                model_cmd=None,
+                oracle_cmd=None,
+                mutant_model_jsonls=[],
+                mutant_model_cmds=[],
+                exact_nan_bits=True,
+            )
+            self.assertEqual(rc_exact, 1)
+
+            # Unkilled mutant fails closed.
+            rc_survive, rep_survive = diff_oracle_runner.run_differential_suite(
+                cases_jsonl=None,
+                model_jsonl=model_p,
+                oracle_jsonl=oracle_p,
+                model_cmd=None,
+                oracle_cmd=None,
+                mutant_model_jsonls=[mut_ident],
+                mutant_model_cmds=[],
+            )
+            self.assertEqual(rc_survive, 1)
+            self.assertEqual(rep_survive["stage"], "mutant_kill_gate")
 
 
 class StageRefPkgTests(unittest.TestCase):
