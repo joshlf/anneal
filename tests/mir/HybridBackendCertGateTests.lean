@@ -918,11 +918,31 @@ theorem test_backend_transform_stream_prefix_safe :
     hValid (2, paddingOpt)
       (List.Mem.tail _ (List.Mem.tail _ (List.Mem.head _)))⟩
 
-/-- The halted `blockOptGate` stream `[0, 1, 3, 2]` emits only what the table
-holds for each key (no invented or swapped output), its emitted keys are a
-prefix of the input, and it stopped at block `3`, the block the gate rejected.
--/
+/-- Expected compiled block per id for `backendStreamTable`. -/
+def backendStreamOut : Nat → CompiledBlockUnit
+  | 0 => u64UncheckedAddOpt
+  | 1 => u64UncheckedSubOpt
+  | 2 => paddingOpt
+  | _ => u64UncheckedAddOpt
+
+/-- The halted `blockOptGate` stream `[0, 1, 3, 2]` emits only accepted table
+entries, its emitted keys are the prefix `[0, 1]` halted at `.fuzz` block `3`,
+the complete stream `[0, 1, 2]` matches `transformStream_complete_exact` on
+BOTH keys and outputs, and `obligationChunkGate` over
+`farkasMirBoundedEdgeGate` halts an empty-edge bomb mid-stream as
+`.witnessOversized`. -/
 theorem test_backend_transform_stream_entries_and_prefix :
+    -- Full-list exact completeness (keys AND outputs)
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun p : Nat × CompiledBlockUnit =>
+        SemRefinesUnder (SourceEntryPre (backendStreamSrc p.1))
+          (evalSourceBlockUnit (backendStreamSrc p.1))
+          (evalCompiledBlockUnit p.2))
+      backendStreamGate (transformTableProducer backendStreamTable ()) ()
+      [0, 1, 2] =
+      ([ (0, u64UncheckedAddOpt),
+         (1, u64UncheckedSubOpt),
+         (2, paddingOpt) ], none) ∧
     (∀ p : Nat × CompiledBlockUnit,
       p ∈ (Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
         (ValidChunk := fun p : Nat × CompiledBlockUnit =>
@@ -931,12 +951,43 @@ theorem test_backend_transform_stream_entries_and_prefix :
             (evalCompiledBlockUnit p.2))
         backendStreamGate (transformTableProducer backendStreamTable ()) ()
         [0, 1, 3, 2]).1 →
-      ∃ w, backendStreamTable p.1 = some (p.2, w)) ∧
+      ∃ w, backendStreamTable p.1 = some (p.2, w) ∧
+        Anneal.Hybrid.gateCheckBounded
+          (gateComapY backendStreamSrc (blockOptGate 4)) (p.1, p.2, w) =
+          true) ∧
     (∃ rest : List Nat, [0, 1, 3, 2] = [0, 1] ++ rest ∧
       ∃ u rest', rest = u :: rest' ∧
         Anneal.Hybrid.evalGate backendStreamGate ((), u)
           (transformTableProducer backendStreamTable () () u) =
-          .error .rejectedByChecker) := by
+          .error .rejectedByChecker) ∧
+    -- Bounded-edge obligation stream halts mid-stream on an empty-edge bomb
+    Anneal.Hybrid.foldStreamPrefix (AccInv := fun _ => True)
+      (ValidChunk := fun i => (mirObligation i).denote)
+      (obligationChunkGate
+        (gateComap mirObligation (farkasMirBoundedEdgeGate 8)) Nat.beq
+        (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h))
+      (tableProducer
+        (fun i => match i with
+          | 0 => some mirAddCert
+          | 1 => some (.edge (List.replicate 9 []))
+          | _ => some mirMulCert) ()) () [0, 1, 2] =
+      ([0], some (.witnessOversized 9 8)) := by
+  have hExact :=
+    transformStream_complete_exact (E := Unit)
+      (gateComapY backendStreamSrc (blockOptGate 4)) Nat.beq
+      (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
+      Anneal.InitLemmas.nat_beq_refl backendStreamTable backendStreamOut ()
+      [0, 1, 2]
+      (fun x hMem => by
+        cases hMem with
+        | head => exact ⟨_, rfl, rfl⟩
+        | tail _ h1 =>
+          cases h1 with
+          | head => exact ⟨_, rfl, rfl⟩
+          | tail _ h2 =>
+            cases h2 with
+            | head => exact ⟨_, rfl, rfl⟩
+            | tail _ h3 => cases h3)
   have hEntries :=
     transformStream_table_entries (E := Unit)
       (gateComapY backendStreamSrc (blockOptGate 4)) Nat.beq
@@ -947,8 +998,7 @@ theorem test_backend_transform_stream_entries_and_prefix :
       (gateComapY backendStreamSrc (blockOptGate 4)) Nat.beq
       (fun _ _ h => Anneal.InitLemmas.nat_eq_of_beq h)
       (transformTableProducer backendStreamTable ()) [0, 1, 3, 2]
-  exact ⟨fun p hMem => let ⟨w, hE, _⟩ := hEntries p hMem; ⟨w, hE⟩,
-    ⟨rest, hSplit, hSome _ rfl⟩⟩
+  exact ⟨hExact, hEntries, ⟨rest, hSplit, hSome _ rfl⟩, rfl⟩
 
 /-! ## 4. `Anneal.Backend` + `OverflowTrapRefinement` End-to-End & Negatives -/
 
@@ -1767,7 +1817,7 @@ run_cmd do
     auditModule `Anneal.Backend.Canaries propextOnly propextOnly 30 64 0
   let r9 ←
     auditModule `Anneal.HybridCertBridgesV2026 constructive constructive
-      189 260 4
+      190 263 4
   -- Enforce an EXACT duplicate-free `Quot.sound` allowlist on
   -- `Anneal.HybridCertBridgesV2026`: every non-allowlisted constant must be
   -- `<= [propext]` (only exact allowlisted theorems and their direct
@@ -1910,6 +1960,7 @@ run_cmd do
     seenTestQuot := tq :: seenTestQuot
   let mut testThms : Nat := 0
   let mut testDefs : Nat := 0
+  let mut testOther : Nat := 0
   let mut testUsed : List Name := []
   let mut testQuotActual : List Name := []
   for (c, ci) in env.constants.map₂.toList do
@@ -1926,15 +1977,18 @@ run_cmd do
       testThms := testThms + 1
     else if kind == 2 then
       testDefs := testDefs + 1
+    else
+      testOther := testOther + 1
   for tq in testQuotAllowed do
     unless testQuotActual.contains tq do
       throwError "audit: stale testQuotAllowed entry {tq}"
-  if testThms != 29 || testDefs != 57 then
-    throwError "audit: test count drift: thms={testThms}, defs={testDefs}"
+  if testThms != 29 || testDefs != 57 || testOther != 0 then
+    throwError
+      "audit: test drift: thms={testThms}, defs={testDefs}, aux={testOther}"
   let rT :=
-    s!"test module: {testThms} thms, {testDefs} defs, axioms={testUsed}, " ++
-    s!"quotAllowed={quotAllowed.length}+{quotMatchHelpers}m, " ++
-    s!"testQuot={testQuotAllowed.length}, " ++
+    s!"test module: {testThms} thms, {testDefs} defs, {testOther} aux, " ++
+    s!"axioms={testUsed}, quotAllowed={quotAllowed.length}+" ++
+    s!"{quotMatchHelpers}m, testQuot={testQuotAllowed.length}, " ++
     s!"annealTransitive={annealTransitive}, " ++
     s!"baseCompanions={baseCompanions.length}"
   -- Pin the EXACT axiom set of every capstone, so a proof that starts to
@@ -1968,6 +2022,7 @@ run_cmd do
       ``transformStream_all_emitted_valid,
       ``transformStream_emitted_prefix,
       ``transformStream_complete,
+      ``transformStream_complete_exact,
       ``transformStream_table_entries ]
   expectAxioms propextOnly
     [ ``natCutIdxGate_cut_sound,
@@ -2043,6 +2098,7 @@ run_cmd do
 #print axioms transformStream_all_emitted_valid
 #print axioms transformStream_emitted_prefix
 #print axioms transformStream_complete
+#print axioms transformStream_complete_exact
 #print axioms transformStream_table_entries
 #print axioms mirOptExactOutcomeRefines_exec_iff_on_u64
 #print axioms semRefinesUnder_preserves_mirOptRefines_asymmetric

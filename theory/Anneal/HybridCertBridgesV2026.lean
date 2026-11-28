@@ -1882,6 +1882,47 @@ theorem transformStream_complete {X Y W E : Type} {Spec : X → Y → Prop}
     dsimp only [List.map]
     exact ⟨ih.1, congrArg (List.cons u) ih.2⟩
 
+/-- Exact full-list completeness for `transformChunkGate` with
+`transformTableProducer`: whenever `entryOf` maps every `x ∈ us` to
+`some (yOf x, w)` accepted by `g`, the stream completes with `err = none` and
+emits the exact list `us.map (fun x => (x, yOf x))` (pinning both keys and
+outputs in one shot). -/
+theorem transformStream_complete_exact {X Y W E : Type} {Spec : X → Y → Prop}
+    (g : CertifiedGate X Y W (fun _ => True) Spec)
+    (beqX : X → X → Bool) (hBeq : ∀ x y, beqX x y = true → x = y)
+    (hBeqRefl : ∀ x, beqX x x = true) (entryOf : X → Option (Y × W))
+    (yOf : X → Y) (eMissing : E) :
+    ∀ us : List X,
+      (∀ x, x ∈ us → ∃ w, entryOf x = some (yOf x, w) ∧
+        gateCheckBounded g (x, yOf x, w) = true) →
+      foldStreamPrefix (AccInv := fun _ => True)
+        (ValidChunk := fun p => Spec p.1 p.2)
+        (transformChunkGate g beqX hBeq)
+        (transformTableProducer entryOf eMissing) () us =
+        (us.map (fun x => (x, yOf x)), none)
+  | [], _ => rfl
+  | u :: us, hAll => by
+    have ⟨w, hEnt, hChk⟩ := hAll u (List.Mem.head _)
+    have hChk' : (Nat.ble (g.wSize w) (g.maxWitness u) && g.check u (yOf u) w) =
+        true := hChk
+    have hCheck : (beqX u u && g.check u (yOf u) w) = true := by
+      rw [hBeqRefl u, bool_and_right hChk']
+      rfl
+    have hEv :
+        evalGate (transformChunkGate g beqX hBeq) ((), u)
+          (transformTableProducer entryOf eMissing () u) =
+          .ok ((), (u, yOf u)) := by
+      dsimp only [transformTableProducer]
+      rw [hEnt]
+      exact (evalGate_candidate_ok_iff
+        (transformChunkGate g beqX hBeq) ((), u) ((), (u, yOf u)) w
+        ((), (u, yOf u))).2
+        ⟨rfl, Nat.le_of_ble_eq_true (bool_and_left hChk'), hCheck⟩
+    rw [foldStreamPrefix_cons, hEv]
+    dsimp only [List.map]
+    rw [transformStream_complete_exact g beqX hBeq hBeqRefl entryOf yOf
+      eMissing us (fun x hMem => hAll x (List.Mem.tail _ hMem))]
+
 /-- With the table producer, every emitted pair is the table's own entry for
 its key, accepted by `g`, for ANY input list and whether or not the stream
 halts: the stream neither invents an output nor swaps outputs between keys.
