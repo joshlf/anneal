@@ -183,6 +183,45 @@ class PreflightSyntaxCheckTests(unittest.TestCase):
             self.assertIn("dbgTrace", msgs)
             self.assertIn("System", msgs)
 
+    def test_local_semireducible_allowlist_and_shadow_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            admitted = root / "Admitted.lean"
+            admitted.write_text(
+                "prelude\nimport Init.Core\nimport Init.Data.Nat.Bitwise.Basic\n\n"
+                "attribute [local semireducible] _root_.Nat.bitwise in\n"
+                "private theorem ok_unfold : 1 = 1 := by rfl\n",
+                encoding="utf-8",
+            )
+            unqual = root / "Unqualified.lean"
+            unqual.write_text(
+                "prelude\nimport Init.Core\nimport Init.Data.Nat.Bitwise.Basic\n\n"
+                "attribute [local semireducible] Nat.bitwise in\n"
+                "theorem bad_unqual : 1 = 1 := by rfl\n",
+                encoding="utf-8",
+            )
+            shadow = root / "Shadow.lean"
+            shadow.write_text(
+                "prelude\nimport Init.Core\n\n"
+                "namespace Foo.Nat\ndef bitwise : Nat := 0\nend Foo.Nat\n",
+                encoding="utf-8",
+            )
+            theory_rep = preflight_syntax_check.run_syntax_preflight(
+                [admitted, unqual, shadow], role="theory"
+            )
+            by_name = {pathlib.Path(f["file"]).name: f for f in theory_rep["files"]}
+            self.assertTrue(by_name["Admitted.lean"]["clean"], by_name["Admitted.lean"]["violations"])
+            self.assertFalse(by_name["Unqualified.lean"]["clean"])
+            self.assertFalse(by_name["Shadow.lean"]["clean"])
+            shadow_msgs = "\n".join(v["message"] for v in by_name["Shadow.lean"]["violations"])
+            self.assertIn("localSemireducibleAllowlist", shadow_msgs)
+
+            corr_rep = preflight_syntax_check.run_syntax_preflight([admitted], role="correspondence")
+            self.assertFalse(corr_rep["clean"])
+
+            trusted_rep = preflight_syntax_check.run_syntax_preflight([admitted], role="trusted")
+            self.assertFalse(trusted_rep["clean"])
+
 
 class BuildLeanDagTests(unittest.TestCase):
     def test_lake_free_module_dag_build_cache_and_audit(self) -> None:

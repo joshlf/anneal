@@ -136,6 +136,40 @@ def allowedAttributeNames : List Name :=
 def allowedTheoryImportAllModules : List Name :=
   [`Init.Data.Nat.Bitwise.Basic]
 
+def localSemireducibleAllowlist : List Name := [`Nat.bitwise]
+
+def matchLocalSemireducibleIn? (args : Array Syntax) : Option (Name × Syntax) := do
+  guard (args.size == 3)
+  let lhs := args[0]!
+  guard (lhs.isOfKind ``Parser.Command.attribute && lhs.getArgs.size == 5)
+  let items := lhs[2].getArgs
+  guard (items.size == 1)
+  let inst := items[0]!
+  guard (inst.isOfKind ``Parser.Term.attrInstance && inst.getArgs.size == 2)
+  let kind := inst[0]
+  guard (kind.isOfKind ``Parser.Term.attrKind && kind.getArgs.size == 1)
+  let kindOpt := kind[0]
+  guard (kindOpt.isOfKind nullKind && kindOpt.getArgs.size == 1 &&
+    kindOpt[0].isOfKind ``Parser.Term.local)
+  let attr := inst[1]
+  guard (attr.isOfKind ``Parser.Attr.simple && attr.getArgs.size == 2 &&
+    attr[0].isIdent && attr[0].getId == `semireducible &&
+    attr[1].isOfKind nullKind && attr[1].getArgs.isEmpty)
+  let ids := lhs[4].getArgs
+  guard (ids.size == 1 && ids[0]!.isIdent)
+  let raw := ids[0]!.getId
+  guard (!raw.hasMacroScopes && raw != rootNamespace &&
+    rootNamespace.isPrefixOf raw)
+  let c := raw.replacePrefix rootNamespace .anonymous
+  guard (localSemireducibleAllowlist.contains c)
+  let decl := args[2]!
+  guard (decl.isOfKind ``Parser.Command.declaration && decl.getArgs.size == 2)
+  guard ([``Parser.Command.theorem, ``Parser.Command.definition].contains
+    decl[1].getKind)
+  guard (decl[0].isOfKind ``Parser.Command.declModifiers &&
+    decl[0].getArgs.size > 1 && decl[0][1].isNone)
+  return (c, decl)
+
 def forbiddenPureTermKinds : NameSet := .ofList [
   ``Lean.includeStr,
   `Lean.Parser.Term.dbgTrace, `Lean.Parser.Term.idbg,
@@ -290,7 +324,8 @@ def inspectNodeKind (k : SyntaxNodeKind) (args : Array Syntax)
 partial def inspectSyntaxFull (fmap : FileMap) (allowedKinds : NameSet) (s : Syntax)
     (acc : Array Violation) (requirePrelude : Bool := true)
     (currNs : Name := .anonymous) (openDecls : List OpenDecl := [])
-    (checkPureRefs : Bool := true) : Array Violation :=
+    (checkPureRefs : Bool := true)
+    (allowLocalSemireducible : Bool := false) : Array Violation :=
   let (ln, col) := posOfSyntax fmap s
   match s with
   | .missing =>
@@ -309,28 +344,50 @@ partial def inspectSyntaxFull (fmap : FileMap) (allowedKinds : NameSet) (s : Syn
         pushUnique acc { line := ln, column := col, message := s!"disallowed reference `{val}`" }
       else acc
   | .node _ k args =>
-    let acc :=
-      if forbiddenPureTermKinds.contains k then
-        pushUnique acc { line := ln, column := col, message := s!"disallowed syntax `{k}`" }
-      else acc
-    let acc :=
-      if k == nullKind || allowedKinds.contains k then acc
-      else pushUnique acc { line := ln, column := col, message := s!"unsupported syntax kind `{k}`" }
-    let acc := (inspectNodeKind k args requirePrelude).foldl
-      (fun a msg => pushUnique a { line := ln, column := col, message := msg }) acc
-    if k == ``Parser.Command.in && checkPureRefs && args.size == 3 then
-      let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
-      let acc := inspectSyntaxFull fmap allowedKinds args[1]! acc requirePrelude currNs openDecls checkPureRefs
-      let nextOpen := extendOpenDeclsForOpenCmd currNs openDecls args[0]!
-      inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs nextOpen checkPureRefs
-    else if k == ``Parser.Command.mutual && checkPureRefs && args.size == 3 then
-      let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
-      let (acc, _) := args[1]!.getArgs.foldl (init := (acc, openDecls)) fun (a, mutOpen) child =>
-        let a' := inspectSyntaxFull fmap allowedKinds child a requirePrelude currNs mutOpen checkPureRefs
-        (a', extendOpenDeclsForOpenCmd currNs mutOpen child)
-      inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs openDecls checkPureRefs
+    if allowLocalSemireducible && k == ``Parser.Command.in then
+      match matchLocalSemireducibleIn? args with
+      | some (_, decl) =>
+        inspectSyntaxFull fmap allowedKinds decl acc requirePrelude currNs openDecls checkPureRefs
+      | none =>
+        let acc :=
+          if forbiddenPureTermKinds.contains k then
+            pushUnique acc { line := ln, column := col, message := s!"disallowed syntax `{k}`" }
+          else acc
+        let acc :=
+          if k == nullKind || allowedKinds.contains k then acc
+          else pushUnique acc { line := ln, column := col, message := s!"unsupported syntax kind `{k}`" }
+        let acc := (inspectNodeKind k args requirePrelude).foldl
+          (fun a msg => pushUnique a { line := ln, column := col, message := msg }) acc
+        if checkPureRefs && args.size == 3 then
+          let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
+          let acc := inspectSyntaxFull fmap allowedKinds args[1]! acc requirePrelude currNs openDecls checkPureRefs
+          let nextOpen := extendOpenDeclsForOpenCmd currNs openDecls args[0]!
+          inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs nextOpen checkPureRefs
+        else
+          args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs) acc
     else
-      args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs) acc
+      let acc :=
+        if forbiddenPureTermKinds.contains k then
+          pushUnique acc { line := ln, column := col, message := s!"disallowed syntax `{k}`" }
+        else acc
+      let acc :=
+        if k == nullKind || allowedKinds.contains k then acc
+        else pushUnique acc { line := ln, column := col, message := s!"unsupported syntax kind `{k}`" }
+      let acc := (inspectNodeKind k args requirePrelude).foldl
+        (fun a msg => pushUnique a { line := ln, column := col, message := msg }) acc
+      if k == ``Parser.Command.in && checkPureRefs && args.size == 3 then
+        let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
+        let acc := inspectSyntaxFull fmap allowedKinds args[1]! acc requirePrelude currNs openDecls checkPureRefs
+        let nextOpen := extendOpenDeclsForOpenCmd currNs openDecls args[0]!
+        inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs nextOpen checkPureRefs
+      else if k == ``Parser.Command.mutual && checkPureRefs && args.size == 3 then
+        let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
+        let (acc, _) := args[1]!.getArgs.foldl (init := (acc, openDecls)) fun (a, mutOpen) child =>
+          let a' := inspectSyntaxFull fmap allowedKinds child a requirePrelude currNs mutOpen checkPureRefs
+          (a', extendOpenDeclsForOpenCmd currNs mutOpen child)
+        inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs openDecls checkPureRefs
+      else
+        args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs) acc
 
 def collectScopedExtensionNamespaces (env : Environment) : IO NameSet := do
   let exts ← scopedEnvExtensionsRef.get
@@ -422,6 +479,45 @@ def declarationIdent? (stx : Syntax) : Option Name :=
     if decl[3].isNone then none else some decl[3][0][0].getId
   else
     some decl[1][0].getId
+
+def endsWithLocalSemireducibleName (n : Name) : Bool :=
+  localSemireducibleAllowlist.any (·.components.isSuffixOf n.components)
+
+partial def declaresLocalSemireducibleShadow (currNs : Name) (stx : Syntax) : Bool :=
+  let k := stx.getKind
+  if k == ``Parser.Command.declaration then
+    match declarationIdent? stx with
+    | some id =>
+      let full := currNs ++ id.replacePrefix rootNamespace .anonymous
+      let inner := collectIdents stx[1]
+      endsWithLocalSemireducibleName full ||
+        endsWithLocalSemireducibleName id ||
+        inner.any fun i => endsWithLocalSemireducibleName (full ++ i)
+    | none => false
+  else if k == ``Parser.Command.in then
+    declaresLocalSemireducibleShadow currNs stx[2]
+  else if k == ``Parser.Command.mutual then
+    stx[1].getArgs.any (declaresLocalSemireducibleShadow currNs)
+  else false
+where
+  collectIdents (s : Syntax) : Array Name :=
+    let here :=
+      if [``Parser.Command.ctor, ``Parser.Command.structCtor,
+          ``Parser.Command.structSimpleBinder,
+          ``Parser.Command.structExplicitBinder,
+          ``Parser.Command.structImplicitBinder,
+          ``Parser.Command.structInstBinder,
+          ``Parser.Command.structParent].contains s.getKind then
+        directIdents s
+      else #[]
+    here ++ s.getArgs.foldl (fun acc c => acc ++ collectIdents c) #[]
+  directIdents (s : Syntax) : Array Name :=
+    s.getArgs.foldl (init := #[]) fun acc c =>
+      if c.isIdent then acc.push c.getId
+      else if c.isOfKind nullKind then
+        acc ++ c.getArgs.filterMap fun d =>
+          if d.isIdent then some d.getId else none
+      else acc
 
 partial def applyCommandScope (fmap : FileMap) (scopedNamespaces scopedPrefixes : NameSet)
     (parserEnv : Environment) (scopes : List ParseScope) (stx : Syntax)
@@ -547,6 +643,7 @@ def main (args : List String) : IO Unit := do
   let role := args[1]?.getD "theory"
   let allowedKinds :=
     if role == "trusted" then allowedTrustedSyntaxKinds else allowedTheorySyntaxKinds
+  let allowLocalSemireducible := role == "theory"
   let rawManifest ← IO.FS.readFile manifestPath
   let filesJson ← IO.ofExcept (Json.parse rawManifest)
   let filesArr ← IO.ofExcept filesJson.getArr?
@@ -575,7 +672,7 @@ def main (args : List String) : IO Unit := do
         bad := pushUnique bad { line := hln, column := hcol, message := "non-exported `import` requires `module` header" }
       if imp.importAll then
         let allowImportAll :=
-          isModule && role == "theory" && allowedTheoryImportAllModules.contains imp.module
+          isModule && role != "trusted" && allowedTheoryImportAllModules.contains imp.module
         if !allowImportAll then
           bad := pushUnique bad { line := hln, column := hcol, message := s!"unsupported `import all {imp.module}`" }
       if isForbiddenPureImport imp.module then
@@ -598,11 +695,18 @@ def main (args : List String) : IO Unit := do
           let d ← m.data.toString
           bad := pushUnique bad { line := m.pos.line, column := m.pos.column + 1, message := s!"parseCommand error: {d}" }
       if !Parser.isTerminalCommand cmd then
+        let (cln, ccol) := posOfSyntax ictx.fileMap cmd
         if !allowedCommandKinds.contains cmd.getKind then
-          let (cln, ccol) := posOfSyntax ictx.fileMap cmd
           bad := pushUnique bad { line := cln, column := ccol, message := s!"unsupported command `{cmd.getKind}`" }
+        if allowLocalSemireducible && declaresLocalSemireducibleShadow top.currNamespace cmd then
+          bad := pushUnique bad {
+            line := cln
+            column := ccol
+            message := "declares a constant whose name could shadow one in `localSemireducibleAllowlist`"
+          }
         bad := inspectSyntaxFull ictx.fileMap allowedKinds cmd bad
-          (requirePrelude := true) (currNs := top.currNamespace) (openDecls := top.openDecls) (checkPureRefs := true)
+          (requirePrelude := true) (currNs := top.currNamespace) (openDecls := top.openDecls)
+          (checkPureRefs := true) (allowLocalSemireducible := allowLocalSemireducible)
         let (nextEnv, nextScopes, bad') :=
           applyCommandScope ictx.fileMap scopedNamespaces scopedPrefixes parserEnv scopes cmd bad
         parserEnv := nextEnv
@@ -660,7 +764,7 @@ def run_syntax_preflight(
     lake_dir: pathlib.Path | None = None,
     disable_wrapper: bool = False,
 ) -> dict[str, Any]:
-    if role not in {"theory", "trusted"}:
+    if role not in {"theory", "correspondence", "trusted"}:
         raise ValueError(f"Unsupported role: {role!r}")
     resolved_files = [str(f.resolve()) for f in files]
     if not resolved_files:
@@ -727,8 +831,8 @@ def run_syntax_preflight(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", help="Lean `.lean` files or directories to inspect.")
-    parser.add_argument("--role", choices=("theory", "trusted"), default="theory",
-                        help="Syntax allowlist role (`theory` permits 26 tactics; `trusted` is tactic-free).")
+    parser.add_argument("--role", choices=("theory", "correspondence", "trusted"), default="theory",
+                        help="Syntax allowlist role (`theory` permits Pass-1 tactics + localSemireducibleAllowlist; `correspondence` omits localSemireducibleAllowlist; `trusted` is tactic-free).")
     parser.add_argument("--lake-dir", default=None,
                         help="Optional Lake workspace directory used only to select the pinned Lean toolchain.")
     parser.add_argument("--no-wrapper", action="store_true",
