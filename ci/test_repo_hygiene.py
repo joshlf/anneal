@@ -48,8 +48,12 @@ def _tracked_files() -> list[str]:
     ]
 
 
-def _tracked_utf8_text(path: Path) -> str | None:
-    """Read raw UTF-8 file or symlink-target bytes without newline changes."""
+def _tracked_text(path: Path) -> str | None:
+    """Read a file, or a symlink's target, as `check_pr_hygiene.py` does.
+
+    Bytes are decoded by `cph.scannable_text` without newline translation;
+    binary content yields `None`.
+    """
     try:
         if path.is_symlink():
             raw = os.fsencode(os.readlink(path))
@@ -59,10 +63,7 @@ def _tracked_utf8_text(path: Path) -> str | None:
             return None
     except OSError:
         return None
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
+    return cph.scannable_text(raw)
 
 
 class RepoHygieneTests(unittest.TestCase):
@@ -88,7 +89,7 @@ class RepoHygieneTests(unittest.TestCase):
             root = Path(tmp)
             cr_file = root / "cr.txt"
             cr_file.write_bytes(f"first\rsecond\n{cli}\n".encode())
-            cr_text = _tracked_utf8_text(cr_file)
+            cr_text = _tracked_text(cr_file)
             self.assertIsNotNone(cr_text)
             self.assertEqual(
                 cph.internal_reference_hits(cr_text or ""),
@@ -96,15 +97,22 @@ class RepoHygieneTests(unittest.TestCase):
             )
             broken = root / "dangling"
             os.symlink(mnt, broken)
-            link_text = _tracked_utf8_text(broken)
+            link_text = _tracked_text(broken)
             self.assertEqual(link_text, mnt)
             self.assertEqual(
                 cph.internal_reference_hits(link_text or ""),
                 [(1, "internal-mount")],
             )
-            bad = root / "bad.bin"
-            bad.write_bytes(b"\xff\xfe" + cli.encode())
-            self.assertIsNone(_tracked_utf8_text(bad))
+            binary = root / "bad.bin"
+            binary.write_bytes(b"\x00\xff\xfe" + cli.encode())
+            self.assertIsNone(_tracked_text(binary))
+            # A stray invalid byte in text does not hide a reference.
+            latin1 = root / "latin1.txt"
+            latin1.write_bytes(b"caf\xe9\n" + cli.encode() + b"\n")
+            self.assertEqual(
+                cph.internal_reference_hits(_tracked_text(latin1) or ""),
+                [(2, "internal-cli")],
+            )
 
     def test_no_ephemeral_batons_or_internal_skills(self) -> None:
         bad_paths: list[str] = []
@@ -124,7 +132,7 @@ class RepoHygieneTests(unittest.TestCase):
         for rel in _tracked_files():
             if rel.startswith(_EXCLUDED_PREFIXES):
                 continue
-            text = _tracked_utf8_text(REPO_ROOT / rel)
+            text = _tracked_text(REPO_ROOT / rel)
             if text is None:
                 continue
             for line_no, label in cph.internal_reference_hits(text):

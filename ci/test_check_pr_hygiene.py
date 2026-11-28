@@ -1557,7 +1557,8 @@ class InternalHygieneMixin:
         self.commit()
         self.assertEqual(self.internal(), set())
 
-    def test_binary_and_invalid_utf8_blobs_are_skipped(self):
+    def test_binary_blobs_are_skipped(self):
+        # A NUL byte early in the blob makes it binary, as Git decides.
         path = self.repo / self.ROOT / "assets" / "blob.bin"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe " + self.CLI.encode()
@@ -1591,17 +1592,17 @@ class InternalHygieneMixin:
                     f"{self.CLI}.\n\n{TRAILER}\n")
         self.assert_clean()
 
-    def test_invalid_utf8_to_valid_utf8_transition_scans_all_lines(self):
-        # At `base`, both blobs are skipped as invalid UTF-8. Making either
-        # valid UTF-8 (even by deleting a line with zero added lines, or by
-        # editing an unrelated line) brings its pre-existing lines into UTF-8
-        # text scope for `test_repo_hygiene.py`, so diff mode must catch them.
+    def test_binary_to_text_transition_scans_all_lines(self):
+        # At `base`, both blobs are skipped as binary. Making either text
+        # (even by deleting a line with zero added lines, or by editing an
+        # unrelated line) brings its pre-existing lines into text scope for
+        # `test_repo_hygiene.py`, so diff mode must catch them.
         del_path = self.repo / self.ROOT / "assets" / "del_bad.txt"
         edit_path = self.repo / self.ROOT / "assets" / "edit_head.txt"
         del_path.parent.mkdir(parents=True, exist_ok=True)
-        del_path.write_bytes(b"\xff\n" + self.MOUNT.encode() + b"\n")
-        edit_path.write_bytes(b"\xff\n" + self.CLI.encode() + b"\n")
-        self.commit("Seed invalid UTF-8 blobs")
+        del_path.write_bytes(b"\x00\xff\n" + self.MOUNT.encode() + b"\n")
+        edit_path.write_bytes(b"\x00\xff\n" + self.CLI.encode() + b"\n")
+        self.commit("Seed binary blobs")
         git(self.repo, "branch", "-f", "base")
         del_path.write_bytes(self.MOUNT.encode() + b"\n")
         edit_path.write_bytes(b"clean header\n" + self.CLI.encode() + b"\n")
@@ -1612,6 +1613,31 @@ class InternalHygieneMixin:
         }
         self.assertEqual(self.internal(), expected)
         self.assertEqual(self.internal(base=None), expected)
+
+    def test_non_utf8_text_is_scanned(self):
+        # A stray invalid byte must not hide a text file's references.
+        legacy = self.repo / self.ROOT / "docs" / "legacy.txt"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_bytes(b"old \xff " + self.CLI.encode() + b"\nline two\n")
+        self.commit("Seed")
+        git(self.repo, "branch", "-f", "base")
+        # Pre-existing lines of a text file stay out of a diff-mode change.
+        legacy.write_bytes(b"old \xff " + self.CLI.encode() + b"\nline 2\n")
+        latin1 = self.repo / self.ROOT / "docs" / "latin1.txt"
+        latin1.write_bytes(b"caf\xe9\n" + self.MOUNT.encode() + b"\n")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            self.ref("docs/latin1.txt", 2, "internal-mount")})
+        self.assertEqual(self.internal(base=None), {
+            self.ref("docs/latin1.txt", 2, "internal-mount"),
+            self.ref("docs/legacy.txt", 1, "internal-cli"),
+        })
+        # Appending an invalid byte cannot hide a newly added reference.
+        legacy.write_bytes(b"old \xff " + self.CLI.encode() + b"\nline 2\n"
+                           + self.MOUNT.encode() + b" \x80\n")
+        self.commit()
+        self.assertIn(self.ref("docs/legacy.txt", 3, "internal-mount"),
+                      self.internal())
 
     def test_submodule_entries_and_typechange(self):
         sub_sha = git(self.repo, "rev-parse", "HEAD").strip()
@@ -1752,6 +1778,20 @@ class InternalUnitTests(unittest.TestCase):
                              ("anneal/skills/adversarial-rounds/x", solo),
                              ("skills/other/x", solo)):
             self.assertIsNone(cph.internal_path_message(path, layout), path)
+
+    def test_scannable_text(self):
+        self.assertEqual(cph.scannable_text(b"ok\n"), "ok\n")
+        # Valid UTF-8 is text even with NUL bytes.
+        self.assertEqual(cph.scannable_text(b"\x00ok"), "\x00ok")
+        self.assertIsNone(cph.scannable_text(b"\x00\xff"))
+        self.assertEqual(cph.scannable_text(b"a\xff\nb"), "a\ufffd\nb")
+        # Git only sniffs the first 8000 bytes for NUL.
+        late = b"x" * 8000 + b"\x00\xff"
+        self.assertIsNotNone(cph.scannable_text(late))
+        self.assertIsNone(cph.scannable_text(late[1:]))
+        # A truncated sequence before a line feed keeps the line count.
+        text = cph.scannable_text(b"a\xe2\x82\nb\n")
+        self.assertEqual(text.split("\n"), ["a\ufffd", "b", ""])
 
     def test_every_banned_pattern_matches_and_respects_boundaries(self):
         for (label, pat), lit in zip(cph.BANNED_CONTENT_PATTERNS,

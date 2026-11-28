@@ -42,8 +42,9 @@ tree at `--head`:
   case-insensitive internal-infrastructure references, with the definitions
   that `ci/test_repo_hygiene.py` imports. With `--base`, they cover changed
   paths, the added lines of changed files, and every line of files entering
-  Anneal scope or UTF-8 text scope; without it, every path and line in scope
-  at `--head`. Commit messages are not scanned.
+  Anneal scope or turning from binary into text; without it, every path and
+  line in scope at `--head`. Binary blobs (see `scannable_text`) and commit
+  messages are not scanned.
 - `layout`: the candidate head changes the repository layout that the
   target base uses.
 
@@ -1718,12 +1719,25 @@ def internal_path_message(path: str, layout: Layout = MONOREPO) -> str | None:
     return None
 
 
-def _is_utf8(raw: bytes) -> bool:
+# Git's own binary heuristic looks for a NUL byte this far into a blob.
+_BINARY_SNIFF_BYTES = 8000
+
+
+def scannable_text(raw: bytes) -> str | None:
+    """Decode a blob for the internal-reference scan; `None` if binary.
+
+    Valid UTF-8 is always scanned. Other content is scanned with U+FFFD
+    replacements unless Git would also call it binary (a NUL byte in its
+    first 8000 bytes), where short patterns would match by chance. One
+    stray invalid byte therefore cannot hide a text file's references.
+    Replacement never consumes a line feed, so line numbers are kept.
+    """
     try:
-        raw.decode("utf-8")
-        return True
+        return raw.decode("utf-8")
     except UnicodeDecodeError:
-        return False
+        if b"\0" in raw[:_BINARY_SNIFF_BYTES]:
+            return None
+        return raw.decode("utf-8", "replace")
 
 
 def internal_findings(
@@ -1734,14 +1748,13 @@ def internal_findings(
     """`internal-path` and `internal-reference` findings at `head`.
 
     With `files` (diff mode), checks each non-deleted in-scope changed path,
-    every line of a file entering Anneal scope or UTF-8 blob scope (added,
-    copied, renamed from outside scope, changed from a non-blob, or changed
-    from invalid UTF-8 at `base` to valid UTF-8 at `head`), and the added
-    lines of other files, so untouched already-scanned lines never fail a
-    change. Without `files` (tree mode), checks every in-scope path and line.
-    Like `ci/test_repo_hygiene.py`, content scanning skips blobs that are not
-    valid UTF-8, where short patterns would match binary data by chance; a
-    symbolic link is scanned as its target text.
+    every line of a file entering Anneal scope or text scope (added, copied,
+    renamed from outside scope, changed from a non-blob, or changed from a
+    binary blob at `base` to text at `head`), and the added lines of other
+    files, so untouched already-scanned lines never fail a change. Without
+    `files` (tree mode), checks every in-scope path and line. Like
+    `ci/test_repo_hygiene.py`, content scanning skips binary blobs (see
+    `scannable_text`); a symbolic link is scanned as its target text.
     """
     out: list[Finding] = []
     scan: list[tuple[str, str, str | None, set[int] | None]] = []
@@ -1804,11 +1817,10 @@ def internal_findings(
     ]
     blobs = git.blobs(need_oids)
     for path, oid, prev_oid, lines in scan:
-        try:
-            text = blobs[oid].decode("utf-8")
-        except UnicodeDecodeError:
+        text = scannable_text(blobs[oid])
+        if text is None:
             continue
-        if prev_oid is not None and not _is_utf8(blobs[prev_oid]):
+        if prev_oid is not None and scannable_text(blobs[prev_oid]) is None:
             lines = None
         if lines == set():
             continue
