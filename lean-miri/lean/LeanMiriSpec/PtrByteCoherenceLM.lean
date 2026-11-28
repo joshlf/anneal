@@ -3072,6 +3072,54 @@ theorem readPtr4_allBytes_runtime_iff {Prov : Type} [DecidableEq Prov] [PointerP
   | none => simp
   | some f => simp
 
+/-- **Explicit CTFE biconditionals (`8`-byte pointers).** In CTFE strict partial-pointer mode,
+vendored `readPtr` of the translated state retains provenance iff `Trusted` finds the stream
+coherent; it is the `readPartialPointer` error iff the stream is incoherent but carries some
+provenance fragment; and it is `.ok none` iff the stream carries no provenance fragment at all. -/
+theorem readPtr8_allBytes_ctfe_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (bs : List AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntries pv bs) 0 8 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = true) ↔
+      trRead (trEntries pv bs) 0 8 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = false) ↔
+      trRead (trEntries pv bs) 0 8 = .ok none) := by
+  rw [readPtr8_allBytes_ctfe_corr pv hoff bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs with
+  | none => cases abstractBytesHaveProv bs <;> simp
+  | some f => cases abstractBytesHaveProv bs <;> simp
+
+/-- **Explicit CTFE biconditionals (`4`-byte pointers).** In CTFE strict partial-pointer mode,
+vendored `readPtr` of the translated state retains provenance iff `Trusted` finds the stream
+coherent; it is the `readPartialPointer` error iff the stream is incoherent but carries some
+provenance fragment; and it is `.ok none` iff the stream carries no provenance fragment at all. -/
+theorem readPtr4_allBytes_ctfe_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (bs : List AbstractByte) (hlen : bs.length = 4)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 4 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntries pv bs) 0 4 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = true) ↔
+      trRead (trEntries pv bs) 0 4 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = false) ↔
+      trRead (trEntries pv bs) 0 4 = .ok none) := by
+  rw [readPtr4_allBytes_ctfe_corr pv hoff bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs with
+  | none => cases abstractBytesHaveProv bs <;> simp
+  | some f => cases abstractBytesHaveProv bs <;> simp
+
 /-- Helper: decoding LE bits of `encodePtrBytesAux` yields `bits % 256 ^ n`. -/
 theorem decodeLittleEndianBits_encodePtrBytesAux (a t o pb : Nat) :
     ∀ (n bits idx : Nat),
@@ -3566,6 +3614,30 @@ theorem ep2_b1_non_vacuity_instances :
           exact ⟨hi'.1.trans hj'.1.symm, hi'.2.trans hj'.2.symm⟩)).trans rfl
 
 end WideAndKani
+
+/-- Non-vacuous instantiations of `readPtr8_allBytes_ctfe_iff` and `readPtr4_allBytes_ctfe_iff`
+on the plain (provenance-free) images of `0x1000` with CTFE provenance. -/
+theorem readPtr_allBytes_ctfe_iff_instance :
+    (((∃ f, abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = some f) ↔
+      ∃ p, trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 8)) 0 8 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = none ∧ abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 8) = true) ↔
+      trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 8)) 0 8 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = none ∧ abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 8) = false) ↔
+      trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 8)) 0 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 4) = some f) ↔
+      ∃ p, trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 4)) 0 4 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 4) = none ∧ abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 4) = true) ↔
+      trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 4)) 0 4 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 4) = none ∧ abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 4) = false) ↔
+      trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 4)) 0 4 = .ok none)) :=
+  ⟨readPtr8_allBytes_ctfe_iff pvCt rfl (encodePlainLittleEndianBytes 0x1000 8) rfl
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h)
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h)
+      (by intro i _ _ _ _ _ hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h),
+   readPtr4_allBytes_ctfe_iff pvCt rfl (encodePlainLittleEndianBytes 0x1000 4) rfl
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | _+4, h => cases h)
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | _+4, h => cases h)
+      (by intro i _ _ _ _ _ hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | _+4, h => cases h)⟩
 
 end V06
 
@@ -4802,6 +4874,55 @@ theorem readPtr4_allBytes_runtime_iff {Prov : Type} [DecidableEq Prov] [PointerP
   have h := readPtr4_allBytes_runtime_corr pv hoff bs hlen hwf hnw hinj
   rw [h]; cases abstractBytesCoherentPtrProv? bs <;> simp
 
+/-- **Explicit CTFE biconditionals (`8`-byte pointers).** In CTFE strict partial-pointer mode,
+vendored `readPtr` of the translated state retains provenance iff `Trusted` finds the stream
+coherent; it is the `readPartialPointer` error iff the stream is incoherent but carries some
+provenance fragment; and it is `.ok none` iff the stream carries no provenance fragment at all. -/
+theorem readPtr8_allBytes_ctfe_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (bs : List AbstractByte) (hlen : bs.length = 8)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 8 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntries pv bs) 0 8 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = true) ↔
+      trRead (trEntries pv bs) 0 8 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = false) ↔
+      trRead (trEntries pv bs) 0 8 = .ok none) := by
+  rw [readPtr8_allBytes_ctfe_corr pv hoff bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs with
+  | none => cases abstractBytesHaveProv bs <;> simp
+  | some f => cases abstractBytesHaveProv bs <;> simp
+
+/-- **Explicit CTFE biconditionals (`4`-byte pointers).** In CTFE strict partial-pointer mode,
+vendored `readPtr` of the translated state retains provenance iff `Trusted` finds the stream
+coherent; it is the `readPartialPointer` error iff the stream is incoherent but carries some
+provenance fragment; and it is `.ok none` iff the stream carries no provenance fragment at all. -/
+theorem readPtr4_allBytes_ctfe_iff {Prov : Type} [DecidableEq Prov] [PointerProvenance Prov]
+    (pv : Nat → Nat → Prov) (hoff : PointerProvenance.offsetIsAddr (Prov := Prov) = false)
+    (bs : List AbstractByte) (hlen : bs.length = 4)
+    (hwf : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) → WF 4 f)
+    (hnw : ∀ (i : Nat) (v : UInt8) (f : PtrByteFrag), bs[i]? = some (.init v (some f)) →
+      ¬ some (pv f.allocId f.tag) = PointerProvenance.wildcard (Prov := Prov))
+    (hinj : ∀ (i j : Nat) (vi vj : UInt8) (fi fj : PtrByteFrag),
+      bs[i]? = some (.init vi (some fi)) → bs[j]? = some (.init vj (some fj)) →
+      pv fi.allocId fi.tag = pv fj.allocId fj.tag → fi.allocId = fj.allocId ∧ fi.tag = fj.tag) :
+    ((∃ f, abstractBytesCoherentPtrProv? bs = some f) ↔
+      ∃ p, trRead (trEntries pv bs) 0 4 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = true) ↔
+      trRead (trEntries pv bs) 0 4 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    ((abstractBytesCoherentPtrProv? bs = none ∧ abstractBytesHaveProv bs = false) ↔
+      trRead (trEntries pv bs) 0 4 = .ok none) := by
+  rw [readPtr4_allBytes_ctfe_corr pv hoff bs hlen hwf hnw hinj]
+  cases abstractBytesCoherentPtrProv? bs with
+  | none => cases abstractBytesHaveProv bs <;> simp
+  | some f => cases abstractBytesHaveProv bs <;> simp
+
+/-- Helper: decoding LE bits of `encodePtrBytesAux` yields `bits % 256 ^ n`. -/
 theorem decodeLittleEndianBits_encodePtrBytesAux (a t o pb : Nat) :
     ∀ (n bits idx : Nat),
       decodeLittleEndianBits (encodePtrBytesAux a t o pb bits idx n) = some (bits % 256 ^ n)
@@ -5276,6 +5397,30 @@ theorem ep2_b1_non_vacuity_instances :
 
 end WideAndKani
 
+/-- Non-vacuous instantiations of `readPtr8_allBytes_ctfe_iff` and `readPtr4_allBytes_ctfe_iff`
+on the plain (provenance-free) images of `0x1000` with CTFE provenance. -/
+theorem readPtr_allBytes_ctfe_iff_instance :
+    (((∃ f, abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = some f) ↔
+      ∃ p, trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 8)) 0 8 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = none ∧ abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 8) = true) ↔
+      trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 8)) 0 8 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 8) = none ∧ abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 8) = false) ↔
+      trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 8)) 0 8 = .ok none)) ∧
+    (((∃ f, abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 4) = some f) ↔
+      ∃ p, trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 4)) 0 4 = .ok (some p)) ∧
+    ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 4) = none ∧ abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 4) = true) ↔
+      trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 4)) 0 4 = .error (.readPartialPointer (Size.ofBytes 0))) ∧
+    ((abstractBytesCoherentPtrProv? (encodePlainLittleEndianBytes 0x1000 4) = none ∧ abstractBytesHaveProv (encodePlainLittleEndianBytes 0x1000 4) = false) ↔
+      trRead (trEntries pvCt (encodePlainLittleEndianBytes 0x1000 4)) 0 4 = .ok none)) :=
+  ⟨readPtr8_allBytes_ctfe_iff pvCt rfl (encodePlainLittleEndianBytes 0x1000 8) rfl
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h)
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h)
+      (by intro i _ _ _ _ _ hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | 4, h | 5, h | 6, h | 7, h | _+8, h => cases h),
+   readPtr4_allBytes_ctfe_iff pvCt rfl (encodePlainLittleEndianBytes 0x1000 4) rfl
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | _+4, h => cases h)
+      (by intro i v f hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | _+4, h => cases h)
+      (by intro i _ _ _ _ _ hi; match i, hi with | 0, h | 1, h | 2, h | 3, h | _+4, h => cases h)⟩
+
 end V08
 
 /-! ## Lockstep parity `V2026_06_01 ↔ V2026_08_01` -/
@@ -5416,6 +5561,7 @@ elab "#assert_ptr_byte_coherence_lm_audit" : command => do
     "readPtr8_allBytes_runtime_corr", "readPtr8_allBytes_ctfe_corr",
     "readPtr4_allBytes_runtime_corr", "readPtr4_allBytes_ctfe_corr",
     "readPtr8_allBytes_runtime_iff", "readPtr4_allBytes_runtime_iff",
+    "readPtr8_allBytes_ctfe_iff", "readPtr4_allBytes_ctfe_iff", "readPtr_allBytes_ctfe_iff_instance",
     "intact_roundtrip_8", "intact_roundtrip_4",
     "rawCarrier_ptr_roundtrip_8", "rawCarrier_ptr_roundtrip_4",
     "w_lm_wide_slice_and_str", "w_lm_wide_dyn",

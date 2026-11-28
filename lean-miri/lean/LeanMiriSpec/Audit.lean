@@ -27225,6 +27225,9 @@ example :
   LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_runtime_corr
   LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_ctfe_corr
   LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr8_allBytes_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr_allBytes_ctfe_iff_instance
   LeanMiriSpec.PtrByteCoherenceLM.V06.readPtr4_allBytes_runtime_iff
   LeanMiriSpec.PtrByteCoherenceLM.V06.intact_roundtrip_8
   LeanMiriSpec.PtrByteCoherenceLM.V06.intact_roundtrip_4
@@ -27254,6 +27257,9 @@ example :
   LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_runtime_corr
   LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_ctfe_corr
   LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_runtime_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr8_allBytes_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_ctfe_iff
+  LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr_allBytes_ctfe_iff_instance
   LeanMiriSpec.PtrByteCoherenceLM.V08.readPtr4_allBytes_runtime_iff
   LeanMiriSpec.PtrByteCoherenceLM.V08.intact_roundtrip_8
   LeanMiriSpec.PtrByteCoherenceLM.V08.intact_roundtrip_4

@@ -642,6 +642,55 @@ theorem minirust_bool_uninit_decodeM {M : Type} [Gen.Memory M] [Interp.MemoryOps
   · intro _ h; cases h
   · intro _ h; cases h
 
+
+/-- The MiniRust little-endian value of `leBytes u n` is `u mod 256 ^ n`. -/
+theorem leValue_leBytes : ∀ (n u : Nat), Interp.leValue (Interp.leBytes u n) = u % 256 ^ n
+  | 0, u => by
+      show 0 = u % 256 ^ 0
+      rw [Nat.pow_zero, Nat.mod_one]
+  | n + 1, u => by
+      show (UInt8.ofNat (u % 256)).toNat + 256 * Interp.leValue (Interp.leBytes (u / 256) n) =
+        u % 256 ^ (n + 1)
+      rw [leValue_leBytes n (u / 256), u8_ofNat_toNat, Nat.mod_mod, Nat.pow_succ,
+        Nat.mul_comm (256 ^ n) 256, Nat.mod_mul]
+
+/-- Provenance-free MiniRust bytes carry exactly their data. -/
+theorem mapM_data_init : ∀ (l : List UInt8),
+    (l.map (fun b => (Gen.AbstractByte.Init b none : Interp.Byte))).mapM Interp.AbstractByte.data =
+      some l
+  | [] => rfl
+  | b :: rest => by
+      rw [List.map_cons, List.mapM_cons, mapM_data_init rest]
+      rfl
+
+/-- `encode_ptr` bytes without provenance are plain initialized bytes. -/
+theorem encodePtrBytesM_none {M : Type} [Gen.Memory M] :
+    ∀ (l : List UInt8) (idx : Nat),
+      Interp.encodePtrBytesM (M := M) none idx l = l.map (fun b => Gen.AbstractByte.Init b none)
+  | [], _ => rfl
+  | _ :: rest, idx => congrArg (List.cons _) (encodePtrBytesM_none rest (idx + 1))
+
+theorem leBytes_length : ∀ (n u : Nat), (Interp.leBytes u n).length = n
+  | 0, _ => rfl
+  | n + 1, u => congrArg (· + 1) (leBytes_length n (u / 256))
+
+/-- **MiniRust `Type::Int(u32)` accepts every 32-bit pattern** (in particular all 2048 UTF-16
+surrogates `0xD800 ..= 0xDFFF` and everything above `0x10FFFF`): the closest MiniRust type to
+`char` performs no scalar-value check. -/
+theorem minirust_u32_accepts_all (c : Nat) (hc : c < 2 ^ 32) :
+    Interp.Type.decode (.Int ⟨.Unsigned, ⟨4⟩⟩)
+      ((Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none)) = .ok (some (.Int c)) := by
+  show Interp.Type.decodeInt ⟨.Unsigned, ⟨4⟩⟩ _ = _
+  unfold Interp.Type.decodeInt
+  dsimp only
+  have hlen : ¬ (((Interp.leBytes c 4).map (fun b => (Gen.AbstractByte.Init b none : Interp.Byte))).length ≠
+      (⟨4⟩ : LibSpecr.Size).bytes) := by
+    rw [List.length_map, leBytes_length]
+    exact fun h => h rfl
+  rw [ite_of_neg hlen, mapM_data_init]
+  show Except.ok (some (Gen.Value.Int ((Interp.leValue (Interp.leBytes c 4) : Nat) : Int))) = _
+  rw [leValue_leBytes, Nat.mod_eq_of_lt (by omega)]
+
 end Shared
 
 /-! ## `V2026_06_01`: correspondence of `Trusted.Rustc.V2026_06_01.MirSemantics` with `MiniRustSpec.Interp` -/
@@ -2649,6 +2698,36 @@ theorem ep2_b1_mr_non_vacuity_instances :
    swapped_wide_slice_div (M := Interp.TBM) tbProv true (.uint .u8) wLen3 wP
      ⟨7, 7, 0, 0x1000, 8⟩ [3, 0, 0, 0, 0, 0, 0, 0] rfl rfl rfl ⟨3, rfl⟩ rfl,
    kani5205_bool_correspondence_M (M := Interp.TBM) tbProv wLayouts wTyBool rfl 2⟩
+
+
+/-- **Universal `DIV-MR-CHAR` (`Kani#5205`, `char`).** For every 32-bit pattern `c`, `Trusted`'s
+typed `char` validity is exactly `isValidCharCode c` (rejecting every surrogate and every value
+above `0x10FFFF`), the `Trusted` untyped encoding of `c` projects to MiniRust's own little-endian
+encoding of `c`, and MiniRust's closest type `Type::Int(u32)` accepts that encoding for every `c`.
+MiniRust has no `char` type, so the typed rejection is `Trusted`-only. -/
+theorem kani5205_char_divergence (c : Nat) (hc : c < 2 ^ 32) :
+    validateValueForTy? wLayouts (some wTyChar) (.scalar ⟨c, 4⟩) = isValidCharCode c ∧
+    projBytes bmProv (encodePlainLittleEndianBytes c 4) =
+      (Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none) ∧
+    Interp.Type.decode (.Int ⟨.Unsigned, ⟨4⟩⟩) (projBytes bmProv (encodePlainLittleEndianBytes c 4)) =
+      .ok (some (.Int c)) := by
+  have hp : projBytes bmProv (encodePlainLittleEndianBytes c 4) =
+      (Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none) :=
+    (proj_plain_bytes (M := Interp.BM) bmProv 4 c 0).trans (encodePtrBytesM_none _ 0)
+  refine ⟨?_, hp, ?_⟩
+  · show Bool.and (Nat.beq 4 4) (isValidCharCode c) = isValidCharCode c
+    rfl
+  · rw [hp]
+    exact minirust_u32_accepts_all c hc
+
+theorem kani5205_char_divergence_instance :
+    (validateValueForTy? wLayouts (some wTyChar) (.scalar ⟨0xD800, 4⟩) = isValidCharCode 0xD800 ∧
+      projBytes bmProv (encodePlainLittleEndianBytes 0xD800 4) =
+        (Interp.leBytes 0xD800 4).map (fun b => Gen.AbstractByte.Init b none) ∧
+      Interp.Type.decode (.Int ⟨.Unsigned, ⟨4⟩⟩) (projBytes bmProv (encodePlainLittleEndianBytes 0xD800 4)) =
+        .ok (some (.Int 0xD800))) ∧
+    isValidCharCode 0xD800 = false ∧ isValidCharCode 0x41 = true :=
+  ⟨kani5205_char_divergence 0xD800 (by decide), rfl, rfl⟩
 
 end Witnesses
 
@@ -4660,6 +4739,36 @@ theorem ep2_b1_mr_non_vacuity_instances :
      ⟨7, 7, 0, 0x1000, 8⟩ [3, 0, 0, 0, 0, 0, 0, 0] rfl rfl rfl ⟨3, rfl⟩ rfl,
    kani5205_bool_correspondence_M (M := Interp.TBM) tbProv wLayouts wTyBool rfl 2⟩
 
+
+/-- **Universal `DIV-MR-CHAR` (`Kani#5205`, `char`).** For every 32-bit pattern `c`, `Trusted`'s
+typed `char` validity is exactly `isValidCharCode c` (rejecting every surrogate and every value
+above `0x10FFFF`), the `Trusted` untyped encoding of `c` projects to MiniRust's own little-endian
+encoding of `c`, and MiniRust's closest type `Type::Int(u32)` accepts that encoding for every `c`.
+MiniRust has no `char` type, so the typed rejection is `Trusted`-only. -/
+theorem kani5205_char_divergence (c : Nat) (hc : c < 2 ^ 32) :
+    validateValueForTy? wLayouts (some wTyChar) (.scalar ⟨c, 4⟩) = isValidCharCode c ∧
+    projBytes bmProv (encodePlainLittleEndianBytes c 4) =
+      (Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none) ∧
+    Interp.Type.decode (.Int ⟨.Unsigned, ⟨4⟩⟩) (projBytes bmProv (encodePlainLittleEndianBytes c 4)) =
+      .ok (some (.Int c)) := by
+  have hp : projBytes bmProv (encodePlainLittleEndianBytes c 4) =
+      (Interp.leBytes c 4).map (fun b => Gen.AbstractByte.Init b none) :=
+    (proj_plain_bytes (M := Interp.BM) bmProv 4 c 0).trans (encodePtrBytesM_none _ 0)
+  refine ⟨?_, hp, ?_⟩
+  · show Bool.and (Nat.beq 4 4) (isValidCharCode c) = isValidCharCode c
+    rfl
+  · rw [hp]
+    exact minirust_u32_accepts_all c hc
+
+theorem kani5205_char_divergence_instance :
+    (validateValueForTy? wLayouts (some wTyChar) (.scalar ⟨0xD800, 4⟩) = isValidCharCode 0xD800 ∧
+      projBytes bmProv (encodePlainLittleEndianBytes 0xD800 4) =
+        (Interp.leBytes 0xD800 4).map (fun b => Gen.AbstractByte.Init b none) ∧
+      Interp.Type.decode (.Int ⟨.Unsigned, ⟨4⟩⟩) (projBytes bmProv (encodePlainLittleEndianBytes 0xD800 4)) =
+        .ok (some (.Int 0xD800))) ∧
+    isValidCharCode 0xD800 = false ∧ isValidCharCode 0x41 = true :=
+  ⟨kani5205_char_divergence 0xD800 (by decide), rfl, rfl⟩
+
 end Witnesses
 
 end V08
@@ -4924,7 +5033,7 @@ elab "#assert_ptr_byte_coherence_mr_audit" : command => do
     "minirust_bool_invalid", "minirust_u8_valid", "kani5205_bool_correspondence_M",
     "w_roundtrip", "w_ucg558_w1", "w_mixed_missing_uninit", "w_offset_splice_p_p4",
     "w_offset_splice_p_p256", "w_basic_memory_tag_blind", "w_wide_slice",
-    "w_wide_swapped_halves", "w_wide_dyn", "w_kani5205_bool", "w_kani5205_char",
+    "w_wide_swapped_halves", "w_wide_dyn", "w_kani5205_bool", "w_kani5205_char", "kani5205_char_divergence", "kani5205_char_divergence_instance",
     "w_kani5205_unaligned_and_maybeuninit",
     "coherent_decode_agreement_instance", "encode_roundtrip_instance",
     "rawCarrier_ptr_roundtrip_instance", "strip_laws_instance", "offset_splice_instance",

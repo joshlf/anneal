@@ -19289,6 +19289,8 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.w_wide_dyn
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_bool
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_char
+  MiniRustSpec.PtrByteCoherenceMR.V06.kani5205_char_divergence
+  MiniRustSpec.PtrByteCoherenceMR.V06.kani5205_char_divergence_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.encode_roundtrip_instance
@@ -19355,6 +19357,8 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.w_wide_dyn
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_bool
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_char
+  MiniRustSpec.PtrByteCoherenceMR.V08.kani5205_char_divergence
+  MiniRustSpec.PtrByteCoherenceMR.V08.kani5205_char_divergence_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.encode_roundtrip_instance
@@ -19452,6 +19456,8 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V06.w_wide_dyn
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_bool
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_char
+  MiniRustSpec.PtrByteCoherenceMR.V06.kani5205_char_divergence
+  MiniRustSpec.PtrByteCoherenceMR.V06.kani5205_char_divergence_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V06.coherent_decode_agreement_instance
   MiniRustSpec.PtrByteCoherenceMR.V06.encode_roundtrip_instance
@@ -19518,6 +19524,8 @@ non-vacuity instantiations, and the kernel-checked witnesses across
   MiniRustSpec.PtrByteCoherenceMR.V08.w_wide_dyn
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_bool
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_char
+  MiniRustSpec.PtrByteCoherenceMR.V08.kani5205_char_divergence
+  MiniRustSpec.PtrByteCoherenceMR.V08.kani5205_char_divergence_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.w_kani5205_unaligned_and_maybeuninit
   MiniRustSpec.PtrByteCoherenceMR.V08.coherent_decode_agreement_instance
   MiniRustSpec.PtrByteCoherenceMR.V08.encode_roundtrip_instance
