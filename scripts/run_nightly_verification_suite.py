@@ -139,10 +139,12 @@ def _git_head_sha(repo_root: Path, ref: str = "HEAD") -> str:
 #
 # Dual-authority correspondence modules cited by name below. Each relates
 # `Trusted.Rustc.V2026_06_01.MirSemantics` to MiniRust (`MiniRustSpec.Interp`, the `MR` module)
-# and to vendored Miri (`Miri.Interpreter.Step`, the `LM` module); each `Bundle` module closes
-# the MiniRust side and exports the parameterized `DualCorrespondenceBundle` combinators that
-# the cross-root kernel bridges (`tests/mir/DropBinderAndSubtypeCorrTests.lean`,
-# `tests/mir/NullaryAndPtrCoercionCorrTests.lean`) close against the `LM` module:
+# and to vendored Miri (`Miri.Interpreter.Step`, the `LM` module); each `Bundle`/`DualSpec`
+# module closes the MiniRust side and exports the parameterized `DualCorrespondenceBundle`
+# combinators that the cross-root kernel bridges (`tests/mir/DropBinderAndSubtypeCorrTests.lean`,
+# `tests/mir/NullaryAndPtrCoercionCorrTests.lean`,
+# `tests/mir/OpaqueCastAndFnEntryProtectorCorrespondenceTests.lean`) close against the `LM`
+# module:
 #   UnwindSetDiscrAndFnPtr{MR,LM}        minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean,
 #                                        lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean
 #   DropBinderAndSubtype{MR,LM,Bundle}   minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean,
@@ -151,10 +153,14 @@ def _git_head_sha(repo_root: Path, ref: str = "HEAD") -> str:
 #   NullaryAndPtrCoercion{MR,LM,Bundle}  minirust/lean/MiniRustSpec/NullaryAndPtrCoercionMR.lean,
 #                                        lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean,
 #                                        theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean
+#   OpaqueCastAndFnEntryProtector{MR,LM,DualSpec}
+#                                        minirust/lean/MiniRustSpec/OpaqueCastAndFnEntryProtectorMR.lean,
+#                                        lean-miri/lean/LeanMiriSpec/OpaqueCastAndFnEntryProtectorLM.lean,
+#                                        theory/Anneal/Mir/OpaqueCastAndFnEntryProtectorDualSpec.lean
 #
-# Census: 90 `proved_corresponding`, 1 `supported_and_tested` (`ProjectionElem.opaqueCast`),
-# 0 `supported_untested`, 3 `unsupported_fail_closed` (`TerminatorKind.inlineAsm`,
-# `Rvalue.threadLocalRef`, `AggregateKind.coroutine`).
+# Census: 91 `proved_corresponding`, 0 `supported_and_tested`, 0 `supported_untested`,
+# 3 `unsupported_fail_closed` (`TerminatorKind.inlineAsm`, `Rvalue.threadLocalRef`,
+# `AggregateKind.coroutine`).
 MIR_AST_CATEGORIES: list[dict[str, Any]] = [
     {
         "category": "StatementKind",
@@ -215,8 +221,14 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("constantIndex", "proved_corresponding"),
             ("subslice", "proved_corresponding"),
             ("downcast", "proved_corresponding"),
-            # Phase boundary, not a gap: rustc's validator rejects OpaqueCast at MirPhase::Runtime (after PostAnalysisNormalize) and both vendored Miri paths throw "OpaqueCast after borrowck" (Projection.lean `.invariant` / PlaceDynamic.lean `.invalidProgram`), while Trusted treats it as a value-transparent retype.
-            ("opaqueCast", "supported_and_tested"),
+            # OpaqueCastAndFnEntryProtector{MR,LM,DualSpec} (`D1`, closed in
+            # `tests/mir/OpaqueCastAndFnEntryProtectorCorrespondenceTests.lean`): Trusted
+            # value-transparent dispatch + cast-erasure correspondence (with honest `.unsupported`
+            # deref-below-cast boundary on case `8`), MiniRust fail-closed translation +
+            # cast-erased execution, and vendored Miri `OpaqueCast after borrowck` phase-boundary
+            # rejection (`Projection.lean` `.invariant` / `PlaceDynamic.lean` `.invalidProgram`)
+            # plus `Step.step` execution on the post-borrowck cast-erased image.
+            ("opaqueCast", "proved_corresponding"),
             # UnwindSetDiscrAndFnPtr{MR,LM} (`C9`) and NullaryAndPtrCoercion{MR,LM,Bundle}.
             ("unwrapUnsafeBinder", "proved_corresponding"),
         ],

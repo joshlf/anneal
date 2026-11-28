@@ -51,9 +51,9 @@ UNTESTED_VARIANT_TEST_WORKSPACE_IMPORTS = (
     "MiniRustSpec.Correspondence.Translate",
 )
 
-# The dual-authority correspondence modules `MIR_AST_CATEGORIES` cites for the 14 variants
-# promoted to `proved_corresponding`, the cross-root kernel bridges closing the `Bundle`
-# modules over `LM`, and concrete kernel-checked theorem / variant evidence in each file.
+# The dual-authority correspondence modules `MIR_AST_CATEGORIES` cites for the 15 variants
+# promoted to `proved_corresponding`, the cross-root kernel bridges closing the `Bundle` /
+# `DualSpec` modules over `LM`, and concrete kernel-checked theorem / variant evidence in each file.
 MIR_DUAL_AUTHORITY_MODULES: dict[str, tuple[str, ...]] = {
     "UnwindSetDiscrAndFnPtr": (
         "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean",
@@ -69,10 +69,16 @@ MIR_DUAL_AUTHORITY_MODULES: dict[str, tuple[str, ...]] = {
         "lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean",
         "theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean",
     ),
+    "OpaqueCastAndFnEntryProtector": (
+        "minirust/lean/MiniRustSpec/OpaqueCastAndFnEntryProtectorMR.lean",
+        "lean-miri/lean/LeanMiriSpec/OpaqueCastAndFnEntryProtectorLM.lean",
+        "theory/Anneal/Mir/OpaqueCastAndFnEntryProtectorDualSpec.lean",
+    ),
 }
 MIR_BUNDLE_KERNEL_BRIDGES: dict[str, str] = {
     "DropBinderAndSubtype": "tests/mir/DropBinderAndSubtypeCorrTests.lean",
     "NullaryAndPtrCoercion": "tests/mir/NullaryAndPtrCoercionCorrTests.lean",
+    "OpaqueCastAndFnEntryProtector": "tests/mir/OpaqueCastAndFnEntryProtectorCorrespondenceTests.lean",
 }
 # Each promoted variant maps to `{rel_path: (theorems_or_bundle_variant_names, ...)}`.
 # For `MR`/`LM` files, every entry must be an actual `theorem`/`lemma` declaration in
@@ -161,6 +167,26 @@ MIR_PROMOTED_VARIANT_THEOREMS: dict[str, dict[str, tuple[str, ...]]] = {
         "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
             "step_unwindTerminate_directUnwind_abort_simulation",
             "w_c2_c3_unwind_all_regimes_and_terminate",
+        ),
+    },
+    "ProjectionElem.opaqueCast": {
+        "minirust/lean/MiniRustSpec/OpaqueCastAndFnEntryProtectorMR.lean": (
+            "mrOcTrusted_cast_erasure_agree",
+            "mr_translate_opaqueCast_fail_closed",
+            "trusted_evalStmt_assign_pure_cast_eq",
+            "ep1_minirust_opaquecast_fnentry_capstone",
+        ),
+        "lean-miri/lean/LeanMiriSpec/OpaqueCastAndFnEntryProtectorLM.lean": (
+            "lm_opaqueCast_phase_boundary",
+            "lm_d1_phase_boundary_table",
+            "lmOc_trusted_agreement",
+            "ep1_lean_miri_opaquecast_fnentry_capstone",
+        ),
+        "theory/Anneal/Mir/OpaqueCastAndFnEntryProtectorDualSpec.lean": (
+            ".castDerefBoundary",
+            "dual_exact_three_way_classification",
+            "dual_d1_cast_erasure_and_boundary",
+            "ep2_opaquecast_fnentry_dual_authority_capstone",
         ),
     },
     "ProjectionElem.unwrapUnsafeBinder": {
@@ -354,6 +380,7 @@ MIR_PROMOTED_VARIANT_EVIDENCE: dict[str, tuple[str, ...]] = {
     "TerminatorKind.drop": ("DropBinderAndSubtype",),
     "TerminatorKind.unwindResume": ("UnwindSetDiscrAndFnPtr",),
     "TerminatorKind.unwindTerminate": ("UnwindSetDiscrAndFnPtr",),
+    "ProjectionElem.opaqueCast": ("OpaqueCastAndFnEntryProtector",),
     "ProjectionElem.unwrapUnsafeBinder": ("UnwindSetDiscrAndFnPtr", "NullaryAndPtrCoercion"),
     "Rvalue.nullaryOp": ("NullaryAndPtrCoercion",),
     "Rvalue.shallowInitBox": ("DropBinderAndSubtype",),
@@ -570,8 +597,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         # Exactly the `Trusted.Rustc.V2026_06_01.MirAst` constructors (checked against the Lean
         # inductives by `scripts/audit_mir_coverage_matrix.py`).
         self.assertEqual(mir["total_variants"], 94)
-        self.assertEqual(mir["proved_corresponding"], 90)
-        self.assertEqual(mir["supported_and_tested"], 1)
+        self.assertEqual(mir["proved_corresponding"], 91)
+        self.assertEqual(mir["supported_and_tested"], 0)
         self.assertEqual(mir["unsupported_fail_closed"], 3)
         self.assertEqual(mir["supported_untested"], 0)
         self.assertEqual(mir["untested_variants"], [])
@@ -589,8 +616,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         }
         self.assertEqual(statuses["StatementKind.constEvalCounter"], "proved_corresponding")
         self.assertEqual(statuses["TerminatorKind.tailCall"], "proved_corresponding")
-        # Explicit phase boundary (rejected after borrowck by rustc and Miri).
-        self.assertEqual(statuses["ProjectionElem.opaqueCast"], "supported_and_tested")
+        self.assertEqual(statuses["ProjectionElem.opaqueCast"], "proved_corresponding")
         self.assertGreaterEqual(mir["stage1_lowered_lintrinsic_op_variants"], 30)
 
         mr = stage_a["minirust_authority"]
@@ -629,7 +655,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         self.assertIn("LM-3.3", lm["milestones_merged"])
         self.assertGreater(lm["audited_declarations"], 500)
 
-    def test_mir_ast_categories_reconciled_to_90_of_94_proved_corresponding(self) -> None:
+    def test_mir_ast_categories_reconciled_to_91_of_94_proved_corresponding(self) -> None:
         statuses: dict[str, str] = {}
         for entry in suite.MIR_AST_CATEGORIES:
             for name, status in entry["variants"]:
@@ -641,19 +667,19 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         def with_status(status: str) -> list[str]:
             return [key for key, value in statuses.items() if value == status]
 
-        self.assertEqual(len(with_status("proved_corresponding")), 90)
-        self.assertEqual(with_status("supported_and_tested"), ["ProjectionElem.opaqueCast"])
+        self.assertEqual(len(with_status("proved_corresponding")), 91)
+        self.assertEqual(with_status("supported_and_tested"), [])
         self.assertEqual(with_status("supported_untested"), [])
         self.assertEqual(
             with_status("unsupported_fail_closed"),
             ["TerminatorKind.inlineAsm", "Rvalue.threadLocalRef", "AggregateKind.coroutine"],
         )
         self.assertEqual(
-            set(statuses.values()), {"proved_corresponding", "supported_and_tested", "unsupported_fail_closed"}
+            set(statuses.values()), {"proved_corresponding", "unsupported_fail_closed"}
         )
 
-        # The 14 variants promoted from `supported_and_tested` / `unsupported_fail_closed`.
-        self.assertEqual(len(MIR_PROMOTED_VARIANT_EVIDENCE), 14)
+        # The 15 variants promoted from `supported_and_tested` / `unsupported_fail_closed`.
+        self.assertEqual(len(MIR_PROMOTED_VARIANT_EVIDENCE), 15)
         self.assertEqual(set(MIR_PROMOTED_VARIANT_THEOREMS), set(MIR_PROMOTED_VARIANT_EVIDENCE))
         for key in MIR_PROMOTED_VARIANT_EVIDENCE:
             self.assertEqual(statuses[key], "proved_corresponding", key)
@@ -720,6 +746,15 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "ep2_nullary_ptrcoercion_fnptr_unwrap_root_capstone",
                 ),
             ),
+            (
+                MIR_BUNDLE_KERNEL_BRIDGES["OpaqueCastAndFnEntryProtector"],
+                (
+                    "d1_opaqueCast_canaries",
+                    "d2_fnentry_protector_canaries",
+                    "d3_safe_ptr_dereferenceable_canaries",
+                    "root_capstone_instantiation",
+                ),
+            ),
         ):
             code = proof_code[rel]
             for sym in bridge_theorems:
@@ -769,9 +804,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 mir["supported_untested"],
                 mir["unsupported_fail_closed"],
             ),
-            (94, 90, 1, 0, 3),
+            (94, 91, 0, 0, 3),
         )
-        self.assertEqual(mir["proved_corresponding_pct"], 95.74)
+        self.assertEqual(mir["proved_corresponding_pct"], 96.81)
         self.assertEqual(mir["supported_total"], 91)
         self.assertEqual(mir["supported_pct"], 96.81)
         self.assertEqual(mir["untested_variants"], [])
@@ -789,7 +824,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 "StatementKind": (12, 0, 0, 12),
                 "NonDivergingIntrinsic": (2, 0, 0, 2),
                 "TerminatorKind": (10, 0, 1, 11),
-                "ProjectionElem": (7, 1, 0, 8),
+                "ProjectionElem": (8, 0, 0, 8),
                 "Rvalue": (14, 0, 1, 15),
                 "BinOp": (26, 0, 0, 26),
                 "UnOp": (3, 0, 0, 3),
@@ -2869,7 +2904,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertFalse(spec_olean.exists())
             self.assertTrue(miri_olean.exists())
 
-            # 2. `run_suite_and_generate_dashboard` records the new steps and reconciled 90/94
+            # 2. `run_suite_and_generate_dashboard` records the new steps and reconciled 91/94
             #    MIR matrix in both JSON and Markdown outputs for `quick` (13) and `nightly` (34).
             #    Stub Stage B corpus scanning and divergence discovery (covered by their own
             #    end-to-end tests) so running both profiles stays fast while Stage A, step
@@ -2974,9 +3009,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 self.assertEqual(p2["steps_total"], expected_count, profile)
                 self.assertEqual(p2["steps_passed"], expected_count, profile)
                 mir = dash["pillar_1_completeness"]["syntactic_authorities"]["anneal_mir_ast"]
-                self.assertEqual(mir["proved_corresponding"], 90)
+                self.assertEqual(mir["proved_corresponding"], 91)
                 self.assertEqual(mir["total_variants"], 94)
-                self.assertIn("`90` (`95.74%`)", md)
+                self.assertIn("`91` (`96.81%`)", md)
                 self.assertIn("`lake_build_examples_trusted`", md)
                 if profile == "nightly":
                     self.assertIn("`lake_build_examples_miri_vendor`", md)
