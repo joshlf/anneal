@@ -1392,9 +1392,7 @@ indirect `TerminatorKind.call` across all 256 `u8` inputs.
 theorem reifyAndCallFnPtr_verified :
     VerificationResult reifyAndCallFnPtrClaim := by
   refine verifyByWPFuelFree reifyAndCallFnPtrClaim ?_
-  rintro _ ⟨x, _, rfl⟩
-  (conv => whnf)
-  rintro _ ⟨⟩
+  rintro _ ⟨x, _, rfl⟩ _ ⟨⟩
   simp <;> omega -- `simp` leaves the `u8` range side condition `x % 2 < 256`.
 
 /--
@@ -2427,6 +2425,12 @@ def pinnedWithSpecCalleesClaim : Claim where
   post args ret :=
     MirBoolPredicateHoldsWithCallees companionWithCallEnsMir [incU8CallbackMir] (args ++ [ret])
 
+private theorem pinnedWithSpecCallees_check :
+    checkMirAutoPinnedSpecWithSpecCallees 16 16 pinnedWithSpecCalleesSubjectMir
+      [incU8CallbackMir] [incU8CallbackMir]
+      (.some companionPinnedReqMir) (.some companionWithCallEnsMir) = true := by
+  decide +kernel
+
 /--
 Kernel-checked verification of `pinnedWithSpecCalleesClaim` where both the
 subject body and its `ensures` companion predicate invoke a linked callee in
@@ -2439,6 +2443,7 @@ theorem pinnedWithSpecCallees_verified :
     [incU8CallbackMir]
     (.some companionPinnedReqMir)
     (.some companionWithCallEnsMir)
+    (h_check := pinnedWithSpecCallees_check)
 
 def pinnedWithSpecCalleesTotalClaim : TotalClaim where
   body := pinnedWithSpecCalleesSubjectMir
@@ -2461,6 +2466,7 @@ theorem pinnedWithSpecCalleesTotal_verified :
     [incU8CallbackMir]
     (.some companionPinnedReqMir)
     (.some companionWithCallEnsMir)
+    (h_check := pinnedWithSpecCallees_check)
 
 /-!
 ## 7. Scalar-Represented Fieldless Enum Return Classification (`DIFF-E`)
@@ -3584,6 +3590,49 @@ def extCallThenLinkedPanicMir : CapturedMir :=
         terminator := mkTerm .return_
         isCleanup := false } ]
 
+/--
+Calls the unlinked `sym_test::external_get` into `_0` and returns it: an
+external call that returns normally admits no modular safe-panic certificate,
+and no path that returns from the call panics.
+-/
+def extCallReturnsMir : CapturedMir :=
+  mkMirBody "sym_test::ext_call_returns" 0
+    [ mkDecl .mut u32MirTy ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call
+            (fnConstOp "sym_test::external_get")
+            []
+            { local_ := 0, projection := [] }
+            (.some 1)
+            .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+-- Share one kernel evaluation across `extCallThenLinkedPanic` and
+-- `extCallReturns`.
+private theorem s13_linkedAndReturns_checks :
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 24
+        extCallThenLinkedPanicMir
+        (initMachineStateWithMemoryAndCallees extCallThenLinkedPanicMir []
+          emptyMemory [panickingHelperMir]) = true ∧
+    reachesModularSafePanicExecBounded 8 extCallReturnsMir
+        MirCallAnswerStream.unitEmpty
+        (.running
+          (initMachineStateWithMemory extCallReturnsMir [] emptyMemory)) =
+      false ∧
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
+        extCallReturnsMir
+        (initMachineStateWithMemory extCallReturnsMir [] emptyMemory) =
+      false ∧
+    reachesPanicAcrossCallsBounded (fun req => .panicked req.memory) 8
+        extCallReturnsMir
+        (initMachineStateWithMemory extCallReturnsMir [] emptyMemory) =
+      true := by
+  decide +kernel
+
 /-- Modular safe-panic certificate with a linked `callees` table. -/
 theorem extCallThenLinkedPanic_modular_safe_panic_verified :
     ModularVerificationResult
@@ -3631,28 +3680,7 @@ theorem extCallThenLinkedPanic_modular_safe_panic_verified :
            | (rw [reachesModularSafePanicExecStep_call]; apply modular_call_branches_true)
            | exact reachesModularSafePanicExecStep_ret_panic _ _ _
            | exact reachesModularSafePanicExecStep_ret_abort _ _ _)))
-    (by decide +kernel)
-
-/--
-Calls the unlinked `sym_test::external_get` into `_0` and returns it: an
-external call that returns normally admits no modular safe-panic certificate,
-and no path that returns from the call panics.
--/
-def extCallReturnsMir : CapturedMir :=
-  mkMirBody "sym_test::ext_call_returns" 0
-    [ mkDecl .mut u32MirTy ]
-    [ { statements := []
-        terminator :=
-          mkTerm (.call
-            (fnConstOp "sym_test::external_get")
-            []
-            { local_ := 0, projection := [] }
-            (.some 1)
-            .continue_)
-        isCleanup := false }
-    , { statements := []
-        terminator := mkTerm .return_
-        isCleanup := false } ]
+    s13_linkedAndReturns_checks.1
 
 /--
 The modular checker rejects `extCallReturnsMir`, and returning from the external
@@ -3675,26 +3703,11 @@ theorem extCallReturns_modular_safe_panic_rejected :
     ¬ ({ body := extCallReturnsMir
          pre := fun args mem => args = [] ∧ mem = emptyMemory
          post := fun _ _ _ _ => True } : TotalClaim).holds := by
-  have h :
-      reachesModularSafePanicExecBounded 8 extCallReturnsMir
-          MirCallAnswerStream.unitEmpty
-          (.running
-            (initMachineStateWithMemory extCallReturnsMir [] emptyMemory)) =
-        false ∧
-      reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
-          extCallReturnsMir
-          (initMachineStateWithMemory extCallReturnsMir [] emptyMemory) =
-        false ∧
-      reachesPanicAcrossCallsBounded (fun req => .panicked req.memory) 8
-          extCallReturnsMir
-          (initMachineStateWithMemory extCallReturnsMir [] emptyMemory) =
-        true := by
-    decide +kernel
-  refine ⟨fun h_all => ?_, h.2.1,
+  refine ⟨fun h_all => ?_, s13_linkedAndReturns_checks.2.2.1,
     refuteTotalClaimByBoundedPanicAcrossCalls _ 8 [] emptyMemory ⟨rfl, rfl⟩
-      (fun req => .panicked req.memory) h.2.2⟩
+      (fun req => .panicked req.memory) s13_linkedAndReturns_checks.2.2.2⟩
   have h_true := h_all MirCallAnswerStream.unitEmpty
-  rw [h.1] at h_true
+  rw [s13_linkedAndReturns_checks.2.1] at h_true
   nomatch h_true
 
 /--
@@ -3768,17 +3781,6 @@ def extCallBranchesMir : CapturedMir :=
         terminator := mkTerm .return_
         isCleanup := false } ]
 
-theorem extCallBranches_modular_safe_panic_rejected :
-    reachesModularSafePanicExecBounded 16 extCallBranchesMir
-        (fun _ => (.scalar { bits := 1, sizeBytes := 1 }, emptyMemory))
-        (.running
-          (initMachineStateWithMemory extCallBranchesMir [] emptyMemory)) =
-      false ∧
-    reachesModularSafePanicBounded 16 extCallBranchesMir
-        (initMachineStateWithMemory extCallBranchesMir [] emptyMemory) =
-      false := by
-  decide +kernel
-
 /--
 Reaches `unreachable` (undefined behavior) after the external call returns:
 the checker rejects a fault on any answer path.
@@ -3798,16 +3800,6 @@ def extCallThenUbMir : CapturedMir :=
     , { statements := []
         terminator := mkTerm .unreachable
         isCleanup := false } ]
-
-theorem extCallThenUb_modular_safe_panic_rejected :
-    reachesModularSafePanicBounded 8 extCallThenUbMir
-        (initMachineStateWithMemory extCallThenUbMir [] emptyMemory) =
-      false ∧
-    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
-        extCallThenUbMir
-        (initMachineStateWithMemory extCallThenUbMir [] emptyMemory) =
-      false := by
-  decide +kernel
 
 /--
 Calls the linked callee `sym_test::fmt_panic`, which itself performs an external
@@ -3850,20 +3842,57 @@ def divergingExtCallMir : CapturedMir :=
             .continue_)
         isCleanup := false } ]
 
--- Share one kernel evaluation across `callerOfFmtPanic` and `divergingExtCall`.
-private theorem s13_callerAndDiverging_checks :
+-- Share one kernel evaluation across `extCallBranches`, `extCallThenUb`,
+-- `callerOfFmtPanic`, and `divergingExtCall`.
+private theorem s13_tailClosedChecks :
+    (reachesModularSafePanicExecBounded 16 extCallBranchesMir
+        (fun _ => (.scalar { bits := 1, sizeBytes := 1 }, emptyMemory))
+        (.running
+          (initMachineStateWithMemory extCallBranchesMir [] emptyMemory)) =
+      false ∧
+    reachesModularSafePanicBounded 16 extCallBranchesMir
+        (initMachineStateWithMemory extCallBranchesMir [] emptyMemory) =
+      false) ∧
+    (reachesModularSafePanicBounded 8 extCallThenUbMir
+        (initMachineStateWithMemory extCallThenUbMir [] emptyMemory) =
+      false ∧
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
+        extCallThenUbMir
+        (initMachineStateWithMemory extCallThenUbMir [] emptyMemory) =
+      false) ∧
     reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 24
         callerOfFmtPanicMir
         (initMachineStateWithMemoryAndCallees callerOfFmtPanicMir []
           emptyMemory [fmtPanicMir]) = true ∧
-    reachesModularSafePanicBounded 8 divergingExtCallMir
+    (reachesModularSafePanicBounded 8 divergingExtCallMir
         (initMachineStateWithMemory divergingExtCallMir [] emptyMemory) =
       false ∧
     reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
         divergingExtCallMir
         (initMachineStateWithMemory divergingExtCallMir [] emptyMemory) =
-      false := by
+      false) := by
   decide +kernel
+
+theorem extCallBranches_modular_safe_panic_rejected :
+    reachesModularSafePanicExecBounded 16 extCallBranchesMir
+        (fun _ => (.scalar { bits := 1, sizeBytes := 1 }, emptyMemory))
+        (.running
+          (initMachineStateWithMemory extCallBranchesMir [] emptyMemory)) =
+      false ∧
+    reachesModularSafePanicBounded 16 extCallBranchesMir
+        (initMachineStateWithMemory extCallBranchesMir [] emptyMemory) =
+      false :=
+  s13_tailClosedChecks.1
+
+theorem extCallThenUb_modular_safe_panic_rejected :
+    reachesModularSafePanicBounded 8 extCallThenUbMir
+        (initMachineStateWithMemory extCallThenUbMir [] emptyMemory) =
+      false ∧
+    reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory) 8
+        extCallThenUbMir
+        (initMachineStateWithMemory extCallThenUbMir [] emptyMemory) =
+      false :=
+  s13_tailClosedChecks.2.1
 
 theorem callerOfFmtPanic_modular_safe_panic_verified :
     ModularVerificationResult
@@ -3878,7 +3907,7 @@ theorem callerOfFmtPanic_modular_safe_panic_verified :
          callees := [fmtPanicMir] } : TotalClaim).holds :=
   verifyModularSafePanicMirBounded callerOfFmtPanicMir
     [fmtPanicMir] 24 [] emptyMemory
-    (h_panic := s13_callerAndDiverging_checks.1)
+    (h_panic := s13_tailClosedChecks.2.2.1)
 
 theorem divergingExtCall_modular_safe_panic_rejected :
     reachesModularSafePanicBounded 8 divergingExtCallMir
@@ -3888,7 +3917,7 @@ theorem divergingExtCall_modular_safe_panic_rejected :
         divergingExtCallMir
         (initMachineStateWithMemory divergingExtCallMir [] emptyMemory) =
       false :=
-  s13_callerAndDiverging_checks.2
+  s13_tailClosedChecks.2.2.2
 
 /-! ## 14. `V2026_06_01` Closure-Captured Dereference Auto-Discharge & Soundness Canaries -/
 
@@ -4788,44 +4817,6 @@ def v26FfiReadRegReversedClaim : Claim where
       (argsMatchCalleeParamTys v26FfiReadRegMir args)
   post args ret := MirBoolPredicateHolds v26FfiReadRegEnsMir (args ++ [ret])
 
-private theorem v26FfiReadRegRev_checks :
-    listScalar1Beq (extractMirRequiresPins 64 v26FfiReadRegReversedReqMir)
-      ⟨10, 4⟩ = true ∧
-    checkMirRequiresPinsScalars 64 v26FfiReadRegReversedReqMir [⟨10, 4⟩] =
-      false ∧
-    checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir
-      (.some v26FfiReadRegReversedReqMir) [⟨10, 4⟩] = true := by
-  decide +kernel
-
-theorem v26FfiReadRegReversedPinnedAuto_verified :
-    extractMirRequiresPins 64 v26FfiReadRegReversedReqMir = [⟨10, 4⟩] ∧
-    checkMirRequiresPinsScalars 64 v26FfiReadRegReversedReqMir [⟨10, 4⟩] = false ∧
-    checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir (.some v26FfiReadRegReversedReqMir) [⟨10, 4⟩] = true ∧
-    VerificationResult v26FfiReadRegReversedClaim := by
-  have h_ext := listScalar1_eq_of_beq v26FfiReadRegRev_checks.1
-  refine ⟨h_ext, v26FfiReadRegRev_checks.2.1, v26FfiReadRegRev_checks.2.2,
-    dischargeRustPinnedContractAuto
-      v26FfiReadRegReversedClaim 64 64 (.some v26FfiReadRegReversedReqMir) (.some v26FfiReadRegEnsMir)
-      (h_pre := fun _ h => ⟨h.1, optArgsTyped_of_typed (Or.inl h.2)⟩)
-      (h_check := ?_)⟩
-  unfold checkMirAutoPinnedSpecWithCallees extractOptMirRequiresPins
-  dsimp only [v26FfiReadRegReversedClaim]
-  rw [h_ext, mapStrictList_eq strictScalarInt strictScalarInt_eq]
-  dsimp only [mapScalarValues]
-  rw [v26FfiReadRegRev_checks.2.2, v26FfiReadReg_subjEns64]
-  rfl
-
-theorem v26FfiReadRegReversedEqU32_verified : VerificationResult v26FfiReadRegReversedClaim :=
-  dischargeRustEqU32FuelFree
-    v26FfiReadRegReversedClaim v26FfiReadRegReversedReqMir v26FfiReadRegEnsMir 10
-    (h_pre := fun _ h => ⟨h.1, optArgsTyped_of_typed (Or.inl h.2)⟩)
-    (h_check := by
-      unfold checkMirRustEqScalar1SpecWithCallees
-      rw [strictScalarInt_eq]
-      dsimp only [v26FfiReadRegReversedClaim]
-      rw [v26FfiReadRegRev_checks.2.2, v26FfiReadReg_subjSpecEns16,
-          Bool.and_self, Bool.or_true])
-
 /-- Closure-deref `requires` with an intermediate local move
 (`_9 = copy (*_10); _11 = move _9; _7 = Eq(move _11, const 10)`). -/
 def v26FfiReadRegIntermMoveReqMir : CapturedMir :=
@@ -4881,28 +4872,6 @@ def v26FfiReadRegIntermMoveTotalClaim : TotalClaim where
         (mem = (initMachineState v26FfiReadRegMir args).memory))
       (argsMatchSignature (v26FfiReadRegMir.instantiate .nil) args mem)
   post args _ ret _ := MirBoolPredicateHolds v26FfiReadRegEnsMir (args ++ [ret])
-
-private theorem v26FfiReadRegIntermMove_checks :
-    listScalar1Beq
-      (extractOptMirRequiresPins 64 (.some v26FfiReadRegIntermMoveReqMir))
-      ⟨10, 4⟩ = true ∧
-    checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir
-      (.some v26FfiReadRegIntermMoveReqMir) [⟨10, 4⟩] = true := by
-  decide +kernel
-
-theorem v26FfiReadRegIntermMoveTotal_verified :
-    TotalVerificationResult v26FfiReadRegIntermMoveTotalClaim :=
-  dischargeRustTotalPinnedContractAuto
-    v26FfiReadRegIntermMoveTotalClaim 64 64 (.some v26FfiReadRegIntermMoveReqMir) (.some v26FfiReadRegEnsMir)
-    (h_pre := fun _ mem h => ⟨h.1, optArgsTyped_of_typed (Or.inr (Or.inl ⟨mem, h.2⟩))⟩)
-    (h_check := by
-      unfold checkMirAutoPinnedSpecWithCallees
-      dsimp only [v26FfiReadRegIntermMoveTotalClaim]
-      rw [listScalar1_eq_of_beq v26FfiReadRegIntermMove_checks.1,
-          mapStrictList_eq strictScalarInt strictScalarInt_eq]
-      dsimp only [mapScalarValues]
-      rw [v26FfiReadRegIntermMove_checks.2, v26FfiReadReg_subjEns64]
-      rfl)
 
 /-- Two-parameter `u32` closure-deref short-circuit `requires` (`a == 10 && 20 == b`)
 and `ensures` (`30 == result`), discharged via both `dischargeRustPinnedContractAuto`
@@ -5038,16 +5007,73 @@ def v26AddTwoRegsClaim : Claim where
       (argsMatchCalleeParamTys v26AddTwoRegsMir args)
   post args ret := MirBoolPredicateHolds v26AddTwoRegsEnsMir (args ++ [ret])
 
-private theorem v26AddTwoRegs_checks :
-    listScalar2Beq (extractMirRequiresPins 64 v26AddTwoRegsReqMir)
-      ⟨10, 4⟩ ⟨20, 4⟩ = true ∧
-    checkOptMirRequiresPinsScalarsForSubject 64 v26AddTwoRegsMir
-      (.some v26AddTwoRegsReqMir) [⟨10, 4⟩, ⟨20, 4⟩] = true ∧
-    checkMirBoolExecPlain 64 v26AddTwoRegsEnsMir
-      (.running
-        (initMachineStateWithCallees v26AddTwoRegsEnsMir
-          [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩] [])) = true := by
+-- Share one kernel evaluation across the reversed-pin, intermediate-move, and
+-- two-argument closure-deref fixtures.
+private theorem v26Tail_checks :
+    (listScalar1Beq (extractMirRequiresPins 64 v26FfiReadRegReversedReqMir)
+        ⟨10, 4⟩ = true ∧
+      checkMirRequiresPinsScalars 64 v26FfiReadRegReversedReqMir [⟨10, 4⟩] =
+        false ∧
+      checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir
+        (.some v26FfiReadRegReversedReqMir) [⟨10, 4⟩] = true) ∧
+    (listScalar1Beq
+        (extractOptMirRequiresPins 64 (.some v26FfiReadRegIntermMoveReqMir))
+        ⟨10, 4⟩ = true ∧
+      checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir
+        (.some v26FfiReadRegIntermMoveReqMir) [⟨10, 4⟩] = true) ∧
+    (listScalar2Beq (extractMirRequiresPins 64 v26AddTwoRegsReqMir)
+        ⟨10, 4⟩ ⟨20, 4⟩ = true ∧
+      checkOptMirRequiresPinsScalarsForSubject 64 v26AddTwoRegsMir
+        (.some v26AddTwoRegsReqMir) [⟨10, 4⟩, ⟨20, 4⟩] = true ∧
+      checkMirBoolExecPlain 64 v26AddTwoRegsEnsMir
+        (.running
+          (initMachineStateWithCallees v26AddTwoRegsEnsMir
+            [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩] [])) =
+        true) := by
   decide +kernel
+
+theorem v26FfiReadRegReversedPinnedAuto_verified :
+    extractMirRequiresPins 64 v26FfiReadRegReversedReqMir = [⟨10, 4⟩] ∧
+    checkMirRequiresPinsScalars 64 v26FfiReadRegReversedReqMir [⟨10, 4⟩] = false ∧
+    checkOptMirRequiresPinsScalarsForSubject 64 v26FfiReadRegMir (.some v26FfiReadRegReversedReqMir) [⟨10, 4⟩] = true ∧
+    VerificationResult v26FfiReadRegReversedClaim := by
+  have h_ext := listScalar1_eq_of_beq v26Tail_checks.1.1
+  refine ⟨h_ext, v26Tail_checks.1.2.1, v26Tail_checks.1.2.2,
+    dischargeRustPinnedContractAuto
+      v26FfiReadRegReversedClaim 64 64 (.some v26FfiReadRegReversedReqMir) (.some v26FfiReadRegEnsMir)
+      (h_pre := fun _ h => ⟨h.1, optArgsTyped_of_typed (Or.inl h.2)⟩)
+      (h_check := ?_)⟩
+  unfold checkMirAutoPinnedSpecWithCallees extractOptMirRequiresPins
+  dsimp only [v26FfiReadRegReversedClaim]
+  rw [h_ext, mapStrictList_eq strictScalarInt strictScalarInt_eq]
+  dsimp only [mapScalarValues]
+  rw [v26Tail_checks.1.2.2, v26FfiReadReg_subjEns64]
+  rfl
+
+theorem v26FfiReadRegReversedEqU32_verified : VerificationResult v26FfiReadRegReversedClaim :=
+  dischargeRustEqU32FuelFree
+    v26FfiReadRegReversedClaim v26FfiReadRegReversedReqMir v26FfiReadRegEnsMir 10
+    (h_pre := fun _ h => ⟨h.1, optArgsTyped_of_typed (Or.inl h.2)⟩)
+    (h_check := by
+      unfold checkMirRustEqScalar1SpecWithCallees
+      rw [strictScalarInt_eq]
+      dsimp only [v26FfiReadRegReversedClaim]
+      rw [v26Tail_checks.1.2.2, v26FfiReadReg_subjSpecEns16,
+          Bool.and_self, Bool.or_true])
+
+theorem v26FfiReadRegIntermMoveTotal_verified :
+    TotalVerificationResult v26FfiReadRegIntermMoveTotalClaim :=
+  dischargeRustTotalPinnedContractAuto
+    v26FfiReadRegIntermMoveTotalClaim 64 64 (.some v26FfiReadRegIntermMoveReqMir) (.some v26FfiReadRegEnsMir)
+    (h_pre := fun _ mem h => ⟨h.1, optArgsTyped_of_typed (Or.inr (Or.inl ⟨mem, h.2⟩))⟩)
+    (h_check := by
+      unfold checkMirAutoPinnedSpecWithCallees
+      dsimp only [v26FfiReadRegIntermMoveTotalClaim]
+      rw [listScalar1_eq_of_beq v26Tail_checks.2.1.1,
+          mapStrictList_eq strictScalarInt strictScalarInt_eq]
+      dsimp only [mapScalarValues]
+      rw [v26Tail_checks.2.1.2, v26FfiReadReg_subjEns64]
+      rfl)
 
 private theorem v26AddTwoRegs_subjEns64 :
     checkMirRustPinnedSpecOptWithCallees 64 64 v26AddTwoRegsMir []
@@ -5060,7 +5086,7 @@ private theorem v26AddTwoRegs_subjEns64 :
         [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩] :=
     by rfl
   exact h.trans
-    (checkMirBoolWithCalleesBounded_of_plain v26AddTwoRegs_checks.2.2)
+    (checkMirBoolWithCalleesBounded_of_plain v26Tail_checks.2.2.2.2)
 
 private theorem v26AddTwoRegs_subjSpecEns16 :
     checkMirRustPinnedSpecOptWithSpecCallees 16 64 v26AddTwoRegsMir [] []
@@ -5073,12 +5099,12 @@ private theorem v26AddTwoRegs_subjSpecEns16 :
         [.scalar ⟨10, 4⟩, .scalar ⟨20, 4⟩, .scalar ⟨30, 4⟩] :=
     by rfl
   exact h.trans
-    (checkMirBoolWithCalleesBounded_of_plain v26AddTwoRegs_checks.2.2)
+    (checkMirBoolWithCalleesBounded_of_plain v26Tail_checks.2.2.2.2)
 
 theorem v26AddTwoRegsPinnedAuto_verified :
     extractMirRequiresPins 64 v26AddTwoRegsReqMir = [⟨10, 4⟩, ⟨20, 4⟩] ∧
     VerificationResult v26AddTwoRegsClaim := by
-  have h_ext := listScalar2_eq_of_beq v26AddTwoRegs_checks.1
+  have h_ext := listScalar2_eq_of_beq v26Tail_checks.2.2.1
   refine ⟨h_ext,
     dischargeRustPinnedContractAuto
       v26AddTwoRegsClaim 64 64 (.some v26AddTwoRegsReqMir) (.some v26AddTwoRegsEnsMir)
@@ -5088,13 +5114,13 @@ theorem v26AddTwoRegsPinnedAuto_verified :
   dsimp only [v26AddTwoRegsClaim]
   rw [h_ext, mapStrictList_eq strictScalarInt strictScalarInt_eq]
   dsimp only [mapScalarValues]
-  rw [v26AddTwoRegs_checks.2.1, v26AddTwoRegs_subjEns64]
+  rw [v26Tail_checks.2.2.2.1, v26AddTwoRegs_subjEns64]
   rfl
 
 theorem v26AddTwoRegsEq2U32_verified : VerificationResult v26AddTwoRegsClaim :=
   dischargeRustEq2U32FuelFree
     v26AddTwoRegsClaim v26AddTwoRegsReqMir v26AddTwoRegsEnsMir 10 20
-    (h_pins := v26AddTwoRegs_checks.2.1)
+    (h_pins := v26Tail_checks.2.2.2.1)
     (h_check := v26AddTwoRegs_subjSpecEns16)
 
 /-! ## 15. Frame-Restoring Modular `.return_` Over Symbolic Borrows (`evalTerminatorFrameSymTree`) -/
