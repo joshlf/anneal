@@ -1860,6 +1860,36 @@ class StandaloneInternalHygieneTests(InternalHygieneMixin,
     ROOT = ""
     LAYOUT = "standalone"
 
+    def text_run(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-I", "-B", str(SCRIPT), "--repo",
+             str(self.repo), "--base", "base"],
+            capture_output=True, text=True, check=False,
+        )
+
+    def test_text_report_names_path_line_and_label_only(self):
+        # Findings carry the path, the 1-based line, and the pattern label,
+        # never the matched token, so CI logs do not repeat it.
+        self.write("docs/x.txt", f"ok\nsee {self.MOUNT}\n")
+        self.write("HANDOFF.md", "x\n")
+        self.commit()
+        res = self.text_run()
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("[internal-reference] docs/x.txt:2: internal-"
+                      "infrastructure reference (internal-mount)", res.stderr)
+        self.assertIn("[internal-path] HANDOFF.md: ephemeral agent baton",
+                      res.stderr)
+        self.assertNotIn(self.MOUNT, res.stderr + res.stdout)
+        # Vendored hits that `ci/test_repo_hygiene.py` checks only warn.
+        git(self.repo, "branch", "-f", "base")
+        self.write("lean-miri/vendor/up/y.txt", f"{self.MOUNT}\n")
+        self.commit()
+        res = self.text_run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("warning: [internal-reference] "
+                      "lean-miri/vendor/up/y.txt:1: ", res.stderr)
+        self.assertIn("`ci/test_repo_hygiene.py` checks it", res.stderr)
+
     def test_cross_vendor_and_scope_to_vendor_renames(self):
         # Moving from unscanned `minirust/vendor/` into scanned
         # `lean-miri/vendor/` warns on every line (`entered` is true), while

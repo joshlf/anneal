@@ -79,7 +79,7 @@ import re
 import subprocess
 import sys
 import tokenize
-from typing import Callable
+from typing import Callable, NamedTuple
 
 SCHEMA = "anneal-pr-hygiene/v1"
 SUBJECT_LIMIT = 72
@@ -1826,6 +1826,21 @@ def _hygiene_scans_content(path: str, layout: Layout) -> bool:
             REPO_HYGIENE_EXCLUDED_PREFIXES))
 
 
+class _ScanItem(NamedTuple):
+    """A blob to scan for internal references, with its `base` blob if any.
+
+    `lines` limits the scan to those line numbers (`None` for every line).
+    """
+
+    path: str
+    is_sym: bool
+    oid: str
+    prev_oid: str | None = None
+    prev_path: str = ""
+    prev_sym: bool = False
+    lines: set[int] | None = None
+
+
 def internal_findings(
     git: Git, head: str, layout: Layout,
     files: dict[str, ChangedFile] | None = None,
@@ -1864,9 +1879,7 @@ def internal_findings(
         if msg is not None:
             report("internal-path", msg, path)
 
-    # `(path, is_sym, oid, prev_oid, prev_path, prev_sym, lines)`.
-    scan: list[tuple[str, bool, str, str | None, str, bool,
-                     set[int] | None]] = []
+    scan: list[_ScanItem] = []
     if files is None:
         records = git.tree_records(head)
         for path in sorted(records):
@@ -1875,8 +1888,7 @@ def internal_findings(
             path_check(path)
             mode, kind, oid = records[path]
             if kind == "blob" and _hygiene_scans_content(path, layout):
-                scan.append(
-                    (path, mode == "120000", oid, None, "", False, None))
+                scan.append(_ScanItem(path, mode == "120000", oid))
     else:
         changed = [
             f for f in sorted(files.values(), key=lambda f: f.path)
@@ -1914,13 +1926,13 @@ def internal_findings(
             is_sym = rec[0] == "120000"
             oid = rec[2]
             if entered(f):
-                scan.append((f.path, is_sym, oid, None, "", False, None))
+                scan.append(_ScanItem(f.path, is_sym, oid))
                 continue
             if base is not None:
                 prev_path = f.old_path or f.path
                 prev = base_records.get(prev_path)
                 if prev is None or prev[1] != "blob":
-                    scan.append((f.path, is_sym, oid, None, "", False, None))
+                    scan.append(_ScanItem(f.path, is_sym, oid))
                     continue
                 prev_sym = prev[0] == "120000"
                 prev_oid = prev[2]
@@ -1929,15 +1941,13 @@ def internal_findings(
                     and _always_text_path(f.path, is_sym)
                 )
                 if prev_oid != oid or forced_flip:
-                    scan.append((
-                        f.path, is_sym, oid, prev_oid, prev_path, prev_sym,
-                        f.added,
-                    ))
+                    scan.append(_ScanItem(f.path, is_sym, oid, prev_oid,
+                                          prev_path, prev_sym, f.added))
                     continue
             if f.added:
-                scan.append((f.path, is_sym, oid, None, "", False, f.added))
-    need_oids = [oid for _, _, oid, _, _, _, _ in scan] + [
-        prev_oid for _, _, _, prev_oid, _, _, _ in scan if prev_oid is not None
+                scan.append(_ScanItem(f.path, is_sym, oid, lines=f.added))
+    need_oids = [item.oid for item in scan] + [
+        item.prev_oid for item in scan if item.prev_oid is not None
     ]
     blobs = git.blobs(need_oids)
     for path, is_sym, oid, prev_oid, prev_path, prev_sym, lines in scan:
