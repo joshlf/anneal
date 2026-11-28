@@ -147,6 +147,17 @@ against Round B3:
 - **V-M2 / universe-parameter scoping**: rejects duplicate `levelParams` and unbound
   `Level.param` references in both binary and in-memory validators (`forgedLevelMData`).
 
+## Adversarial Hardening Regressions (Round B4)
+
+- **V-S5 / IR-decl hijack through `extraConstNames`**: `importModules` assigns
+  `const2ModIdx` with `insertIfNew`, and the IR interpreter / `IR.findEnvDecl` consult only
+  the owning module's `declMapExt` entries. A forged module imported before an honest one
+  that lists the honest module's IR-only auxiliary name in its own `extraConstNames` (and
+  ships a forged `IR.Decl` body) takes over which body runs; the round-A3 ownership check
+  accepted it because the attacker "owns" the name. Every module's own `extraConstNames`
+  (in-memory header plus `.ir`-part bytes) must now be owned by that module
+  (`shadowedConstant`).
+
 ## Running the Suite
 
 ```bash

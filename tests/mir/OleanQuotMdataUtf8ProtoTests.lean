@@ -2000,6 +2000,13 @@ def validateEnvModule (env : Environment) (modName : Name)
   for en in data.extraConstNames do
     let (st1, _) := validateNameDag en en st fuel
     st := st1
+    -- B4 hardening: `importModules` assigns `const2ModIdx` with `insertIfNew`, and the IR
+    -- interpreter / `IR.findEnvDecl` consult ONLY the owning module's `declMapExt` entries.
+    -- An earlier-imported module listing this module's IR-only name in ITS `extraConstNames`
+    -- therefore hijacks which `IR.Decl` body runs. Every own extra name must be owned here.
+    if env.getModuleIdxFor? en != some modIdx then
+      st := st.record "shadowedConstant" en
+        s!"extraConstName {en} of {modName} is owned by module index {(env.getModuleIdxFor? en).map (·.toNat)} (IR lookup hijack)"
   for ci in data.constants do
     st := validateConstantInfo ci (some modName) st fuel
   if data.constNames.size != data.constants.size then
@@ -4205,6 +4212,22 @@ def binExportedAxiomClaimsPerPart (rawParts : Array ByteArray) :
     out := out.push { isModule := isMod, constNames := cns, claims := pClaims }
   return out
 
+/-- Decode `ModuleData.extraConstNames` (field 3) of every part (forward-pointer isolated). -/
+def binExtraConstNames (rawParts : Array ByteArray) : Except String (Array Name) := do
+  let parts ← parseOleanParts rawParts
+  let mut out : Array Name := #[]
+  for pIdx in [0:parts.size] do
+    let visParts := parts.extract 0 (pIdx + 1)
+    let p := parts[pIdx]!
+    if isScalarWord p.rootPtr then continue
+    let rh ← readObjHeader visParts p.rootPtr
+    for w in ← readArrayElems visParts (← readFieldPtr visParts rh 3) do
+      let (st, info) := validateBinName visParts .anonymous w {}
+      if !st.violations.isEmpty then
+        throw s!"extraConstName invalid: {st.violations.map Violation.render}"
+      out := out.push info.name
+  return out
+
 /-- Decode the per-declaration axiom arrays stored in a module's binary `exportedAxiomsExt`
 entries (flattened across parts). -/
 def binExportedAxiomClaims (rawParts : Array ByteArray) :
@@ -4349,7 +4372,21 @@ def validateEnvModuleFull (env : Environment) (modName : Name) (oleanParts : Arr
       | .error e => { violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := s!"{label} exportedAxiomsExt decode: {e}" }] }
   let r2 := decodeGroup oleanParts "olean" true
   let r3 := decodeGroup irParts "ir" false
-  { violations := r1.violations ++ r2.violations ++ r3.violations, stats := r1.stats }
+  -- B4: `module` files list IR-only names in the `.ir` part's `extraConstNames`, which the
+  -- in-memory header does not expose; decode them from bytes and require local ownership.
+  let r4 : AuditReport := Id.run do
+    if irParts.isEmpty then return {}
+    let some modIdx := env.getModuleIdx? modName | return {}
+    match binExtraConstNames irParts with
+    | .error e => return { violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := s!"ir extraConstNames decode: {e}" }] }
+    | .ok ens =>
+      let mut vs : Array Violation := #[]
+      for en in ens do
+        if env.getModuleIdxFor? en != some modIdx then
+          vs := vs.push { tag := "shadowedConstant", decl := en
+                          detail := s!"ir extraConstName {en} of {modName} is owned by another module (IR lookup hijack)" }
+      return { violations := vs }
+  { violations := r1.violations ++ r2.violations ++ r3.violations ++ r4.violations, stats := r1.stats }
 
 /-! ## Section 10: Process Memory (`VmHWM` / `VmRSS`) & Benchmark Harness -/
 
@@ -5590,6 +5627,55 @@ A3 V-M2 unbound Level.param: binary=#[forgedLevelMData] memory=#[forgedLevelMDat
     let pUnbLp ← b1Save dir `A3UnbLp #[`Init.Core] #[`a3UnbLp] #[unbLpCi]
     let envUnbLp ← b1Import libDir [(`A3UnbLp, pUnbLp)] `A3UnbLp
     IO.println s!"A3 V-M2 unbound Level.param: binary={(validateOleanParts #[← IO.FS.readBinFile pUnbLp] `A3UnbLp).tags} memory={(validateEnvModule envUnbLp `A3UnbLp).tags}"
+  finally
+    try IO.FS.removeDirAll dir catch _ => pure ()
+
+/-! ## Section 11h: Round-B4 Adversarial Regressions -/
+
+/--
+info: B4 V-S5 IR hijack: victim aux IR decl owned by B4Attacker, IR.findEnvDecl params=0 (victim's real decl has params=2)
+B4 V-S5 IR hijack: attacker binary=#[] attacker memory=#[] (A3 ownership check satisfied via extraConstNames)
+B4 V-S5 IR hijack: victim memory(Full)=#[shadowedConstant]
+B4 V-S5 IR hijack: honest victim alone memory(Full) ok=true
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  let pid ← IO.Process.getPID
+  let dir : System.FilePath := ⟨s!"/tmp/anneal-proto-b4-{pid}"⟩
+  IO.FS.createDirAll dir
+  try
+    let libDir ← b1LibDir
+    -- Honest victim with a compiler-generated IR-only auxiliary declaration.
+    let pV ← b2Compile dir libDir "B4Victim" "def b4vFn (xs : List Nat) : List Nat := xs.map (fun x => x * 3 + 1)\n" #["Init"]
+    let bV ← IO.FS.readBinFile pV
+    let envV ← b1Import libDir [(`B4Victim, pV)] `B4Victim
+    let some vIdx := envV.getModuleIdx? `B4Victim | throw (IO.userError "victim not loaded")
+    let auxNames := envV.header.moduleData[vIdx.toNat]!.extraConstNames
+    let some aux := auxNames.find? (fun n => (IR.findEnvDecl envV n).isSome)
+      | throw (IO.userError s!"no IR-only aux decl in victim: {auxNames}")
+    let realParams := ((IR.findEnvDecl envV aux).map (·.params.size)).getD 99
+    -- Attacker: claims the victim's aux name in ITS extraConstNames and ships a forged body.
+    let forged : IR.Decl := .fdecl aux #[] .object (.ret (.var ⟨0⟩)) {}
+    let donorEnv := IR.declMapExt.addEntry (← mkEmptyEnvironment) forged
+    let pDonor := dir / "B4Donor.olean"
+    writeModule donorEnv pDonor (writeIR := false)
+    let (donorMd, _) ← readModuleData pDonor
+    let pA := dir / "B4Attacker.olean"
+    saveModuleData pA `B4Attacker {
+      isModule := false
+      imports := #[{ module := `Init.Core, importAll := false, isExported := true, isMeta := false }]
+      constNames := #[], constants := #[], extraConstNames := #[aux]
+      entries := donorMd.entries.filter (·.1 == `Lean.IR.declMapExt) }
+    -- Root importing the attacker BEFORE the honest victim.
+    let pR ← b1Save dir `B4Root #[`B4Attacker, `B4Victim] #[] #[]
+    let env ← b1Import libDir [(`B4Attacker, pA), (`B4Victim, pV), (`B4Root, pR)] `B4Root
+    let owner := (env.getModuleIdxFor? aux).map (fun i => env.header.modules[i.toNat]!.module) |>.getD .anonymous
+    let hijParams := ((IR.findEnvDecl env aux).map (·.params.size)).getD 99
+    IO.println s!"B4 V-S5 IR hijack: victim aux IR decl owned by {owner}, IR.findEnvDecl params={hijParams} (victim's real decl has params={realParams})"
+    let bA ← IO.FS.readBinFile pA
+    IO.println s!"B4 V-S5 IR hijack: attacker binary={(validateOleanParts #[bA] `B4Attacker).tags} attacker memory={(validateEnvModule env `B4Attacker).tags} (A3 ownership check satisfied via extraConstNames)"
+    IO.println s!"B4 V-S5 IR hijack: victim memory(Full)={(validateEnvModuleFull env `B4Victim #[bV]).tags}"
+    IO.println s!"B4 V-S5 IR hijack: honest victim alone memory(Full) ok={(validateEnvModuleFull envV `B4Victim #[bV]).ok}"
   finally
     try IO.FS.removeDirAll dir catch _ => pure ()
 
