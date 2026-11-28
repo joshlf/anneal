@@ -366,9 +366,13 @@ def oleanMagicBytes : ByteArray := "olean".toUTF8
 def oleanVerBytes : ByteArray := "4.34.1".toUTF8
 def oleanGitBytes : ByteArray := "5045d0056413266e57c625dcd7c365b10e377c52".toUTF8
 
-/-- Pre-`importModules` binary validation of one `.olean*` or `.ir*` layer (`leanprover/lean4#16737`). -/
-def validateOleanBytes (b : ByteArray) (parents disjoint : Array (Nat × Nat × Nat)) :
-    Except String (Nat × Nat × Nat) := do
+/-- One validated compacted-region layer: `baseAddr`, byte size, `rootPtr`, root child pointers. -/
+abbrev OleanLayer := Nat × Nat × Nat × Array Nat
+
+/-- Pre-`importModules` binary validation of one `.olean*` or `.ir*` layer (`leanprover/lean4#16737`).
+Every pinned 4.34.1 root is a `ModuleData`-shaped ctor (tag 0, 5 object fields, 56 bytes) whose fields
+are own-region `Array`s (tag 246, elements in bounds) or the same-slot field of a parent layer. -/
+def validateOleanBytes (b : ByteArray) (parents disjoint : Array OleanLayer) : Except String OleanLayer := do
   let sz := b.size
   unless sz >= 96 do throw s!"file smaller than 96-byte header ({sz})"
   unless b.extract 0 5 == oleanMagicBytes && b.get! 5 == 2 && b.get! 6 <= 1 &&
@@ -384,26 +388,25 @@ def validateOleanBytes (b : ByteArray) (parents disjoint : Array (Nat × Nat × 
     unless rootPtr % 8 == 0 do throw "unaligned .olean rootPtr"
     let off := rootPtr - baseAddr
     let (rc, csSz, mOther, mTag) := (readU32LE b off, readU16LE b (off + 4), (b.get! (off + 6)).toNat, (b.get! (off + 7)).toNat)
-    let minSz := 8 + 8 * mOther; let objSz := if csSz > 0 then csSz else minSz
-    unless rc == 0 && mTag <= 243 && (csSz == 0 || csSz >= minSz) && off + objSz <= sz do
+    unless rc == 0 && mTag == 0 && mOther == 5 && csSz == 56 && off + 56 <= sz do
       throw s!"invalid root object header (rc={rc}, tag={mTag}, cs_sz={csSz}, other={mOther})"
-    for k in [0:mOther] do
+    let mut kids : Array Nat := #[]
+    for k in [0:5] do
       let c := readU64LE b (off + 8 + 8 * k)
-      if c % 2 == 1 then continue
-      let inOwn := c % 8 == 0 && baseAddr + 96 <= c && c <= baseAddr + sz - 8
-      let inPar := c % 8 == 0 && parents.any fun (pb, ps, _) => pb + 96 <= c && c <= pb + ps - 8
-      unless inOwn || inPar do throw s!"out-of-bounds root child pointer at slot {k}"
-      if inOwn then
-        let co := c - baseAddr
-        unless readU32LE b co == 0 && (b.get! (co + 7)).toNat <= 249 do
-          throw s!"invalid root child object header at slot {k}"
-  else unless !parents.isEmpty && sz == 96 && parents.any fun (_, _, pr) => pr == rootPtr do
+      if c % 8 == 0 && baseAddr + 96 <= c && c + 24 <= baseAddr + sz then
+        let co := c - baseAddr; let cap := readU64LE b (co + 16)
+        unless readU32LE b co == 0 && (b.get! (co + 7)).toNat == 246 && readU64LE b (co + 8) <= cap && co + 24 + 8 * cap <= sz do
+          throw s!"invalid root child array header at slot {k}"
+      else unless parents.any fun (_, _, _, pk) => pk[k]? == some c do throw s!"out-of-bounds root child pointer at slot {k}"
+      kids := kids.push c
+    return (baseAddr, sz, rootPtr, kids)
+  else unless !parents.isEmpty && sz == 96 && parents.any fun (_, _, pr, _) => pr == rootPtr do
     throw "out-of-region rootPtr is not a valid 96-byte empty delta layer"
-  return (baseAddr, sz, rootPtr)
+  return (baseAddr, sz, rootPtr, #[])
 
 def validateOleanParts (m : Name) (oleanParts : Array System.FilePath)
-    (disjoint : Array (Nat × Nat × Nat) := #[]) : AuditM (Array (Nat × Nat × Nat)) := do
-  let mut parents : Array (Nat × Nat × Nat) := #[]
+    (disjoint : Array OleanLayer := #[]) : AuditM (Array OleanLayer) := do
+  let mut parents : Array OleanLayer := #[]
   for p in oleanParts do
     let sz? ← (show IO (Option Nat) from do try pure (some (← p.metadata).byteSize.toNat) catch _ => pure none)
     let some sz := sz? | report "oleanBinaryInvalid" m m s!"cannot stat {p}"; return parents
