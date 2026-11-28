@@ -568,6 +568,14 @@ def run_quorum(
                 mut_kernels["con-ron"] = run_timed(
                     [str(con_ron_bin), "--verified", f"--jobs={jobs}", str(mf_res)], env=exp_env
                 )
+            if con_leche_bin.is_file():
+                mut_kernels["con-leche"] = run_timed(
+                    [str(con_leche_bin), "--verified", f"--jobs={jobs}", str(mf_res)], env=exp_env
+                )
+            if lean4lean_bin.is_file():
+                mut_kernels["lean4lean"] = run_timed(
+                    [str(lean4lean_bin), "--import", str(mf_res)], env=exp_env
+                )
             if anneal_kc_bin is not None:
                 mut_kernels["anneal-kc"] = run_timed(
                     [str(anneal_kc_bin), "--anneal-policy", str(mf_res)], env=exp_env

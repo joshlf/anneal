@@ -24,9 +24,10 @@ Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, exact
 `Nat.shiftRight`, and `Nat.testBit` lemmas missing from `foundation-lock.json`
 (`Init.Data.Nat.Bitwise.Lemmas` is outside the 51 locked foundation modules):
 
-1. Single-point `Nat.bitwise.eq_def` unfolding bridge (`nat_bitwise_unfold`)
-   and width-preservation bounds (`nat_bitwise_lt_two_pow`,
-   `nat_land_lt_two_pow`, `nat_lor_lt_two_pow`, `nat_xor_lt_two_pow`).
+1. Single-point `Quot.sound`-free `Nat.bitwise` unfolding bridge
+   (`nat_bitwise_unfold`) and width-preservation bounds
+   (`nat_bitwise_lt_two_pow`, `nat_land_lt_two_pow`, `nat_lor_lt_two_pow`,
+   `nat_xor_lt_two_pow`).
 2. `Nat.testBit` characterization on numerals, powers of two, low masks
    `2^k - 1`, `Nat.mod _ (2^k)`, `Nat.shiftLeft`, and `Nat.shiftRight`.
 3. Pointwise `Nat.testBit` distribution over `Nat.bitwise`, `Nat.land`,
@@ -187,6 +188,56 @@ private theorem nat_lt_two_pow_self : ∀ n : Nat, n < Nat.pow 2 n
     rw [nat_pow_succ, Nat.mul_two]
     exact Nat.lt_of_succ_le (Nat.add_le_add ih hpos)
 
+/-! ## Unfolding Without `funext`
+
+Lean's generated `Nat.bitwise.eq_def` goes through `WellFounded.Nat.fix_eq`,
+which uses `funext` to rewrite under the recursive-call argument and therefore
+depends on `Quot.sound`. `fix_eq_of_congr` proves the same equation from a
+pointwise congruence property of the step function instead, which
+`Nat.bitwise`'s step function satisfies by case analysis alone. -/
+
+private theorem dite_congr_pt {α : Sort u} {c : Prop} [d : Decidable c]
+    {t₁ t₂ : c → α} {e₁ e₂ : ¬c → α}
+    (ht : ∀ h, t₁ h = t₂ h) (he : ∀ h, e₁ h = e₂ h) :
+    dite c t₁ e₁ = dite c t₂ e₂ := by
+  cases d with
+  | isTrue h => exact ht h
+  | isFalse h => exact he h
+
+section FixEq
+variable {α : Sort u} {motive : α → Sort v} (h : α → Nat)
+  (F : ∀ x : α, (∀ y : α, InvImage (· < ·) h y x → motive y) → motive x)
+
+private theorem fix_go_congr
+    (hF : ∀ x a₁ a₂, (∀ y hy, a₁ y hy = a₂ y hy) → F x a₁ = F x a₂) :
+    ∀ (fuel₁ fuel₂ : Nat) (x : α) (h₁ : h x < fuel₁) (h₂ : h x < fuel₂),
+      WellFounded.Nat.fix.go h F fuel₁ x h₁ =
+        WellFounded.Nat.fix.go h F fuel₂ x h₂ := by
+  intro fuel₁
+  induction fuel₁ with
+  | zero => intro _ x h₁; exact absurd h₁ (Nat.not_lt_zero _)
+  | succ k ih =>
+    intro fuel₂
+    cases fuel₂ with
+    | zero => intro x _ h₂; exact absurd h₂ (Nat.not_lt_zero _)
+    | succ k₂ =>
+      intro x _ _
+      exact hF x _ _ (fun y _ => ih k₂ y _ _)
+
+private theorem fix_eq_of_congr
+    (hF : ∀ x a₁ a₂, (∀ y hy, a₁ y hy = a₂ y hy) → F x a₁ = F x a₂)
+    (x : α) :
+    WellFounded.Nat.fix h F x = F x (fun y _ => WellFounded.Nat.fix h F y) :=
+  (fix_go_congr h F hF _ (h x + 1) x _ (Nat.lt_add_one _)).trans
+    (hF x _ _ (fun y _ => fix_go_congr h F hF _ _ y _ _))
+
+end FixEq
+
+attribute [local semireducible] _root_.Nat.bitwise in
+private theorem bitwise_eq_unary (f : Bool → Bool → Bool) (n m : Nat) :
+    Nat.bitwise f n m = Nat.bitwise._unary f (PSigma.mk n m) :=
+  rfl
+
 /-! ## 1. `Nat.bitwise` Unfolding and Width Bounds -/
 
 theorem nat_bitwise_unfold (f : Bool → Bool → Bool) (n m : Nat) :
@@ -200,8 +251,17 @@ theorem nat_bitwise_unfold (f : Bool → Bool → Bool) (n m : Nat) :
         if f (decide (Nat.mod n 2 = 1)) (decide (Nat.mod m 2 = 1)) then
           r + r + 1
         else
-          r + r :=
-  Nat.bitwise.eq_def f n m
+          r + r := by
+  rw [bitwise_eq_unary f n m, bitwise_eq_unary f (Nat.div n 2) (Nat.div m 2)]
+  change WellFounded.Nat.fix (motive := fun _ => Nat) _ _
+    (PSigma.mk (β := fun _ => Nat) n m) = _
+  refine (fix_eq_of_congr _ _ ?_ _).trans ?_
+  intro x a₁ a₂ hpt
+  cases x with
+  | mk n m =>
+    exact dite_congr_pt (fun _ => rfl) (fun _ => dite_congr_pt (fun _ => rfl)
+      (fun _ => by dsimp only; rw [hpt]))
+  rfl
 
 theorem nat_land_eq_bitwise (n m : Nat) :
     Nat.land n m = Nat.bitwise and n m := rfl

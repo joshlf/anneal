@@ -1655,7 +1655,7 @@
       "path": "lean/Workbench/Pass1/NatBitwise.lean",
       "badge": "pass1_portable",
       "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, exact `TrustedBoundary` CST syntax, axioms `⊆ [propext]`) library consolidating the `Nat.bitwise`, `Nat.land`, `Nat.lor`, `Nat.xor`, `Nat.shiftLeft`, `Nat.shiftRight`, and `Nat.testBit` lemmas missing from `foundation-lock.json` (`Init.Data.Nat.Bitwise.Lemmas` is outside the 51 locked foundation modules):",
-      "line_count": 875,
+      "line_count": 934,
       "imports": [
         "Init.Core",
         "Init.NotationExtra",
@@ -1665,7 +1665,7 @@
         "Init.Data.Nat.Div.Basic",
         "Init.Data.Nat.Bitwise.Basic"
       ],
-      "declaration_count": 72,
+      "declaration_count": 76,
       "declarations": [
         {
           "kind": "theorem",
@@ -1774,6 +1774,22 @@
         {
           "kind": "theorem",
           "name": "nat_lt_two_pow_self"
+        },
+        {
+          "kind": "theorem",
+          "name": "dite_congr_pt"
+        },
+        {
+          "kind": "theorem",
+          "name": "fix_go_congr"
+        },
+        {
+          "kind": "theorem",
+          "name": "fix_eq_of_congr"
+        },
+        {
+          "kind": "theorem",
+          "name": "bitwise_eq_unary"
         },
         {
           "kind": "theorem",
