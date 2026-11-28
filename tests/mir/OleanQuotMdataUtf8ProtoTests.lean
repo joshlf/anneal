@@ -9,6 +9,8 @@
 import Lean
 import Lean.Replay
 import Lean.Compiler.ExportAttr
+import Lean.Compiler.IR.Basic
+import Lean.Compiler.ImplementedByAttr
 import Anneal.NatBitwise
 
 /-!
@@ -535,15 +537,144 @@ def syntaxStrictKey (root : Syntax) : ByteArray := Id.run do
               out := keyPushStr out f
   return out.push 0xFF
 
+def strictSubstringRawEq (a b : Substring.Raw) : Bool :=
+  strictStringEq a.str b.str && a.startPos == b.startPos && a.stopPos == b.stopPos
+
+theorem strictSubstringRawEq_refl (a : Substring.Raw) : strictSubstringRawEq a a = true := by
+  simp [strictSubstringRawEq, strictStringEq_refl]
+
+def strictSourceInfoEq : SourceInfo → SourceInfo → Bool
+  | .original l1 p1 t1 e1, .original l2 p2 t2 e2 =>
+    strictSubstringRawEq l1 l2 && p1 == p2 && strictSubstringRawEq t1 t2 && e1 == e2
+  | .synthetic p1 e1 c1, .synthetic p2 e2 c2 =>
+    p1 == p2 && e1 == e2 && c1 == c2
+  | .none, .none => true
+  | _, _ => false
+
+theorem strictSourceInfoEq_refl : ∀ s : SourceInfo, strictSourceInfoEq s s = true
+  | .original l p t e => by
+    simp [strictSourceInfoEq, strictSubstringRawEq_refl]
+  | .synthetic p e c => by
+    simp [strictSourceInfoEq]
+  | .none => rfl
+
+def strictStringListEq : List String → List String → Bool
+  | [], [] => true
+  | a :: as, b :: bs => strictStringEq a b && strictStringListEq as bs
+  | _, _ => false
+
+theorem strictStringListEq_refl : ∀ xs : List String, strictStringListEq xs xs = true
+  | [] => rfl
+  | x :: xs => by simp [strictStringListEq, strictStringEq_refl, strictStringListEq_refl xs]
+
+def strictPreresolvedEq : Syntax.Preresolved → Syntax.Preresolved → Bool
+  | .namespace n1, .namespace n2 => strictNameEq n1 n2
+  | .decl n1 f1, .decl n2 f2 => strictNameEq n1 n2 && strictStringListEq f1 f2
+  | _, _ => false
+
+theorem strictPreresolvedEq_refl : ∀ p : Syntax.Preresolved, strictPreresolvedEq p p = true
+  | .namespace n => by simp [strictPreresolvedEq, strictNameEq_refl]
+  | .decl n f => by simp [strictPreresolvedEq, strictNameEq_refl, strictStringListEq_refl]
+
+def strictPreresolvedListEq : List Syntax.Preresolved → List Syntax.Preresolved → Bool
+  | [], [] => true
+  | a :: as, b :: bs => strictPreresolvedEq a b && strictPreresolvedListEq as bs
+  | _, _ => false
+
+theorem strictPreresolvedListEq_refl :
+    ∀ xs : List Syntax.Preresolved, strictPreresolvedListEq xs xs = true
+  | [] => rfl
+  | x :: xs => by
+    simp [strictPreresolvedListEq, strictPreresolvedEq_refl, strictPreresolvedListEq_refl xs]
+
+/-! ### DAG-safe strict `Syntax` equality and hash (`withPtrEq`, A1 hardening)
+
+B1's `syntaxStrictKey` walked `Syntax` as an unmemoized tree with fuel `100000`, so a tiny
+depth-30 shared `Syntax.node` DAG (31 nodes in memory, `2^30` paths) exhausted fuel on BOTH
+`syntaxStrictKey` and `validateSyntaxDag` (exponential DoS). `strictSyntaxEq` uses `withPtrEq`
+at every node (O(1) on shared pointers, full byte+`m_length`+`Name.hash` structural check on
+distinct pointers), and `StrictSyntaxKey` enables O(N) DAG memoization in `validateSyntaxDag`. -/
+
+mutual
+def strictSyntaxEqAux : (a b : Syntax) → { r : Bool // a = b → r = true }
+  | .missing, .missing => ⟨true, fun _ => rfl⟩
+  | .node i1 k1 a1, .node i2 k2 a2 =>
+    ⟨strictSourceInfoEq i1 i2 && strictNameEq k1 k2 &&
+     withPtrEq a1 a2 (fun _ => (strictSyntaxListEqAux a1.toList a2.toList).val) (fun h => by
+       subst h; exact (strictSyntaxListEqAux a1.toList a1.toList).property rfl),
+     fun h => by
+       injection h with hi hk ha; subst hi; subst hk; subst ha
+       simp [withPtrEq, strictSourceInfoEq_refl, strictNameEq_refl,
+         (strictSyntaxListEqAux a1.toList a1.toList).property rfl]⟩
+  | .atom i1 v1, .atom i2 v2 =>
+    ⟨strictSourceInfoEq i1 i2 && strictStringEq v1 v2, fun h => by
+      injection h with hi hv; subst hi; subst hv
+      simp [strictSourceInfoEq_refl, strictStringEq_refl]⟩
+  | .ident i1 r1 v1 p1, .ident i2 r2 v2 p2 =>
+    ⟨strictSourceInfoEq i1 i2 && strictSubstringRawEq r1 r2 &&
+     strictNameEq v1 v2 && strictPreresolvedListEq p1 p2, fun h => by
+      injection h with hi hr hv hp; subst hi; subst hr; subst hv; subst hp
+      simp [strictSourceInfoEq_refl, strictSubstringRawEq_refl, strictNameEq_refl,
+        strictPreresolvedListEq_refl]⟩
+  | .missing, .node _ _ _ => ⟨false, fun h => nomatch h⟩
+  | .missing, .atom _ _ => ⟨false, fun h => nomatch h⟩
+  | .missing, .ident _ _ _ _ => ⟨false, fun h => nomatch h⟩
+  | .node _ _ _, .missing => ⟨false, fun h => nomatch h⟩
+  | .node _ _ _, .atom _ _ => ⟨false, fun h => nomatch h⟩
+  | .node _ _ _, .ident _ _ _ _ => ⟨false, fun h => nomatch h⟩
+  | .atom _ _, .missing => ⟨false, fun h => nomatch h⟩
+  | .atom _ _, .node _ _ _ => ⟨false, fun h => nomatch h⟩
+  | .atom _ _, .ident _ _ _ _ => ⟨false, fun h => nomatch h⟩
+  | .ident _ _ _ _, .missing => ⟨false, fun h => nomatch h⟩
+  | .ident _ _ _ _, .node _ _ _ => ⟨false, fun h => nomatch h⟩
+  | .ident _ _ _ _, .atom _ _ => ⟨false, fun h => nomatch h⟩
+
+def strictSyntaxListEqAux : (xs ys : List Syntax) → { r : Bool // xs = ys → r = true }
+  | [], [] => ⟨true, fun _ => rfl⟩
+  | x :: xs, y :: ys =>
+    ⟨withPtrEq x y (fun _ => (strictSyntaxEqAux x y).val) (fun h => by
+       subst h; exact (strictSyntaxEqAux x x).property rfl) &&
+     (strictSyntaxListEqAux xs ys).val,
+     fun h => by
+       injection h with hx hxs; subst hx; subst hxs
+       simp [withPtrEq, (strictSyntaxEqAux x x).property rfl,
+         (strictSyntaxListEqAux xs xs).property rfl]⟩
+  | [], _ :: _ => ⟨false, fun h => nomatch h⟩
+  | _ :: _, [] => ⟨false, fun h => nomatch h⟩
+end
+
+def strictSyntaxEq (a b : Syntax) : Bool :=
+  withPtrEq a b (fun _ => (strictSyntaxEqAux a b).val) (fun h => by
+    subst h; exact (strictSyntaxEqAux a a).property rfl)
+
+theorem strictSyntaxEq_refl (a : Syntax) : strictSyntaxEq a a = true := by
+  simp [strictSyntaxEq, withPtrEq, (strictSyntaxEqAux a a).property rfl]
+
+/-- Shallow O(1) structural hash for `StrictSyntaxKey` (always agrees on `strictSyntaxEq`-equal
+nodes because `strictSyntaxEq` checks raw UTF-8 bytes, `m_length`, `Name.hash`, and arity). -/
+def strictSyntaxHash : Syntax → UInt64
+  | .missing => 101
+  | .node _ kind args => mixHash 103 (mixHash kind.hash (UInt64.ofNat args.size))
+  | .atom _ val => mixHash 107 (mixHash (UInt64.ofNat val.length) (UInt64.ofNat val.toUTF8.size))
+  | .ident _ rawVal val pre =>
+    mixHash 109 (mixHash val.hash (mixHash (UInt64.ofNat rawVal.str.length) (UInt64.ofNat pre.length)))
+
+structure StrictSyntaxKey where
+  val : Syntax
+
+instance : BEq StrictSyntaxKey where
+  beq a b := strictSyntaxEq a.val b.val
+
+instance : Hashable StrictSyntaxKey where
+  hash a := strictSyntaxHash a.val
+
 def strictDataValueEq : DataValue → DataValue → Bool
   | .ofString s1, .ofString s2 => strictStringEq s1 s2
   | .ofBool b1, .ofBool b2 => b1 == b2
   | .ofName n1, .ofName n2 => strictNameEq n1 n2
   | .ofNat v1, .ofNat v2 => v1 == v2
   | .ofInt v1, .ofInt v2 => v1 == v2
-  | .ofSyntax s1, .ofSyntax s2 =>
-    withPtrEq s1 s2 (fun _ => (syntaxStrictKey s1).data == (syntaxStrictKey s2).data) (fun h => by
-      subst h; simp)
+  | .ofSyntax s1, .ofSyntax s2 => strictSyntaxEq s1 s2
   | _, _ => false
 
 theorem strictDataValueEq_refl : ∀ dv : DataValue, strictDataValueEq dv dv = true
@@ -552,7 +683,7 @@ theorem strictDataValueEq_refl : ∀ dv : DataValue, strictDataValueEq dv dv = t
   | .ofName n => by simp [strictDataValueEq, strictNameEq_refl]
   | .ofNat _ => by simp [strictDataValueEq]
   | .ofInt _ => by simp [strictDataValueEq]
-  | .ofSyntax s => by simp [strictDataValueEq, withPtrEq]
+  | .ofSyntax s => by simp [strictDataValueEq, strictSyntaxEq_refl]
 
 def strictKVEntriesEq : List (Name × DataValue) → List (Name × DataValue) → Bool
   | [], [] => true
@@ -863,12 +994,13 @@ def hasKernelFreshComponent : Name → Bool
 /-! ## Section 7: In-Memory DAG-Memoized Validator (V-Q1..V-S5) -/
 
 structure MemValidatorState where
-  nameCache  : Std.HashMap StrictNameKey UInt64 := {}
-  levelCache : Std.HashMap StrictLevelKey UInt64 := {}
-  exprCache  : Std.HashMap StrictExprKey UInt64 := {}
-  violations : Array Violation := #[]
-  seenV      : Std.HashSet (String × Name × String) := {}
-  stats      : AuditStats := {}
+  nameCache   : Std.HashMap StrictNameKey UInt64 := {}
+  levelCache  : Std.HashMap StrictLevelKey UInt64 := {}
+  exprCache   : Std.HashMap StrictExprKey UInt64 := {}
+  syntaxCache : Std.HashSet StrictSyntaxKey := {}
+  violations  : Array Violation := #[]
+  seenV       : Std.HashSet (String × Name × String) := {}
+  stats       : AuditStats := {}
 
 def MemValidatorState.record (st : MemValidatorState) (tag : String) (decl : Name)
     (detail : String) : MemValidatorState :=
@@ -1024,9 +1156,9 @@ def validateLevelDag (decl : Name) (root : Level) (st0 : MemValidatorState)
     return (st, 0)
   return (st, st.levelCache.getD ⟨root⟩ 0)
 
-/-- Validate every `String` / `Name` reachable from an in-memory `Syntax` tree carried by
-an `MData` `DataValue.ofSyntax` payload (B1: A0 skipped `.ofSyntax` entirely, so invalid
-UTF-8 atoms / identifier substrings / forged `Name.hash` rode through `Expr.mdata`). -/
+/-- Validate every `String` / `Name` reachable from an in-memory `Syntax` DAG carried by
+an `MData` `DataValue.ofSyntax` payload (DAG-memoized via `StrictSyntaxKey` / `withPtrEq` so
+depth-35 shared `Syntax` DAGs run in linear O(N) time without false `auditFuelExhausted`). -/
 def validateSyntaxDag (decl : Name) (root : Syntax) (st0 : MemValidatorState) :
     MemValidatorState := Id.run do
   let fuel := syntaxValidationFuel
@@ -1048,6 +1180,9 @@ def validateSyntaxDag (decl : Name) (root : Syntax) (st0 : MemValidatorState) :
     | [] => completed := true; break
     | s :: rest =>
       work := rest
+      let key : StrictSyntaxKey := ⟨s⟩
+      if st.syntaxCache.contains key then continue
+      st := { st with syntaxCache := st.syntaxCache.insert key }
       match s with
       | .missing => pure ()
       | .node info kind args =>
@@ -1250,63 +1385,20 @@ def strictOptExprEq : Option Expr → Option Expr → Bool
   | some a, some b => strictExprEq a b
   | _, _ => false
 
-def strictLocalDeclEq (a b : LocalDecl) : Bool :=
-  a.index == b.index && strictNameEq a.fvarId.name b.fvarId.name &&
-  strictNameEq a.userName b.userName && strictExprEq a.type b.type &&
-  strictOptExprEq a.value? b.value? && a.isLet == b.isLet
+def localDeclKindEq : LocalDeclKind → LocalDeclKind → Bool
+  | .default, .default => true
+  | .implDetail, .implDetail => true
+  | .auxDecl, .auxDecl => true
+  | _, _ => false
 
-def validateLocalDeclSt (ldecl : LocalDecl) (st0 : MemValidatorState) (fuel : Nat) :
-    MemValidatorState := Id.run do
-  let fvName := ldecl.fvarId.name
-  let (st1, _) := validateNameDag fvName fvName st0 fuel
-  let (st2, _) := validateNameDag fvName ldecl.userName st1 fuel
-  let (st3, _) := validateExprDag fvName ldecl.type st2 (requireClosed := false) fuel
-  let mut st := st3
-  if let some val := ldecl.value? then
-    let (st4, _) := validateExprDag fvName val st (requireClosed := false) fuel
-    st := st4
-  return st
-
-/-- `LocalContext` validation into an existing state. B1 hardening: the kernel resolves
-`Expr.fvar` through `fvarIdToDecl` (`lean_local_ctx_find` = `LocalContext.find?`), not
-through `decls`. A0 only iterated `decls`, so a context whose map key is
-`_kernel_fresh.0` but whose `decls` entry is an honest `fvarId` passed validation while
-the kernel still resolved (and captured) the colliding key. Every map key is now
-validated and must equal its decl's `fvarId`, and `decls` must agree with the map. -/
-def validateLocalContextSt (lctx : LocalContext) (st0 : MemValidatorState) (fuel : Nat) :
-    MemValidatorState := Id.run do
-  let mut st := st0
-  let mut mapCount : Nat := 0
-  for (k, d) in lctx.fvarIdToDecl.toList do
-    mapCount := mapCount + 1
-    let (st1, _) := validateNameDag k.name k.name st fuel
-    st := st1
-    if !strictNameEq k.name d.fvarId.name then
-      st := st.record "malformedLocalContext" k.name
-        s!"fvarIdToDecl key {k.name} aliases LocalDecl with fvarId {d.fvarId.name}"
-    st := validateLocalDeclSt d st fuel
-  let mut arrCount : Nat := 0
-  for ldecl in lctx do
-    arrCount := arrCount + 1
-    st := validateLocalDeclSt ldecl st fuel
-    match lctx.fvarIdToDecl.find? ldecl.fvarId with
-    | none =>
-      st := st.record "malformedLocalContext" ldecl.fvarId.name
-        "decls entry missing from fvarIdToDecl (kernel cannot resolve it)"
-    | some d =>
-      if !strictLocalDeclEq d ldecl then
-        st := st.record "malformedLocalContext" ldecl.fvarId.name
-          "decls entry differs from the fvarIdToDecl entry the kernel resolves"
-  if mapCount != arrCount then
-    st := st.record "malformedLocalContext" .anonymous
-      s!"fvarIdToDecl has {mapCount} entries but decls has {arrCount}"
-  return st
-
-/-- Validate a `LocalContext` before passing it to `Lean.Kernel.{check,isDefEq,whnf}`
-to prevent `lean4#16767` `_kernel_fresh` `FVarId` collisions as well as forged `m_data`/UTF-8. -/
-def validateLocalContext (lctx : LocalContext) (fuel : Nat := 100000) : AuditReport :=
-  let st := validateLocalContextSt lctx {} fuel
-  { violations := st.violations, stats := st.stats }
+def strictLocalDeclEq : LocalDecl → LocalDecl → Bool
+  | .cdecl i1 fv1 un1 ty1 bi1 k1, .cdecl i2 fv2 un2 ty2 bi2 k2 =>
+    i1 == i2 && strictNameEq fv1.name fv2.name && strictNameEq un1 un2 &&
+    strictExprEq ty1 ty2 && bi1 == bi2 && localDeclKindEq k1 k2
+  | .ldecl i1 fv1 un1 ty1 val1 nd1 k1, .ldecl i2 fv2 un2 ty2 val2 nd2 k2 =>
+    i1 == i2 && strictNameEq fv1.name fv2.name && strictNameEq un1 un2 &&
+    strictExprEq ty1 ty2 && strictExprEq val1 val2 && nd1 == nd2 && localDeclKindEq k1 k2
+  | _, _ => false
 
 /-- Collect every `FVarId` occurring in `e` (fuel-bounded, DAG-memoized by `StrictExprKey`). -/
 def collectFVarIdsBounded (e : Expr) (fuel : Nat := 2000000) : Option (Array FVarId) := Id.run do
@@ -1329,20 +1421,136 @@ def collectFVarIdsBounded (e : Expr) (fuel : Nat := 2000000) : Option (Array FVa
       | _ => pure ()
   return none
 
+/-- Collect every constant `Name` referenced in `e` (fuel-bounded, DAG-memoized by `StrictExprKey`). -/
+def collectConstsBounded (e : Expr) (fuel : Nat := 2000000) : Option NameSet := Id.run do
+  let mut seen : Std.HashSet StrictExprKey := {}
+  let mut out : NameSet := {}
+  let mut work : List Expr := [e]
+  for _ in [0:fuel] do
+    match work with
+    | [] => return some out
+    | x :: rest =>
+      work := rest
+      if seen.contains ⟨x⟩ then continue
+      seen := seen.insert ⟨x⟩
+      match x with
+      | .const n _ => out := out.insert n
+      | .app f a => work := f :: a :: work
+      | .lam _ t b _ | .forallE _ t b _ => work := t :: b :: work
+      | .letE _ t v b _ => work := t :: v :: b :: work
+      | .mdata _ b | .proj _ _ b => work := b :: work
+      | _ => pure ()
+  return none
+
+def exprDataKernelQuerySafe (d : UInt64) : Bool :=
+  !exprDataHasExprMVar d && !exprDataHasLevelMVar d && exprDataLooseBVarRange d == 0
+
+def validateLocalDeclSt (ldecl : LocalDecl) (st0 : MemValidatorState) (fuel : Nat) :
+    MemValidatorState := Id.run do
+  let fvName := ldecl.fvarId.name
+  let (st1, _) := validateNameDag fvName fvName st0 fuel
+  let (st2, _) := validateNameDag fvName ldecl.userName st1 fuel
+  let (st3, tyData) := validateExprDag fvName ldecl.type st2 (requireClosed := false) fuel
+  let mut st := st3
+  if !exprDataKernelQuerySafe tyData then
+    st := st.record "malformedLocalContext" fvName
+      s!"LocalDecl type has loose bvars or mvars (looseBVarRange={exprDataLooseBVarRange tyData}, hasExprMVar={exprDataHasExprMVar tyData}, hasLevelMVar={exprDataHasLevelMVar tyData})"
+  if let some val := ldecl.value? then
+    let (st4, valData) := validateExprDag fvName val st (requireClosed := false) fuel
+    st := st4
+    if !exprDataKernelQuerySafe valData then
+      st := st.record "malformedLocalContext" fvName
+        s!"LocalDecl value has loose bvars or mvars (looseBVarRange={exprDataLooseBVarRange valData}, hasExprMVar={exprDataHasExprMVar valData}, hasLevelMVar={exprDataHasLevelMVar valData})"
+  return st
+
+/-- `LocalContext` validation into an existing state.
+Hardened across B1 & A1:
+- Validates every `fvarIdToDecl` map key and requires exact bijection with `decls` under
+  full `strictLocalDeclEq` (checking `binderInfo`, `nonDep`, `kind`, `index`, `type`, `value?`).
+- Verifies slot index agreement (`decls[i] = some d → d.index == i`) and rejects duplicate
+  `fvarId`s in `decls`.
+- Enforces strict telescopic scoping inside `lctx`: every `FVarId` referenced in `d.type` or
+  `d.value?` must already be declared at an earlier index (blocking undeclared fvars,
+  self-references, and forward-reference cycles) and forbids loose `bvar`s / `mvar`s. -/
+def validateLocalContextSt (lctx : LocalContext) (st0 : MemValidatorState) (fuel : Nat) :
+    MemValidatorState := Id.run do
+  let mut st := st0
+  let mut mapCount : Nat := 0
+  for (k, d) in lctx.fvarIdToDecl.toList do
+    mapCount := mapCount + 1
+    let (st1, _) := validateNameDag k.name k.name st fuel
+    st := st1
+    if !strictNameEq k.name d.fvarId.name then
+      st := st.record "malformedLocalContext" k.name
+        s!"fvarIdToDecl key {k.name} aliases LocalDecl with fvarId {d.fvarId.name}"
+    st := validateLocalDeclSt d st fuel
+  let mut arrCount : Nat := 0
+  let mut declaredSoFar : Std.HashSet FVarId := {}
+  for i in [0:lctx.decls.size] do
+    if let some ldecl := lctx.decls[i]! then
+      arrCount := arrCount + 1
+      if ldecl.index != i then
+        st := st.record "malformedLocalContext" ldecl.fvarId.name
+          s!"decls[{i}] has mismatched LocalDecl.index={ldecl.index}"
+      if declaredSoFar.contains ldecl.fvarId then
+        st := st.record "malformedLocalContext" ldecl.fvarId.name
+          s!"duplicate fvarId {ldecl.fvarId.name} in LocalContext.decls"
+      st := validateLocalDeclSt ldecl st fuel
+      match collectFVarIdsBounded ldecl.type fuel with
+      | none =>
+        st := st.record "auditFuelExhausted" ldecl.fvarId.name
+          "collectFVarIdsBounded exhausted fuel on LocalDecl.type"
+      | some ids =>
+        for id in ids do
+          if !declaredSoFar.contains id then
+            st := st.record "undeclaredFVar" id.name
+              s!"LocalDecl {ldecl.fvarId.name} type references undeclared/self/forward fvar {id.name}"
+      if let some val := ldecl.value? then
+        match collectFVarIdsBounded val fuel with
+        | none =>
+          st := st.record "auditFuelExhausted" ldecl.fvarId.name
+            "collectFVarIdsBounded exhausted fuel on LocalDecl.value"
+        | some ids =>
+          for id in ids do
+            if !declaredSoFar.contains id then
+              st := st.record "undeclaredFVar" id.name
+                s!"LocalDecl {ldecl.fvarId.name} value references undeclared/self/forward fvar {id.name}"
+      declaredSoFar := declaredSoFar.insert ldecl.fvarId
+      match lctx.fvarIdToDecl.find? ldecl.fvarId with
+      | none =>
+        st := st.record "malformedLocalContext" ldecl.fvarId.name
+          "decls entry missing from fvarIdToDecl (kernel cannot resolve it)"
+      | some d =>
+        if !strictLocalDeclEq d ldecl then
+          st := st.record "malformedLocalContext" ldecl.fvarId.name
+            "decls entry differs from the fvarIdToDecl entry the kernel resolves"
+  if mapCount != arrCount then
+    st := st.record "malformedLocalContext" .anonymous
+      s!"fvarIdToDecl has {mapCount} entries but decls has {arrCount}"
+  return st
+
+/-- Validate a `LocalContext` before passing it to `Lean.Kernel.{check,isDefEq,whnf}`
+to prevent `lean4#16767` `_kernel_fresh` `FVarId` collisions as well as forged `m_data`/UTF-8. -/
+def validateLocalContext (lctx : LocalContext) (fuel : Nat := 100000) : AuditReport :=
+  let st := validateLocalContextSt lctx {} fuel
+  { violations := st.violations, stats := st.stats }
+
 /-- Validate a complete kernel query `(lctx, exprs)` before `Kernel.{check,isDefEq,whnf}`.
-B1 hardening: `lean4#16767` does NOT need a colliding `LocalContext` entry. With the EMPTY
-context, `Kernel.isDefEq env {} (fun x : Bool => fvar _kernel_fresh.0) (fun x => x)` returns
-`true` because the kernel's own fresh binder is named `_kernel_fresh.0` and captures the
-undeclared caller fvar; A0's `validateLocalContext {}` reported `ok`. The query expressions
-are now validated too (catching `_kernel_fresh` fvars) and every free `fvar` must be
-declared in `lctx` (`undeclaredFVar`). -/
+Hardened across B1 & A1:
+- Validates `lctx` (including telescopic fvar scoping, full `strictLocalDeclEq`, and `_kernel_fresh`).
+- Validates every query expression with `fuel` propagated to BOTH `validateExprDag` and
+  `collectFVarIdsBounded`, rejects loose `bvar`s / `Expr.mvar` / `Level.mvar` (`malformedKernelQuery`),
+  and requires every free `fvar` to be declared in `lctx` (`undeclaredFVar`). -/
 def validateKernelQuery (lctx : LocalContext) (exprs : Array Expr) (fuel : Nat := 100000) :
     AuditReport := Id.run do
   let mut st := validateLocalContextSt lctx {} fuel
   for e in exprs do
-    let (st1, _) := validateExprDag `kernelQuery e st (requireClosed := false) fuel
+    let (st1, rootData) := validateExprDag `kernelQuery e st (requireClosed := false) fuel
     st := st1
-    match collectFVarIdsBounded e with
+    if !exprDataKernelQuerySafe rootData then
+      st := st.record "malformedKernelQuery" `kernelQuery
+        s!"query expression has loose bvars or mvars (looseBVarRange={exprDataLooseBVarRange rootData}, hasExprMVar={exprDataHasExprMVar rootData}, hasLevelMVar={exprDataHasLevelMVar rootData})"
+    match collectFVarIdsBounded e fuel with
     | none => st := st.record "auditFuelExhausted" `kernelQuery "collectFVarIdsBounded exhausted fuel"
     | some ids =>
       for id in ids do
@@ -1400,11 +1608,14 @@ def validateConstantInfo (ci : ConstantInfo) (originMod : Option Name)
   | .axiomInfo _ => pure ()
   return st
 
-/-- V-S5: Audit all `@[export]` and C-symbol surfaces for module `modIdx` plus live state:
-1. `exportAttr.ext.getModuleEntries env modIdx`
-2. `exportAttr.ext.getModuleIREntries env modIdx` (closes `OleanEnvAuditor.lean:1649` gap)
-3. live `exportAttr.ext.getState env` (both list and map)
-4. `getExportNameFor?` and `isExport` (catching unannotated `main` C-symbol binding). -/
+/-- V-S5: Audit all `@[export]`, C-symbol, FFI, compiler-override, and IR-extern surfaces for
+module `modIdx` plus live state:
+1. `exportAttr.ext.getModuleEntries` & `getModuleIREntries` (closes `OleanEnvAuditor.lean:1649` gap)
+2. `externAttr.ext`, `Compiler.implementedByAttr.ext`, `regularInitAttr.ext`, `builtinInitAttr.ext`
+   across BOTH `.olean` (`getModuleEntries`) and `.ir` (`getModuleIREntries`) tables
+3. `IR.declMapExt` across BOTH `.olean` and `.ir` tables for `IR.Decl.extern` C-symbol stubs
+4. live `exportAttr.ext.getState env` (both list and map)
+5. `getExportNameFor?` and `isExport` (catching unannotated `main` C-symbol binding). -/
 def auditExportSurface (env : Environment) (modIdx : Nat) (modName : Name)
     (st0 : MemValidatorState) (checkLiveState : Bool := true)
     (forbidMainExport : Bool := true) : MemValidatorState := Id.run do
@@ -1415,6 +1626,51 @@ def auditExportSurface (env : Environment) (modIdx : Nat) (modName : Name)
   for (declName, cSym) in exportAttr.ext.getModuleIREntries env modIdx do
     st := st.record "forbiddenExportAttr" declName
       s!"@[export {cSym}] in module {modName} (.ir entries)"
+  for (declName, _) in externAttr.ext.getModuleEntries env modIdx do
+    st := st.record "forbiddenExportAttr" declName
+      s!"@[extern] C-symbol binding in module {modName} (.olean entries)"
+  for (declName, _) in externAttr.ext.getModuleIREntries env modIdx do
+    st := st.record "forbiddenExportAttr" declName
+      s!"@[extern] C-symbol binding in module {modName} (.ir entries)"
+  for (declName, tgt) in Compiler.implementedByAttr.ext.getModuleEntries env modIdx do
+    st := st.record "forbiddenExportAttr" declName
+      s!"@[implemented_by {tgt}] override in module {modName} (.olean entries)"
+  for (declName, tgt) in Compiler.implementedByAttr.ext.getModuleIREntries env modIdx do
+    st := st.record "forbiddenExportAttr" declName
+      s!"@[implemented_by {tgt}] override in module {modName} (.ir entries)"
+  for (declName, _) in regularInitAttr.ext.getModuleEntries env modIdx do
+    st := st.record "forbiddenExportAttr" declName
+      s!"@[init] hook in module {modName} (.olean entries)"
+  for (declName, _) in regularInitAttr.ext.getModuleIREntries env modIdx do
+    st := st.record "forbiddenExportAttr" declName
+      s!"@[init] hook in module {modName} (.ir entries)"
+  for (declName, _) in builtinInitAttr.ext.getModuleEntries env modIdx do
+    st := st.record "forbiddenExportAttr" declName
+      s!"@[builtin_init] hook in module {modName} (.olean entries)"
+  for (declName, _) in builtinInitAttr.ext.getModuleIREntries env modIdx do
+    st := st.record "forbiddenExportAttr" declName
+      s!"@[builtin_init] hook in module {modName} (.ir entries)"
+  let isMod := (env.header.moduleData[modIdx]?).map (·.isModule) |>.getD false
+  let mut irFdeclNames : NameSet := {}
+  for irDecl in IR.declMapExt.getModuleIREntries env modIdx do
+    match irDecl with
+    | .extern f _ _ _ =>
+      st := st.record "forbiddenExportAttr" f
+        s!"IR.Decl.extern C-symbol stub in module {modName} (.ir IR.declMapExt)"
+    | .fdecl f .. =>
+      irFdeclNames := irFdeclNames.insert f
+  for irDecl in IR.declMapExt.getModuleEntries env modIdx do
+    match irDecl with
+    | .extern f _ _ info =>
+      let pureOpaque := match info.entries with | [.opaque] => true | _ => false
+      -- Lean 4.34.1 `module` interfaces emit pure `.opaque` IR signature stubs in `.olean`
+      -- that MUST resolve to an `IR.Decl.fdecl` in `.ir`. Any C-symbol entry (`.standard`/
+      -- `.inline`/`.adhoc`), any non-module `.extern`, or any stub lacking an `.ir` `.fdecl`
+      -- is rejected as `forbiddenExportAttr`.
+      if !(isMod && pureOpaque && irFdeclNames.contains f) then
+        st := st.record "forbiddenExportAttr" f
+          s!"IR.Decl.extern C-symbol or unresolved stub in module {modName} (.olean IR.declMapExt)"
+    | .fdecl .. => pure ()
   if let some data := env.header.moduleData[modIdx]? then
     for ci in data.constants do
       if let some cSym := getExportNameFor? env ci.name then
@@ -1451,25 +1707,45 @@ def strictConstInfoEq (a b : ConstantInfo) : Bool :=
   a.levelParams == b.levelParams && strictExprEq a.type b.type &&
   strictOptExprEq (a.value? (allowOpaque := true)) (b.value? (allowOpaque := true))
 
-/-- Benign realizable-theorem duplication tolerated by `importModules` (`subsumesInfo`):
-two THEOREMS with strictly identical name, universe params and type (proof irrelevance). -/
-def benignTheoremDuplicate (a b : ConstantInfo) : Bool :=
-  (a matches .thmInfo _) && (b matches .thmInfo _) && strictNameEq a.name b.name &&
-  a.levelParams == b.levelParams && strictExprEq a.type b.type
+/-- Strict reserved-theorem duplicate check (A1 hardening):
+B1's `benignTheoremDuplicate` tolerated ANY two `.thmInfo` declarations with equal
+name/levelParams/type, letting Module B replace Module A's `theorem thmBridge : False := evilAx`
+with a cyclic self-proof `theorem thmBridge : False := thmBridge`, laundering `evilAx` out of
+every axiom-closure audit while `validateEnvModule` returned `ok` on both modules!
+Cross-module `.thmInfo` duplication is now accepted ONLY when:
+1. `isReservedName env cn` holds (compiler-generated reserved lemma, never user theorems),
+2. both are `.thmInfo` with strictly equal name, `levelParams`, and `type`,
+3. NEITHER proof body references `cn` (blocks direct self-referential cycles), and
+4. both proof bodies have strictly identical `StrictExprKey` constant sets (so a shadowed
+   theorem cannot silently drop dependencies/axioms). -/
+def safeReservedTheoremDuplicate (env : Environment) (cn : Name) (a b : ConstantInfo)
+    (fuel : Nat) : Bool :=
+  if !isReservedName env cn then false
+  else match a, b with
+  | .thmInfo va, .thmInfo vb =>
+    if !(strictNameEq va.name vb.name && va.levelParams == vb.levelParams &&
+         strictExprEq va.type vb.type) then false
+    else
+      match collectConstsBounded va.value fuel, collectConstsBounded vb.value fuel with
+      | some ca, some cb =>
+        !ca.contains cn && !cb.contains cn &&
+        ca.toArray.qsort Name.lt == cb.toArray.qsort Name.lt
+      | _, _ => false
+  | _, _ => false
 
 /-- Full in-memory DAG-memoized validation of one loaded module in `env`
 (covers V-Q1, V-M2, V-U3, V-F4, V-S5).
 
-B1 hardening (all reproduced live against A0, which reported `ok`):
-- `importModules` binds `constNames[i] ↦ constants[i]` (`finalizeImport`), so a forged
-  module can alias a lookup key to a `ConstantInfo` with a DIFFERENT name, or make the
-  arrays differ in length (the excess is silently dropped): `constNameAliasMismatch`.
-- `importModules` lets a later module's `.thmInfo` REPLACE an earlier module's
-  `.axiomInfo` of the same name/type (`subsumesInfo`), laundering the axiom: every
-  axiom-closure audit (including the V-N6 oracle) then reports `[]` for its users. Each
-  module constant must be the one bound in the environment, owned by this module, unless
-  it is a benign strictly-identical theorem duplicate: `shadowedConstant`.
-- Import module names are validated (`Name.hash` / UTF-8 / `_kernel_fresh`). -/
+Hardened across B1 & A1:
+- Rejects `constNames.size != constants.size` and `constNames[i] != constants[i].name`
+  (`constNameAliasMismatch`).
+- Rejects intra-module duplicate `constNames` (`shadowedConstant`), closing single-module
+  self-shadowing.
+- Rejects cross-module shadowing including theorem-over-axiom AND theorem-over-theorem axiom
+  laundering (`shadowedConstant`), tolerating only non-circular, identical-dependency
+  compiler-reserved theorem duplicates (`safeReservedTheoremDuplicate`).
+- Validates import module names (`Name.hash` / UTF-8 / `_kernel_fresh`) and complete
+  V-S5 export/extern/IR-stub surfaces. -/
 def validateEnvModule (env : Environment) (modName : Name)
     (fuel : Nat := 20000000) (checkLiveExportState : Bool := true) : AuditReport := Id.run do
   let some modIdx := env.getModuleIdx? modName
@@ -1481,9 +1757,14 @@ def validateEnvModule (env : Environment) (modName : Name)
   for imp in data.imports do
     let (st1, _) := validateNameDag modName imp.module st fuel
     st := st1
+  let mut seenInMod : NameSet := {}
   for cn in data.constNames do
     let (st1, _) := validateNameDag cn cn st fuel
     st := st1
+    if seenInMod.contains cn then
+      st := st.record "shadowedConstant" cn
+        s!"duplicate constName {cn} within module {modName}"
+    seenInMod := seenInMod.insert cn
   for en in data.extraConstNames do
     let (st1, _) := validateNameDag en en st fuel
     st := st1
@@ -1501,7 +1782,7 @@ def validateEnvModule (env : Environment) (modName : Name)
       st := st.record "shadowedConstant" cn "module constant is not bound in the loaded environment"
     | some envCi =>
       if !strictConstInfoEq ci envCi then
-        if !benignTheoremDuplicate ci envCi then
+        if !safeReservedTheoremDuplicate env cn ci envCi fuel then
           st := st.record "shadowedConstant" cn
             s!"module {constKindName ci} {cn} was replaced in the loaded environment by a {constKindName envCi} from another module"
       else
@@ -1511,7 +1792,7 @@ def validateEnvModule (env : Environment) (modName : Name)
             let prev? := (env.header.moduleData[owner.toNat]?).bind fun d =>
               ((d.constNames.zip d.constants).find? (fun (n, _) => strictNameEq n cn)).map (·.2)
             let benign := match prev? with
-              | some prev => benignTheoremDuplicate ci prev
+              | some prev => safeReservedTheoremDuplicate env cn ci prev fuel
               | none => false
             if !benign then
               let prevKind := match prev? with | some prev => constKindName prev | none => "<missing>"
@@ -1647,6 +1928,13 @@ def readScalarU64 (parts : Array OleanPart) (h : ObjHeader) (scalarByteOff : Nat
     throw s!"ctor scalar U64 at +{scalarByteOff} out of bounds (cs_sz={h.csSz})"
   return readU64LE b soff
 
+def readScalarU32 (parts : Array OleanPart) (h : ObjHeader) (scalarByteOff : Nat) : Except String UInt32 := do
+  let b := parts[h.partIdx]!.bytes
+  let soff := h.off + 8 + h.other * 8 + scalarByteOff
+  if soff + 4 > h.off + h.csSz || soff + 4 > b.size then
+    throw s!"ctor scalar U32 at +{scalarByteOff} out of bounds (cs_sz={h.csSz})"
+  return readU32LE b soff
+
 def readScalarU8 (parts : Array OleanPart) (h : ObjHeader) (scalarByteOff : Nat) : Except String UInt8 := do
   let b := parts[h.partIdx]!.bytes
   let soff := h.off + 8 + h.other * 8 + scalarByteOff
@@ -1771,20 +2059,19 @@ def readBinNat (parts : Array OleanPart) (word : UInt64) : Except String (Nat ×
   if (mpSizeRaw &&& 0x80000000) != 0 then
     throw s!"negative LeanMPZ _mp_size in Nat at ptr {word}"
   let mpSize := mpSizeRaw.toNat
-  if mpSize > mpAlloc.toNat then
-    throw s!"LeanMPZ _mp_size ({mpSize}) > _mp_alloc ({mpAlloc}) at ptr {word}"
+  if mpSize > mpAlloc.toNat || mpAlloc.toNat > 1024 then
+    throw s!"LeanMPZ _mp_size ({mpSize}) > _mp_alloc ({mpAlloc}) or alloc cap exceeded at ptr {word}"
   let limbsPtr := readU64LE b (h.off + 16)
-  -- B1 hardening: the runtime (`lean_nat_eq` / `lean_nat_big_eq`, `Name` equality, kernel
+  -- B1/A1 hardening: the runtime (`lean_nat_eq` / `lean_nat_big_eq`, `Name` equality, kernel
   -- literal comparison) assumes CANONICAL Nats: every value `<= LEAN_MAX_SMALL_NAT = 2^63-1`
-  -- is a tagged scalar and big values have a non-zero top limb. A0 accepted e.g. `5` encoded
-  -- as a heap `LeanMPZ`, so `Name.num p 5` (MPZ) and `Name.num p 5` (scalar) print and hash
-  -- identically but compare unequal at runtime (a name-aliasing primitive).
+  -- is a tagged scalar, big values have a non-zero top limb, and the full `_mp_alloc` limb
+  -- buffer fits within the compacted region.
   if mpSize == 0 then
     throw s!"non-canonical LeanMPZ zero (must be tagged scalar 0) at ptr {word}"
   let (lpi, loff) ← resolveHeapPtr parts limbsPtr
   let lb := parts[lpi]!.bytes
-  if loff + mpSize * 8 > lb.size then
-    throw s!"LeanMPZ limbs ({mpSize}) extend past region end at ptr {word}"
+  if loff + mpAlloc.toNat * 8 > lb.size then
+    throw s!"LeanMPZ limbs (alloc={mpAlloc}, size={mpSize}) extend past region end at ptr {word}"
   let limb0 := readU64LE lb loff
   if readU64LE lb (loff + (mpSize - 1) * 8) == 0 then
     throw s!"non-canonical LeanMPZ with zero top limb at ptr {word}"
@@ -1816,11 +2103,11 @@ def readBinIntWellFormed (parts : Array OleanPart) (word : UInt64) : Except Stri
   let raw := readU32LE b (h.off + 12)
   let neg := (raw &&& 0x80000000) != 0
   let mpSize : Nat := if neg then 2 ^ 32 - raw.toNat else raw.toNat
-  if mpSize == 0 || mpSize > mpAlloc || mpSize > 1024 then
+  if mpSize == 0 || mpSize > mpAlloc || mpAlloc > 1024 then
     throw s!"malformed LeanMPZ Int sizes (size={mpSize}, alloc={mpAlloc}) at ptr {word}"
   let (lpi, loff) ← resolveHeapPtr parts (readU64LE b (h.off + 16))
   let lb := parts[lpi]!.bytes
-  if loff + mpSize * 8 > lb.size then
+  if loff + mpAlloc * 8 > lb.size then
     throw s!"LeanMPZ Int limbs extend past region end at ptr {word}"
   if readU64LE lb (loff + (mpSize - 1) * 8) == 0 then
     throw s!"non-canonical LeanMPZ Int with zero top limb at ptr {word}"
@@ -2117,41 +2404,58 @@ def readBinList (parts : Array OleanPart) (headWord : UInt64) (fuel : Nat := 100
     return .error "readBinList exhausted fuel"
   return .ok out
 
-/-- Typed, fuel-bounded, address-memoized validation of a binary `Syntax` tree
-(`DataValue.ofSyntax`): every atom / substring `LeanString` (RFC 3629 + `m_length`), every
+/-- Typed, fuel-bounded, address-memoized validation of a binary `Syntax` DAG
+(`DataValue.ofSyntax`) with 3-color cycle detection (`visiting` + `done` sets):
+B1 used a 1-color `seen` set, so a cyclic `Syntax.node` whose `args` pointed back to itself
+passed with `ok=true`. Every atom / substring `LeanString` (RFC 3629 + `m_length`), every
 `Name` (hash, UTF-8, `_kernel_fresh`), every position `Nat` (canonical), and every
-constructor shape (`Syntax`, `SourceInfo`, `Substring.Raw`, `Syntax.Preresolved`). -/
+constructor shape (`Syntax`, `SourceInfo`, `Substring.Raw`, `Syntax.Preresolved`) is checked. -/
 def validateBinSyntax (parts : Array OleanPart) (decl : Name) (rootWord : UInt64)
     (st0 : BinValidatorState) : BinValidatorState := Id.run do
   let fuel := syntaxValidationFuel
   let mut st := st0
   -- kinds: 0 Syntax, 1 SourceInfo, 2 Substring.Raw, 3 Preresolved, 4 Nat, 5 String
-  let mut work : List (Nat × UInt64) := [(0, rootWord)]
-  let mut seen : Std.HashSet (Nat × UInt64) := {}
+  let mut work : List (Bool × Nat × UInt64) := [(false, 0, rootWord)]
+  let mut visiting : Std.HashSet (Nat × UInt64) := {}
+  let mut done : Std.HashSet (Nat × UInt64) := {}
   let mut completed := false
   let bad (s : BinValidatorState) (msg : String) : BinValidatorState :=
     s.record "malformedOleanRegion" decl s!"MData Syntax: {msg}"
   for _ in [0:fuel] do
     match work with
     | [] => completed := true; break
-    | (kind, w) :: rest =>
+    | (true, kind, w) :: rest =>
       work := rest
-      if seen.contains (kind, w) then continue
-      seen := seen.insert (kind, w)
+      visiting := visiting.erase (kind, w)
+      done := done.insert (kind, w)
+    | (false, kind, w) :: rest =>
+      work := rest
+      let key := (kind, w)
+      if done.contains key then continue
+      if visiting.contains key then
+        st := bad st s!"cycle detected in binary Syntax DAG (kind={kind}) at ptr {w}"
+        return st
       if kind == 4 then
         if let .error e := readBinNat parts w then st := bad st e
+        done := done.insert key
         continue
       if kind == 5 then
         st := (readBinString parts decl w st).1
+        done := done.insert key
         continue
       if isScalarWord w then
         -- Only `Syntax.missing` (0) and `SourceInfo.none` (2) are nullary.
         let okScalar := (kind == 0 && unboxScalar w == 0) || (kind == 1 && unboxScalar w == 2)
         if !okScalar then st := bad st s!"invalid scalar {w} for kind {kind}"
+        done := done.insert key
         continue
       match readObjHeader parts w with
-      | .error e => st := bad st e
+      | .error e =>
+        st := bad st e
+        done := done.insert key
       | .ok h =>
+        visiting := visiting.insert key
+        let exitFrame := (true, kind, w)
         let f (i : Nat) : Except String UInt64 := readFieldPtr parts h i
         match kind, h.tag.toNat, h.other with
         | 0, 1, 3 => -- node info kind args
@@ -2159,48 +2463,91 @@ def validateBinSyntax (parts : Array OleanPart) (decl : Name) (rootWord : UInt64
           | .ok i, .ok k, .ok a =>
             st := (validateBinName parts decl k st fuel).1
             match readArrayElems parts a with
-            | .ok elems => work := (1, i) :: (elems.toList.map fun x => (0, x)) ++ work
-            | .error e => st := bad st e
-          | _, _, _ => st := bad st "node field read error"
+            | .ok elems =>
+              work := (false, 1, i) :: (elems.toList.map fun x => (false, 0, x)) ++ (exitFrame :: work)
+            | .error e =>
+              st := bad st e
+              visiting := visiting.erase key
+              done := done.insert key
+          | _, _, _ =>
+            st := bad st "node field read error"
+            visiting := visiting.erase key
+            done := done.insert key
         | 0, 2, 2 => -- atom info val
           match f 0, f 1 with
-          | .ok i, .ok v => work := (1, i) :: (5, v) :: work
-          | _, _ => st := bad st "atom field read error"
+          | .ok i, .ok v => work := (false, 1, i) :: (false, 5, v) :: exitFrame :: work
+          | _, _ =>
+            st := bad st "atom field read error"
+            visiting := visiting.erase key
+            done := done.insert key
         | 0, 3, 4 => -- ident info rawVal val preresolved
           match f 0, f 1, f 2, f 3 with
           | .ok i, .ok r, .ok n, .ok p =>
             st := (validateBinName parts decl n st fuel).1
             match readBinList parts p fuel with
-            | .ok ps => work := (1, i) :: (2, r) :: (ps.toList.map fun x => (3, x)) ++ work
-            | .error e => st := bad st e
-          | _, _, _, _ => st := bad st "ident field read error"
+            | .ok ps =>
+              work := (false, 1, i) :: (false, 2, r) :: (ps.toList.map fun x => (false, 3, x)) ++ (exitFrame :: work)
+            | .error e =>
+              st := bad st e
+              visiting := visiting.erase key
+              done := done.insert key
+          | _, _, _, _ =>
+            st := bad st "ident field read error"
+            visiting := visiting.erase key
+            done := done.insert key
         | 1, 0, 4 => -- SourceInfo.original leading pos trailing endPos
           match f 0, f 1, f 2, f 3 with
-          | .ok l, .ok p, .ok t, .ok e => work := (2, l) :: (4, p) :: (2, t) :: (4, e) :: work
-          | _, _, _, _ => st := bad st "SourceInfo.original field read error"
+          | .ok l, .ok p, .ok t, .ok e =>
+            work := (false, 2, l) :: (false, 4, p) :: (false, 2, t) :: (false, 4, e) :: exitFrame :: work
+          | _, _, _, _ =>
+            st := bad st "SourceInfo.original field read error"
+            visiting := visiting.erase key
+            done := done.insert key
         | 1, 1, 2 => -- SourceInfo.synthetic pos endPos; canonical
           match f 0, f 1, readScalarU8 parts h 0 with
           | .ok p, .ok e, .ok c =>
             if c > 1 then st := bad st s!"invalid Bool byte {c} in SourceInfo.synthetic"
-            work := (4, p) :: (4, e) :: work
-          | _, _, _ => st := bad st "SourceInfo.synthetic field read error"
+            work := (false, 4, p) :: (false, 4, e) :: exitFrame :: work
+          | _, _, _ =>
+            st := bad st "SourceInfo.synthetic field read error"
+            visiting := visiting.erase key
+            done := done.insert key
         | 2, 0, 3 => -- Substring.Raw str startPos stopPos
           match f 0, f 1, f 2 with
-          | .ok s, .ok a, .ok b => work := (5, s) :: (4, a) :: (4, b) :: work
-          | _, _, _ => st := bad st "Substring field read error"
+          | .ok s, .ok a, .ok b =>
+            work := (false, 5, s) :: (false, 4, a) :: (false, 4, b) :: exitFrame :: work
+          | _, _, _ =>
+            st := bad st "Substring field read error"
+            visiting := visiting.erase key
+            done := done.insert key
         | 3, 0, 1 => -- Preresolved.namespace ns
           match f 0 with
-          | .ok n => st := (validateBinName parts decl n st fuel).1
-          | .error e => st := bad st e
+          | .ok n =>
+            st := (validateBinName parts decl n st fuel).1
+            visiting := visiting.erase key
+            done := done.insert key
+          | .error e =>
+            st := bad st e
+            visiting := visiting.erase key
+            done := done.insert key
         | 3, 1, 2 => -- Preresolved.decl n fields
           match f 0, f 1 with
           | .ok n, .ok fs =>
             st := (validateBinName parts decl n st fuel).1
             match readBinList parts fs fuel with
-            | .ok ws => work := (ws.toList.map fun x => (5, x)) ++ work
-            | .error e => st := bad st e
-          | _, _ => st := bad st "Preresolved.decl field read error"
-        | k, t, o => st := bad st s!"invalid ctor (kind={k}, tag={t}, other={o}) at ptr {w}"
+            | .ok ws => work := (ws.toList.map fun x => (false, 5, x)) ++ (exitFrame :: work)
+            | .error e =>
+              st := bad st e
+              visiting := visiting.erase key
+              done := done.insert key
+          | _, _ =>
+            st := bad st "Preresolved.decl field read error"
+            visiting := visiting.erase key
+            done := done.insert key
+        | k, t, o =>
+          st := bad st s!"invalid ctor (kind={k}, tag={t}, other={o}) at ptr {w}"
+          visiting := visiting.erase key
+          done := done.insert key
   if !completed then
     st := st.record "auditFuelExhausted" decl "validateBinSyntax exhausted fuel"
   return st
@@ -2554,6 +2901,10 @@ def validateBinExpr (parts : Array OleanPart) (decl : Name) (rootWord : UInt64)
       s!"binary Expr root is open per recomputed Expr.Data (hasFVar={exprDataHasFVar rootData}, hasExprMVar={exprDataHasExprMVar rootData}, hasLevelMVar={exprDataHasLevelMVar rootData}, looseBVarRange={exprDataLooseBVarRange rootData})"
   return (st, rootData)
 
+def binNameCleanMatches (parts : Array OleanPart) (ptr : UInt64) (expected : Name) : Bool :=
+  let (st, info) := validateBinName parts expected ptr {}
+  st.violations.isEmpty && info.name == expected
+
 /-- Compare a binary `Expr` pointer in a compacted region directly against a canonical `Expr`
 (used to verify binary `.quotInfo` types without trusting `importModules`). -/
 def binExprMatchesCanonical (parts : Array OleanPart) (ptr : UInt64) (expected : Expr)
@@ -2587,8 +2938,7 @@ def binExprMatchesCanonical (parts : Array OleanPart) (ptr : UInt64) (expected :
                 lh.tag == 4 && lh.other == 1 &&
                 match readFieldPtr parts lh 0, readScalarU64 parts lh 0 with
                 | .ok np, .ok ld =>
-                  ld == (u.data : UInt64) &&
-                  (validateBinName parts pn np {}).2.name == pn
+                  ld == (u.data : UInt64) && binNameCleanMatches parts np pn
                 | _, _ => false
               | .error _ => false
             | _ => false
@@ -2597,7 +2947,7 @@ def binExprMatchesCanonical (parts : Array OleanPart) (ptr : UInt64) (expected :
           h.tag == 4 && h.other == 2 &&
           match readFieldPtr parts h 0, readFieldPtr parts h 1 with
           | .ok np, .ok usp =>
-            (validateBinName parts n np {}).2.name == n &&
+            binNameCleanMatches parts np n &&
             match readBinList parts usp fuel with
             | .ok lws =>
               lws.size == us.length &&
@@ -2609,8 +2959,7 @@ def binExprMatchesCanonical (parts : Array OleanPart) (ptr : UInt64) (expected :
                     lh.tag == 4 && lh.other == 1 &&
                     match readFieldPtr parts lh 0, readScalarU64 parts lh 0 with
                     | .ok pnp, .ok ld =>
-                      ld == (eu.data : UInt64) &&
-                      (validateBinName parts pn pnp {}).2.name == pn
+                      ld == (eu.data : UInt64) && binNameCleanMatches parts pnp pn
                     | _, _ => false
                   | .error _ => false
                 | _ => false
@@ -2627,7 +2976,7 @@ def binExprMatchesCanonical (parts : Array OleanPart) (ptr : UInt64) (expected :
           match readFieldPtr parts h 0, readFieldPtr parts h 1, readFieldPtr parts h 2, readScalarU8 parts h 8 with
           | .ok np, .ok tp, .ok bp, .ok biB =>
             biB.toUInt64 == bi.toUInt64 &&
-            (validateBinName parts n np {}).2.name == n &&
+            binNameCleanMatches parts np n &&
             binExprMatchesCanonical parts tp t fuel &&
             binExprMatchesCanonical parts bp b fuel
           | _, _, _, _ => false
@@ -2843,6 +3192,9 @@ def validateBinConstantInfo (parts : Array OleanPart) (ciPtr : UInt64)
                   if hh.tag != 2 || hh.other != 0 then
                     st := st.record "malformedOleanRegion" decl
                       s!"invalid ReducibilityHints ctor (tag={hh.tag}, other={hh.other})"
+                  else if let .error e := readScalarU32 parts hh 0 then
+                    st := st.record "malformedOleanRegion" decl
+                      s!"ReducibilityHints.regular height scalar truncated: {e}"
                 | .error e => st := st.record "malformedOleanRegion" decl s!"ReducibilityHints: {e}"
             | .error _ => pure ()
           | 3 => st := binCheckByte parts decl vh 0 1 "OpaqueVal.isUnsafe" st
@@ -2863,13 +3215,125 @@ def validateBinConstantInfo (parts : Array OleanPart) (ciPtr : UInt64)
           | _ => pure ()
           return st
 
-/-- Validate `ModuleData.entries` in a binary `.olean` or `.ir` region for `Lean.exportAttr`
-(V-S5) and validate all extension keys' `Name.hash`/UTF-8. -/
-def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entriesArrPtr : UInt64)
-    (st0 : BinValidatorState) (fuel : Nat) : BinValidatorState := Id.run do
+/-- Bounded 3-color compacted-region reachability sweep over opaque `ModuleData.entries`
+payloads (A1 hardening): validates `m_rc == 0`, OOB pointers, cycles, forbids runtime-only
+heap object tags (`245` closure, `251` thunk, `252` task, `253` ref, `254` external, `255`),
+validates every reachable `LeanString` (RFC 3629 UTF-8 + `m_length` + NUL terminator), and
+checks `LeanArray` / `LeanScalarArray` / `LeanMPZ` bounds so malformed UTF-8 or corrupted
+objects cannot hide inside non-`exportAttr` extensions (`docStringExt`, `IR.declMapExt`, etc.). -/
+def sweepBinRegionGraph (parts : Array OleanPart) (modName : Name) (rootPtr : UInt64)
+    (st0 : BinValidatorState) (fuel : Nat := 2000000) : BinValidatorState := Id.run do
+  if isScalarWord rootPtr then return st0
   let mut st := st0
+  let mut visiting : Std.HashSet UInt64 := {}
+  let mut done : Std.HashSet UInt64 := {}
+  let mut work : List (Bool × UInt64) := [(false, rootPtr)]
+  let mut completed := false
+  for _ in [0:fuel] do
+    match work with
+    | [] => completed := true; break
+    | (true, w) :: rest =>
+      work := rest
+      visiting := visiting.erase w
+      done := done.insert w
+    | (false, w) :: rest =>
+      work := rest
+      if isScalarWord w then continue
+      if done.contains w then continue
+      if visiting.contains w then
+        st := st.record "malformedOleanRegion" modName
+          s!"cycle detected in ModuleData.entries compacted region at ptr {w}"
+        return st
+      match readObjHeader parts w with
+      | .error e =>
+        st := st.record "malformedOleanRegion" modName s!"ModuleData.entries object error: {e}"
+        done := done.insert w
+      | .ok h =>
+        if h.tag == 249 then
+          st := (readBinString parts modName w st).1
+          done := done.insert w
+        else if h.tag == 250 then
+          if let .error e := readBinIntWellFormed parts w then
+            st := st.record "malformedOleanRegion" modName s!"ModuleData.entries LeanMPZ error: {e}"
+          done := done.insert w
+        else if h.tag == 248 then
+          -- LeanScalarArray (ByteArray / FloatArray): validate size <= cap and byte bounds.
+          let b := parts[h.partIdx]!.bytes
+          if h.off + 24 > b.size then
+            st := st.record "malformedOleanRegion" modName s!"LeanScalarArray header OOB at ptr {w}"
+          else
+            let sz := (readU64LE b (h.off + 8)).toNat
+            let cap := (readU64LE b (h.off + 16)).toNat
+            let elemSz := h.other
+            if elemSz == 0 || cap < sz || h.off + 24 + cap * elemSz > b.size then
+              st := st.record "malformedOleanRegion" modName
+                s!"LeanScalarArray invalid bounds (elemSz={elemSz}, sz={sz}, cap={cap}) at ptr {w}"
+          done := done.insert w
+        else if h.tag == 246 then
+          match readArrayElems parts w with
+          | .error e =>
+            st := st.record "malformedOleanRegion" modName s!"ModuleData.entries array error: {e}"
+            done := done.insert w
+          | .ok elems =>
+            visiting := visiting.insert w
+            let mut nextWork : List (Bool × UInt64) := (true, w) :: work
+            for el in elems do
+              if !isScalarWord el then
+                nextWork := (false, el) :: nextWork
+            work := nextWork
+        else if h.tag <= 243 then
+          visiting := visiting.insert w
+          let mut nextWork : List (Bool × UInt64) := (true, w) :: work
+          let mut okFields := true
+          for i in [0:h.other] do
+            match readFieldPtr parts h i with
+            | .ok fp =>
+              if !isScalarWord fp then
+                nextWork := (false, fp) :: nextWork
+            | .error e =>
+              st := st.record "malformedOleanRegion" modName e
+              okFields := false
+          if okFields then
+            work := nextWork
+          else
+            visiting := visiting.erase w
+            done := done.insert w
+        else
+          -- Reject runtime-only / non-compacted tags: 244 (struct), 245 (closure!),
+          -- 247 (struct array), 251 (thunk), 252 (task), 253 (ref), 254 (external), 255.
+          st := st.record "malformedOleanRegion" modName
+            s!"forbidden heap object tag {h.tag} in ModuleData.entries at ptr {w}"
+          done := done.insert w
+  if !completed then
+    st := st.record "auditFuelExhausted" modName "sweepBinRegionGraph exhausted fuel"
+  return st
+
+/-- True iff binary `ExternAttrData` (unboxed `List ExternEntry`) is strictly `[ExternEntry.opaque]`
+(constructor tag 3 -> nullary scalar word 7), i.e., carries ZERO C symbol names. -/
+def binExternAttrDataIsPureOpaque (parts : Array OleanPart) (externDataWord : UInt64) : Bool :=
+  match readBinList parts externDataWord 16 with
+  | .ok elems => elems.size == 1 && isScalarWord elems[0]! && unboxScalar elems[0]! == 3
+  | .error _ => false
+
+/-- Validate `ModuleData.entries` in a binary `.olean` or `.ir` region:
+- V-S5: flags any non-empty `Lean.exportAttr`, `Lean.externAttr`,
+  `Lean.Compiler.implementedByAttr`, `Lean.regularInitAttr`, `Lean.builtinInitAttr`, and any
+  C-symbol / `.ir` / non-module `IR.Decl.extern` (tag 1) entry inside `Lean.IR.declMapExt`
+  (`forbiddenExportAttr`). Returns `(st, opaqueIrStubs, irFdeclNames)` so multi-part
+  `validateModuleArtifactParts` verifies every `module` `.olean` opaque IR stub resolves to
+  an `IR.Decl.fdecl` in `.ir`.
+- Validates all extension keys' `Name.hash`/UTF-8 AND sweeps the full compacted-region graph
+  reachable from `entriesArrPtr` (`sweepBinRegionGraph`) so malformed UTF-8 / `m_length` /
+  `m_rc != 0` / cycles / `LeanClosure` objects cannot hide in any extension payload. -/
+def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entriesArrPtr : UInt64)
+    (st0 : BinValidatorState) (fuel : Nat) (allowOpaqueIrStubs : Bool := false) :
+    BinValidatorState × NameSet × NameSet := Id.run do
+  let mut st := st0
+  let mut opaqueStubs : NameSet := {}
+  let mut fdecls : NameSet := {}
   match readArrayElems parts entriesArrPtr with
-  | .error e => return st.record "malformedOleanRegion" modName s!"entries array error: {e}"
+  | .error e =>
+    return (st.record "malformedOleanRegion" modName s!"entries array error: {e}", opaqueStubs, fdecls)
   | .ok pairs =>
     for pairPtr in pairs do
       match readObjHeader parts pairPtr with
@@ -2907,20 +3371,78 @@ def validateBinModuleEntries (parts : Array OleanPart) (modName : Name) (entries
                   | .error _ =>
                     st := st.record "forbiddenExportAttr" modName
                       s!"binary Lean.exportAttr entry in {modName}"
+            else if extInfo.name == `Lean.externAttr ||
+                    extInfo.name == `Lean.Compiler.implementedByAttr ||
+                    extInfo.name == `Lean.regularInitAttr ||
+                    extInfo.name == `Lean.builtinInitAttr then
+              match readArrayElems parts arrPtr with
+              | .error e =>
+                st := st.record "forbiddenExportAttr" modName
+                  s!"malformed {extInfo.name} entries array in {modName}: {e}"
+              | .ok attrEntries =>
+                for ep in attrEntries do
+                  let mut declName := modName
+                  if let .ok eh := readObjHeader parts ep then
+                    if eh.tag == 0 && eh.other >= 1 then
+                      if let .ok dPtr := readFieldPtr parts eh 0 then
+                        let (st2, dInfo) := validateBinName parts modName dPtr st fuel
+                        st := st2
+                        declName := dInfo.name
+                  st := st.record "forbiddenExportAttr" declName
+                    s!"binary {extInfo.name} entry in {modName}"
+            else if extInfo.name == `Lean.IR.declMapExt then
+              match readArrayElems parts arrPtr with
+              | .error e =>
+                st := st.record "malformedOleanRegion" modName
+                  s!"malformed Lean.IR.declMapExt array in {modName}: {e}"
+              | .ok irDecls =>
+                for dp in irDecls do
+                  match readObjHeader parts dp with
+                  | .error e =>
+                    st := st.record "malformedOleanRegion" modName s!"IR.Decl header error: {e}"
+                  | .ok dh =>
+                    if dh.tag == 0 then
+                      if dh.other >= 1 then
+                        if let .ok fPtr := readFieldPtr parts dh 0 then
+                          let (st2, fInfo) := validateBinName parts modName fPtr st fuel
+                          st := st2
+                          fdecls := fdecls.insert fInfo.name
+                    else if dh.tag == 1 then
+                      -- `IR.Decl.extern (f : FunId) (xs : Array Param) (type : IRType) (info : ExternAttrData)`
+                      let mut fName := modName
+                      if dh.other >= 1 then
+                        if let .ok fPtr := readFieldPtr parts dh 0 then
+                          let (st2, fInfo) := validateBinName parts modName fPtr st fuel
+                          st := st2
+                          fName := fInfo.name
+                      let pureOpaque :=
+                        if dh.other == 4 then
+                          match readFieldPtr parts dh 3 with
+                          | .ok edPtr => binExternAttrDataIsPureOpaque parts edPtr
+                          | .error _ => false
+                        else false
+                      if allowOpaqueIrStubs && pureOpaque then
+                        opaqueStubs := opaqueStubs.insert fName
+                      else
+                        st := st.record "forbiddenExportAttr" fName
+                          s!"binary IR.Decl.extern C-symbol stub in {modName}"
+                    else
+                      st := st.record "malformedOleanRegion" modName
+                        s!"unknown IR.Decl tag {dh.tag} at ptr {dp}"
           | _, _ => st := st.record "malformedOleanRegion" modName s!"entries pair field error"
-    return st
+    st := sweepBinRegionGraph parts modName entriesArrPtr st (min fuel 2000000)
+    return (st, opaqueStubs, fdecls)
 
-/-- Full pure-Lean binary `.olean`/`.ir` compacted-region pointer-DAG validation over
-`rawParts : Array ByteArray`. Validates every part's `ModuleData` root, all constants,
-all `Name`/`Level`/`Expr` metadata, UTF-8 + `m_length`, `_kernel_fresh`, `.quotInfo`,
-and `Lean.exportAttr` extension entries (including `.ir` files!). -/
-def validateOleanParts (rawParts : Array ByteArray) (modName : Name)
-    (forbidMainExport : Bool := true) (fuel : Nat := 20000000) : AuditReport := Id.run do
+def validateOleanPartsEx (rawParts : Array ByteArray) (modName : Name)
+    (forbidMainExport : Bool := true) (fuel : Nat := 20000000)
+    (isIrGroup : Bool := false) : AuditReport × NameSet × NameSet := Id.run do
   match parseOleanParts rawParts with
   | .error err =>
-    return { violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := err }] }
+    return ({ violations := #[{ tag := "malformedOleanRegion", decl := modName, detail := err }] }, {}, {})
   | .ok parts =>
     let mut st : BinValidatorState := {}
+    let mut opaqueStubs : NameSet := {}
+    let mut fdecls : NameSet := {}
     for pIdx in [0:parts.size] do
       let rootPtr := parts[pIdx]!.rootPtr
       if isScalarWord rootPtr then
@@ -2939,6 +3461,7 @@ def validateOleanParts (rawParts : Array ByteArray) (modName : Name)
           -- B1 hardening: `ModuleData.isModule` byte and `imports` (A0 skipped field 0, so a
           -- forged import `Name.hash` / invalid UTF-8 / `_kernel_fresh` import name passed).
           st := binCheckByte parts modName rh 0 1 "ModuleData.isModule" st
+          let partIsModule := match readScalarU8 parts rh 0 with | .ok 1 => true | _ => false
           match readFieldPtr parts rh 0 with
           | .error e => st := st.record "malformedOleanRegion" modName s!"imports field error: {e}"
           | .ok importsPtr =>
@@ -2960,6 +3483,7 @@ def validateOleanParts (rawParts : Array ByteArray) (modName : Name)
                 readFieldPtr parts rh 3, readFieldPtr parts rh 4 with
           | .ok constNamesPtr, .ok constsPtr, .ok extraNamesPtr, .ok entriesPtr =>
             let mut cnInfos : Array BinNameInfo := #[]
+            let mut partSeenConstNames : NameSet := {}
             match readArrayElems parts constNamesPtr with
             | .error e => st := st.record "malformedOleanRegion" modName s!"constNames error: {e}"
             | .ok cnPtrs =>
@@ -2967,6 +3491,10 @@ def validateOleanParts (rawParts : Array ByteArray) (modName : Name)
                 let (st1, nInfo) := validateBinName parts modName cnp st fuel
                 st := st1
                 cnInfos := cnInfos.push nInfo
+                if partSeenConstNames.contains nInfo.name then
+                  st := st.record "shadowedConstant" nInfo.name
+                    s!"duplicate constName {nInfo.name} in part {pIdx} of module {modName}"
+                partSeenConstNames := partSeenConstNames.insert nInfo.name
                 if forbidMainExport && nInfo.name == `main then
                   st := st.record "forbiddenExportAttr" `main
                     s!"unannotated `main` C-symbol entry point in binary module {modName}"
@@ -2996,29 +3524,82 @@ def validateOleanParts (rawParts : Array ByteArray) (modName : Name)
                     if !(cnInfo.name == ciName.name && cnInfo.hashVal == ciName.hashVal) then
                       st := st.record "constNameAliasMismatch" cnInfo.name
                         s!"constNames entry {cnInfo.name} binds a ConstantInfo named {ciName.name}"
-            st := validateBinModuleEntries parts modName entriesPtr st fuel
+            let (stE, pStubs, pFdecls) := validateBinModuleEntries parts modName entriesPtr st fuel
+              (allowOpaqueIrStubs := !isIrGroup && partIsModule)
+            st := stE
+            opaqueStubs := pStubs.foldl (·.insert ·) opaqueStubs
+            fdecls := pFdecls.foldl (·.insert ·) fdecls
           | _, _, _, _ =>
             st := st.record "malformedOleanRegion" modName s!"part {pIdx} ModuleData fields unreadable"
-    return { violations := st.violations, stats := st.stats }
+    return ({ violations := st.violations, stats := st.stats }, opaqueStubs, fdecls)
+
+def mergeAuditStats (a b : AuditStats) : AuditStats := {
+  declsChecked := a.declsChecked + b.declsChecked
+  exprNodesVisited := a.exprNodesVisited + b.exprNodesVisited
+  exprCacheHits := a.exprCacheHits + b.exprCacheHits
+  levelNodesVisited := a.levelNodesVisited + b.levelNodesVisited
+  levelCacheHits := a.levelCacheHits + b.levelCacheHits
+  nameNodesVisited := a.nameNodesVisited + b.nameNodesVisited
+  nameCacheHits := a.nameCacheHits + b.nameCacheHits
+  stringsValidated := a.stringsValidated + b.stringsValidated
+}
+
+/-- Validate a module's `.olean*` compacted-region group and its independent `.ir*`
+compacted-region group separately (A1 hardening: `.ir.sig`/`.ir` have an independent base
+address space from `.olean`/`.olean.server`/`.olean.private`, and every `module` `.olean`
+pure-`.opaque` IR signature stub must be backed by an `IR.Decl.fdecl` in `.ir`). -/
+def validateModuleArtifactParts (oleanParts irParts : Array ByteArray) (modName : Name)
+    (forbidMainExport : Bool := true) (fuel : Nat := 20000000) : AuditReport := Id.run do
+  let (r1, oStubs, oFdecls) := validateOleanPartsEx oleanParts modName forbidMainExport fuel (isIrGroup := false)
+  let (r2, irFdecls) :=
+    if irParts.isEmpty then ({}, ({} : NameSet))
+    else
+      let (rep, _, fds) := validateOleanPartsEx irParts modName forbidMainExport fuel (isIrGroup := true)
+      (rep, fds)
+  let allFdecls := irFdecls.foldl (·.insert ·) oFdecls
+  let mut vs := r1.violations ++ r2.violations
+  for stub in oStubs do
+    if !allFdecls.contains stub then
+      vs := vs.push {
+        tag := "forbiddenExportAttr"
+        decl := stub
+        detail := s!"unresolved module IR.Decl.extern opaque stub {stub} in {modName} without backing .ir fdecl"
+      }
+  return { violations := vs, stats := mergeAuditStats r1.stats r2.stats }
+
+/-- Full pure-Lean binary `.olean`/`.ir` compacted-region pointer-DAG validation over
+`rawParts : Array ByteArray`. Fails closed on any unresolved `IR.Decl.extern` stub. -/
+def validateOleanParts (rawParts : Array ByteArray) (modName : Name)
+    (forbidMainExport : Bool := true) (fuel : Nat := 20000000) : AuditReport :=
+  validateModuleArtifactParts rawParts #[] modName forbidMainExport fuel
 
 /-! ## Section 9: V-N6 `lean4#16831` `Nat.xor` / `[propext]` Second-Kernel Parity Oracle -/
 
-def declUsedConsts (ci : ConstantInfo) : NameSet := Id.run do
-  let mut acc : NameSet := ci.type.getUsedConstants.foldl (·.insert ·) {}
+def declUsedConsts (ci : ConstantInfo) (fuel : Nat := 2000000) : Except Violation NameSet := do
+  let mergeInto (acc : NameSet) (e : Expr) : Except Violation NameSet :=
+    match collectConstsBounded e fuel with
+    | some ns => .ok (ns.foldl (·.insert ·) acc)
+    | none => .error {
+        tag := "auditFuelExhausted"
+        decl := ci.name
+        detail := "declUsedConsts exhausted fuel"
+      }
+  let mut acc ← mergeInto {} ci.type
   if let some v := ci.value? (allowOpaque := true) then
-    acc := v.getUsedConstants.foldl (·.insert ·) acc
+    acc ← mergeInto acc v
   match ci with
   | .inductInfo v => acc := (v.all ++ v.ctors).foldl (·.insert ·) acc
   | .ctorInfo v => acc := acc.insert v.induct
   | .recInfo v =>
     acc := v.all.foldl (·.insert ·) acc
     for r in v.rules do
-      acc := r.rhs.getUsedConstants.foldl (·.insert ·) (acc.insert r.ctor)
+      acc ← mergeInto (acc.insert r.ctor) r.rhs
   | _ => pure ()
   return acc
 
 /-- Collect the exact reachable declaration set and axiom set for `roots` in `env`
-(pure, total, fuel-bounded DAG BFS; fails closed with `auditFuelExhausted`). -/
+(pure, total, fuel-bounded DAG BFS using `StrictExprKey`-memoized constant extraction;
+fails closed with `auditFuelExhausted`). -/
 def collectReachableAndAxioms (env : Environment) (roots : Array Name)
     (fuel : Nat := 200000) : Except Violation (NameSet × Array Name) := Id.run do
   let mut visited : NameSet := {}
@@ -3037,10 +3618,13 @@ def collectReachableAndAxioms (env : Environment) (roots : Array Name)
       if let some ci := env.find? n then
         if ci matches .axiomInfo _ then
           axioms := axioms.insert n
-        for d in declUsedConsts ci do
-          if !visited.contains d then
-            visited := visited.insert d
-            stack := d :: stack
+        match declUsedConsts ci with
+        | .error v => return .error v
+        | .ok used =>
+          for d in used do
+            if !visited.contains d then
+              visited := visited.insert d
+              stack := d :: stack
   if !done then
     return .error {
       tag := "auditFuelExhausted"
@@ -3763,6 +4347,215 @@ info: B1 binary non-canonical LeanMPZ: Name.num(5 as MPZ)=#[malformedOleanRegion
     | .error _ => #["PARSE_ERROR"]
   IO.println s!"B1 binary non-canonical LeanMPZ: Name.num(5 as MPZ)={run true} scalar control={run false}"
 
+/-! ## Section 11c: Round-A1 Adversarial Regressions
+
+Pins every bypass reproduced LIVE against B1 (`8cf7fa0f`):
+1. Theorem-over-theorem axiom laundering (`benignTheoremDuplicate` bypass) & intra-module
+   duplicate `constNames`.
+2. Depth-35 shared `Syntax` DAG (exponential DoS on unmemoized `validateSyntaxDag`) &
+   cyclic binary `Syntax` (bypassed 1-color `seen` set in `validateBinSyntax`).
+3. V-S5 `IR.Decl.extern` C-symbol stub & `Lean.externAttr` (zero `exportAttr`).
+4. Binary `ReducibilityHints.regular` truncated `cs_sz`, malformed UTF-8 hidden in
+   `ModuleData.entries` (`Lean.docStringExt`), and forbidden `LeanClosure` (tag `245`) in
+   `ModuleData.entries`.
+5. `strictLocalDeclEq` `binderInfo`/`kind` mismatch, `LocalContext` self/forward/undeclared
+   fvar references, and `validateKernelQuery` loose `bvar` / `mvar` / `fuel` propagation.
+6. Multi-part 5-file Lean 4.34.1 `module` (`.olean*` + `.ir*`) independent-group validation. -/
+
+/--
+info: A1 V-F4 cdecl binderInfo/kind mismatch: tags=#[malformedLocalContext]
+A1 V-F4 lctx self/forward fvar: self=#[undeclaredFVar] forward=#[undeclaredFVar]
+A1 V-F4 query looseBVar/mvar: loose=#[malformedKernelQuery] mvar=#[malformedKernelQuery]
+A1 V-F4 query fuel propagation: fuel1=#[auditFuelExhausted]
+A1 V-U3 depth-35 shared Syntax DAG: ok=true strictEq=true
+A1 V-U3 cyclic binary Syntax: tags=#[malformedOleanRegion]
+A1 binary truncated ReducibilityHints.regular: tags=#[malformedOleanRegion]
+A1 binary ModuleData.entries LeanClosure tag 245: tags=#[malformedOleanRegion]
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  -- (1) `strictLocalDeclEq` binderInfo/kind mismatch between fvarIdToDecl and decls.
+  let hId : FVarId := ⟨`h_bi⟩
+  let c1 : LocalDecl := .cdecl 0 hId `x (mkConst ``Nat) .default .default
+  let c2 : LocalDecl := .cdecl 0 hId `x (mkConst ``Nat) .implicit .auxDecl
+  let lctxBi : LocalContext := {
+    fvarIdToDecl := ({} : PersistentHashMap FVarId LocalDecl).insert hId c1
+    decls := ({} : PersistentArray (Option LocalDecl)).push (some c2) }
+  IO.println s!"A1 V-F4 cdecl binderInfo/kind mismatch: tags={(validateLocalContext lctxBi).tags}"
+  -- (2) Telescopic fvar scoping in LocalContext (self-ref and forward-ref).
+  let sId : FVarId := ⟨`self_fv⟩
+  let dSelf : LocalDecl := .cdecl 0 sId `x (Expr.fvar sId) .default .default
+  let lctxSelf : LocalContext := {
+    fvarIdToDecl := ({} : PersistentHashMap FVarId LocalDecl).insert sId dSelf
+    decls := ({} : PersistentArray (Option LocalDecl)).push (some dSelf) }
+  let f1 : FVarId := ⟨`fv_first⟩
+  let f2 : FVarId := ⟨`fv_second⟩
+  let dF1 : LocalDecl := .cdecl 0 f1 `a (Expr.fvar f2) .default .default
+  let dF2 : LocalDecl := .cdecl 1 f2 `b (mkConst ``Nat) .default .default
+  let lctxFwd : LocalContext := {
+    fvarIdToDecl := (({} : PersistentHashMap FVarId LocalDecl).insert f1 dF1).insert f2 dF2
+    decls := (({} : PersistentArray (Option LocalDecl)).push (some dF1)).push (some dF2) }
+  IO.println s!"A1 V-F4 lctx self/forward fvar: self={(validateLocalContext lctxSelf).tags} forward={(validateLocalContext lctxFwd).tags}"
+  -- (3) validateKernelQuery loose bvar, mvar, and fuel propagation.
+  let rLoose := validateKernelQuery {} #[.bvar 0]
+  let rMVar := validateKernelQuery {} #[.mvar ⟨`mv_bad⟩]
+  let rFuel := validateKernelQuery {} #[Expr.app (.const `Nat []) (.const `Nat [])] (fuel := 1)
+  IO.println s!"A1 V-F4 query looseBVar/mvar: loose={rLoose.tags} mvar={rMVar.tags}"
+  IO.println s!"A1 V-F4 query fuel propagation: fuel1={rFuel.tags}"
+  -- (4) Depth-35 shared Syntax DAG (2^35 paths, 36 unique nodes) validates cleanly in O(36).
+  let mut stx : Syntax := Syntax.atom .none "leaf"
+  for _ in [0:35] do
+    stx := Syntax.node .none `pair #[stx, stx]
+  let stStx := validateSyntaxDag `A1SynDag35 stx {}
+  IO.println s!"A1 V-U3 depth-35 shared Syntax DAG: ok={stStx.violations.isEmpty} strictEq={strictSyntaxEq stx stx}"
+  -- (5) Cyclic binary Syntax.node whose args points back to itself.
+  let base : UInt64 := 0x200000
+  let mkHdr (sz : Nat) : ByteArray := Id.run do
+    let mut b := ByteArray.mk (Array.replicate sz (0 : UInt8))
+    b := b.set! 0 0x6f |>.set! 1 0x6c |>.set! 2 0x65 |>.set! 3 0x61 |>.set! 4 0x6e |>.set! 5 2
+    b := b1PutU64 b 80 base
+    b := b1PutU64 b 88 (base + 96)
+    return b
+  let mut cb := mkHdr 256
+  cb := cb.set! 100 32 |>.set! 102 3 |>.set! 103 1
+  cb := b1PutU64 cb 104 5
+  cb := b1PutU64 cb 112 1
+  cb := b1PutU64 cb 120 (base + 128)
+  cb := cb.set! 135 246
+  cb := b1PutU64 cb 136 1
+  cb := b1PutU64 cb 144 1
+  cb := b1PutU64 cb 152 (base + 96)
+  let cycParts := match parseOleanParts #[cb] with | .ok ps => ps | .error _ => #[]
+  IO.println s!"A1 V-U3 cyclic binary Syntax: tags={b1Tags (validateBinSyntax cycParts `A1CycSyn (base + 96) {}).violations}"
+  -- (6) Truncated `ReducibilityHints.regular` (`cs_sz = 8`, missing 4-byte UInt32 height).
+  let mut hb := mkHdr 128
+  hb := hb.set! 100 8 |>.set! 102 0 |>.set! 103 2
+  let hParts := match parseOleanParts #[hb] with | .ok ps => ps | .error _ => #[]
+  let hTags : Array String := match readObjHeader hParts (base + 96) with
+    | .ok hh =>
+      match readScalarU32 hParts hh 0 with
+      | .ok _ => #[]
+      | .error _ => #["malformedOleanRegion"]
+    | .error _ => #["malformedOleanRegion"]
+  IO.println s!"A1 binary truncated ReducibilityHints.regular: tags={hTags}"
+  -- (7) Forbidden `LeanClosure` (tag 245) hidden inside `ModuleData.entries` graph.
+  let mut clb := mkHdr 256
+  clb := clb.set! 103 246
+  clb := b1PutU64 clb 104 1
+  clb := b1PutU64 clb 112 1
+  clb := b1PutU64 clb 120 (base + 128)
+  -- Closure object at off 128: tag=245, rc=0
+  clb := clb.set! 135 245
+  let clParts := match parseOleanParts #[clb] with | .ok ps => ps | .error _ => #[]
+  IO.println s!"A1 binary ModuleData.entries LeanClosure tag 245: tags={b1Tags (sweepBinRegionGraph clParts `A1Closure (base + 96) {}).violations}"
+
+/--
+info: A1 V-N6 thm-over-thm laundering: axioms(useBridge)=#[] memory(A)=#[shadowedConstant] memory(B)=#[shadowedConstant]
+A1 V-N6 intra-mod dup constNames: binary=#[shadowedConstant] memory=#[shadowedConstant]
+A1 V-S5 IR.Decl.extern (zero exportAttr): binary=#[forbiddenExportAttr] memory=#[forbiddenExportAttr]
+A1 V-U3 docStringExt surrogate in entries: binary=#[invalidUtf8Literal]
+A1 multi-part 5-file module clean control: binMod ok=true memory ok=true
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  let pid ← IO.Process.getPID
+  let dir : System.FilePath := ⟨s!"/tmp/anneal-proto-a1-{pid}"⟩
+  IO.FS.createDirAll dir
+  try
+    let libDir ← b1LibDir
+    let core := #[`Init.Core]
+    -- (1) Theorem-over-theorem axiom laundering (bypassed B1's `benignTheoremDuplicate`).
+    let ax : ConstantInfo := .axiomInfo { name := `evilAx2, levelParams := [], type := mkConst ``False, isUnsafe := false }
+    let bridgeA : ConstantInfo := .thmInfo {
+      name := `thmBridge, levelParams := [], type := mkConst ``False, value := mkConst `evilAx2, all := [`thmBridge] }
+    let useIt : ConstantInfo := .thmInfo {
+      name := `useBridge, levelParams := [], type := mkConst ``False, value := mkConst `thmBridge, all := [`useBridge] }
+    let pA ← b1Save dir `A1ThmA core #[`evilAx2, `thmBridge, `useBridge] #[ax, bridgeA, useIt]
+    let bridgeB : ConstantInfo := .thmInfo {
+      name := `thmBridge, levelParams := [], type := mkConst ``False, value := mkConst `thmBridge, all := [`thmBridge] }
+    let pB ← b1Save dir `A1ThmB #[`A1ThmA] #[`thmBridge] #[bridgeB]
+    let envAB ← b1Import libDir [(`A1ThmA, pA), (`A1ThmB, pB)] `A1ThmB
+    let axs := match collectReachableAndAxioms envAB #[`useBridge] with | .ok (_, a) => a | .error _ => #[`ERR]
+    IO.println s!"A1 V-N6 thm-over-thm laundering: axioms(useBridge)={axs} memory(A)={(validateEnvModule envAB `A1ThmA).tags} memory(B)={(validateEnvModule envAB `A1ThmB).tags}"
+    -- (2) Intra-module duplicate `constNames` (bypassed B1 binary validator).
+    let pDup ← b1Save dir `A1Dup core #[`dupThm, `dupThm] #[
+      .thmInfo { name := `dupThm, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`dupThm] },
+      .thmInfo { name := `dupThm, levelParams := [], type := mkConst ``True, value := mkConst `dupThm, all := [`dupThm] }
+    ]
+    let envDup ← b1Import libDir [(`A1Dup, pDup)] `A1Dup
+    let bDup ← IO.FS.readBinFile pDup
+    IO.println s!"A1 V-N6 intra-mod dup constNames: binary={(validateOleanParts #[bDup] `A1Dup).tags} memory={(validateEnvModule envDup `A1Dup).tags}"
+    -- (3) V-S5 `IR.Decl.extern` C-symbol stub with zero `exportAttr` (bypassed B1).
+    let extData : ExternAttrData := { entries := [.standard `all "a1_forged_extern_sym"] }
+    let extDecl : IR.Decl := .extern `a1Fn #[{ x := ⟨1⟩, borrow := false, ty := .object }] .object extData
+    let donorEnv := IR.declMapExt.addEntry (← mkEmptyEnvironment) extDecl
+    let pDonor := dir / "A1IrDonor.olean"
+    writeModule donorEnv pDonor (writeIR := false)
+    let (donorMd, _) ← readModuleData pDonor
+    let irEntries := donorMd.entries.filter (·.1 == `Lean.IR.declMapExt)
+    let pIrExt := dir / "A1IrExt.olean"
+    saveModuleData pIrExt `A1IrExt {
+      isModule := false
+      imports := #[{ module := `Init.Core, importAll := false, isExported := true, isMeta := false }]
+      constNames := #[`a1Fn]
+      constants := #[.defnInfo {
+        name := `a1Fn, levelParams := [], type := mkConst ``Nat, value := mkNatLit 0
+        hints := .abbrev, safety := .safe, all := [`a1Fn] }]
+      extraConstNames := #[]
+      entries := irEntries
+    }
+    let bIrExt ← IO.FS.readBinFile pIrExt
+    let envIrExt ← b1Import libDir [(`A1IrExt, pIrExt)] `A1IrExt
+    IO.println s!"A1 V-S5 IR.Decl.extern (zero exportAttr): binary={(validateOleanParts #[bIrExt] `A1IrExt).tags} memory={(validateEnvModule envIrExt `A1IrExt).tags}"
+    -- (4) Malformed UTF-8 hidden in `ModuleData.entries` (`Lean.docStringExt`) caught by sweep!
+    let appDir ← IO.appDir
+    let leanBin : System.FilePath :=
+      match ← IO.getEnv "LEAN_BIN" with
+      | some p => ⟨p⟩
+      | none => ⟨appDir.toString ++ "/lean"⟩
+    let leanExe := if ← leanBin.pathExists then leanBin else ⟨"lean"⟩
+    let docSrc := dir / "A1Doc.lean"
+    let docSetup := dir / "A1Doc.setup.json"
+    let pDoc := dir / "A1Doc.olean"
+    IO.FS.writeFile docSrc "prelude\nimport Init.Core\n/-- DDDDDDDD -/\ndef a1DocFn : Nat := 0\n"
+    IO.FS.writeFile docSetup
+      "{\"name\":\"A1Doc\",\"isModule\":false,\"imports\":[{\"module\":\"Init.Core\",\"importAll\":false,\"isExported\":true,\"isMeta\":false}],\"importArts\":{},\"dynlibs\":[],\"plugins\":[],\"options\":{}}"
+    let cDoc ← IO.Process.output {
+      cmd := leanExe.toString
+      args := #["-j1", "--setup", docSetup.toString, "-o", pDoc.toString, docSrc.toString]
+      cwd := some dir
+    }
+    if cDoc.exitCode != 0 then
+      throw (IO.userError s!"compile A1Doc failed: {cDoc.stderr}")
+    let bDocMut ← b1PatchString (← IO.FS.readBinFile pDoc) "DDDDDDDD " (ByteArray.mk #[0xED, 0xA0, 0x80, 0x41]) 2
+    IO.println s!"A1 V-U3 docStringExt surrogate in entries: binary={(validateOleanParts #[bDocMut] `A1Doc).tags}"
+    -- (5) Real compiled 5-file Lean 4.34.1 `module` clean control via `validateModuleArtifactParts`.
+    let modSrc := dir / "A1ModClean.lean"
+    let modSetup := dir / "A1ModClean.setup.json"
+    let modOlean := dir / "A1ModClean.olean"
+    IO.FS.writeFile modSrc "module\npublic def a1Pub (x : Nat) : Nat := x + 1\ndef a1Priv (x : Nat) : Nat := x + 2\n"
+    IO.FS.writeFile modSetup
+      "{\"name\":\"A1ModClean\",\"isModule\":true,\"imports\":[{\"module\":\"Init.Core\",\"importAll\":false,\"isExported\":true,\"isMeta\":false}],\"importArts\":{},\"dynlibs\":[],\"plugins\":[],\"options\":{}}"
+    let cMod ← IO.Process.output {
+      cmd := leanExe.toString
+      args := #["-j1", "--setup", modSetup.toString, "-o", modOlean.toString, modSrc.toString]
+      cwd := some dir
+    }
+    if cMod.exitCode != 0 then
+      throw (IO.userError s!"compile A1ModClean failed: {cMod.stderr}")
+    let (olPs, irPs) ← loadModulePartsFromDisk (dir / "A1ModClean")
+    let repBinMod := validateModuleArtifactParts olPs irPs `A1ModClean
+    let olPaths : Array System.FilePath := #[dir / "A1ModClean.olean", dir / "A1ModClean.olean.server", dir / "A1ModClean.olean.private"]
+    let irPaths : Array System.FilePath := #[dir / "A1ModClean.ir.sig", dir / "A1ModClean.ir"]
+    searchPathRef.set [libDir]
+    let mArts : NameMap ImportArtifacts :=
+      ({} : NameMap ImportArtifacts).insert `A1ModClean (.ofArrays #[olPaths, irPaths])
+    let envMod ← importModules #[{ module := `A1ModClean }] {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private) (arts := mArts)
+    let repMemMod := validateEnvModule envMod `A1ModClean
+    IO.println s!"A1 multi-part 5-file module clean control: binMod ok={repBinMod.ok} memory ok={repMemMod.ok}"
+  finally
+    try IO.FS.removeDirAll dir catch _ => pure ()
+
 /-! ## Section 12: Live Latency & Peak-RSS Benchmark on Compiled `Anneal.NatBitwise` & `Anneal.MirLiftCore` -/
 
 def runModuleBenchmark (modName : Name) (relBase : String) : IO Unit := do
@@ -3770,12 +4563,11 @@ def runModuleBenchmark (modName : Name) (relBase : String) : IO Unit := do
   let (oleanParts, irParts) ← loadModulePartsFromDisk basePath
   if oleanParts.isEmpty then
     throw (IO.userError s!"compiled artifact missing for {modName} at {basePath}.olean")
-  let allParts := oleanParts ++ irParts
-  let totalBytes := allParts.foldl (fun a b => a + b.size) 0
-  -- 1. Pure-Lean binary `.olean` compacted-region pointer-DAG validation.
+  let totalBytes := (oleanParts ++ irParts).foldl (fun a b => a + b.size) 0
+  -- 1. Pure-Lean binary `.olean` + `.ir` compacted-region pointer-DAG validation.
   -- Force control dependence on `binRep` before reading `t1` so the compiler cannot sink pure `let`s.
   let t0 ← IO.monoNanosNow
-  let binRep := validateOleanParts allParts modName
+  let binRep := validateModuleArtifactParts oleanParts irParts modName
   if !binRep.ok then
     throw (IO.userError s!"FALSE POSITIVE on honest module {modName} (binary): {binRep.violations.map Violation.render}")
   let binGuard ← IO.mkRef binRep.stats.totalNodes
@@ -3823,6 +4615,21 @@ def cliValidateBin (modNameStr : String) (paths : List String) : IO UInt32 := do
   for p in paths do
     parts := parts.push (← IO.FS.readBinFile ⟨p⟩)
   let rep := validateOleanParts parts modNameStr.toName
+  IO.println rep.toJson.compress
+  return if rep.ok then 0 else 1
+
+/-- Validate independent `.olean*` and `.ir*` compacted-region groups for a `module`. -/
+def cliValidateBinMod (modNameStr oleanCsv irCsv : String) : IO UInt32 := do
+  let loadCsv (s : String) : IO (Array ByteArray) := do
+    if s.isEmpty then return #[]
+    let mut out : Array ByteArray := #[]
+    for p in s.splitOn "," do
+      if !p.isEmpty then
+        out := out.push (← IO.FS.readBinFile ⟨p⟩)
+    return out
+  let olParts ← loadCsv oleanCsv
+  let irParts ← loadCsv irCsv
+  let rep := validateModuleArtifactParts olParts irParts modNameStr.toName
   IO.println rep.toJson.compress
   return if rep.ok then 0 else 1
 
@@ -4004,6 +4811,8 @@ def cliMain (args : List String) : IO UInt32 := do
   match args with
   | "validate-bin" :: modName :: paths =>
     cliValidateBin modName paths
+  | ["validate-bin-mod", modName, oleanCsv, irCsv] =>
+    cliValidateBinMod modName oleanCsv irCsv
   | ["validate-env", sysroot, modName, oleanCsv, irCsv] =>
     cliValidateEnv sysroot modName oleanCsv irCsv
   | ["check-cached-closed", sysroot, modName, declName, oleanPath] =>

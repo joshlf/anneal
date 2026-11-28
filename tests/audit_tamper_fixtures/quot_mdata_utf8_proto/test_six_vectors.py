@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -574,6 +575,56 @@ open Lean
             self.assertEqual(env_rc, 1, f"{label} in-memory should reject: {env_rep}")
             self.assertIn("invalidUtf8Literal", env_rep["tags"], f"{label} in-memory: {env_rep}")
 
+            # Live Lean 4.34.1 memory-safety witness: loading truncated UTF-8 (`E2 82`) via
+            # `importModules` succeeds, and then standard `reprStr` walks past the 2-byte
+            # payload + NUL terminator into unmapped mmap memory and crashes with SIGSEGV!
+            if label == "truncated_utf8":
+                crash_probe = f"""
+import Lean
+open Lean
+#eval show IO Unit from do
+  searchPathRef.set [System.FilePath.mk "{self.sysroot}/lib/lean"]
+  let arts := ({{}} : NameMap ImportArtifacts).insert `Vu3Target (.ofArrays #[#[System.FilePath.mk "{mut_path}"], #[]])
+  let env ← importModules #[{{ module := `Vu3Target }}] {{}} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private) (arts := arts)
+  let some (.defnInfo d) := env.find? `u3StrTarget | throw (IO.userError "missing")
+  match d.value with
+  | .lit (.strVal s) => IO.println (reprStr s)
+  | _ => throw (IO.userError "unexpected expr")
+"""
+                r_crash = self._run_lean_stdin(crash_probe)
+                self.assertEqual(
+                    r_crash.returncode,
+                    -signal.SIGSEGV,
+                    f"expected SIGSEGV (-11) on truncated UTF-8 reprStr in Lean 4.34.1, got rc={r_crash.returncode}",
+                )
+
+        # (b) Malformed UTF-8 hidden inside `ModuleData.entries` (`Lean.docStringExt`):
+        # BEFORE: live production `OleanEnvAuditor.lean` ACCEPTS it (exit 0, ok=true);
+        # AFTER: our binary compacted-region sweep (`sweepBinRegionGraph`) catches `invalidUtf8Literal`!
+        doc_olean, _ = self._compile_fixture(
+            "Vu3DocMod",
+            "prelude\nimport Init.Core\n/-- DDDDDDDD -/\ndef u3DocFn : Nat := 0\n",
+            ["Init.Core"],
+        )
+        img_doc = mut.OleanImage(doc_olean[0].read_bytes())
+        doc_ptrs = img_doc.find_string_ptrs(b"DDDDDDDD ")
+        self.assertTrue(doc_ptrs, "docstring needle not found in Vu3DocMod.olean")
+        for sp in doc_ptrs:
+            img_doc.patch_string_payload(sp, b"\xed\xa0\x80A", new_m_length=2)
+        doc_mut_path = self.tmp / "v_u3_doc_entries/Vu3DocMod.olean"
+        doc_mut_path.parent.mkdir(parents=True, exist_ok=True)
+        doc_mut_path.write_bytes(img_doc.to_bytes())
+
+        aud_doc_rc, aud_doc_v = self._run_production_auditor("Vu3DocMod", [doc_mut_path], [])
+        self.assertEqual(
+            aud_doc_rc,
+            0,
+            f"BEFORE gap: expected current OleanEnvAuditor to accept malformed UTF-8 in docStringExt: {aud_doc_v}",
+        )
+        bin_doc_rc, bin_doc_rep = self._run_proto_cli("validate-bin", "Vu3DocMod", str(doc_mut_path))
+        self.assertEqual(bin_doc_rc, 1, bin_doc_rep)
+        self.assertIn("invalidUtf8Literal", bin_doc_rep["tags"], bin_doc_rep)
+
     # ------------------------------------------------------------------
     # V-F4: `_kernel_fresh` `FVarId` collision (`lean4#16767`)
     # ------------------------------------------------------------------
@@ -654,6 +705,16 @@ open Lean
         # (c) Forged `.ir` `Lean.exportAttr` entry evading `OleanEnvAuditor.lean:1649`!
         c_src = (FIXTURES_DIR / "v_s5_clean_mod.lean").read_text(encoding="utf-8")
         c_olean, c_ir = self._compile_fixture("Vs5ForgedIr", c_src, ["Init.Core"], is_module=True)
+        # Positive 5-file `module` control via `validate-bin-mod` BEFORE forging `.ir`:
+        clean_mod_rc, clean_mod_rep = self._run_proto_cli(
+            "validate-bin-mod",
+            "Vs5ForgedIr",
+            ",".join(str(p) for p in c_olean),
+            ",".join(str(p) for p in c_ir),
+        )
+        self.assertEqual(clean_mod_rc, 0, f"clean 5-file module should pass: {clean_mod_rep}")
+        self.assertTrue(clean_mod_rep["ok"], clean_mod_rep)
+
         donor_olean = self.tmp / "s5_donor.olean"
         forge_code = f"""
 import Lean
@@ -704,6 +765,51 @@ open Lean
         )
         self.assertEqual(bin_ir_rc, 1, bin_ir_rep)
         self.assertIn("forbiddenExportAttr", bin_ir_rep["tags"])
+
+        # (d) Forged `.ir` `IR.Decl.extern` C-symbol stub (ZERO `exportAttr`!):
+        e_olean, e_ir = self._compile_fixture("Vs5IrExtern", c_src, ["Init.Core"], is_module=True)
+        ext_donor = self.tmp / "s5_ir_extern_donor.olean"
+        forge_ir_ext = f"""
+import Lean
+import Lean.Compiler.IR.Basic
+open Lean
+#eval show IO Unit from do
+  searchPathRef.set [System.FilePath.mk "{self.sysroot}/lib/lean"]
+  let parts ← readModuleDataParts #[System.FilePath.mk "{e_ir[0]}", System.FilePath.mk "{e_ir[1]}"]
+  if h : 1 < parts.size then
+    let irMd := parts[1].1
+    let extData : ExternAttrData := {{ entries := [.standard `all "forged_ir_extern_c_sym"] }}
+    let extDecl : IR.Decl := .extern `s5CleanFn #[{{ x := ⟨1⟩, borrow := false, ty := .object }}] .object extData
+    let env0 := IR.declMapExt.addEntry (← mkEmptyEnvironment) extDecl
+    writeModule env0 (System.FilePath.mk "{ext_donor}") (writeIR := false)
+    let (donorMd, _) ← readModuleData (System.FilePath.mk "{ext_donor}")
+    let kept := irMd.entries.filter (·.1 != `Lean.IR.declMapExt)
+    let forgedIrMd : ModuleData := {{ irMd with entries := kept ++ donorMd.entries }}
+    saveModuleData (System.FilePath.mk "{e_ir[1]}") `Vs5IrExtern forgedIrMd
+  else
+    throw (IO.userError "missing ir parts")
+"""
+        r_fext = self._run_lean_stdin(forge_ir_ext)
+        self.assertEqual(r_fext.returncode, 0, r_fext.stderr)
+
+        bin_ext_rc, bin_ext_rep = self._run_proto_cli(
+            "validate-bin-mod",
+            "Vs5IrExtern",
+            ",".join(str(p) for p in e_olean),
+            ",".join(str(p) for p in e_ir),
+        )
+        self.assertEqual(bin_ext_rc, 1, bin_ext_rep)
+        self.assertIn("forbiddenExportAttr", bin_ext_rep["tags"])
+
+        env_ext_rc, env_ext_rep = self._run_proto_cli(
+            "validate-env",
+            str(self.sysroot),
+            "Vs5IrExtern",
+            ",".join(str(p) for p in e_olean),
+            ",".join(str(p) for p in e_ir),
+        )
+        self.assertEqual(env_ext_rc, 1, env_ext_rep)
+        self.assertIn("forbiddenExportAttr", env_ext_rep["tags"])
 
     # ------------------------------------------------------------------
     # V-N6: `lean4#16831` `Nat.xor` / `[propext]` second-kernel parity

@@ -53,6 +53,34 @@ against the initial validator (each forged artifact was previously reported `ok`
   discriminants (e.g. `DefinitionVal.safety = 7`), unchecked `DataValue` arities, and
   forged `ModuleData.imports` name hashes.
 
+## Adversarial Hardening Regressions (Round A1)
+
+`tests/mir/OleanQuotMdataUtf8ProtoTests.lean` Section 11c and `test_six_vectors.py` pin
+bypasses reproduced live against Round B1:
+
+- **V-N6 / Shadowing**: theorem-over-theorem axiom laundering (a later module replacing an
+  axiom-dependent theorem with a cyclic self-proof of the same type bypassed
+  `benignTheoremDuplicate`) and intra-module duplicate `constNames` (bypassed binary
+  validation); closed by `safeReservedTheoremDuplicate` (requiring `isReservedName`,
+  non-circularity, and identical `StrictExprKey` dependency closure) plus intra-part /
+  intra-module duplicate rejection (`shadowedConstant`).
+- **V-S5 / IR-extern**: `IR.Decl.extern` C-symbol stubs and `Lean.externAttr` /
+  `implementedByAttr` / `regularInitAttr` / `builtinInitAttr` entries in `.olean` or `.ir`
+  with zero `exportAttr`; closed in both binary and in-memory validators
+  (`forbiddenExportAttr`).
+- **V-U3 / Syntax & Entries**: exponential DoS on unmemoized `validateSyntaxDag` /
+  `syntaxStrictKey` (closed via `withPtrEq` `strictSyntaxEq` and `StrictSyntaxKey` DAG
+  memoization, verified on a depth-35 shared `Syntax` DAG), cyclic binary `Syntax` bypassing
+  a 1-color `seen` set (closed via 3-color DFS), malformed UTF-8 / `LeanClosure` (tag 245)
+  hidden inside non-`exportAttr` `ModuleData.entries` such as `Lean.docStringExt` (closed
+  via `sweepBinRegionGraph`), and a safe subprocess witness confirming truncated UTF-8
+  (`E2 82`) triggers `SIGSEGV` in Lean 4.34.1 `reprStr` after `importModules`.
+- **V-F4 / Kernel Query & Binary Bounds**: full `strictLocalDeclEq` (`binderInfo`, `nonDep`,
+  `kind`), telescopic `LocalContext` `fvar` scoping & slot-index checks, loose `bvar`/`mvar`
+  rejection (`malformedKernelQuery`) and `fuel` propagation in `validateKernelQuery`,
+  truncated `ReducibilityHints.regular` `cs_sz` + `LeanMPZ` `_mp_alloc` bounds, and
+  independent `.olean*` / `.ir*` compacted-region validation (`validateModuleArtifactParts`).
+
 ## Running the Suite
 
 ```bash
