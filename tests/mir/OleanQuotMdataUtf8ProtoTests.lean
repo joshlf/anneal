@@ -680,26 +680,22 @@ theorem pairList_diag : ∀ (xs : List α) (p : α × α), p ∈ pairList xs xs 
     | inl h => subst h; rfl
     | inr h => exact pairList_diag xs p h
 
-def strictSyntaxPairsEqFallback : List (Syntax × Syntax) → Bool
-  | [] => true
-  | (a, b) :: rest => (strictSyntaxEqAux a b).val && strictSyntaxPairsEqFallback rest
+/-- Tail-recursive, zero-`ByteArray`-allocation structural equality for `Syntax` (A2), charged one
+unit of `fuel` per compared node pair.
 
-theorem strictSyntaxPairsEqFallback_diag :
-    ∀ (xs : List (Syntax × Syntax)), (∀ p ∈ xs, p.1 = p.2) → strictSyntaxPairsEqFallback xs = true
-  | [], _ => rfl
-  | (a, b) :: rest, h => by
-    have hab : a = b := h (a, b) (List.mem_cons_self ..)
-    have hrest : ∀ p ∈ rest, p.1 = p.2 := fun p hp => h p (List.mem_cons_of_mem _ hp)
-    simp [strictSyntaxPairsEqFallback, (strictSyntaxEqAux a b).property hab,
-      strictSyntaxPairsEqFallback_diag rest hrest]
-
-/-- Tail-recursive, zero-`ByteArray`-allocation structural equality for `Syntax` (A2 hardening):
-peels up to `fuel` layers iteratively (so 50,000-node chains use zero native stack frames),
-never truncates to a false `0xFF == 0xFF` match on `>100k`-node chains differing at a leaf,
-and delegates any remaining suffix beyond `fuel` to `strictSyntaxPairsEqFallback`. -/
+B3 hardening: A2 handed everything left after `fuel` pairs to the recursive, per-pair
+`strictSyntaxPairsEqFallback`, which (i) recurses natively as deep as the remaining tree and
+(ii) re-expands shared sub-DAGs once per path whenever the two sides are distinct objects:
+comparing two separately built but structurally identical depth-`d` shared `Syntax` DAGs costs
+`2^d` (two `MData` payloads over one body with such DAGs collide in the bounded 512-node
+fingerprint, so `validateExprDag` stalls instead of failing closed). Exhausting `fuel` now
+returns `true`. This is sound because the loop consumes one pair per node of `a`'s tree
+expansion: exhaustion means that expansion exceeds `syntaxValidationFuel` nodes, so whichever
+side was validated (cache entries are inserted only after validation; module constants are all
+validated) already recorded `auditFuelExhausted` and the audit fails closed regardless. -/
 def strictSyntaxEqIterLoop : Nat → List (Syntax × Syntax) → Bool
   | _, [] => true
-  | 0, xs => strictSyntaxPairsEqFallback xs
+  | 0, _ => true
   | fuel + 1, (a, b) :: rest =>
     match a, b with
     | .missing, .missing => strictSyntaxEqIterLoop fuel rest
@@ -723,7 +719,7 @@ theorem strictSyntaxEqIterLoop_diag :
       (∀ p ∈ xs, p.1 = p.2) → strictSyntaxEqIterLoop fuel xs = true
   | 0, [], _ => rfl
   | _ + 1, [], _ => rfl
-  | 0, _ :: _, h => strictSyntaxPairsEqFallback_diag _ h
+  | 0, _ :: _, _ => rfl
   | fuel + 1, (a, b) :: rest, h => by
     have hab : a = b := h (a, b) (List.mem_cons_self ..)
     have hrest : ∀ p ∈ rest, p.1 = p.2 := fun p hp => h p (List.mem_cons_of_mem _ hp)
@@ -3997,16 +3993,21 @@ def validateExportedAxiomCache (env : Environment) (modName : Name)
   let some modIdx := env.getModuleIdx? modName
     | return { violations := #[{ tag := "missingModule", decl := modName, detail := "module not loaded in environment" }] }
   let mut vs : Array Violation := #[]
-  let mut seenClaims : NameSet := {}
+  -- B3: a `module` file legitimately stores the SAME (`.uniform`) cache in `.olean`,
+  -- `.olean.server` and `.olean.private`, so A2's "any duplicate" rule rejected every honest
+  -- module-system file. Only CONFLICTING duplicates are flagged; every copy is still checked
+  -- against the independent closure below.
+  let mut seenClaims : NameMap (Array Name) := {}
   let mut owned : Array (Name × Array Name) := #[]
   for (c, cached) in claims do
-    if seenClaims.contains c then
-      vs := vs.push {
-        tag := "forgedExportedAxioms"
-        decl := c
-        detail := s!"duplicate exportedAxiomsExt cache entry for {c} in module {modName}"
-      }
-    seenClaims := seenClaims.insert c
+    if let some prev := seenClaims.find? c then
+      if prev.qsort Name.lt != cached.qsort Name.lt then
+        vs := vs.push {
+          tag := "forgedExportedAxioms"
+          decl := c
+          detail := s!"conflicting duplicate exportedAxiomsExt cache entries for {c} in module {modName}: {prev} vs {cached}"
+        }
+    seenClaims := seenClaims.insert c cached
     if env.getModuleIdxFor? c == some modIdx then
       owned := owned.push (c, cached)
     else
@@ -5071,8 +5072,8 @@ Pins every bypass reproduced LIVE against B2 (`8d981f89`):
 /--
 info: A2 V-N6 mutual-recursion SCC: cycB=(some #[sccEvil]) cycC=(some #[sccEvil]) forgedCache(cycC=#[])=#[forgedExportedAxioms]
 A2 V-N6 recInfo rules.rhs axiom: useRec=(some #[sccEvil]) forgedCache(useRec=#[])=#[forgedExportedAxioms]
-A2 V-N6 duplicate & foreign exportedAxiomsExt: dup=#[forgedExportedAxioms] foreign=#[forgedExportedAxioms]
-A2 V-U3 >100k Syntax chain fail-closed eq: distinctEq=false ptrIdentEq=true
+A2 V-N6 duplicate & foreign exportedAxiomsExt: identicalDup(uniform parts, B3)=#[] foreign=#[forgedExportedAxioms]
+A2 V-U3 >100k Syntax chain: validate=#[auditFuelExhausted] boundedEq(distinct)=true ptrIdentEq=true
 -/
 #guard_msgs in
 #eval show IO Unit from do
@@ -5116,7 +5117,7 @@ A2 V-U3 >100k Syntax chain fail-closed eq: distinctEq=false ptrIdentEq=true
     -- (3) Duplicate and foreign-owned `exportedAxiomsExt` entries.
     let repDup := validateExportedAxiomCache envScc `A2Scc #[(`cycB, #[`sccEvil]), (`cycB, #[`sccEvil])]
     let repFor := validateExportedAxiomCache envScc `A2Scc #[(`Nat.add, #[])]
-    IO.println s!"A2 V-N6 duplicate & foreign exportedAxiomsExt: dup={repDup.tags} foreign={repFor.tags}"
+    IO.println s!"A2 V-N6 duplicate & foreign exportedAxiomsExt: identicalDup(uniform parts, B3)={repDup.tags} foreign={repFor.tags}"
     -- (4) >100k `Syntax` chains differing only at leaf fail closed (`false`), while pointer-identical passes (`true`).
     let mkDeep (leaf : String) : Syntax := Id.run do
       let mut s : Syntax := Syntax.atom .none leaf
@@ -5125,7 +5126,78 @@ A2 V-U3 >100k Syntax chain fail-closed eq: distinctEq=false ptrIdentEq=true
       return s
     let sA := mkDeep "A"
     let sB := mkDeep "B"
-    IO.println s!"A2 V-U3 >100k Syntax chain fail-closed eq: distinctEq={strictDataValueEq (.ofSyntax sA) (.ofSyntax sB)} ptrIdentEq={strictDataValueEq (.ofSyntax sA) (.ofSyntax sA)}"
+    -- B3: bounded equality truncates to `true` past the budget; sound because the oversize tree
+    -- itself fails validation closed (`validate=#[auditFuelExhausted]`).
+    IO.println s!"A2 V-U3 >100k Syntax chain: validate={b1Tags (validateSyntaxDag `A2Deep sA {}).violations} boundedEq(distinct)={strictDataValueEq (.ofSyntax sA) (.ofSyntax sB)} ptrIdentEq={strictDataValueEq (.ofSyntax sA) (.ofSyntax sA)}"
+  finally
+    try IO.FS.removeDirAll dir catch _ => pure ()
+
+/-! ## Section 11f: Round-B3 Adversarial Regressions -/
+
+/-- Shared depth-`depth` `Syntax` DAG (`2^depth` tree paths, `depth + 1` objects). -/
+@[noinline] def b3Dag (depth : Nat) (leaf : String) : Syntax := Id.run do
+  let mut s : Syntax := Syntax.atom .none leaf
+  for _ in [0:depth] do
+    s := Syntax.node .none `b3pair #[s, s]
+  return s
+
+/--
+info: B3 V-U3 distinct depth-40 Syntax DAGs: boundedEq=true (no 2^40 re-expansion)
+B3 V-U3 two mdata nodes over one body with distinct depth-40 DAGs: tags=#[auditFuelExhausted]
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  -- Two separately built (distinct-pointer) but structurally identical shared DAGs, differing
+  -- only in a sibling leaf. A2's recursive fallback re-expanded the shared sub-DAG once per path.
+  let r ← IO.mkRef "L"
+  let l1 ← r.get
+  let l2 ← r.get
+  let a := Syntax.node .none `b3top #[b3Dag 40 l1, Syntax.atom .none "A"]
+  let b := Syntax.node .none `b3top #[b3Dag 40 l2, Syntax.atom .none "B"]
+  IO.println s!"B3 V-U3 distinct depth-40 Syntax DAGs: boundedEq={strictDataValueEq (.ofSyntax a) (.ofSyntax b)} (no 2^40 re-expansion)"
+  let md (s : Syntax) : MData := KVMap.empty.insert `b3.syn (.ofSyntax s)
+  let body := mkNatLit 0
+  let st1 := (validateExprDag `B3X (.mdata (md a) body) {} (requireClosed := true)).1
+  let st2 := (validateExprDag `B3Y (.mdata (md b) body) st1 (requireClosed := true)).1
+  IO.println s!"B3 V-U3 two mdata nodes over one body with distinct depth-40 DAGs: tags={b1Tags st2.violations}"
+
+/--
+info: B3 V-N6 honest 5-file module (uniform cache in 3 olean parts): claims=6 Full ok=true
+B3 V-N6 conflicting duplicate claim: tags=#[forgedExportedAxioms]
+-/
+#guard_msgs in
+#eval show IO Unit from do
+  let pid ← IO.Process.getPID
+  let dir : System.FilePath := ⟨s!"/tmp/anneal-proto-b3-{pid}"⟩
+  IO.FS.createDirAll dir
+  try
+    let libDir ← b1LibDir
+    let appDir ← IO.appDir
+    let leanBin : System.FilePath :=
+      match ← IO.getEnv "LEAN_BIN" with
+      | some p => ⟨p⟩
+      | none => ⟨appDir.toString ++ "/lean"⟩
+    let leanExe := if ← leanBin.pathExists then leanBin else ⟨"lean"⟩
+    IO.FS.writeFile (dir / "B3Mod.lean")
+      "module\npublic axiom b3Ax : False\npublic theorem b3Use : False := b3Ax\ntheorem b3Priv : 1 = 1 := rfl\n"
+    IO.FS.writeFile (dir / "B3Mod.setup.json")
+      "{\"name\":\"B3Mod\",\"isModule\":true,\"imports\":[{\"module\":\"Init\",\"importAll\":false,\"isExported\":true,\"isMeta\":false}],\"importArts\":{},\"dynlibs\":[],\"plugins\":[],\"options\":{}}"
+    let out ← IO.Process.output {
+      cmd := leanExe.toString
+      args := #["-j1", "--setup", (dir / "B3Mod.setup.json").toString, "-o", (dir / "B3Mod.olean").toString, (dir / "B3Mod.lean").toString]
+      cwd := some dir }
+    if out.exitCode != 0 then throw (IO.userError s!"compile B3Mod failed: {out.stderr}")
+    let (olPs, irPs) ← loadModulePartsFromDisk (dir / "B3Mod")
+    let nClaims := match binExportedAxiomClaims olPs with | .ok cs => cs.size | .error _ => 0
+    searchPathRef.set [libDir]
+    let olPaths : Array System.FilePath := #[dir / "B3Mod.olean", dir / "B3Mod.olean.server", dir / "B3Mod.olean.private"]
+    let irPaths : Array System.FilePath := #[dir / "B3Mod.ir.sig", dir / "B3Mod.ir"]
+    let mArts : NameMap ImportArtifacts := ({} : NameMap ImportArtifacts).insert `B3Mod (.ofArrays #[olPaths, irPaths])
+    let env ← importModules #[{ module := `B3Mod }] {} (trustLevel := 0) (plugins := #[]) (loadExts := false)
+      (level := .private) (arts := mArts)
+    IO.println s!"B3 V-N6 honest 5-file module (uniform cache in 3 olean parts): claims={nClaims} Full ok={(validateEnvModuleFull env `B3Mod olPs (irParts := irPs)).ok}"
+    let conflict := validateExportedAxiomCache env `B3Mod #[(`b3Use, #[`b3Ax]), (`b3Use, #[`b3Ax, `propext])]
+    IO.println s!"B3 V-N6 conflicting duplicate claim: tags={conflict.tags}"
   finally
     try IO.FS.removeDirAll dir catch _ => pure ()
 

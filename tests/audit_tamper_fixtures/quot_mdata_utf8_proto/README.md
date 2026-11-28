@@ -113,6 +113,19 @@ against Round B2:
   lockstep `strictSyntaxEqIter` (`withPtrEq` fast-path) and bounded-budget
   `syntaxBoundedFingerprint`.
 
+## Adversarial Hardening Regressions (Round B3)
+
+- **V-N6 / module-system false positive**: `module` files store the same `.uniform`
+  `exportedAxiomsExt` cache in `.olean`, `.olean.server` and `.olean.private`; the
+  round-A2 "any duplicate claim" rule rejected every honest module-system file. Only
+  conflicting duplicates are now flagged (every copy is still checked against the
+  independent closure).
+- **V-U3 / exponential equality**: the round-A2 recursive fallback of
+  `strictSyntaxEqIter` re-expanded shared sub-DAGs once per path when the two sides are
+  distinct objects (two distinct depth-24 DAGs did not finish within 170 s). Past the
+  budget the bounded equality now returns `true`, which is sound because any `Syntax` that
+  large already fails validation closed (`auditFuelExhausted`).
+
 ## Running the Suite
 
 ```bash
