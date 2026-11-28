@@ -1591,6 +1591,67 @@ class InternalHygieneMixin:
                     f"{self.CLI}.\n\n{TRAILER}\n")
         self.assert_clean()
 
+    def test_invalid_utf8_to_valid_utf8_transition_scans_all_lines(self):
+        # At `base`, both blobs are skipped as invalid UTF-8. Making either
+        # valid UTF-8 (even by deleting a line with zero added lines, or by
+        # editing an unrelated line) brings its pre-existing lines into UTF-8
+        # text scope for `test_repo_hygiene.py`, so diff mode must catch them.
+        del_path = self.repo / self.ROOT / "assets" / "del_bad.txt"
+        edit_path = self.repo / self.ROOT / "assets" / "edit_head.txt"
+        del_path.parent.mkdir(parents=True, exist_ok=True)
+        del_path.write_bytes(b"\xff\n" + self.MOUNT.encode() + b"\n")
+        edit_path.write_bytes(b"\xff\n" + self.CLI.encode() + b"\n")
+        self.commit("Seed invalid UTF-8 blobs")
+        git(self.repo, "branch", "-f", "base")
+        del_path.write_bytes(self.MOUNT.encode() + b"\n")
+        edit_path.write_bytes(b"clean header\n" + self.CLI.encode() + b"\n")
+        self.commit()
+        expected = {
+            self.ref("assets/del_bad.txt", 1, "internal-mount"),
+            self.ref("assets/edit_head.txt", 2, "internal-cli"),
+        }
+        self.assertEqual(self.internal(), expected)
+        self.assertEqual(self.internal(base=None), expected)
+
+    def test_submodule_entries_and_typechange(self):
+        sub_sha = git(self.repo, "rev-parse", "HEAD").strip()
+        clean_sub = self.ROOT + "third_party/sub"
+        git(self.repo, "update-index", "--add", "--cacheinfo",
+            f"160000,{sub_sha},{clean_sub}")
+        git(self.repo, "commit", "-q", "-m", GOOD_MESSAGE)
+        self.assert_clean()
+        self.assert_clean(base=None)
+
+        # A gitlink at a banned path reports `internal-path` (exit 1) rather
+        # than crashing with `GitError` (exit 2) when `cat-file blob` runs.
+        git(self.repo, "branch", "-f", "base")
+        baton_sub = self.ROOT + "HANDOFF.md"
+        skill_sub = self.ROOT + "skills/adversarial-rounds/sub"
+        git(self.repo, "update-index", "--add", "--cacheinfo",
+            f"160000,{sub_sha},{baton_sub}")
+        git(self.repo, "update-index", "--add", "--cacheinfo",
+            f"160000,{sub_sha},{skill_sub}")
+        git(self.repo, "commit", "-q", "-m", GOOD_MESSAGE)
+        expected_paths = {
+            ("internal-path", baton_sub, None, None),
+            ("internal-path", skill_sub, None, None),
+        }
+        code, _ = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.internal(), expected_paths)
+        self.assertEqual(self.internal(base=None), expected_paths)
+
+        # Replacing a submodule (`160000`) with a regular file (`100644`)
+        # scans the new blob's lines.
+        git(self.repo, "rm", "-q", "--cached", baton_sub, skill_sub)
+        git(self.repo, "commit", "-q", "-m", GOOD_MESSAGE)
+        git(self.repo, "branch", "-f", "base")
+        git(self.repo, "rm", "-q", "--cached", clean_sub)
+        self.write(clean_sub, f"now a blob with {self.CLI}\n")
+        self.commit()
+        self.assertEqual(self.internal(), {
+            self.ref("third_party/sub", 1, "internal-cli")})
+
 
 class MonorepoInternalHygieneTests(InternalHygieneMixin, RepoTestCase):
     ROOT = "anneal/"
@@ -1692,6 +1753,47 @@ class InternalUnitTests(unittest.TestCase):
                              ("skills/other/x", solo)):
             self.assertIsNone(cph.internal_path_message(path, layout), path)
 
+    def test_every_banned_pattern_matches_and_respects_boundaries(self):
+        for (label, pat), lit in zip(cph.BANNED_CONTENT_PATTERNS,
+                                     cph._BANNED_LITERALS):
+            with self.subTest(label=label):
+                hits = cph.internal_reference_hits(f"prefix {lit} suffix\n")
+                self.assertIn((1, label), hits)
+                if pat.pattern.startswith(r"\b"):
+                    self.assertNotIn(
+                        (1, label),
+                        cph.internal_reference_hits(f"a{lit} suffix\n"))
+                if pat.pattern.endswith(r"\b"):
+                    self.assertNotIn(
+                        (1, label),
+                        cph.internal_reference_hits(f"prefix {lit}z\n"))
+
+    def test_git_blobs_rejects_malformed_batch_output(self):
+        oid = "a" * 40
+
+        class FakeGit(cph.Git):
+            def __init__(self, payload: bytes):
+                self.payload = payload
+
+            def run(self, *args: str, ok_codes: tuple[int, ...] = (0,),
+                    stdin: bytes | None = None) -> bytes:
+                return self.payload
+
+        self.assertEqual(FakeGit(b"").blobs([]), {})
+        self.assertEqual(FakeGit(f"{oid} blob 2\nhi\n".encode()).blobs([oid]),
+                         {oid: b"hi"})
+        bad_payloads = (
+            b"truncated-without-eol",
+            f"{oid} commit 2\nhi\n".encode(),
+            f"{oid} blob \u00b2\nhi\n".encode(),
+            f"{oid} blob 2\nhiX".encode(),
+            f"{oid} blob 2\nhi\nextra".encode(),
+        )
+        for payload in bad_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(cph.GitError):
+                    FakeGit(payload).blobs([oid])
+
 
 class RepoHygieneParityTests(unittest.TestCase):
     """`ci/test_repo_hygiene.py` enforces the same definitions as this script.
@@ -1731,6 +1833,7 @@ class RepoHygieneParityTests(unittest.TestCase):
         self.assertEqual(len(pats), 27)
         self.assertEqual(cph.BANNED_FILENAME_RE.pattern,
                          r"(^|/)(HANDOFF|PROGRESS|REPRODUCE[^/]*)\.md$")
+        self.assertEqual(cph.BANNED_FILENAME_RE.flags, re.UNICODE)
         self.assertEqual(cph.BANNED_INTERNAL_PREFIXES, (
             "skills/adversarial-rounds/", "skills/hierarchical-supervision/"))
         blob = "\n".join(f"{label}\t{pat.pattern}\t{pat.flags}"

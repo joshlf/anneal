@@ -42,8 +42,8 @@ tree at `--head`:
   case-insensitive internal-infrastructure references, with the definitions
   that `ci/test_repo_hygiene.py` imports. With `--base`, they cover changed
   paths, the added lines of changed files, and every line of files entering
-  Anneal scope; without it, every path and line in scope at `--head`.
-  Commit messages are not scanned.
+  Anneal scope or UTF-8 text scope; without it, every path and line in scope
+  at `--head`. Commit messages are not scanned.
 - `layout`: the candidate head changes the repository layout that the
   target base uses.
 
@@ -454,14 +454,25 @@ class Git:
             return None
         return data.decode("utf-8", "replace")
 
-    def tree_entries(self, commit: str) -> dict[str, tuple[str, str]]:
-        """Map each path in the tree at `commit` to its object type and ID."""
-        listing = self.run("ls-tree", "-r", "-z", "--full-tree", commit)
+    def tree_entries(
+        self, commit: str, paths: list[str] | None = None
+    ) -> dict[str, tuple[str, str]]:
+        """Map paths in the tree at `commit` to their object type and ID."""
+        if paths is not None and not paths:
+            return {}
+        extra = (
+            ("--", *paths) if paths is not None and len(paths) <= 256 else ()
+        )
+        keep = set(paths) if paths is not None and not extra else None
+        listing = self.run("ls-tree", "-r", "-z", "--full-tree", commit,
+                           *extra)
         out: dict[str, tuple[str, str]] = {}
         for entry in listing.decode("utf-8", "surrogateescape").split("\0"):
             if not entry:
                 continue
             meta, path = entry.split("\t", 1)
+            if keep is not None and path not in keep:
+                continue
             parts = meta.split()
             if len(parts) != 3:
                 raise GitError(f"malformed `git ls-tree` entry {entry[:80]!r}")
@@ -483,7 +494,7 @@ class Git:
                 raise GitError("truncated `git cat-file --batch` output")
             header = data[pos:eol].decode("utf-8", "replace").split()
             if (len(header) != 3 or header[0] != oid or header[1] != "blob"
-                    or not header[2].isdigit()):
+                    or not (header[2].isascii() and header[2].isdecimal())):
                 raise GitError(f"cannot read blob {oid}: {' '.join(header)}")
             start = eol + 1
             end = start + int(header[2])
@@ -491,6 +502,8 @@ class Git:
                 raise GitError("malformed `git cat-file --batch` output")
             out[oid] = data[start:end]
             pos = end + 1
+        if pos != len(data):
+            raise GitError("trailing bytes in `git cat-file --batch` output")
         return out
 
 
@@ -1705,49 +1718,99 @@ def internal_path_message(path: str, layout: Layout = MONOREPO) -> str | None:
     return None
 
 
+def _is_utf8(raw: bytes) -> bool:
+    try:
+        raw.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
 def internal_findings(
     git: Git, head: str, layout: Layout,
     files: dict[str, ChangedFile] | None = None,
+    base: str | None = None,
 ) -> list[Finding]:
     """`internal-path` and `internal-reference` findings at `head`.
 
     With `files` (diff mode), checks each non-deleted in-scope changed path,
-    every line of a file entering Anneal scope (added, or renamed from
-    outside it), and the added lines of other files, so untouched lines
-    never fail a change. Without `files` (tree mode), checks every in-scope
-    path and line. Like `ci/test_repo_hygiene.py`, content scanning skips
-    blobs that are not valid UTF-8, where short patterns would match binary
-    data by chance; a symbolic link is scanned as its target text.
+    every line of a file entering Anneal scope or UTF-8 blob scope (added,
+    copied, renamed from outside scope, changed from a non-blob, or changed
+    from invalid UTF-8 at `base` to valid UTF-8 at `head`), and the added
+    lines of other files, so untouched already-scanned lines never fail a
+    change. Without `files` (tree mode), checks every in-scope path and line.
+    Like `ci/test_repo_hygiene.py`, content scanning skips blobs that are not
+    valid UTF-8, where short patterns would match binary data by chance; a
+    symbolic link is scanned as its target text.
     """
-    entries = git.tree_entries(head)
-    # Each path to check, with the lines to scan (`None` for all).
-    todo: list[tuple[str, set[int] | None]] = []
-    if files is None:
-        todo = [(p, None) for p in sorted(entries) if layout.in_scope(p)]
-    else:
-        for f in sorted(files.values(), key=lambda f: f.path):
-            if f.status == "D" or not layout.in_scope(f.path):
-                continue
-            entered = f.status == "A" or (
-                f.old_path is not None and not layout.in_scope(f.old_path))
-            todo.append((f.path, None if entered else f.added))
     out: list[Finding] = []
-    scan: list[tuple[str, str, set[int] | None]] = []
-    for path, lines in todo:
-        msg = internal_path_message(path, layout)
-        if msg is not None:
-            out.append(Finding("internal-path", msg, path))
-        entry = entries.get(path)
-        if entry is None:
-            raise GitError(f"cannot find {head[:12]}:{path}")
-        # Submodule entries have no content here.
-        if entry[0] == "blob" and lines != set():
-            scan.append((path, entry[1], lines))
-    blobs = git.blobs([oid for _, oid, _ in scan])
-    for path, oid, lines in scan:
+    scan: list[tuple[str, str, str | None, set[int] | None]] = []
+    if files is None:
+        entries = git.tree_entries(head)
+        for path in sorted(entries):
+            if not layout.in_scope(path):
+                continue
+            msg = internal_path_message(path, layout)
+            if msg is not None:
+                out.append(Finding("internal-path", msg, path))
+            kind, oid = entries[path]
+            if kind == "blob":
+                scan.append((path, oid, None, None))
+    else:
+        changed = [
+            f for f in sorted(files.values(), key=lambda f: f.path)
+            if f.status != "D" and layout.in_scope(f.path)
+        ]
+        if not changed:
+            return []
+        entries = git.tree_entries(head, [f.path for f in changed])
+        prev_lookup: list[str] = []
+        for f in changed:
+            entered = f.status in ("A", "C") or (
+                f.old_path is not None and not layout.in_scope(f.old_path))
+            if not entered and base is not None:
+                prev_lookup.append(f.old_path or f.path)
+        base_entries = (
+            git.tree_entries(base, prev_lookup) if prev_lookup else {}
+        )
+        for f in changed:
+            msg = internal_path_message(f.path, layout)
+            if msg is not None:
+                out.append(Finding("internal-path", msg, f.path))
+            entry = entries.get(f.path)
+            if entry is None:
+                raise GitError(f"cannot find {head[:12]}:{f.path}")
+            # Submodule entries (`commit`) have no blob content here.
+            if entry[0] != "blob":
+                continue
+            oid = entry[1]
+            entered = f.status in ("A", "C") or (
+                f.old_path is not None and not layout.in_scope(f.old_path))
+            if entered:
+                scan.append((f.path, oid, None, None))
+                continue
+            if base is not None:
+                prev = base_entries.get(f.old_path or f.path)
+                if prev is None or prev[0] != "blob":
+                    scan.append((f.path, oid, None, None))
+                    continue
+                if prev[1] != oid:
+                    scan.append((f.path, oid, prev[1], f.added))
+                    continue
+            if f.added:
+                scan.append((f.path, oid, None, f.added))
+    need_oids = [oid for _, oid, _, _ in scan] + [
+        prev_oid for _, _, prev_oid, _ in scan if prev_oid is not None
+    ]
+    blobs = git.blobs(need_oids)
+    for path, oid, prev_oid, lines in scan:
         try:
             text = blobs[oid].decode("utf-8")
         except UnicodeDecodeError:
+            continue
+        if prev_oid is not None and not _is_utf8(blobs[prev_oid]):
+            lines = None
+        if lines == set():
             continue
         for lineno, label in internal_reference_hits(text, lines):
             out.append(Finding(
@@ -1895,7 +1958,8 @@ def check(
         report.findings += commit_message_findings(c.sha, c.message)
 
     files = changed_files(git, merge_base, head)
-    report.findings += internal_findings(git, head, layout, files)
+    report.findings += internal_findings(
+        git, head, layout, files, merge_base)
     scoped = [f for f in files.values() if in_anneal_scope(f.path, layout)]
     citation_prefixes = layout.trusted_citation_prefixes
     check_paths = [f.path for f in scoped if f.status != "D"]
@@ -1938,6 +2002,9 @@ def check(
             continue
         content = git.blob_text(head, f.path)
         if content is None:
+            if (git.tree_entries(head, [f.path]).get(f.path, ("",))[0]
+                    == "commit"):
+                continue
             raise GitError(f"cannot read {head[:12]}:{f.path}")
         if entered_scope and needs_header(f.path, layout):
             report.findings += header_findings(f.path, content, max_year)

@@ -8,10 +8,12 @@
 
 """Repository hygiene checks for public distribution boundaries."""
 
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -37,11 +39,30 @@ _BANNED_CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 def _tracked_files() -> list[str]:
+    # `-z` avoids Git's C-quoting of paths with quotes or non-ASCII bytes.
     out = subprocess.check_output(
-        ["git", "-C", str(REPO_ROOT), "ls-files"],
-        text=True,
+        ["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
     )
-    return [line for line in out.splitlines() if line]
+    return [
+        rel for rel in out.decode("utf-8", "surrogateescape").split("\0") if rel
+    ]
+
+
+def _tracked_utf8_text(path: Path) -> str | None:
+    """Read raw UTF-8 file or symlink-target bytes without newline changes."""
+    try:
+        if path.is_symlink():
+            raw = os.fsencode(os.readlink(path))
+        elif path.is_file():
+            raw = path.read_bytes()
+        else:
+            return None
+    except OSError:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 class RepoHygieneTests(unittest.TestCase):
@@ -59,6 +80,31 @@ class RepoHygieneTests(unittest.TestCase):
             cph.internal_reference_hits("let (ty, checkPtrL, r) := x\n"),
             [],
         )
+
+    def test_symlink_and_cr_reading_matches_pr_hygiene(self) -> None:
+        cli = "cp" + "L"
+        mnt = "/x" + "20/missing"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cr_file = root / "cr.txt"
+            cr_file.write_bytes(f"first\rsecond\n{cli}\n".encode())
+            cr_text = _tracked_utf8_text(cr_file)
+            self.assertIsNotNone(cr_text)
+            self.assertEqual(
+                cph.internal_reference_hits(cr_text or ""),
+                [(2, "internal-cli")],
+            )
+            broken = root / "dangling"
+            os.symlink(mnt, broken)
+            link_text = _tracked_utf8_text(broken)
+            self.assertEqual(link_text, mnt)
+            self.assertEqual(
+                cph.internal_reference_hits(link_text or ""),
+                [(1, "internal-mount")],
+            )
+            bad = root / "bad.bin"
+            bad.write_bytes(b"\xff\xfe" + cli.encode())
+            self.assertIsNone(_tracked_utf8_text(bad))
 
     def test_no_ephemeral_batons_or_internal_skills(self) -> None:
         bad_paths: list[str] = []
@@ -78,12 +124,8 @@ class RepoHygieneTests(unittest.TestCase):
         for rel in _tracked_files():
             if rel.startswith(_EXCLUDED_PREFIXES):
                 continue
-            path = REPO_ROOT / rel
-            if not path.is_file():
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
+            text = _tracked_utf8_text(REPO_ROOT / rel)
+            if text is None:
                 continue
             for line_no, label in cph.internal_reference_hits(text):
                 violations.append(f"{rel}:{line_no} [{label}]")
