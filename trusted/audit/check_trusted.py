@@ -759,38 +759,45 @@ def _validate_layer_chain(module: str, chain, phase: str, disjoint=()) -> list[t
                 size = os.fstat(f.fileno()).st_size
                 if size < 96 or size > _OLEAN_MAX_BYTES:
                     raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: {p} size {size} outside [96, 256 MiB]")
-                hdr = f.read(96)
-                if len(hdr) != 96 or hdr[:5] != _OLEAN_MAGIC or hdr[5] != 2 or (hdr[6] & ~1) != 0:
-                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid header magic/version/flags in {p}")
-                if hdr[7:40] != _OLEAN_LEAN_VER or hdr[40:80] != _OLEAN_GITHASH:
-                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: unpinned Lean version/githash in {p}")
-                base_addr, root_ptr = struct.unpack_from("<QQ", hdr, 80)
-                if base_addr == 0 or (base_addr & 7) != 0 or base_addr + size >= (1 << 64):
-                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid/overflowing baseAddr in {p}")
-                if any(not (base_addr + size <= pb or pb + ps <= base_addr) for pb, ps, *_ in (*parents, *disjoint)):
-                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: overlapping compacted-region layer in {p}")
-                kids: tuple[int, ...] = ()
-                if base_addr + 96 <= root_ptr <= base_addr + size - 8:
-                    off = root_ptr - base_addr
-                    f.seek(off)
-                    obj = f.read(48)
-                    # Pinned roots are `ModuleData`-shaped: tag 0, 5 object fields, 56 bytes.
-                    if (root_ptr & 7) != 0 or len(obj) != 48 or struct.unpack_from("<iHBB", obj) != (0, 56, 5, 0) or off + 56 > size:
-                        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root object header in {p}")
-                    kids = struct.unpack_from("<5Q", obj, 8)
-                    for k, child in enumerate(kids):
-                        if (child & 7) == 0 and base_addr + 96 <= child and child + 24 <= base_addr + size:
-                            f.seek(child - base_addr)
-                            crc, _, _, ctag, asz, cap = struct.unpack("<iHBBQQ", f.read(24))
-                            if crc != 0 or ctag != 246 or asz > cap or child - base_addr + 24 + 8 * cap > size:
-                                raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root child array header in {p}")
-                        elif not any(len(pk) == 5 and pk[k] == child for *_, pk in parents):
-                            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: out-of-bounds root child ptr in {p}")
-                elif not parents or size != 96 or not any(root_ptr == pr for _, _, pr, _ in parents):
-                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid out-of-region rootPtr in {p}")
-                parents.append((base_addr, size, root_ptr, kids))
+                data = f.read()
         except OSError as error:
             raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: cannot read {p}: {error}") from error
+        if len(data) != size or data[:5] != _OLEAN_MAGIC or data[5] != 2 or (data[6] & ~1) != 0:
+            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid header magic/version/flags in {p}")
+        if data[7:40] != _OLEAN_LEAN_VER or data[40:80] != _OLEAN_GITHASH:
+            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: unpinned Lean version/githash in {p}")
+        base_addr, root_ptr = struct.unpack_from("<QQ", data, 80)
+        if base_addr == 0 or (base_addr & 7) != 0 or base_addr + size >= (1 << 64):
+            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid/overflowing baseAddr in {p}")
+        if any(not (base_addr + size <= pb or pb + ps <= base_addr) for pb, ps, *_ in (*parents, *disjoint)):
+            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: overlapping compacted-region layer in {p}")
+        kids: tuple[int, ...] = ()
+        if base_addr + 96 <= root_ptr <= base_addr + size - 8:
+            off = root_ptr - base_addr
+            # Pinned roots are `ModuleData`-shaped: tag 0, 5 object fields, 56 bytes.
+            if (root_ptr & 7) != 0 or off + 56 > size or struct.unpack_from("<iHBB", data, off) != (0, 56, 5, 0):
+                raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root object header in {p}")
+            kids = struct.unpack_from("<5Q", data, off + 8)
+            for k, child in enumerate(kids):
+                if (child & 7) == 0 and base_addr + 96 <= child and child + 24 <= base_addr + size:
+                    co = child - base_addr
+                    crc, _, _, ctag, asz, cap = struct.unpack_from("<iHBBQQ", data, co)
+                    if crc != 0 or ctag != 246 or asz > cap or co + 24 + 8 * cap > size:
+                        raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root child array header in {p}")
+                    for e in struct.unpack_from(f"<{asz}Q", data, co + 24):
+                        if e & 1:
+                            continue
+                        if (e & 7) == 0 and base_addr + 96 <= e <= base_addr + size - 8:
+                            eo = e - base_addr
+                            if struct.unpack_from("<i", data, eo)[0] != 0 or data[eo + 7] > 249:
+                                raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid root array element header in {p}")
+                        elif not ((e & 7) == 0 and any(pb + 96 <= e <= pb + ps - 8 for pb, ps, *_ in parents)):
+                            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: out-of-bounds root array element ptr in {p}")
+                elif not any(len(pk) == 5 and pk[k] == child for *_, pk in parents):
+                    raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: out-of-bounds root child ptr in {p}")
+        elif not parents or size != 96 or not any(root_ptr == pr for _, _, pr, _ in parents):
+            raise Failure(1, phase, f"[oleanBinaryInvalid] {module}: invalid out-of-region rootPtr in {p}")
+        parents.append((base_addr, size, root_ptr, kids))
     return parents
 
 

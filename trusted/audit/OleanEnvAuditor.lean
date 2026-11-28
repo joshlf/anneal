@@ -369,9 +369,7 @@ def oleanGitBytes : ByteArray := "5045d0056413266e57c625dcd7c365b10e377c52".toUT
 /-- One validated compacted-region layer: `baseAddr`, byte size, `rootPtr`, root child pointers. -/
 abbrev OleanLayer := Nat × Nat × Nat × Array Nat
 
-/-- Pre-`importModules` binary validation of one `.olean*` or `.ir*` layer (`leanprover/lean4#16737`).
-Every pinned 4.34.1 root is a `ModuleData`-shaped ctor (tag 0, 5 object fields, 56 bytes) whose fields
-are own-region `Array`s (tag 246, elements in bounds) or the same-slot field of a parent layer. -/
+/-- Pre-`importModules` binary `.olean*`/`.ir*` validation (`leanprover/lean4#16737`). -/
 def validateOleanBytes (b : ByteArray) (parents disjoint : Array OleanLayer) : Except String OleanLayer := do
   let sz := b.size
   unless sz >= 96 do throw s!"file smaller than 96-byte header ({sz})"
@@ -394,9 +392,17 @@ def validateOleanBytes (b : ByteArray) (parents disjoint : Array OleanLayer) : E
     for k in [0:5] do
       let c := readU64LE b (off + 8 + 8 * k)
       if c % 8 == 0 && baseAddr + 96 <= c && c + 24 <= baseAddr + sz then
-        let co := c - baseAddr; let cap := readU64LE b (co + 16)
-        unless readU32LE b co == 0 && (b.get! (co + 7)).toNat == 246 && readU64LE b (co + 8) <= cap && co + 24 + 8 * cap <= sz do
+        let co := c - baseAddr; let (asz, cap) := (readU64LE b (co + 8), readU64LE b (co + 16))
+        unless readU32LE b co == 0 && (b.get! (co + 7)).toNat == 246 && asz <= cap && co + 24 + 8 * cap <= sz do
           throw s!"invalid root child array header at slot {k}"
+        for j in [0:asz] do
+          let e := readU64LE b (co + 24 + 8 * j)
+          if e % 2 == 1 then continue
+          if e % 8 == 0 && baseAddr + 96 <= e && e <= baseAddr + sz - 8 then
+            let eo := e - baseAddr
+            unless readU32LE b eo == 0 && (b.get! (eo + 7)).toNat <= 249 do throw s!"invalid root array element header at slot {k}[{j}]"
+          else unless e % 8 == 0 && parents.any fun (pb, ps, _, _) => pb + 96 <= e && e <= pb + ps - 8 do
+            throw s!"out-of-bounds root array element pointer at slot {k}[{j}]"
       else unless parents.any fun (_, _, _, pk) => pk[k]? == some c do throw s!"out-of-bounds root child pointer at slot {k}"
       kids := kids.push c
     return (baseAddr, sz, rootPtr, kids)
@@ -505,38 +511,37 @@ def sysrootParts (libDir : System.FilePath) (m : Name) : IO (Array System.FilePa
   return (olean, ir)
 
 def checkNoToolchainShadow (m : Name) (artRoot : System.FilePath) : AuditM Unit := do
+  let symType (p : System.FilePath) : IO (Option IO.FS.FileType) := do try pure (some (← p.symlinkMetadata).type) catch _ => pure none
   for r in #["Init", "Std", "Lean"] do
     for ext in partNames do
       let f := artRoot / (r ++ "." ++ ext)
       if ← entryExistsOnDisk f then report "moduleProvenanceSpoofed" m m s!"artifact root shadows toolchain file {f}"
     let sub := artRoot / r
-    if let some md ← (show IO (Option IO.FS.Metadata) from do try pure (some (← sub.symlinkMetadata)) catch _ => pure none) then
-      if md.type == .symlink then report "moduleProvenanceSpoofed" m m s!"artifact root has symlinked toolchain dir {sub}"
-      else if md.type == .dir then
-        let mut pending : List System.FilePath := [sub]; let mut done := false
-        for _ in [0:4096] do
-          match pending with
-          | [] => done := true; break
-          | d :: rest =>
-            pending := rest
-            for e in ← (show IO (Array IO.FS.DirEntry) from do try d.readDir catch _ => pure #[]) do
-              if let some emd ← (show IO (Option IO.FS.Metadata) from do try pure (some (← e.path.symlinkMetadata)) catch _ => pure none) then
-                if emd.type == .symlink then report "moduleProvenanceSpoofed" m m s!"symlink under shadowed toolchain dir {e.path}"
-                else if emd.type == .dir then pending := e.path :: pending
-                else if partNames.any (fun ext => e.fileName.endsWith ("." ++ ext)) then
-                  report "moduleProvenanceSpoofed" m m s!"artifact root shadows toolchain artifact {e.path}"
-        unless done do report "auditFuelExhausted" m m s!"shadow scan under {sub} exhausted its fuel"
+    match ← symType sub with
+    | some .symlink => report "moduleProvenanceSpoofed" m m s!"artifact root has symlinked toolchain dir {sub}"
+    | some .dir =>
+      let mut pending : List System.FilePath := [sub]; let mut done := false
+      for _ in [0:4096] do
+        match pending with
+        | [] => done := true; break
+        | d :: rest =>
+          pending := rest
+          for e in ← (show IO (Array IO.FS.DirEntry) from do try d.readDir catch _ => pure #[]) do
+            match ← symType e.path with
+            | some .symlink => report "moduleProvenanceSpoofed" m m s!"symlink under shadowed toolchain dir {e.path}"
+            | some .dir => pending := e.path :: pending
+            | some _ => if partNames.any (fun ext => e.fileName.endsWith ("." ++ ext)) then report "moduleProvenanceSpoofed" m m s!"artifact root shadows toolchain artifact {e.path}"
+            | none => pure ()
+      unless done do report "auditFuelExhausted" m m s!"shadow scan under {sub} exhausted its fuel"
+    | _ => pure ()
 
-/-- Artifact checks that need no loaded environment and therefore run before `importModules`
-reads a single byte: shape, canonical names, canonical paths, binary `.olean*` bounds, shadowing &
-`approvedBuildRoots` containment, byte-for-byte pinned-sysroot identity for staged foundation
-modules, and omitted companion parts. -/
+/-- Pre-`importModules` artifact checks (shape, canonical paths, binary bounds, shadowing, foundation). -/
 def preloadArtifactChecks (req : Request) (sysMods : Array Name) : AuditM Nat := do
   let libDir := req.sysroot / "lib" / "lean"
   for br in req.approvedBuildRoots do
-    let isSym ← (show IO Bool from do try pure ((← br.symlinkMetadata).type == .symlink) catch _ => pure true)
-    if isSym || (← realPathOrEmpty br) != br then
-      report "moduleProvenanceSpoofed" .anonymous .anonymous s!"approvedBuildRoots entry {br} is non-canonical or symlink"
+    let notDir ← (show IO Bool from do try pure ((← br.symlinkMetadata).type != .dir) catch _ => pure true)
+    if notDir || (← realPathOrEmpty br) != br then
+      report "moduleProvenanceSpoofed" .anonymous .anonymous s!"approvedBuildRoots entry {br} is not a canonical directory"
   let mut checked := 0; let mut seen : NameSet := {}; let mut checkedRoots : Std.HashSet String := {}
   for (m, olean, ir) in req.artifacts do
     if seen.contains m then report "moduleProvenanceSpoofed" m m "duplicate artifact entry"; continue
@@ -1823,26 +1828,25 @@ def checkPrivateName (L : Loaded) (toolchainNames : Std.HashSet Name) (m n : Nam
     | head :: tails =>
       if !tails.isEmpty && !head.isEmpty then
         let mut ok := true
+        let hName := partsToName head
         if hasPrivateMention head then
           match parseStrictPrivate head with
           | some (hMod, hUser) =>
-            let hName := partsToName head
-            let hOk := L.modIdx.contains hMod && !isShareCommonName env hName &&
-              (L.toolchainProv.contains hMod || !privateUserForbidden hMod hUser toolchainNames) &&
-              irAuxBaseOwned env hName hMod true
-            if !hOk then ok := false
+            if !(L.modIdx.contains hMod && !isShareCommonName env hName && (L.toolchainProv.contains hMod || !privateUserForbidden hMod hUser toolchainNames) && irAuxBaseOwned env hName hMod true) then ok := false
           | none => ok := false
+        else if !(head.all Sum.isLeft && !isShareCommonName env hName && ((env.find? hName).isSome || (IR.findEnvDecl env hName).isSome)) then ok := false
         let lastIdx := tails.length - 1; let mut totalSpecs := 0
         for h : idx in [0:tails.length] do
           match stripSpecTail? tails[idx] with
           | none => ok := false
           | some (site, sp) =>
-            totalSpecs := totalSpecs + sp
-            if idx == lastIdx && sp == 0 then ok := false
+            totalSpecs := totalSpecs + sp; if idx == lastIdx && sp == 0 then ok := false
+            let sName := partsToName site
             if hasPrivateMention site then
               match parseStrictPrivate site with
-              | some (sMod, sUser) => if !L.modIdx.contains sMod || privateUserForbidden sMod sUser toolchainNames || (idx == lastIdx && sMod != m) then ok := false
+              | some (sMod, sUser) => if !L.modIdx.contains sMod || privateUserForbidden sMod sUser toolchainNames || (idx == lastIdx && sMod != m) || !irAuxBaseOwned env sName sMod true then ok := false
               | none => ok := false
+            else if !(site.all Sum.isLeft && !isShareCommonName env sName && ((env.find? sName).isSome || (IR.findEnvDecl env sName).isSome || irAuxBaseOwned env sName m true) && (idx != lastIdx || irAuxBaseOwned env sName m true || !privateUserForbidden m sName toolchainNames)) then ok := false
         if ok && totalSpecs == tails.length then return
     | _ => pure ()
     report "privateNamespaceSpoofed" n m "malformed or spoofed _private _at_ specialization name"; return
@@ -2026,12 +2030,15 @@ def scanModuleEntries (L : Loaded) (toolchainNames : Std.HashSet Name) :
         report "compilerOverrideAttribute" n m "macro_inline: non-toolchain @[macro_inline] outside verified I.ctorIdx shape"
     for entry in Compiler.LCNF.postponedCompileDeclsExt.getModuleEntries env i ++ Compiler.LCNF.postponedCompileDeclsExt.getModuleIREntries env i do
       for n in entry.declNames do checkExtTarget m n; report "environmentLoadFailed" n m "compilation postponed (separate compilation without IR)"
-    for (lbl, ns) in #[("casesOn_tag", auxRecExt.getModuleEntries env i ++ auxRecExt.getModuleIREntries env i),
-        ("sparse_casesOn_tag", sparseCasesOnExt.getModuleEntries env i ++ sparseCasesOnExt.getModuleIREntries env i),
-        ("noConfusion_tag", (noConfusionExt.getModuleEntries env i ++ noConfusionExt.getModuleIREntries env i).map Prod.fst)] do
-      for n in ns do
-        checkExtTarget m n
-        unless origin? env n == some m do report "compilerOverrideAttribute" n m s!"{lbl}: tag on a foreign declaration"
+    let sameNoConf : Option NoConfusionInfo → NoConfusionInfo → Bool
+      | some (.regular a b c), .regular a' b' c' => a == a' && b == b' && c == c'
+      | some (.perCtor a b), .perCtor a' b' => a == a' && b == b' | _, _ => false
+    for (lbl, ns) in #[("casesOn_tag", auxRecExt.getModuleEntries env i), ("sparse_casesOn_tag", sparseCasesOnExt.getModuleEntries env i),
+        ("noConfusion_tag", (noConfusionExt.getModuleEntries env i).map Prod.fst)] do
+      for n in ns do checkExtTarget m n; unless origin? env n == some m do report "compilerOverrideAttribute" n m s!"{lbl}: tag on a foreign declaration"
+    for n in auxRecExt.getModuleIREntries env i do checkExtTarget m n; unless origin? env n == some m && isAuxRecursor env n do report "compilerOverrideAttribute" n m "casesOn_tag: IR-only or foreign entry"
+    for n in sparseCasesOnExt.getModuleIREntries env i do checkExtTarget m n; unless origin? env n == some m && isSparseCasesOn env n do report "compilerOverrideAttribute" n m "sparse_casesOn_tag: IR-only or foreign entry"
+    for (n, info) in noConfusionExt.getModuleIREntries env i do checkExtTarget m n; unless origin? env n == some m && sameNoConf (noConfusionExt.find? env n) info do report "compilerOverrideAttribute" n m "noConfusion_tag: IR-only or mismatched entry"
     let modData := env.header.moduleData[i]!
     let modKernelNames : NameSet := modData.constNames.foldl (·.insert ·) {}
     let modExtraNames : NameSet := modData.extraConstNames.foldl (·.insert ·) {}
@@ -2055,7 +2062,7 @@ def scanModuleEntries (L : Loaded) (toolchainNames : Std.HashSet Name) :
       match (stripLeadingLams e.key 256).1.getAppFn with
       | .const kfn _ =>
         let dnStr := dn.toString
-        unless dnStr.startsWith (kfn.toString ++ "._at_.") && (dnStr.splitOn ".spec_").length > 1 do
+        unless ((env.find? kfn).isSome || (IR.findEnvDecl env kfn).isSome) && dnStr.startsWith (kfn.toString ++ "._at_.") && (dnStr.splitOn ".spec_").length > 1 do
           report "compilerOverrideAttribute" dn m s!"specialize_cache: target {dn} does not match specialization key head {kfn}"
       | _ => report "compilerOverrideAttribute" dn m "specialize_cache: malformed specialization key"
     for e in Compiler.LCNF.Specialize.specCacheExt.getModuleEntries env i ++ Compiler.LCNF.Specialize.specCacheExt.getModuleIREntries env i do
@@ -2063,38 +2070,30 @@ def scanModuleEntries (L : Loaded) (toolchainNames : Std.HashSet Name) :
   let csimpStack := Compiler.CSimp.ext.ext.getState env
   for frame in csimpStack.stateStack do
     for (k, ent) in frame.state.map.toList do
-      unless k == ent.fromDeclName && toolchainCSimp.contains (k, ent.toDeclName, ent.thmName) do
-        report "compilerOverrideAttribute" k .anonymous "csimp: live csimp entry is not a toolchain triple"
+      unless k == ent.fromDeclName && toolchainCSimp.contains (k, ent.toDeclName, ent.thmName) do report "compilerOverrideAttribute" k .anonymous "csimp: live csimp entry is not a toolchain triple"
   for e in csimpStack.newEntries do
     let ent := match e with | .global a => a | .scoped _ a => a
-    unless toolchainCSimp.contains (ent.fromDeclName, ent.toDeclName, ent.thmName) do
-      report "compilerOverrideAttribute" ent.fromDeclName .anonymous "csimp: live newEntries entry is not a toolchain triple"
+    unless toolchainCSimp.contains (ent.fromDeclName, ent.toDeclName, ent.thmName) do report "compilerOverrideAttribute" ent.fromDeclName .anonymous "csimp: live newEntries entry is not a toolchain triple"
   for (_, entries) in csimpStack.scopedEntries.map.toList do
     for ent in entries.toArray do
-      unless toolchainCSimp.contains (ent.fromDeclName, ent.toDeclName, ent.thmName) do
-        report "compilerOverrideAttribute" ent.fromDeclName .anonymous "csimp: live scopedEntries entry is not a toolchain triple"
+      unless toolchainCSimp.contains (ent.fromDeclName, ent.toDeclName, ent.thmName) do report "compilerOverrideAttribute" ent.fromDeclName .anonymous "csimp: live scopedEntries entry is not a toolchain triple"
   let (livePasses, livePM) := Compiler.LCNF.passManagerExt.getState env
   unless livePasses.isEmpty do report "compilerOverrideAttribute" `cpass .anonymous "cpass: live compiler pass registration"
-  unless passManagerFingerprint livePM == passManagerFingerprint Compiler.LCNF.builtinPassManager do
-    report "compilerOverrideAttribute" `compiler_pipeline .anonymous "compiler_pipeline: live PassManager differs from builtinPassManager"
+  unless passManagerFingerprint livePM == passManagerFingerprint Compiler.LCNF.builtinPassManager do report "compilerOverrideAttribute" `compiler_pipeline .anonymous "compiler_pipeline: live PassManager differs from builtinPassManager"
   let (liveFolders, liveFolderMap) := Compiler.LCNF.Simp.ConstantFold.folderExt.getState env
   unless liveFolders.isEmpty do report "compilerOverrideAttribute" `constant_fold .anonymous "constant_fold: live folder registration"
   let mut liveFolderKeys : NameSet := {}
   for (k, _) in liveFolderMap.toList do
     liveFolderKeys := liveFolderKeys.insert k
     unless builtinFolderKeySet.contains k do report "compilerOverrideAttribute" k .anonymous "constant_fold: live folder key not in builtinFolders"
-  unless liveFolderKeys.size == builtinFolderKeySet.size do
-    report "compilerOverrideAttribute" `constant_fold .anonymous "constant_fold: live folder table differs from builtinFolders"
-  for (_, dn) in (Compiler.LCNF.Specialize.specCacheExt.getState env).toList do
-    report "compilerOverrideAttribute" dn .anonymous "specialize_cache: live specialization cache entry"
-  for (lbl, st) in #[("tagged_return", Compiler.LCNF.taggedReturnAttr.ext.getState env),
-      ("unbox", IR.UnboxResult.unboxAttr.ext.getState env), ("never_extract", neverExtractAttr.ext.getState env)] do
+  unless liveFolderKeys.size == builtinFolderKeySet.size do report "compilerOverrideAttribute" `constant_fold .anonymous "constant_fold: live folder table differs from builtinFolders"
+  for (_, dn) in (Compiler.LCNF.Specialize.specCacheExt.getState env).toList do report "compilerOverrideAttribute" dn .anonymous "specialize_cache: live specialization cache entry"
+  for (lbl, st) in #[("tagged_return", Compiler.LCNF.taggedReturnAttr.ext.getState env), ("unbox", IR.UnboxResult.unboxAttr.ext.getState env), ("never_extract", neverExtractAttr.ext.getState env)] do
     for n in st do report "compilerOverrideAttribute" n .anonymous s!"{lbl}: live {lbl} entry"
   for (n, kind) in (Compiler.inlineAttrs.ext.getState env).toList do
     if kind == .macroInline then
       let om := (origin? env n).getD .anonymous
-      unless L.toolchainProv.contains om || genuineCtorIdxMacroInline env L.toolchainProv om n do
-        report "compilerOverrideAttribute" n om "macro_inline: live @[macro_inline] outside verified I.ctorIdx shape"
+      unless L.toolchainProv.contains om || genuineCtorIdxMacroInline env L.toolchainProv om n do report "compilerOverrideAttribute" n om "macro_inline: live @[macro_inline] outside verified I.ctorIdx shape"
   return (toolchainCSimp, toolchainImplByTargets)
 
 /-- Value-preserving, total, fuel-bounded lattice operations for validating
@@ -2290,13 +2289,15 @@ def collectLCNFCodeConsts (code : Compiler.LCNF.Code .pure) (acc : NameSet) (fue
     | .let ld k =>
       let acc := match ld.value with
         | .const c _ _ => acc.insert c
+        | .proj tn _ _ => acc.insert tn
         | _ => acc
       collectLCNFCodeConsts k acc fuel
     | .fun fd k | .jp fd k => do
       let acc ← collectLCNFCodeConsts fd.value acc fuel
       collectLCNFCodeConsts k acc fuel
     | .cases cs =>
-      cs.alts.foldlM (init := acc) fun a alt =>
+      cs.alts.foldlM (init := acc.insert cs.typeName) fun a alt =>
+        let a := match alt with | .alt cn _ _ => a.insert cn | .default _ => a
         collectLCNFCodeConsts alt.getCode a fuel
     | .jmp .. | .return .. | .unreach .. => some acc
 
@@ -3183,7 +3184,19 @@ public def auditDeclsForSpec (env : Environment) (ctx : SpecAuditCtx) (roots : A
         for d in declEdges ci do
           unless visited.contains d do visited := visited.insert d; pending := d :: pending
     unless done do addV "auditFuelExhausted" (roots.getD 0 .anonymous) .anonymous "spec-strength dependency closure exhausted its fuel"
-    -- Vector 2 sweep: declaring modules of `roots` + live `env.constants.map₂` for unreferenced axioms.
+    -- Vector 2 sweep: transitively imported non-toolchain modules of `roots` + live `env.constants.map₂`.
+    let mut mIdx : Std.HashMap Name Nat := {}
+    for h : i in [0:env.header.modules.size] do mIdx := mIdx.insert env.header.modules[i].module i
+    let mut impPending := rootMods.toList
+    for _ in [0:env.header.modules.size + 1] do
+      match impPending with
+      | [] => break
+      | rm :: rest =>
+        impPending := rest
+        if let some ri := mIdx[rm]? then
+          for imp in env.header.moduleData[ri]!.imports do
+            if !ctx.toolchainProv.contains imp.module && !rootMods.contains imp.module then
+              rootMods := rootMods.insert imp.module; impPending := imp.module :: impPending
     for h : i in [0:env.header.modules.size] do
       let m := env.header.modules[i].module
       if rootMods.contains m then
@@ -3804,30 +3817,22 @@ def failWithViolations (req : Request) (violations : Array Violation) : IO α :=
   let tagSummary := ",".intercalate ((tags.toArray.qsort (fun a b => a.1 < b.1)).toList.map fun (t, c) => s!"{t}={c}")
   fail s!"olean-audit rejected ({violations.size} violation(s); {tagSummary}): {"; ".intercalate shown}{more}"
 
-/-- Non-blocking `leanprover/lean4#14896` readiness check: does `e` place a theorem constant in a
-δ-reducible recursor/quotient major-premise or `.proj` scrutinee position? Total, fuel-bounded. -/
+/-- Non-blocking `leanprover/lean4#14896` readiness check (theorem in major-premise/`.proj` scrutinee). -/
 def exprUsesOpaqueTheorem (env : Environment) (e : Expr) (fuel : Nat := 100000) : Bool := Id.run do
-  let headIsThm (x : Expr) : Bool :=
-    match x.getAppFn with | .const c _ => (env.find? c matches some (.thmInfo _)) | _ => false
-  let mut seen : Std.HashSet Expr := {}; let mut stack : List Expr := [e]
+  let headIsThm (x : Expr) := match x.getAppFn with | .const c _ => (env.find? c matches some (.thmInfo _)) | _ => false
+  let mut (seen, stack) : Std.HashSet Expr × List Expr := ({}, [e])
   for _ in [0:fuel] do
     match stack with
     | [] => return false
     | x :: rest =>
-      stack := rest
-      if seen.contains x then continue
-      seen := seen.insert x
+      stack := rest; if seen.contains x then continue; seen := seen.insert x
       match x with
       | .proj _ _ s => if headIsThm s then return true else stack := s :: stack
       | .app f a =>
         if let .const c _ := x.getAppFn then
           let args := x.getAppArgs
-          match env.find? c with
-          | some (.recInfo rv) => if h : rv.getMajorIdx < args.size then if headIsThm args[rv.getMajorIdx] then return true
-          | some (.quotInfo qv) =>
-            let mi := match qv.kind with | .lift => 5 | .ind => 4 | _ => args.size
-            if h : mi < args.size then if headIsThm args[mi] then return true
-          | _ => pure ()
+          let mi := match env.find? c with | some (.recInfo rv) => rv.getMajorIdx | some (.quotInfo qv) => (match qv.kind with | .lift => 5 | .ind => 4 | _ => args.size) | _ => args.size
+          if h : mi < args.size then if headIsThm args[mi] then return true
         stack := f :: a :: stack
       | .lam _ t b _ | .forallE _ t b _ => stack := t :: b :: stack
       | .letE _ t v b _ => stack := t :: v :: b :: stack
