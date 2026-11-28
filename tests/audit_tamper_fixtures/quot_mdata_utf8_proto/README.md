@@ -33,6 +33,26 @@ mutators, and live BEFORE/AFTER reproduction tests for:
   status of `unfold_eq` alongside `[]` and `[propext]` theorems, plus post-`zerocopy#4444`
   regime), and second-kernel `primitiveTargets` export-closure parity oracle (`zerocopy#4488`).
 
+## Adversarial Hardening Regressions (Round B1)
+
+`tests/mir/OleanQuotMdataUtf8ProtoTests.lean` Section 11b pins bypasses reproduced live
+against the initial validator (each forged artifact was previously reported `ok`):
+
+- **V-F4**: `lean4#16767` capture with an EMPTY `LocalContext` (undeclared
+  `_kernel_fresh.0` fvar in the query expression) and with an aliased
+  `fvarIdToDecl` key; closed by `validateKernelQuery` (`undeclaredFVar`) and
+  map/array-consistent `validateLocalContext` (`malformedLocalContext`).
+- **V-Q1 / extra constants**: `constNames[i] ↦ constants[i]` name aliasing and length
+  mismatch (`constNameAliasMismatch`), and theorem-over-axiom replacement via
+  `importModules` subsumption that launders axioms out of every closure audit
+  (`shadowedConstant`).
+- **V-U3**: invalid UTF-8 smuggled through `MData` `DataValue.ofSyntax`, including a
+  `reprStr` cache-key collision; closed by typed binary/in-memory `Syntax` traversal and
+  an injective `syntaxStrictKey`.
+- **Binary region**: non-canonical `LeanMPZ` Nats, out-of-range enum/`Bool` scalar
+  discriminants (e.g. `DefinitionVal.safety = 7`), unchecked `DataValue` arities, and
+  forged `ModuleData.imports` name hashes.
+
 ## Running the Suite
 
 ```bash
