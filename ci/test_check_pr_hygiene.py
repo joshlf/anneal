@@ -1860,6 +1860,46 @@ class StandaloneInternalHygieneTests(InternalHygieneMixin,
     ROOT = ""
     LAYOUT = "standalone"
 
+    def test_cross_vendor_and_scope_to_vendor_renames(self):
+        # Moving from unscanned `minirust/vendor/` into scanned
+        # `lean-miri/vendor/` warns on every line (`entered` is true), while
+        # moving an in-scope file into `lean-miri/vendor/` does not re-warn on
+        # untouched pre-existing lines (`entered` is false).
+        self.write("minirust/vendor/up/a.txt", f"old {self.CLI}\n")
+        self.write("docs/legacy.txt", f"old {self.MOUNT}\n")
+        self.commit("Seed unscanned vendor and legacy doc")
+        git(self.repo, "branch", "-f", "base")
+        (self.repo / "lean-miri/vendor/up").mkdir(parents=True, exist_ok=True)
+        git(self.repo, "mv", "minirust/vendor/up/a.txt",
+            "lean-miri/vendor/up/a.txt")
+        git(self.repo, "mv", "docs/legacy.txt",
+            "lean-miri/vendor/up/legacy.txt")
+        self.commit()
+        self.assertEqual(self.internal(), set())
+        self.assertEqual(self.internal(key="warnings"), {
+            ("internal-reference", "lean-miri/vendor/up/a.txt", 1,
+             "internal-cli")})
+
+    def test_unscanned_vendor_edits_skip_base_tree_lookup(self):
+        self.write("minirust/vendor/up/a.txt", "v1\n")
+        base_sha = self.commit("Seed minirust vendor")
+        self.write("minirust/vendor/up/a.txt", f"v2 {self.CLI}\n")
+        head_sha = self.commit()
+        real_git = cph.Git(self.repo)
+        queried_commits: list[str] = []
+        orig = real_git.tree_records
+
+        def spy(commit: str, paths: list[str] | None = None):
+            queried_commits.append(commit)
+            return orig(commit, paths)
+
+        real_git.tree_records = spy  # type: ignore[method-assign]
+        files = cph.changed_files(real_git, base_sha, head_sha)
+        errs, warns = cph.internal_findings(
+            real_git, head_sha, cph.STANDALONE, files, base_sha)
+        self.assertEqual((errs, warns), ([], []))
+        self.assertEqual(queried_commits, [head_sha])
+
 
 class InternalUnitTests(unittest.TestCase):
     CLI = InternalHygieneMixin.CLI
@@ -1944,7 +1984,7 @@ class InternalUnitTests(unittest.TestCase):
                          ("\x00\ufffd", True))
         # Symlinks, shebang scripts, and source/prose/config paths are text.
         for path in ("docs/note.MD", "notes.txt", "AGENTS.md", "lakefile.toml",
-                     "data/x.json"):
+                     "data/x.json", "LICENSE-MIT", "Makefile"):
             self.assertEqual(dec(b"\x00\xff", path), ("\x00\ufffd", False))
         self.assertEqual(dec(b"#!/bin/sh\n\x00\xff"),
                          ("#!/bin/sh\n\x00\ufffd", False))
@@ -2067,23 +2107,31 @@ class RepoHygieneParityTests(unittest.TestCase):
 class RepositoryTreeTests(unittest.TestCase):
     def test_checked_in_tree_passes_tree_checks(self):
         here = Path(__file__).resolve().parent
-        res = subprocess.run(
-            ["git", "-C", str(here), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=False,
-        )
-        if res.returncode != 0:
+        try:
+            repo = cph.Git(here).toplevel().resolve()
+        except cph.GitError:
             self.skipTest("not running from a Git checkout")
-        repo = Path(res.stdout.strip()).resolve()
-        res = subprocess.run(
-            [sys.executable, "-I", "-B", str(SCRIPT), "--repo", str(repo),
-             "--json"],
-            capture_output=True, text=True, check=False,
-        )
+        old_git_dir = os.environ.get("GIT_DIR")
+        os.environ["GIT_DIR"] = "/nonexistent-git-dir"
+        try:
+            res = subprocess.run(
+                [sys.executable, "-I", "-B", str(SCRIPT), "--repo", str(repo),
+                 "--json"],
+                capture_output=True, text=True, check=False,
+            )
+        finally:
+            if old_git_dir is None:
+                os.environ.pop("GIT_DIR", None)
+            else:
+                os.environ["GIT_DIR"] = old_git_dir
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        report = json.loads(res.stdout)
         # The detected layout matches where this file lives.
         rel = SCRIPT.relative_to(repo).as_posix()
         expected = "monorepo" if rel.startswith("anneal/") else "standalone"
-        self.assertEqual(json.loads(res.stdout)["layout"], expected)
+        self.assertEqual(report["layout"], expected)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["warnings"], [])
 
 
 if __name__ == "__main__":

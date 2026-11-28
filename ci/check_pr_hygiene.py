@@ -1769,14 +1769,19 @@ ALWAYS_TEXT_EXTS = (
 )
 
 
+ALWAYS_TEXT_NAMES = HRS_CONFIG_NAMES | {
+    "Makefile", "Dockerfile", "Justfile", ".gitignore", ".dockerignore",
+}
+
+
 def _always_text_path(path: str, is_symlink: bool = False) -> bool:
     if is_symlink or not path:
         return is_symlink
     p = Path(path)
     return (
         p.suffix.lower() in ALWAYS_TEXT_EXTS
-        or p.name in HRS_CONFIG_NAMES
-        or p.name.startswith(("lakefile", "rust-toolchain"))
+        or p.name in ALWAYS_TEXT_NAMES
+        or p.name.startswith(("lakefile", "rust-toolchain", "LICENSE"))
     )
 
 
@@ -1890,8 +1895,11 @@ def internal_findings(
                 f.old_path is not None and not covered(f.old_path))
 
         records = git.tree_records(head, [f.path for f in changed])
-        prev_lookup = [f.old_path or f.path for f in changed
-                       if not entered(f) and base is not None]
+        prev_lookup = [
+            f.old_path or f.path for f in changed
+            if (not entered(f) and base is not None
+                and _hygiene_scans_content(f.path, layout))
+        ]
         base_records = (
             git.tree_records(base, prev_lookup) if prev_lookup else {}
         )
